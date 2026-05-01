@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI Director</title>
+<style>
+  :root {
+    --bg:     #0f1117;
+    --panel:  #1a1d27;
+    --border: #2a2d3a;
+    --accent: #5b8af7;
+    --text:   #d0d4e8;
+    --muted:  #6b7090;
+    --ok:     #4caf86;
+    --warn:   #f0a500;
+    --err:    #e05555;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: 'Segoe UI', sans-serif; font-size: 14px; }
+
+  /* ── Login ── */
+  #login-screen {
+    display: flex; align-items: center; justify-content: center;
+    min-height: 100vh;
+  }
+  .login-box {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; padding: 40px; width: 340px;
+  }
+  .login-box h1 { font-size: 1.5rem; margin-bottom: 24px; color: var(--accent); }
+  .login-box input {
+    width: 100%; padding: 10px 12px; margin-bottom: 14px;
+    background: var(--bg); border: 1px solid var(--border);
+    border-radius: 6px; color: var(--text); font-size: 14px;
+  }
+  .login-box button {
+    width: 100%; padding: 10px; background: var(--accent);
+    border: none; border-radius: 6px; color: #fff;
+    font-size: 14px; cursor: pointer;
+  }
+  .login-box button:hover { opacity: .9; }
+  #login-error { color: var(--err); margin-top: 12px; font-size: 13px; text-align: center; }
+
+  /* ── Main app ── */
+  #app-screen { display: none; flex-direction: column; min-height: 100vh; }
+
+  nav {
+    display: flex; align-items: center; gap: 16px;
+    padding: 10px 20px; background: var(--panel);
+    border-bottom: 1px solid var(--border);
+  }
+  nav .brand { font-weight: 700; color: var(--accent); font-size: 1.1rem; }
+  nav .spacer { flex: 1; }
+  nav button {
+    padding: 6px 14px; border: 1px solid var(--border);
+    border-radius: 6px; background: transparent;
+    color: var(--text); cursor: pointer; font-size: 13px;
+  }
+  nav button:hover { border-color: var(--accent); color: var(--accent); }
+  nav button.active { border-color: var(--accent); color: var(--accent); }
+
+  .page { display: none; padding: 20px; }
+  .page.active { display: block; }
+
+  h2 { font-size: 1rem; font-weight: 600; margin-bottom: 16px; color: var(--text); }
+
+  /* ── Cards ── */
+  .card {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 8px; padding: 16px; margin-bottom: 16px;
+  }
+  .card-title { font-size: .8rem; text-transform: uppercase;
+    letter-spacing: .06em; color: var(--muted); margin-bottom: 8px; }
+  .stat { font-size: 2rem; font-weight: 700; }
+
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 600px) { .grid-2 { grid-template-columns: 1fr; } }
+
+  /* ── Tasks table ── */
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; padding: 8px 10px; color: var(--muted);
+    border-bottom: 1px solid var(--border); font-weight: 500; }
+  td { padding: 8px 10px; border-bottom: 1px solid var(--border); }
+  tr:last-child td { border-bottom: none; }
+  .badge {
+    display: inline-block; padding: 2px 8px; border-radius: 20px;
+    font-size: 11px; font-weight: 600;
+  }
+  .badge-queued   { background: #3a4a6a; color: #8ab4f8; }
+  .badge-running  { background: #3a5a3a; color: var(--ok); }
+  .badge-completed{ background: #2a4a3a; color: var(--ok); }
+  .badge-failed   { background: #5a2a2a; color: var(--err); }
+  .badge-canceled { background: #3a3a3a; color: var(--muted); }
+  .badge-created  { background: #3a3a2a; color: var(--warn); }
+
+  /* ── Log viewer ── */
+  .log-controls {
+    display: flex; gap: 10px; align-items: center; margin-bottom: 10px; flex-wrap: wrap;
+  }
+  .log-controls select, .log-controls input[type=number] {
+    padding: 6px 10px; background: var(--bg);
+    border: 1px solid var(--border); border-radius: 6px;
+    color: var(--text); font-size: 13px;
+  }
+  .log-controls label { display: flex; align-items: center; gap: 6px; font-size: 13px; }
+  #log-box {
+    background: #0a0c12; border: 1px solid var(--border);
+    border-radius: 6px; padding: 12px;
+    height: 420px; overflow-y: auto;
+    font-family: monospace; font-size: 12px; line-height: 1.6;
+    white-space: pre-wrap; word-break: break-all;
+  }
+  .log-DEBUG  { color: var(--muted); }
+  .log-INFO   { color: var(--text); }
+  .log-NOTICE { color: #8ab4f8; }
+  .log-WARN   { color: var(--warn); }
+  .log-ERROR  { color: var(--err); }
+  .log-CRIT   { color: #ff6060; font-weight: bold; }
+</style>
+</head>
+<body>
+
+<!-- ── Login ── -->
+<div id="login-screen">
+  <div class="login-box">
+    <h1>AI Director</h1>
+    <input id="login-input" type="text" placeholder="Login" autocomplete="username">
+    <input id="pass-input" type="password" placeholder="Password" autocomplete="current-password">
+    <button id="login-btn">Sign in</button>
+    <div id="login-error"></div>
+  </div>
+</div>
+
+<!-- ── App ── -->
+<div id="app-screen">
+  <nav>
+    <span class="brand">AI Director</span>
+    <button id="nav-dashboard" class="active" onclick="showPage('dashboard')">Dashboard</button>
+    <button id="nav-settings" onclick="showPage('settings')">Settings</button>
+    <span class="spacer"></span>
+    <button id="logoff-btn">Log off</button>
+  </nav>
+
+  <!-- Dashboard -->
+  <div id="page-dashboard" class="page active">
+    <div class="grid-2">
+      <div class="card">
+        <div class="card-title">Active tasks</div>
+        <div class="stat" id="stat-tasks">—</div>
+      </div>
+      <div class="card">
+        <div class="card-title">Workers</div>
+        <div class="stat" id="stat-workers">—</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Task queue</div>
+      <table id="tasks-table">
+        <thead>
+          <tr>
+            <th>ID</th><th>Type</th><th>Status</th>
+            <th>Worker</th><th>Created</th>
+          </tr>
+        </thead>
+        <tbody id="tasks-body"></tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Live log</div>
+      <div class="log-controls">
+        <select id="log-file-select">
+          <option value="all">all.log</option>
+          <option value="system">system.log</option>
+          <option value="worker">worker.log</option>
+          <option value="http">http.log</option>
+          <option value="webui">webui.log</option>
+        </select>
+        <label><input type="checkbox" id="log-live" checked> Live update</label>
+        <label><input type="checkbox" id="log-scroll" checked> Auto-scroll</label>
+        <label>Interval&nbsp;
+          <input id="log-interval" type="number" min="0.1" max="10" step="0.1" value="1" style="width:60px">s
+        </label>
+      </div>
+      <div id="log-box"></div>
+    </div>
+  </div>
+
+  <!-- Settings -->
+  <div id="page-settings" class="page">
+    <h2>Settings</h2>
+    <div class="card">
+      <div class="card-title">Raw config (read-only in MVP1)</div>
+      <pre id="config-pre"
+        style="background:#0a0c12;padding:12px;border-radius:6px;overflow:auto;max-height:600px;font-size:12px;"></pre>
+    </div>
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

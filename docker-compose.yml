@@ -1,0 +1,33 @@
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: aidir_redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      ${REDIS_PASSWORD:+--requirepass $REDIS_PASSWORD}
+    ports:
+      - "${REDIS_HOST:-127.0.0.1}:${REDIS_PORT:-6379}:6379"
+    volumes:
+      - ./docker/volumes/redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  nginx:
+    build: ./nginx
+    container_name: aidir_nginx
+    restart: unless-stopped
+    ports:
+      - "${NGINX_HTTP_PORT:-20080}:80"
+    volumes:
+      - ./webui/frontend:/usr/share/nginx/html:ro
+    environment:
+      - WEBUI_HOST=${WEBUI_HOST:-127.0.0.1}
+      - WEBUI_PORT=${WEBUI_PORT:-20080}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - redis
