@@ -11,6 +11,27 @@ warn()  { echo -e "${YLW}[WARN]${NC}  $*"; }
 error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 die()   { error "$*"; exit 1; }
 
+require_file() {
+  [[ -f "$1" ]] || die "Required file not found: $1"
+}
+
+set_env_var() {
+  local file="$1"
+  local key="$2"
+  local value="$3"
+  local escaped_value
+  escaped_value=$(printf '%s' "$value" | sed 's/[&|\\]/\\&/g')
+  if grep -qE "^${key}=" "$file"; then
+    sed -i "s|^${key}=.*|${key}=${escaped_value}|" "$file"
+  else
+    echo "${key}=${value}" >> "$file"
+  fi
+}
+
+generate_password() {
+  tr -dc 'A-Za-z0-9!@#%^*_' < /dev/urandom | head -c 20
+}
+
 # ── Paths ─────────────────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="$SCRIPT_DIR/venv"
@@ -20,6 +41,8 @@ COMPOSE_FILE="$SCRIPT_DIR/docker-compose.yml"
 CORE_APP="$SCRIPT_DIR/core/app.py"
 CRON_SCRIPT="$SCRIPT_DIR/core/cron.py"
 SERVICE_NAME="aidir"
+RUNTIME_DIR="$SCRIPT_DIR/.runtime"
+CRON_RUNNER="$RUNTIME_DIR/cron_runner.sh"
 
 # ── Step 1: Prerequisites check ───────────────────────────────────────────────
 info "Checking prerequisites…"
@@ -30,6 +53,7 @@ check_cmd() {
 
 check_cmd docker
 check_cmd python3
+check_cmd crontab
 
 # docker compose v2 (plugin) or v1 (standalone)
 if docker compose version &>/dev/null 2>&1; then
@@ -47,15 +71,38 @@ python3 -c "import venv" 2>/dev/null || die "python3-venv not available. Install
 # Docker daemon reachable?
 docker info &>/dev/null || die "Docker daemon not running or not accessible. Start Docker and check permissions."
 
+# Required project files
+require_file "$ENV_EXAMPLE"
+require_file "$COMPOSE_FILE"
+require_file "$CORE_APP"
+require_file "$CRON_SCRIPT"
+require_file "$SCRIPT_DIR/requirements.txt"
+
 info "Prerequisites OK"
 
 # ── Step 2: .env setup ────────────────────────────────────────────────────────
 if [[ ! -f "$ENV_FILE" ]]; then
   warn ".env not found – copying from .env.example"
   cp "$ENV_EXAMPLE" "$ENV_FILE"
-  # Set AIDIR_ROOT to actual location
-  sed -i "s|AIDIR_ROOT=.*|AIDIR_ROOT=$SCRIPT_DIR|" "$ENV_FILE"
-  warn "Please review $ENV_FILE and update passwords / ports before using."
+
+  # Auto-fill required runtime values.
+  set_env_var "$ENV_FILE" "AIDIR_ROOT" "$SCRIPT_DIR"
+
+  # Ask only for essential interactive value required by SPEC.
+  echo
+  read -r -s -p "Enter ROOT_PASSWORD for WebUI admin (leave empty to auto-generate): " ROOT_PASSWORD_INPUT
+  echo
+  if [[ -z "$ROOT_PASSWORD_INPUT" ]]; then
+    ROOT_PASSWORD_INPUT="$(generate_password)"
+    info "ROOT_PASSWORD auto-generated. Save it now: $ROOT_PASSWORD_INPUT"
+  fi
+  set_env_var "$ENV_FILE" "ROOT_PASSWORD" "$ROOT_PASSWORD_INPUT"
+
+  chmod 600 "$ENV_FILE"
+  info ".env created and initialized"
+else
+  # Keep existing env file, but ensure required root path stays correct.
+  set_env_var "$ENV_FILE" "AIDIR_ROOT" "$SCRIPT_DIR"
 fi
 
 # Load .env into current shell (for compose variable substitution)
@@ -63,6 +110,25 @@ set -a
 # shellcheck disable=SC1090
 source "$ENV_FILE"
 set +a
+
+# Ensure nginx public port is configured and does not conflict with backend port.
+if [[ -z "${NGINX_HTTP_PORT:-}" ]]; then
+  NGINX_HTTP_PORT=8080
+  set_env_var "$ENV_FILE" "NGINX_HTTP_PORT" "$NGINX_HTTP_PORT"
+  info "NGINX_HTTP_PORT not set; defaulted to $NGINX_HTTP_PORT"
+fi
+
+if [[ "${NGINX_HTTP_PORT}" == "${WEBUI_PORT}" ]]; then
+  if [[ "${WEBUI_PORT}" != "8080" ]]; then
+    NGINX_HTTP_PORT=8080
+  else
+    NGINX_HTTP_PORT=8081
+  fi
+  set_env_var "$ENV_FILE" "NGINX_HTTP_PORT" "$NGINX_HTTP_PORT"
+  warn "WEBUI_PORT and NGINX_HTTP_PORT were equal; NGINX_HTTP_PORT changed to $NGINX_HTTP_PORT"
+fi
+
+mkdir -p "$RUNTIME_DIR"
 
 # ── Step 3: venv + dependencies ───────────────────────────────────────────────
 if [[ ! -d "$VENV_DIR" ]]; then
@@ -98,11 +164,66 @@ done
 
 # ── Step 5: Cron entry ────────────────────────────────────────────────────────
 CRON_PERIOD="${CRON_PERIOD:-60}"
-CRON_CMD="$VENV_DIR/bin/python $CRON_SCRIPT"
-CRON_JOB="*/$CRON_PERIOD * * * * $CRON_CMD"
+if ! [[ "$CRON_PERIOD" =~ ^[0-9]+$ ]] || [[ "$CRON_PERIOD" -le 0 ]]; then
+  warn "Invalid CRON_PERIOD=$CRON_PERIOD; fallback to 60 seconds"
+  CRON_PERIOD=60
+fi
+
+# Cron helper allows second-based schedule semantics while crontab runs each minute.
+cat > "$CRON_RUNNER" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$SCRIPT_DIR"
+ENV_FILE="\$SCRIPT_DIR/.env"
+STATE_FILE="\$SCRIPT_DIR/.runtime/cron_runner.state"
+PYTHON_BIN="\$SCRIPT_DIR/venv/bin/python"
+CRON_SCRIPT="\$SCRIPT_DIR/core/cron.py"
+
+set -a
+# shellcheck disable=SC1090
+source "\$ENV_FILE"
+set +a
+
+period="\${CRON_PERIOD:-60}"
+if ! [[ "\$period" =~ ^[0-9]+$ ]] || [[ "\$period" -le 0 ]]; then
+  period=60
+fi
+
+now=\$(date +%s)
+last=0
+if [[ -f "\$STATE_FILE" ]]; then
+  last=\$(cat "\$STATE_FILE" 2>/dev/null || echo 0)
+fi
+
+# For period >= 60, run only when enough seconds passed.
+if [[ "\$period" -ge 60 ]]; then
+  if [[ \$((now - last)) -lt "\$period" ]]; then
+    exit 0
+  fi
+  echo "\$now" > "\$STATE_FILE"
+  exec "\$PYTHON_BIN" "\$CRON_SCRIPT"
+fi
+
+# For period < 60, run several times during this minute.
+runs=\$((60 / period))
+if [[ "\$runs" -lt 1 ]]; then
+  runs=1
+fi
+
+for ((i=1; i<=runs; i++)); do
+  "\$PYTHON_BIN" "\$CRON_SCRIPT"
+  if [[ "\$i" -lt "\$runs" ]]; then
+    sleep "\$period"
+  fi
+done
+EOF
+chmod +x "$CRON_RUNNER"
+
+CRON_JOB="* * * * * $CRON_RUNNER"
 CRON_MARKER="# aidir-cron"
 
-info "Configuring cron job (every ${CRON_PERIOD} min)…"
+info "Configuring cron job (CRON_PERIOD=${CRON_PERIOD}s)…"
 # Remove old aidir cron entries, add new one
 ( crontab -l 2>/dev/null | grep -v "$CRON_MARKER" ; \
   echo "$CRON_JOB $CRON_MARKER" ) | crontab -
@@ -117,9 +238,15 @@ SERVICE_DESC="AI Director core service"
 if [[ $EUID -eq 0 ]]; then
   SYSTEMD_DIR="/etc/systemd/system"
   SYSTEMCTL="systemctl"
+  WANTED_BY="multi-user.target"
+  SERVICE_AFTER="network.target docker.service"
+  SERVICE_REQUIRES_BLOCK="Requires=docker.service"
 else
   SYSTEMD_DIR="$HOME/.config/systemd/user"
   SYSTEMCTL="systemctl --user"
+  WANTED_BY="default.target"
+  SERVICE_AFTER="network.target"
+  SERVICE_REQUIRES_BLOCK=""
   mkdir -p "$SYSTEMD_DIR"
   # Enable linger so user service survives logout
   loginctl enable-linger "$USER" 2>/dev/null || true
@@ -130,8 +257,8 @@ SERVICE_FILE="$SYSTEMD_DIR/$SERVICE_NAME.service"
 cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=$SERVICE_DESC
-After=network.target docker.service
-Requires=docker.service
+After=$SERVICE_AFTER
+$SERVICE_REQUIRES_BLOCK
 
 [Service]
 Type=simple
@@ -145,12 +272,24 @@ StandardError=journal
 SyslogIdentifier=$SERVICE_NAME
 
 [Install]
-WantedBy=default.target
+WantedBy=$WANTED_BY
 EOF
 
-$SYSTEMCTL daemon-reload
-$SYSTEMCTL enable "$SERVICE_NAME" 2>/dev/null || true
-$SYSTEMCTL restart "$SERVICE_NAME"
+if [[ $EUID -ne 0 ]]; then
+  # systemctl --user requires a user session bus.
+  $SYSTEMCTL show-environment >/dev/null 2>&1 || die "systemctl --user is unavailable (no user DBus session). Login with a regular user session and re-run install.sh, or run as root for a system service."
+fi
+
+$SYSTEMCTL daemon-reload || die "Failed to reload systemd daemon"
+$SYSTEMCTL enable "$SERVICE_NAME" || die "Failed to enable $SERVICE_NAME"
+$SYSTEMCTL restart "$SERVICE_NAME" || die "Failed to restart $SERVICE_NAME"
+
+# Verify service is present and active.
+if [[ $EUID -eq 0 ]]; then
+  $SYSTEMCTL status "$SERVICE_NAME" --no-pager -n 20 || die "Service registered but not active"
+else
+  $SYSTEMCTL status "$SERVICE_NAME" --no-pager -n 20 || die "User service registered but not active"
+fi
 
 info "Service $SERVICE_NAME started"
 

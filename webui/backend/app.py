@@ -24,6 +24,7 @@ from fastapi import (
 )
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from core import log
 
 if TYPE_CHECKING:
     from core.app import Core
@@ -114,6 +115,13 @@ def create_app(core: "Core") -> FastAPI:
 
         user = _find_user(core, login_val, password_val)
         if user is None:
+            client_ip = request.client.host if request.client else "unknown"
+            log(
+                "webui",
+                "warn",
+                f"Failed login attempt for user '{login_val}' from {client_ip}",
+                "auth",
+            )
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
                                 detail="Invalid credentials")
 
@@ -124,6 +132,11 @@ def create_app(core: "Core") -> FastAPI:
             max_age=ttl, httponly=True, samesite="strict",
         )
         return {"ok": True, "token": token}
+
+    @app.get("/api/auth/me")
+    async def auth_me(session: dict = Depends(_require_session)):
+        """Return current session info (login, permissions). Used to restore session on page load."""
+        return {"ok": True, "login": session["login"], "permissions": session.get("permissions", [])}
 
     @app.post("/api/auth/logout")
     async def logout(
@@ -196,8 +209,10 @@ def create_app(core: "Core") -> FastAPI:
         file: str = "all",
         token: str = "",
     ):
-        """Stream new log lines over WebSocket. Client sends token as query param."""
-        session = await _get_session(core, token)
+        """Stream new log lines over WebSocket. Auth via query token or session cookie."""
+        # Prefer query param token; fall back to cookie
+        effective_token = token or websocket.cookies.get("aidir_token", "")
+        session = await _get_session(core, effective_token)
         if session is None:
             await websocket.close(code=4001)
             return

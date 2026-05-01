@@ -46,6 +46,7 @@ The script:
 2. Creates .env file and fills required field in the dialogue mode 
 3. Creates a Python virtual environment in `./venv/` and installs dependencies.
 4. Builds and starts Docker containers (Redis, nginx).
+  Also auto-fixes WebUI port conflicts: `NGINX_HTTP_PORT` is set and kept different from `WEBUI_PORT`.
 5. Adds a cron entry for periodic maintenance (`core/cron.py`).
 6. Registers `core/app.py` as a `systemd` user service (`aidir.service`) and starts it.
 
@@ -73,10 +74,11 @@ Copy from `.env.example`. **Never commit this file** (it is in `.gitignore`).
 | `OLLAMA_BASE_URL` | `http://127.0.0.1:11434` | Upstream Ollama server URL |
 | `WEBUI_PORT` | `20080` | WebUI backend listen port |
 | `WEBUI_HOST` | `127.0.0.1` | WebUI backend bind address |
+| `NGINX_HTTP_PORT` | `8080` | Public HTTP port exposed by nginx (must differ from `WEBUI_PORT`) |
 | `ROOT_USER` | `admin` | WebUI login |
 | `ROOT_PASSWORD` | `changeme` | WebUI password — **change this** |
 | `LOG_WIPE_PERIOD` | `0` | Log cleanup interval in seconds (0 = disabled) |
-| `CRON_PERIOD` | `60` | Cron run interval in minutes |
+| `CRON_PERIOD` | `60` | Cron run interval in seconds |
 | `TASK_QUEUE_TIMEOUT_SECONDS` | `300` | Max time a task waits in queue before cancellation |
 | `TASK_RUN_TIMEOUT_SECONDS` | `300` | Max execution time per task |
 | `TLS_CERT_PATH` | *(optional)* | Path to TLS certificate (handled by nginx) |
@@ -144,8 +146,11 @@ docker logs aidir_nginx -f
 # Ollama endpoint health
 curl -s http://localhost:21434/health
 
-# WebUI backend (before login)
-curl -s http://localhost:20080/health || echo "check WEBUI_PORT"
+# WebUI via nginx (public)
+curl -s http://localhost:8080
+
+# WebUI backend direct (local service)
+curl -s http://localhost:20080/health || echo "check WEBUI_PORT / service status"
 
 # Redis ping
 docker exec aidir_redis redis-cli ping

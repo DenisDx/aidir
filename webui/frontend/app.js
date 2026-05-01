@@ -137,7 +137,8 @@ function reconnectLogs() {
 function connectLogWs() {
   const file = $('log-file-select').value;
   const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
-  const url = `${wsProto}://${location.host}/ws/logs?file=${file}&token=${encodeURIComponent(token)}`;
+  // Cookie is sent automatically by the browser; no token in URL needed
+  const url = `${wsProto}://${location.host}/ws/logs?file=${file}`;
 
   logWs = new WebSocket(url);
 
@@ -182,4 +183,12 @@ async function loadConfig() {
 }
 
 // ── Boot ───────────────────────────────────────────────────────────────────
-showScreen('login');
+// Check for existing session before showing login screen
+(async () => {
+  const r = await fetch('/api/auth/me', { credentials: 'include' });
+  if (r.ok) {
+    onLoggedIn();
+  } else {
+    showScreen('login');
+  }
+})();

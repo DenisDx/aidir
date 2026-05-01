@@ -11,6 +11,12 @@ import signal
 import sys
 from pathlib import Path
 
+# Ensure project root is importable before internal imports when launched as
+# `python /path/to/core/app.py` from systemd.
+_ROOT = Path(__file__).parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
 import redis.asyncio as aioredis
 import uvicorn
 
@@ -21,9 +27,6 @@ from core.scheduler import Scheduler
 from core.workers_loader import load_workers
 from core.endpoints.endpoint_ollama import Endpoint_ollama
 from core import log
-
-_ROOT = Path(__file__).parent.parent
-sys.path.insert(0, str(_ROOT))
 
 
 class Core:
