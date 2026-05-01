@@ -2,97 +2,90 @@
 // JSON5 format: supports comments, unquoted keys, trailing commas
 // Secrets and paths come from .env via ${VAR} or ${VAR:-default} substitution
 {
-    version: "1.0",
-    title: "aidir 1",
-    instance: "${AIDIR_INSTANCE:-aidir1}",
-    root: "${AIDIR_ROOT}",
-
-    redis: {
-        host: "${REDIS_HOST:-127.0.0.1}",
-        port: ${REDIS_PORT:-6379},
-        password: "${REDIS_PASSWORD:-}",
+  "version": "1.0",
+  "title": "aidir 1",
+  "instance": "${AIDIR_INSTANCE:-aidir1}",
+  "root": "${AIDIR_ROOT}",
+  "redis": {
+    "host": "${REDIS_HOST:-127.0.0.1}",
+    "port": ${REDIS_PORT:-6379},
+    "password": "${REDIS_PASSWORD:-}"
+  },
+  "logging": {
+    // Default level for all subsystems. String or int (0-7, systemd-journald scale).
+    "level": "${LOG_LEVEL:-info}",
+    // Seconds between log wipe runs. 0 = never wipe.
+    "wipe_period": ${LOG_WIPE_PERIOD:-0},
+    // wipe_max_age: 86400,  // seconds; defaults to wipe_period if not set
+    "levels": { // thresholds for individual per-type log files
+      "workers": "debug",
+      "http": "info",
+      "webui": "info"
     },
-
-    logging: {
-        // Default level for all subsystems. String or int (0-7, systemd-journald scale).
-        level: "info",
-        // Seconds between log wipe runs. 0 = never wipe.
-        wipe_period: ${LOG_WIPE_PERIOD:-0},
-        // wipe_max_age: 86400,  // seconds; defaults to wipe_period if not set
-        levels: {          // thresholds for individual per-type log files
-            workers: "debug",
-            http: "info",
-            webui: "info",
-        },
-        alllevels: {       // thresholds for all.log
-            core: 4,       // WARNING
-            workers: 4,
-            http: 6,       // INFO
-            webui: 4,
-        },
+    "alllevels": { // thresholds for all.log
+      "core": 4, // WARNING
+      "workers": 4,
+      "http": 6, // INFO
+      "webui": 4
+    }
+  },
+  // Resources to track (VRAM etc). Empty in MVP1 - resource checks are TODO.
+  "resources": [],
+  "endpoints": [
+    {
+      "id": "ollama",
+      "api": "ollama",
+      "port": ${OLLAMA_ENDPOINT_PORT:-21434},
+      "bindAddress": "${OLLAMA_ENDPOINT_HOST:-0.0.0.0}",
+      // worker used for agent tasks; falls back to workers.default if omitted
+      "worker": "call_ollama",
+      "middlewares": [] // TODO: add middleware ids here when needed
+    }
+  ],
+  "workers": {
+    "items": {
+      "call_ollama": {
+        // Upstream ollama provider id from models.providers
+        "provider": "ollama_local",
+        "logging": {
+          "level": "debug",
+          "alllevel": "info"
+        }
+      }
     },
-
-    // Resources to track (VRAM etc). Empty in MVP1 - resource checks are TODO.
-    resources: [],
-
-    endpoints: [
+    "default": "call_ollama"
+  },
+  "middleware": {
+    "items": {} // TODO: add middleware configs here
+  },
+  "models": {
+    "providers": {
+      "ollama_local": {
+        "baseUrl": "${OLLAMA_BASE_URL:-http://127.0.0.1:11434}",
+        "api": "ollama",
+        "models": [] // populated at runtime via /api/tags
+      }
+    }
+  },
+  "webui": {
+    "port": ${WEBUI_PORT:-20080},
+    "bind": "${WEBUI_HOST:-127.0.0.1}",
+    "auth": {
+      "mode": "login",
+      "session_ttl": 86400, // seconds
+      "users": [
         {
-            id: "ollama",
-            api: "ollama",
-            port: ${OLLAMA_ENDPOINT_PORT:-21434},
-            bindAddress: "${OLLAMA_ENDPOINT_HOST:-0.0.0.0}",
-            // worker used for agent tasks; falls back to workers.default if omitted
-            worker: "call_ollama",
-            middlewares: [],  // TODO: add middleware ids here when needed
-        },
-    ],
-
-    workers: {
-        items: {
-            "call_ollama": {
-                // Upstream ollama provider id from models.providers
-                provider: "ollama_local",
-                logging: {
-                    level: "debug",
-                    alllevel: "info",
-                },
-            },
-        },
-        default: "call_ollama",
-    },
-
-    middleware: {
-        items: {},  // TODO: add middleware configs here
-    },
-
-    models: {
-        providers: {
-            "ollama_local": {
-                baseUrl: "${OLLAMA_BASE_URL:-http://127.0.0.1:11434}",
-                api: "ollama",
-                models: [],  // populated at runtime via /api/tags
-            },
-        },
-    },
-
-    webui: {
-        port: ${WEBUI_PORT:-20080},
-        bind: "${WEBUI_HOST:-127.0.0.1}",
-        auth: {
-            mode: "login",
-            session_ttl: 86400,  // seconds
-            users: [
-                {
-                    login: "${ROOT_USER:-admin}",
-                    password: "${ROOT_PASSWORD:-changeme}",
-                    permissions: ["all"],
-                },
-            ],
-        },
-    },
-
-    tasks: {
-        queue_timeout: ${TASK_QUEUE_TIMEOUT_SECONDS:-300},
-        run_timeout: ${TASK_RUN_TIMEOUT_SECONDS:-300},
-    },
+          "login": "${ROOT_USER:-admin}",
+          "password": "${ROOT_PASSWORD:-changeme}",
+          "permissions": [
+            "all"
+          ]
+        }
+      ]
+    }
+  },
+  "tasks": {
+    "queue_timeout": ${TASK_QUEUE_TIMEOUT_SECONDS:-300},
+    "run_timeout": ${TASK_RUN_TIMEOUT_SECONDS:-300}
+  }
 }

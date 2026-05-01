@@ -41,8 +41,6 @@ COMPOSE_FILE="$SCRIPT_DIR/docker-compose.yml"
 CORE_APP="$SCRIPT_DIR/core/app.py"
 CRON_SCRIPT="$SCRIPT_DIR/core/cron.py"
 SERVICE_NAME="aidir"
-RUNTIME_DIR="$SCRIPT_DIR/.runtime"
-CRON_RUNNER="$RUNTIME_DIR/cron_runner.sh"
 
 # ── Step 1: Prerequisites check ───────────────────────────────────────────────
 info "Checking prerequisites…"
@@ -128,8 +126,6 @@ if [[ "${NGINX_HTTP_PORT}" == "${WEBUI_PORT}" ]]; then
   warn "WEBUI_PORT and NGINX_HTTP_PORT were equal; NGINX_HTTP_PORT changed to $NGINX_HTTP_PORT"
 fi
 
-mkdir -p "$RUNTIME_DIR"
-
 # ── Step 3: venv + dependencies ───────────────────────────────────────────────
 if [[ ! -d "$VENV_DIR" ]]; then
   info "Creating Python virtual environment…"
@@ -163,67 +159,18 @@ for i in $(seq 1 20); do
 done
 
 # ── Step 5: Cron entry ────────────────────────────────────────────────────────
-CRON_PERIOD="${CRON_PERIOD:-60}"
+CRON_PERIOD="${CRON_PERIOD:-1}"
 if ! [[ "$CRON_PERIOD" =~ ^[0-9]+$ ]] || [[ "$CRON_PERIOD" -le 0 ]]; then
-  warn "Invalid CRON_PERIOD=$CRON_PERIOD; fallback to 60 seconds"
-  CRON_PERIOD=60
+  warn "Invalid CRON_PERIOD=$CRON_PERIOD; fallback to 1 minute"
+  CRON_PERIOD=1
 fi
 
-# Cron helper allows second-based schedule semantics while crontab runs each minute.
-cat > "$CRON_RUNNER" <<EOF
-#!/usr/bin/env bash
-set -euo pipefail
-
-SCRIPT_DIR="$SCRIPT_DIR"
-ENV_FILE="\$SCRIPT_DIR/.env"
-STATE_FILE="\$SCRIPT_DIR/.runtime/cron_runner.state"
-PYTHON_BIN="\$SCRIPT_DIR/venv/bin/python"
-CRON_SCRIPT="\$SCRIPT_DIR/core/cron.py"
-
-set -a
-# shellcheck disable=SC1090
-source "\$ENV_FILE"
-set +a
-
-period="\${CRON_PERIOD:-60}"
-if ! [[ "\$period" =~ ^[0-9]+$ ]] || [[ "\$period" -le 0 ]]; then
-  period=60
-fi
-
-now=\$(date +%s)
-last=0
-if [[ -f "\$STATE_FILE" ]]; then
-  last=\$(cat "\$STATE_FILE" 2>/dev/null || echo 0)
-fi
-
-# For period >= 60, run only when enough seconds passed.
-if [[ "\$period" -ge 60 ]]; then
-  if [[ \$((now - last)) -lt "\$period" ]]; then
-    exit 0
-  fi
-  echo "\$now" > "\$STATE_FILE"
-  exec "\$PYTHON_BIN" "\$CRON_SCRIPT"
-fi
-
-# For period < 60, run several times during this minute.
-runs=\$((60 / period))
-if [[ "\$runs" -lt 1 ]]; then
-  runs=1
-fi
-
-for ((i=1; i<=runs; i++)); do
-  "\$PYTHON_BIN" "\$CRON_SCRIPT"
-  if [[ "\$i" -lt "\$runs" ]]; then
-    sleep "\$period"
-  fi
-done
-EOF
-chmod +x "$CRON_RUNNER"
-
-CRON_JOB="* * * * * $CRON_RUNNER"
+# Run each minute and execute cron.py only on exact period boundaries.
+# This supports any positive CRON_PERIOD in minutes without extra helper scripts.
+CRON_JOB="* * * * * [ \$(( \$(date +\\%s) / 60 % $CRON_PERIOD )) -eq 0 ] && $VENV_DIR/bin/python $CRON_SCRIPT"
 CRON_MARKER="# aidir-cron"
 
-info "Configuring cron job (CRON_PERIOD=${CRON_PERIOD}s)…"
+info "Configuring cron job (CRON_PERIOD=${CRON_PERIOD}m)…"
 # Remove old aidir cron entries, add new one
 ( crontab -l 2>/dev/null | grep -v "$CRON_MARKER" ; \
   echo "$CRON_JOB $CRON_MARKER" ) | crontab -

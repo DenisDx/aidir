@@ -78,7 +78,7 @@ Copy from `.env.example`. **Never commit this file** (it is in `.gitignore`).
 | `ROOT_USER` | `admin` | WebUI login |
 | `ROOT_PASSWORD` | `changeme` | WebUI password — **change this** |
 | `LOG_WIPE_PERIOD` | `0` | Log cleanup interval in seconds (0 = disabled) |
-| `CRON_PERIOD` | `60` | Cron run interval in seconds |
+| `CRON_PERIOD` | `1` | Cron run interval in minutes (any integer >= 1) |
 | `TASK_QUEUE_TIMEOUT_SECONDS` | `300` | Max time a task waits in queue before cancellation |
 | `TASK_RUN_TIMEOUT_SECONDS` | `300` | Max execution time per task |
 | `TLS_CERT_PATH` | *(optional)* | Path to TLS certificate (handled by nginx) |

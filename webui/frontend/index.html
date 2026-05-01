@@ -104,6 +104,76 @@
     color: var(--text); font-size: 13px;
   }
   .log-controls label { display: flex; align-items: center; gap: 6px; font-size: 13px; }
+  .field-picker {
+    position: relative;
+    display: inline-flex;
+    align-items: stretch;
+  }
+  .field-picker input[type=text] {
+    min-width: 260px;
+    padding: 6px 10px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    font-size: 13px;
+  }
+  .field-picker button {
+    min-width: 34px;
+    padding: 0 10px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    margin-left: 2px;
+    color: var(--text);
+    cursor: pointer;
+    font-size: 12px;
+  }
+  .field-picker button:hover,
+  .field-picker button.is-open {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .field-picker-menu {
+    position: absolute;
+    top: calc(100% + 6px);
+    left: 0;
+    min-width: 100%;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    box-shadow: 0 10px 24px rgba(0, 0, 0, 0.35);
+    padding: 6px;
+    display: none;
+    z-index: 20;
+  }
+  .field-picker-menu.is-open { display: block; }
+  .field-picker-option {
+    display: block;
+    width: 100%;
+    text-align: left;
+    background: transparent;
+    border: 0;
+    color: var(--text);
+    padding: 8px 10px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 13px;
+  }
+  .field-picker-option:hover {
+    background: rgba(91, 138, 247, 0.12);
+    color: var(--accent);
+  }
+  .field-picker-option.is-selected {
+    background: rgba(91, 138, 247, 0.18);
+    color: var(--accent);
+    outline: 1px solid rgba(91, 138, 247, 0.35);
+  }
+  .field-picker-option:focus-visible {
+    background: rgba(91, 138, 247, 0.16);
+    color: var(--accent);
+    outline: 1px solid rgba(91, 138, 247, 0.45);
+  }
   #log-box {
     background: #0a0c12; border: 1px solid var(--border);
     border-radius: 6px; padding: 12px;
@@ -192,7 +262,41 @@
   <div id="page-settings" class="page">
     <h2>Settings</h2>
     <div class="card">
-      <div class="card-title">Raw config (read-only in MVP1)</div>
+      <div class="card-title">Edit mode</div>
+      <div class="log-controls" style="margin-bottom:12px;">
+        <label><input type="radio" name="cfg-mode" id="cfg-mode-raw" checked> Raw config</label>
+        <label><input type="radio" name="cfg-mode" id="cfg-mode-gui"> GUI fields</label>
+      </div>
+
+      <div id="cfg-raw-pane">
+        <div style="margin-bottom:8px;color:var(--muted);font-size:12px;">Direct config editing. Save validates syntax and version.</div>
+        <textarea id="config-editor"
+          style="width:100%;min-height:280px;background:#0a0c12;color:var(--text);border:1px solid var(--border);border-radius:6px;padding:12px;font-family:monospace;font-size:12px;"></textarea>
+        <div style="margin-top:10px;display:flex;gap:10px;align-items:center;">
+          <button id="config-save-raw-btn" style="padding:8px 12px;border-radius:6px;border:none;background:var(--accent);color:#fff;cursor:pointer;">Save raw config</button>
+          <span id="config-save-raw-status" style="font-size:12px;color:var(--muted);"></span>
+        </div>
+      </div>
+
+      <div id="cfg-gui-pane" style="display:none;">
+        <div style="margin-bottom:8px;color:var(--muted);font-size:12px;">Field editor mode (MVP V2 test field).</div>
+        <div class="log-controls" style="margin-bottom:10px;">
+          <label for="cfg-logging-level">Default logging level</label>
+          <div class="field-picker" id="cfg-logging-level-picker">
+            <input id="cfg-logging-level" type="text" placeholder='"info" or "${LOG_LEVEL:-info}"' autocomplete="off">
+            <button id="cfg-logging-level-toggle" type="button" aria-label="Show logging level options" aria-expanded="false">▼</button>
+            <div class="field-picker-menu" id="cfg-logging-level-menu"></div>
+          </div>
+        </div>
+        <div style="display:flex;gap:10px;align-items:center;">
+          <button id="config-save-gui-btn" style="padding:8px 12px;border-radius:6px;border:none;background:var(--accent);color:#fff;cursor:pointer;">Save GUI fields</button>
+          <span id="config-save-gui-status" style="font-size:12px;color:var(--muted);"></span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Current parsed config</div>
       <pre id="config-pre"
         style="background:#0a0c12;padding:12px;border-radius:6px;overflow:auto;max-height:600px;font-size:12px;"></pre>
     </div>

@@ -7,6 +7,27 @@ let logWs = null;
 let logTimer = null;
 let refreshTimer = null;
 
+const TEXT_PICKERS = [
+  {
+    id: 'cfg-logging-level',
+    rootId: 'cfg-logging-level-picker',
+    inputId: 'cfg-logging-level',
+    toggleId: 'cfg-logging-level-toggle',
+    menuId: 'cfg-logging-level-menu',
+    options: [
+      '"emerg"',
+      '"alert"',
+      '"crit"',
+      '"error"',
+      '"warn"',
+      '"notice"',
+      '"info"',
+      '"debug"',
+      '"${LOG_LEVEL:-info}"',
+    ],
+  },
+];
+
 // ── DOM helpers ────────────────────────────────────────────────────────────
 const $ = id => document.getElementById(id);
 
@@ -175,14 +196,213 @@ function appendLog(line) {
 }
 
 // ── Settings ───────────────────────────────────────────────────────────────
-async function loadConfig() {
-  const data = await apiGet('/api/config');
-  if (data) {
-    $('config-pre').textContent = JSON.stringify(data, null, 2);
+function setCfgStatus(elId, text, ok) {
+  const el = $(elId);
+  el.textContent = text;
+  el.style.color = ok ? 'var(--ok)' : 'var(--err)';
+}
+
+function getTextPicker(pickerId) {
+  return TEXT_PICKERS.find(picker => picker.id === pickerId) || null;
+}
+
+function closeTextPicker(picker) {
+  $(picker.menuId).classList.remove('is-open');
+  $(picker.toggleId).classList.remove('is-open');
+  $(picker.toggleId).setAttribute('aria-expanded', 'false');
+}
+
+function closeAllTextPickers(exceptId = '') {
+  TEXT_PICKERS.forEach(picker => {
+    if (picker.id !== exceptId) closeTextPicker(picker);
+  });
+}
+
+function openTextPicker(picker) {
+  closeAllTextPickers(picker.id);
+  syncTextPickerSelection(picker);
+  $(picker.menuId).classList.add('is-open');
+  $(picker.toggleId).classList.add('is-open');
+  $(picker.toggleId).setAttribute('aria-expanded', 'true');
+}
+
+function toggleTextPicker(picker) {
+  if ($(picker.menuId).classList.contains('is-open')) {
+    closeTextPicker(picker);
+  } else {
+    openTextPicker(picker);
   }
 }
 
+function renderTextPickerOptions(picker) {
+  const menu = $(picker.menuId);
+  menu.innerHTML = picker.options.map(value => (
+    `<button class="field-picker-option" type="button" data-picker-id="${picker.id}" data-value="${value.replaceAll('&', '&amp;').replaceAll('"', '&quot;').replaceAll('<', '&lt;')}">${value.replaceAll('&', '&amp;').replaceAll('<', '&lt;')}</button>`
+  )).join('');
+}
+
+function syncTextPickerSelection(picker) {
+  const currentValue = $(picker.inputId).value;
+  document.querySelectorAll(`#${picker.menuId} .field-picker-option`).forEach(option => {
+    const isSelected = option.dataset.value === currentValue;
+    option.classList.toggle('is-selected', isSelected);
+    option.setAttribute('aria-selected', isSelected ? 'true' : 'false');
+  });
+}
+
+function getPickerOptions(picker) {
+  return Array.from(document.querySelectorAll(`#${picker.menuId} .field-picker-option`));
+}
+
+function focusTextPickerOption(picker, index) {
+  const options = getPickerOptions(picker);
+  if (!options.length) return;
+  const normalized = ((index % options.length) + options.length) % options.length;
+  options[normalized].focus();
+}
+
+function selectTextPickerValue(picker, value) {
+  $(picker.inputId).value = value;
+  syncTextPickerSelection(picker);
+  closeTextPicker(picker);
+  $(picker.inputId).focus();
+}
+
+function bindTextPicker(picker) {
+  renderTextPickerOptions(picker);
+  syncTextPickerSelection(picker);
+
+  $(picker.toggleId).addEventListener('click', () => toggleTextPicker(picker));
+
+  $(picker.inputId).addEventListener('input', () => {
+    syncTextPickerSelection(picker);
+  });
+
+  $(picker.inputId).addEventListener('keydown', event => {
+    if (event.key === 'ArrowDown') {
+      event.preventDefault();
+      openTextPicker(picker);
+      const options = getPickerOptions(picker);
+      const selectedIndex = options.findIndex(option => option.classList.contains('is-selected'));
+      focusTextPickerOption(picker, selectedIndex >= 0 ? selectedIndex : 0);
+    } else if (event.key === 'ArrowUp') {
+      event.preventDefault();
+      openTextPicker(picker);
+      const options = getPickerOptions(picker);
+      const selectedIndex = options.findIndex(option => option.classList.contains('is-selected'));
+      focusTextPickerOption(picker, selectedIndex >= 0 ? selectedIndex : options.length - 1);
+    } else if (event.key === 'Escape') {
+      closeTextPicker(picker);
+    }
+  });
+
+  getPickerOptions(picker).forEach((option, index) => {
+    option.addEventListener('click', () => {
+      selectTextPickerValue(picker, option.dataset.value || '');
+    });
+
+    option.addEventListener('keydown', event => {
+      if (event.key === 'ArrowDown') {
+        event.preventDefault();
+        focusTextPickerOption(picker, index + 1);
+      } else if (event.key === 'ArrowUp') {
+        event.preventDefault();
+        focusTextPickerOption(picker, index - 1);
+      } else if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        selectTextPickerValue(picker, option.dataset.value || '');
+      } else if (event.key === 'Escape') {
+        event.preventDefault();
+        closeTextPicker(picker);
+        $(picker.inputId).focus();
+      }
+    });
+  });
+}
+
+function bindSettingsUi() {
+  $('cfg-mode-raw').addEventListener('change', () => {
+    $('cfg-raw-pane').style.display = 'block';
+    $('cfg-gui-pane').style.display = 'none';
+    closeAllTextPickers();
+  });
+
+  $('cfg-mode-gui').addEventListener('change', () => {
+    $('cfg-raw-pane').style.display = 'none';
+    $('cfg-gui-pane').style.display = 'block';
+  });
+
+  $('config-save-raw-btn').addEventListener('click', saveRawConfig);
+  $('config-save-gui-btn').addEventListener('click', saveGuiConfig);
+
+  document.addEventListener('click', event => {
+    TEXT_PICKERS.forEach(picker => {
+      if (!$(picker.rootId).contains(event.target)) closeTextPicker(picker);
+    });
+  });
+
+  document.addEventListener('keydown', event => {
+    if (event.key === 'Escape') closeAllTextPickers();
+  });
+
+  TEXT_PICKERS.forEach(bindTextPicker);
+}
+
+async function loadConfig() {
+  const [data, raw, fields] = await Promise.all([
+    apiGet('/api/config'),
+    apiGet('/api/config/raw'),
+    apiGet('/api/config/fields?keys=logging.level'),
+  ]);
+
+  if (data) {
+    $('config-pre').textContent = JSON.stringify(data, null, 2);
+  }
+
+  if (raw && typeof raw.text === 'string') {
+    $('config-editor').value = raw.text;
+  }
+
+  if (fields && fields.fields && typeof fields.fields['logging.level'] === 'string') {
+    $('cfg-logging-level').value = fields.fields['logging.level'];
+    const picker = getTextPicker('cfg-logging-level');
+    if (picker) syncTextPickerSelection(picker);
+  }
+}
+
+async function saveRawConfig() {
+  setCfgStatus('config-save-raw-status', '', true);
+  const res = await apiPost('/api/config/raw', {
+    config_text: $('config-editor').value,
+  });
+  if (!res.ok) {
+    setCfgStatus('config-save-raw-status', res.data.detail || 'Save failed', false);
+    return;
+  }
+  setCfgStatus('config-save-raw-status', 'Saved', true);
+  await loadConfig();
+}
+
+async function saveGuiConfig() {
+  setCfgStatus('config-save-gui-status', '', true);
+  const changes = [
+    {
+      key: 'logging.level',
+      value_text: $('cfg-logging-level').value,
+    },
+  ];
+  const res = await apiPost('/api/config/fields', { changes });
+  if (!res.ok) {
+    setCfgStatus('config-save-gui-status', res.data.detail || 'Save failed', false);
+    return;
+  }
+  setCfgStatus('config-save-gui-status', 'Saved', true);
+  await loadConfig();
+}
+
 // ── Boot ───────────────────────────────────────────────────────────────────
+bindSettingsUi();
+
 // Check for existing session before showing login screen
 (async () => {
   const r = await fetch('/api/auth/me', { credentials: 'include' });

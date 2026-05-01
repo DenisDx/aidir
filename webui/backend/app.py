@@ -249,6 +249,68 @@ def create_app(core: "Core") -> FastAPI:
         """Return current config (without secrets substituted back)."""
         return core.config.raw()
 
+    @app.get("/api/config/raw")
+    async def get_config_raw(session: dict = Depends(_require_session)):
+        """Return raw config text for direct editing mode."""
+        return {"text": core.config.raw_text()}
+
+    @app.post("/api/config/raw")
+    async def save_config_raw(request: Request, session: dict = Depends(_require_session)):
+        """Validate and save full config text from UI, then reload config cache."""
+        body = await request.json()
+        config_text = body.get("config_text", "")
+        if not isinstance(config_text, str) or not config_text.strip():
+            raise HTTPException(status_code=400, detail="config_text must be a non-empty string")
+
+        try:
+            core.config.save_config_text(config_text)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Failed to save config: {exc}")
+
+        return {"ok": True, "config": core.config.raw()}
+
+    @app.post("/api/config/fields")
+    async def update_config_fields(request: Request, session: dict = Depends(_require_session)):
+        """Update config fields one by one using Config.update_key and reload cache."""
+        body = await request.json()
+        changes = body.get("changes", [])
+        if not isinstance(changes, list) or not changes:
+            raise HTTPException(status_code=400, detail="changes must be a non-empty list")
+
+        try:
+            for change in changes:
+                key = change.get("key")
+                if not isinstance(key, str) or not key.strip():
+                    raise ValueError("Each change must include non-empty key")
+                if "value_text" in change:
+                    core.config.update_key_text(key, change.get("value_text", ""))
+                else:
+                    core.config.update_key(key, change.get("value"))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Failed to update config fields: {exc}")
+
+        return {"ok": True, "config": core.config.raw()}
+
+    @app.get("/api/config/fields")
+    async def get_config_fields(keys: str, session: dict = Depends(_require_session)):
+        """Return raw text values for requested comma-separated config keys."""
+        items = [k.strip() for k in keys.split(",") if k.strip()]
+        if not items:
+            raise HTTPException(status_code=400, detail="keys query parameter is required")
+
+        out: dict[str, str] = {}
+        try:
+            for key in items:
+                out[key] = core.config.get_key_text(key)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+        return {"fields": out}
+
     # ── Static files ──────────────────────────────────────────────────────────
     # Served last so API routes take priority
 
