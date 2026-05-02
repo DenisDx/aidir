@@ -30,16 +30,72 @@
     }
   },
   // Resources to track (VRAM etc). Empty in MVP1 - resource checks are TODO.
-  "resources": [],
+  "resources":[
+        {
+            "id":"local_machine",
+            "type":"cuda",
+            "arch": "nvidia",
+            "limits":{
+                "VRAM":10000, //Максимум можно использовать 10гб
+            }
+        },
+        {
+            "id":"remote_machine",
+            "type":"cuda",
+            "limits":{
+                "VRAM":20000,
+            }
+        },
+    ],
+
   "endpoints": [
     {
-      "id": "ollama",
-      "api": "ollama",
-      "port": ${OLLAMA_ENDPOINT_PORT:-21434},
-      "bindAddress": "${OLLAMA_ENDPOINT_HOST:-0.0.0.0}",
+      "id": "openaix",
+      "api": "openaix",
+      "port": ${OPENAIX_ENDPOINT_PORT:-21434},
+      "bindAddress": "${OPENAIX_ENDPOINT_HOST:-0.0.0.0}",
       // worker used for agent tasks; falls back to workers.default if omitted
-      "worker": "call_ollama",
+      "worker": "openaix",
       "middlewares": [] // TODO: add middleware ids here when needed
+    },
+    {
+      "id": "mcp",
+      "api": "mcp",
+      "port": ${MCP_ENDPOINT_PORT:-20001},
+      "bindAddress": "${MCP_ENDPOINT_HOST:-0.0.0.0}",
+      "tools": {
+        "search": {
+          "worker": "web_search",
+          "description": "Test web search tool",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "query": {"type": "string"},
+              "limit": {"type": "integer"}
+            }
+          }
+        },
+        "fetch": {
+          "worker": "web_fetch",
+          "description": "Test web fetch tool",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "url": {"type": "string"},
+              "maxChars": {"type": "integer"}
+            },
+            "required": ["url"]
+          }
+        },
+        "selftest": {
+          "worker": "selftest",
+          "description": "System health self-test tool",
+          "inputSchema": {
+            "type": "object",
+            "properties": {}
+          }
+        }
+      }
     }
   ],
   "workers": {
@@ -51,6 +107,61 @@
           "level": "debug",
           "alllevel": "info"
         }
+      },
+      "openaix": {
+        "enabled": true,
+        "provider": "ollama_local",
+        "timeoutSeconds": 300,
+        "logging": {
+          "level": "debug",
+          "alllevel": "info"
+        },
+        tools:{
+          "search":{
+              worker:"web_search",//используется worker web_search
+          },
+          "fetch":{
+              worker:"web_fetch",
+          },
+          "selftest":{
+              worker:"selftest",
+          },
+        }
+      },
+      "reject_agent": {
+        "enabled": true,
+        "fallbacks": ["echo_agent"],
+        "retry_count": 2,
+        "retry_period": 1,
+        "on_reject": {
+          "unavailable": {
+            "action": "fallback-retry"
+          },
+          "busy": {
+            "action": "retry",
+            "retry_count": 1,
+            "retry_period": 0
+          },
+          "error": {
+            "action": "cancel"
+          }
+        }
+      },
+      "echo_agent": {
+        "enabled": true
+      },
+      "web_search": {
+        "enabled": true,
+        "provider": "mock"
+      },
+      "web_fetch": {
+        "enabled": true,
+        "timeoutSeconds": 30
+      },
+      "selftest": {
+        "enabled": true,
+        "includeWorkers": true,
+        "includeResources": true
       }
     },
     "default": "call_ollama"

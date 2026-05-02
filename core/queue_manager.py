@@ -110,11 +110,16 @@ class QueueManager:
         task._done_event.set()
 
     async def delete_task(self, task_id: str) -> None:
-        """Remove task from memory and Redis (queue + hash)."""
-        self._tasks.pop(task_id, None)
+        """Remove task from memory and ZSET queue.
+        External tasks (created by endpoints) keep their Redis HASH for cron cleanup;
+        internal tasks are fully deleted from Redis immediately.
+        """
+        task = self._tasks.pop(task_id, None)
+        is_external = task.external if task is not None else False
         pipe = self._redis.pipeline()
-        pipe.delete(self._tk(task_id))
-        # Remove from all known queue types
+        if not is_external:
+            pipe.delete(self._tk(task_id))
+        # Always remove from queue ZSET (task is no longer waiting)
         for task_type in ("agent", "request", "tool"):
             pipe.zrem(self._q(task_type), task_id)
         await pipe.execute()

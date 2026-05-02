@@ -69,8 +69,10 @@ Copy from `.env.example`. **Never commit this file** (it is in `.gitignore`).
 | `REDIS_HOST` | `127.0.0.1` | Redis host |
 | `REDIS_PORT` | `6379` | Redis port |
 | `REDIS_PASSWORD` | *(empty)* | Redis password (leave empty for no auth) |
-| `OLLAMA_ENDPOINT_PORT` | `21434` | Port where aidir listens for Ollama API clients |
-| `OLLAMA_ENDPOINT_HOST` | `0.0.0.0` | Bind address for the Ollama endpoint |
+| `OPENAIX_ENDPOINT_PORT` | `21434` | Port where aidir listens for OpenAIx/Ollama-compatible API clients |
+| `OPENAIX_ENDPOINT_HOST` | `0.0.0.0` | Bind address for the OpenAIx endpoint |
+| `MCP_ENDPOINT_PORT` | `20001` | Port where aidir listens for MCP JSON-RPC requests |
+| `MCP_ENDPOINT_HOST` | `0.0.0.0` | Bind address for the MCP endpoint |
 | `OLLAMA_BASE_URL` | `http://127.0.0.1:11434` | Upstream Ollama server URL |
 | `WEBUI_PORT` | `20080` | WebUI backend listen port |
 | `WEBUI_HOST` | `127.0.0.1` | WebUI backend bind address |
@@ -97,6 +99,25 @@ Key sections:
 - **`tasks`** — queue and run timeouts
 - **`logging`** — log levels per subsystem (0=EMERG … 7=DEBUG)
 - **`resources`** — hardware resources to track (VRAM etc.; enforced in future releases)
+
+### MCP test tools (included)
+
+Default config exposes an MCP endpoint with two test tools:
+
+- `search` -> worker `web_search` (returns mock search results)
+- `fetch` -> worker `web_fetch` (downloads URL and returns short content preview)
+
+Quick checks:
+
+```bash
+curl http://127.0.0.1:20001/mcp \
+  -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+
+curl http://127.0.0.1:20001/mcp \
+  -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search","arguments":{"query":"aidir"}}}'
+```
 
 ---
 

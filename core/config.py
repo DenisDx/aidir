@@ -472,6 +472,19 @@ class Config:
             raise ValueError(f"Unknown config key path: {key}")
         return json.dumps(value, ensure_ascii=True)
 
+    def get_key_text_or_none(self, key: str) -> str | None:
+        """Return key value text or None when key does not exist."""
+        raw = self._path.read_text(encoding="utf-8")
+        values = _extract_scalar_rhs_by_path(raw)
+        if key in values:
+            return values[key]
+
+        sentinel = object()
+        value = self.get(key, sentinel)
+        if value is sentinel:
+            return None
+        return json.dumps(value, ensure_ascii=True)
+
     def update_key_text(self, key: str, value_text: str) -> None:
         """Update one key using raw text value (supports placeholders like ${VAR})."""
         if not isinstance(value_text, str):
@@ -516,6 +529,39 @@ class Config:
         new_text = json.dumps(parsed, ensure_ascii=True, indent=2)
         raw_values[key] = rhs_for_write
         new_text = _reapply_raw_values(new_text, raw_values, set())
+        new_text = _reapply_comments(new_text, before_comments, inline_comments)
+        new_text = _reapply_header_comments(new_text, header_comments)
+        self.save_config_text(new_text)
+
+    def delete_key(self, key: str) -> None:
+        """Delete one dot-path key from config file, preserve comments/raw values for others."""
+        raw = self._path.read_text(encoding="utf-8")
+        header_comments = _extract_header_comments(raw)
+        before_comments, inline_comments = _extract_comments_by_path(raw)
+        raw_values = _extract_raw_values_by_path(raw)
+
+        parsed = json.loads(json.dumps(self._data))
+        node = parsed
+        parts = key.split(".")
+        if not parts:
+            raise ValueError("Key path is empty")
+
+        for part in parts[:-1]:
+            if not isinstance(node, dict) or part not in node:
+                return
+            node = node[part]
+
+        if not isinstance(node, dict):
+            raise ValueError(f"Invalid config key path: {key}")
+
+        node.pop(parts[-1], None)
+
+        new_text = json.dumps(parsed, ensure_ascii=True, indent=2)
+        filtered_raw_values = {
+            path: rhs for path, rhs in raw_values.items()
+            if path != key and not path.startswith(f"{key}.")
+        }
+        new_text = _reapply_raw_values(new_text, filtered_raw_values, set())
         new_text = _reapply_comments(new_text, before_comments, inline_comments)
         new_text = _reapply_header_comments(new_text, header_comments)
         self.save_config_text(new_text)

@@ -79,6 +79,7 @@ class Endpoint_ollama(BaseEndpoint):
         task = Task_agent(
             payload=body,
             stream=stream,
+            external=True,
         )
         # Honour explicit worker override from request body (extended syntax)
         if "worker" in body:

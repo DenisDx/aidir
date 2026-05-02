@@ -181,6 +181,7 @@ def create_app(core: "Core") -> FastAPI:
             "instance": core.config.get("instance", "aidir"),
             "workers":  workers_info,
             "tasks":    len(core.queue.list_tasks()),
+            "resources": core.resources.snapshot() if core.resources else [],
         }
 
     # ── Logs (REST) ───────────────────────────────────────────────────────────
@@ -284,7 +285,9 @@ def create_app(core: "Core") -> FastAPI:
                 key = change.get("key")
                 if not isinstance(key, str) or not key.strip():
                     raise ValueError("Each change must include non-empty key")
-                if "value_text" in change:
+                if bool(change.get("remove")):
+                    core.config.delete_key(key)
+                elif "value_text" in change:
                     core.config.update_key_text(key, change.get("value_text", ""))
                 else:
                     core.config.update_key(key, change.get("value"))
@@ -302,12 +305,9 @@ def create_app(core: "Core") -> FastAPI:
         if not items:
             raise HTTPException(status_code=400, detail="keys query parameter is required")
 
-        out: dict[str, str] = {}
-        try:
-            for key in items:
-                out[key] = core.config.get_key_text(key)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
+        out: dict[str, str | None] = {}
+        for key in items:
+            out[key] = core.config.get_key_text_or_none(key)
 
         return {"fields": out}
 

@@ -82,12 +82,55 @@ async def cleanup_stale_tasks(redis: aioredis.Redis) -> None:
     """
 
 
+async def cleanup_expired_tasks(redis: aioredis.Redis) -> None:
+    """Delete completed external tasks older than config.external_task_live seconds."""
+    interval = 86400  # run once per day
+    if not await _should_run(redis, "cleanup_expired_tasks", interval):
+        return
+
+    max_age = int(config.get("external_task_live") or 0)
+    if max_age <= 0:
+        return
+
+    ns = config.get("instance", "aidir")
+    pattern = f"{ns}:task:*"
+    cutoff = time.time() - max_age
+    deleted = 0
+
+    cursor = 0
+    while True:
+        cursor, keys = await redis.scan(cursor, match=pattern, count=100)
+        for key in keys:
+            try:
+                fields = await redis.hmget(key, "external", "finished_at", "status")
+                is_external, finished_at, status = fields
+                if is_external != "1":
+                    continue
+                if status not in ("completed", "failed", "canceled"):
+                    continue
+                if not finished_at:
+                    continue
+                from datetime import datetime, timezone
+                ft = datetime.fromisoformat(finished_at).timestamp()
+                if ft < cutoff:
+                    await redis.delete(key)
+                    deleted += 1
+            except Exception as exc:
+                log("system", "warning", f"cleanup_expired_tasks: skip {key}: {exc}")
+        if cursor == 0:
+            break
+
+    if deleted:
+        log("system", "info", f"cleanup_expired_tasks: deleted {deleted} expired task(s)")
+
+
 async def main() -> None:
     redis = await _connect_redis()
     try:
         await wipe_logs(redis)
         await health_check(redis)
         await cleanup_stale_tasks(redis)
+        await cleanup_expired_tasks(redis)
     finally:
         await redis.aclose()
 

@@ -15,18 +15,95 @@ const TEXT_PICKERS = [
     toggleId: 'cfg-logging-level-toggle',
     menuId: 'cfg-logging-level-menu',
     options: [
-      '"emerg"',
-      '"alert"',
-      '"crit"',
-      '"error"',
-      '"warn"',
-      '"notice"',
-      '"info"',
-      '"debug"',
-      '"${LOG_LEVEL:-info}"',
+      { label: '"emerg"', value: '"emerg"' },
+      { label: '"alert"', value: '"alert"' },
+      { label: '"crit"', value: '"crit"' },
+      { label: '"error"', value: '"error"' },
+      { label: '"warn"', value: '"warn"' },
+      { label: '"notice"', value: '"notice"' },
+      { label: '"info"', value: '"info"' },
+      { label: '"debug"', value: '"debug"' },
+      { label: '"${LOG_LEVEL:-info}"', value: '"${LOG_LEVEL:-info}"' },
     ],
   },
+  {
+    id: 'cfg-logging-levels-workers',
+    rootId: 'cfg-logging-levels-workers-picker',
+    inputId: 'cfg-logging-levels-workers',
+    toggleId: 'cfg-logging-levels-workers-toggle',
+    menuId: 'cfg-logging-levels-workers-menu',
+    options: [],
+  },
+  {
+    id: 'cfg-logging-levels-http',
+    rootId: 'cfg-logging-levels-http-picker',
+    inputId: 'cfg-logging-levels-http',
+    toggleId: 'cfg-logging-levels-http-toggle',
+    menuId: 'cfg-logging-levels-http-menu',
+    options: [],
+  },
+  {
+    id: 'cfg-logging-levels-webui',
+    rootId: 'cfg-logging-levels-webui-picker',
+    inputId: 'cfg-logging-levels-webui',
+    toggleId: 'cfg-logging-levels-webui-toggle',
+    menuId: 'cfg-logging-levels-webui-menu',
+    options: [],
+  },
+  {
+    id: 'cfg-logging-levels-core',
+    rootId: 'cfg-logging-levels-core-picker',
+    inputId: 'cfg-logging-levels-core',
+    toggleId: 'cfg-logging-levels-core-toggle',
+    menuId: 'cfg-logging-levels-core-menu',
+    options: [],
+  },
+  {
+    id: 'cfg-logging-levels-endpoint',
+    rootId: 'cfg-logging-levels-endpoint-picker',
+    inputId: 'cfg-logging-levels-endpoint',
+    toggleId: 'cfg-logging-levels-endpoint-toggle',
+    menuId: 'cfg-logging-levels-endpoint-menu',
+    options: [],
+  },
+  {
+    id: 'cfg-logging-levels-middleware',
+    rootId: 'cfg-logging-levels-middleware-picker',
+    inputId: 'cfg-logging-levels-middleware',
+    toggleId: 'cfg-logging-levels-middleware-toggle',
+    menuId: 'cfg-logging-levels-middleware-menu',
+    options: [],
+  },
 ];
+
+const LEVEL_LIST_OPTIONS = [
+  { label: 'NOT DEFINED', value: 'NOT DEFINED' },
+  { label: '"emerg"', value: '"emerg"' },
+  { label: '"alert"', value: '"alert"' },
+  { label: '"crit"', value: '"crit"' },
+  { label: '"error"', value: '"error"' },
+  { label: '"warn"', value: '"warn"' },
+  { label: '"notice"', value: '"notice"' },
+  { label: '"info"', value: '"info"' },
+  { label: '"debug"', value: '"debug"' },
+  { label: '"${LOG_LEVEL:-info}"', value: '"${LOG_LEVEL:-info}"' },
+];
+
+const GUI_LEVEL_FIELDS = [
+  { inputId: 'cfg-logging-level', key: 'logging.level', allowNotDefined: false },
+  { inputId: 'cfg-logging-levels-workers', key: 'logging.levels.workers', allowNotDefined: true },
+  { inputId: 'cfg-logging-levels-http', key: 'logging.levels.http', allowNotDefined: true },
+  { inputId: 'cfg-logging-levels-webui', key: 'logging.levels.webui', allowNotDefined: true },
+  { inputId: 'cfg-logging-levels-core', key: 'logging.levels.core', allowNotDefined: true },
+  { inputId: 'cfg-logging-levels-endpoint', key: 'logging.levels.endpoint', allowNotDefined: true },
+  { inputId: 'cfg-logging-levels-middleware', key: 'logging.levels.middleware', allowNotDefined: true },
+];
+
+for (const picker of TEXT_PICKERS) {
+  if (picker.id.startsWith('cfg-logging-levels-')) {
+    picker.options = LEVEL_LIST_OPTIONS;
+  }
+}
 
 // ── DOM helpers ────────────────────────────────────────────────────────────
 const $ = id => document.getElementById(id);
@@ -101,7 +178,10 @@ function onLoggedIn() {
 
 // ── Tasks ──────────────────────────────────────────────────────────────────
 async function loadTasks() {
-  const data = await apiGet('/api/tasks');
+  const [data, status] = await Promise.all([
+    apiGet('/api/tasks'),
+    apiGet('/api/status'),
+  ]);
   if (!data) return;
 
   $('stat-tasks').textContent = data.tasks.length;
@@ -120,10 +200,56 @@ async function loadTasks() {
     body.appendChild(tr);
   });
 
-  const status = await apiGet('/api/status');
   if (status) {
     $('stat-workers').textContent = Object.keys(status.workers).length;
+    renderResources(status.resources || []);
   }
+}
+
+function renderResources(resources) {
+  const body = $('resources-body');
+  if (!body) return;
+  body.innerHTML = '';
+
+  if (!resources.length) {
+    const tr = document.createElement('tr');
+    tr.innerHTML = '<td colspan="4" style="color:var(--muted)">No resources configured</td>';
+    body.appendChild(tr);
+    return;
+  }
+
+  resources.forEach(r => {
+    const usageParts = Object.keys(r.limits || {}).map(key => {
+      const used = Number((r.used || {})[key] || 0);
+      const limit = Number((r.limits || {})[key] || 0);
+      return `${key}: ${used}/${limit}`;
+    });
+
+    const consumers = (r.consumers || []).map(c => {
+      const details = Object.entries(c.usage || {})
+        .map(([k, v]) => `${k}:${v}`)
+        .join(', ');
+      return `<div style="margin-bottom:2px"><span style="font-family:monospace">${escapeHtml(c.id)}</span> <span style="color:var(--muted)">${escapeHtml(details)}</span></div>`;
+    }).join('') || '<span style="color:var(--muted)">—</span>';
+
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td>${escapeHtml(r.id || '—')}</td>
+      <td>${escapeHtml(r.type || '—')}</td>
+      <td>${escapeHtml(usageParts.join(' | ') || '—')}</td>
+      <td>${consumers}</td>
+    `;
+    body.appendChild(tr);
+  });
+}
+
+function escapeHtml(s) {
+  return String(s)
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
 }
 
 function fmtTime(iso) {
@@ -236,8 +362,8 @@ function toggleTextPicker(picker) {
 
 function renderTextPickerOptions(picker) {
   const menu = $(picker.menuId);
-  menu.innerHTML = picker.options.map(value => (
-    `<button class="field-picker-option" type="button" data-picker-id="${picker.id}" data-value="${value.replaceAll('&', '&amp;').replaceAll('"', '&quot;').replaceAll('<', '&lt;')}">${value.replaceAll('&', '&amp;').replaceAll('<', '&lt;')}</button>`
+  menu.innerHTML = picker.options.map(opt => (
+    `<button class="field-picker-option" type="button" data-picker-id="${picker.id}" data-value="${opt.value.replaceAll('&', '&amp;').replaceAll('"', '&quot;').replaceAll('<', '&lt;')}">${opt.label.replaceAll('&', '&amp;').replaceAll('<', '&lt;')}</button>`
   )).join('');
 }
 
@@ -321,15 +447,16 @@ function bindTextPicker(picker) {
 }
 
 function bindSettingsUi() {
+  $('cfg-mode-gui').addEventListener('change', () => {
+    $('cfg-raw-pane').style.display = 'none';
+    $('cfg-gui-pane').style.display = 'block';
+    closeAllTextPickers();
+  });
+
   $('cfg-mode-raw').addEventListener('change', () => {
     $('cfg-raw-pane').style.display = 'block';
     $('cfg-gui-pane').style.display = 'none';
     closeAllTextPickers();
-  });
-
-  $('cfg-mode-gui').addEventListener('change', () => {
-    $('cfg-raw-pane').style.display = 'none';
-    $('cfg-gui-pane').style.display = 'block';
   });
 
   $('config-save-raw-btn').addEventListener('click', saveRawConfig);
@@ -349,10 +476,11 @@ function bindSettingsUi() {
 }
 
 async function loadConfig() {
+  const keys = GUI_LEVEL_FIELDS.map(field => field.key).join(',');
   const [data, raw, fields] = await Promise.all([
     apiGet('/api/config'),
     apiGet('/api/config/raw'),
-    apiGet('/api/config/fields?keys=logging.level'),
+    apiGet(`/api/config/fields?keys=${encodeURIComponent(keys)}`),
   ]);
 
   if (data) {
@@ -363,10 +491,20 @@ async function loadConfig() {
     $('config-editor').value = raw.text;
   }
 
-  if (fields && fields.fields && typeof fields.fields['logging.level'] === 'string') {
-    $('cfg-logging-level').value = fields.fields['logging.level'];
-    const picker = getTextPicker('cfg-logging-level');
-    if (picker) syncTextPickerSelection(picker);
+  if (fields && fields.fields) {
+    GUI_LEVEL_FIELDS.forEach(field => {
+      const val = fields.fields[field.key];
+      if (typeof val === 'string') {
+        $(field.inputId).value = val;
+      } else if (field.allowNotDefined) {
+        $(field.inputId).value = 'NOT DEFINED';
+      } else {
+        $(field.inputId).value = '';
+      }
+
+      const picker = getTextPicker(field.inputId);
+      if (picker) syncTextPickerSelection(picker);
+    });
   }
 }
 
@@ -385,12 +523,17 @@ async function saveRawConfig() {
 
 async function saveGuiConfig() {
   setCfgStatus('config-save-gui-status', '', true);
-  const changes = [
-    {
-      key: 'logging.level',
-      value_text: $('cfg-logging-level').value,
-    },
-  ];
+
+  const changes = [];
+  for (const field of GUI_LEVEL_FIELDS) {
+    const valueText = $(field.inputId).value.trim();
+    if (field.allowNotDefined && (valueText === 'NOT DEFINED' || valueText === '')) {
+      changes.push({ key: field.key, remove: true });
+    } else {
+      changes.push({ key: field.key, value_text: valueText });
+    }
+  }
+
   const res = await apiPost('/api/config/fields', { changes });
   if (!res.ok) {
     setCfgStatus('config-save-gui-status', res.data.detail || 'Save failed', false);

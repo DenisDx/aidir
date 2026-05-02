@@ -145,7 +145,7 @@
     box-shadow: 0 10px 24px rgba(0, 0, 0, 0.35);
     padding: 6px;
     display: none;
-    z-index: 20;
+    z-index: 200;
   }
   .field-picker-menu.is-open { display: block; }
   .field-picker-option {
@@ -174,6 +174,93 @@
     color: var(--accent);
     outline: 1px solid rgba(91, 138, 247, 0.45);
   }
+  .cfg-group {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    margin-bottom: 10px;
+    overflow: visible;
+    background: rgba(0, 0, 0, 0.1);
+  }
+  .cfg-group > summary {
+    list-style: none;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 12px;
+    font-size: 13px;
+    color: var(--text);
+    background: rgba(255, 255, 255, 0.02);
+    border-bottom: 1px solid transparent;
+    user-select: none;
+  }
+  .cfg-group > summary::before {
+    content: "▸";
+    color: var(--muted);
+    font-size: 12px;
+    transition: transform 0.15s ease, color 0.15s ease;
+  }
+  .cfg-group[open] > summary::before {
+    transform: rotate(90deg);
+    color: var(--accent);
+  }
+  .cfg-group[open] > summary {
+    border-bottom-color: var(--border);
+  }
+  .cfg-group > summary::-webkit-details-marker { display: none; }
+  .cfg-group-body {
+    padding: 12px;
+  }
+  .cfg-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 10px;
+    flex-wrap: wrap;
+  }
+  .cfg-row:last-child { margin-bottom: 0; }
+  .cfg-row > label {
+    min-width: 160px;
+    font-size: 13px;
+    color: var(--text);
+  }
+  .hint-wrap {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+  }
+  .hint-dot {
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--muted);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 11px;
+    line-height: 1;
+    user-select: none;
+  }
+  .hint-wrap:hover .hint-dot { color: var(--accent); border-color: var(--accent); }
+  .hint-tip {
+    position: absolute;
+    top: calc(100% + 6px);
+    left: 0;
+    min-width: 280px;
+    max-width: 360px;
+    display: none;
+    padding: 8px 10px;
+    background: #0a0c12;
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font-size: 12px;
+    line-height: 1.4;
+    z-index: 30;
+  }
+  .hint-wrap:hover .hint-tip { display: block; }
   #log-box {
     background: #0a0c12; border: 1px solid var(--border);
     border-radius: 6px; padding: 12px;
@@ -239,6 +326,18 @@
     </div>
 
     <div class="card">
+      <div class="card-title">Resources</div>
+      <table id="resources-table">
+        <thead>
+          <tr>
+            <th>Resource</th><th>Type</th><th>Usage</th><th>Consumers</th>
+          </tr>
+        </thead>
+        <tbody id="resources-body"></tbody>
+      </table>
+    </div>
+
+    <div class="card">
       <div class="card-title">Live log</div>
       <div class="log-controls">
         <select id="log-file-select">
@@ -264,11 +363,90 @@
     <div class="card">
       <div class="card-title">Edit mode</div>
       <div class="log-controls" style="margin-bottom:12px;">
-        <label><input type="radio" name="cfg-mode" id="cfg-mode-raw" checked> Raw config</label>
-        <label><input type="radio" name="cfg-mode" id="cfg-mode-gui"> GUI fields</label>
+        <label><input type="radio" name="cfg-mode" id="cfg-mode-gui" checked> GUI fields</label>
+        <label><input type="radio" name="cfg-mode" id="cfg-mode-raw"> Raw config</label>
       </div>
 
-      <div id="cfg-raw-pane">
+      <div id="cfg-gui-pane">
+        <details class="cfg-group" open>
+          <summary>Logging</summary>
+          <div class="cfg-group-body">
+            <div class="cfg-row">
+              <label for="cfg-logging-level">Default logging level</label>
+              <span class="hint-wrap" aria-hidden="true">
+                <span class="hint-dot">i</span>
+                <span class="hint-tip">Default level for all subsystems. String or int (0-7, systemd-journald scale).</span>
+              </span>
+              <div class="field-picker" id="cfg-logging-level-picker">
+                <input id="cfg-logging-level" type="text" placeholder='"info" or "${LOG_LEVEL:-info}"' autocomplete="off">
+                <button id="cfg-logging-level-toggle" type="button" aria-label="Show logging level options" aria-expanded="false">▼</button>
+                <div class="field-picker-menu" id="cfg-logging-level-menu"></div>
+              </div>
+            </div>
+
+            <details class="cfg-group" open>
+              <summary>Levels</summary>
+              <div class="cfg-group-body">
+                <div class="cfg-row">
+                  <label for="cfg-logging-levels-workers">workers</label>
+                  <div class="field-picker" id="cfg-logging-levels-workers-picker">
+                    <input id="cfg-logging-levels-workers" type="text" placeholder='NOT DEFINED or "info"' autocomplete="off">
+                    <button id="cfg-logging-levels-workers-toggle" type="button" aria-label="Show workers level options" aria-expanded="false">▼</button>
+                    <div class="field-picker-menu" id="cfg-logging-levels-workers-menu"></div>
+                  </div>
+                </div>
+                <div class="cfg-row">
+                  <label for="cfg-logging-levels-http">http</label>
+                  <div class="field-picker" id="cfg-logging-levels-http-picker">
+                    <input id="cfg-logging-levels-http" type="text" placeholder='NOT DEFINED or "info"' autocomplete="off">
+                    <button id="cfg-logging-levels-http-toggle" type="button" aria-label="Show http level options" aria-expanded="false">▼</button>
+                    <div class="field-picker-menu" id="cfg-logging-levels-http-menu"></div>
+                  </div>
+                </div>
+                <div class="cfg-row">
+                  <label for="cfg-logging-levels-webui">webui</label>
+                  <div class="field-picker" id="cfg-logging-levels-webui-picker">
+                    <input id="cfg-logging-levels-webui" type="text" placeholder='NOT DEFINED or "info"' autocomplete="off">
+                    <button id="cfg-logging-levels-webui-toggle" type="button" aria-label="Show webui level options" aria-expanded="false">▼</button>
+                    <div class="field-picker-menu" id="cfg-logging-levels-webui-menu"></div>
+                  </div>
+                </div>
+                <div class="cfg-row">
+                  <label for="cfg-logging-levels-core">core</label>
+                  <div class="field-picker" id="cfg-logging-levels-core-picker">
+                    <input id="cfg-logging-levels-core" type="text" placeholder='NOT DEFINED or "info"' autocomplete="off">
+                    <button id="cfg-logging-levels-core-toggle" type="button" aria-label="Show core level options" aria-expanded="false">▼</button>
+                    <div class="field-picker-menu" id="cfg-logging-levels-core-menu"></div>
+                  </div>
+                </div>
+                <div class="cfg-row">
+                  <label for="cfg-logging-levels-endpoint">endpoint</label>
+                  <div class="field-picker" id="cfg-logging-levels-endpoint-picker">
+                    <input id="cfg-logging-levels-endpoint" type="text" placeholder='NOT DEFINED or "info"' autocomplete="off">
+                    <button id="cfg-logging-levels-endpoint-toggle" type="button" aria-label="Show endpoint level options" aria-expanded="false">▼</button>
+                    <div class="field-picker-menu" id="cfg-logging-levels-endpoint-menu"></div>
+                  </div>
+                </div>
+                <div class="cfg-row">
+                  <label for="cfg-logging-levels-middleware">middleware</label>
+                  <div class="field-picker" id="cfg-logging-levels-middleware-picker">
+                    <input id="cfg-logging-levels-middleware" type="text" placeholder='NOT DEFINED or "info"' autocomplete="off">
+                    <button id="cfg-logging-levels-middleware-toggle" type="button" aria-label="Show middleware level options" aria-expanded="false">▼</button>
+                    <div class="field-picker-menu" id="cfg-logging-levels-middleware-menu"></div>
+                  </div>
+                </div>
+              </div>
+            </details>
+          </div>
+        </details>
+
+        <div style="display:flex;gap:10px;align-items:center;">
+          <button id="config-save-gui-btn" style="padding:8px 12px;border-radius:6px;border:none;background:var(--accent);color:#fff;cursor:pointer;">Save GUI fields</button>
+          <span id="config-save-gui-status" style="font-size:12px;color:var(--muted);"></span>
+        </div>
+      </div>
+
+      <div id="cfg-raw-pane" style="display:none;">
         <div style="margin-bottom:8px;color:var(--muted);font-size:12px;">Direct config editing. Save validates syntax and version.</div>
         <textarea id="config-editor"
           style="width:100%;min-height:280px;background:#0a0c12;color:var(--text);border:1px solid var(--border);border-radius:6px;padding:12px;font-family:monospace;font-size:12px;"></textarea>
@@ -278,21 +456,6 @@
         </div>
       </div>
 
-      <div id="cfg-gui-pane" style="display:none;">
-        <div style="margin-bottom:8px;color:var(--muted);font-size:12px;">Field editor mode (MVP V2 test field).</div>
-        <div class="log-controls" style="margin-bottom:10px;">
-          <label for="cfg-logging-level">Default logging level</label>
-          <div class="field-picker" id="cfg-logging-level-picker">
-            <input id="cfg-logging-level" type="text" placeholder='"info" or "${LOG_LEVEL:-info}"' autocomplete="off">
-            <button id="cfg-logging-level-toggle" type="button" aria-label="Show logging level options" aria-expanded="false">▼</button>
-            <div class="field-picker-menu" id="cfg-logging-level-menu"></div>
-          </div>
-        </div>
-        <div style="display:flex;gap:10px;align-items:center;">
-          <button id="config-save-gui-btn" style="padding:8px 12px;border-radius:6px;border:none;background:var(--accent);color:#fff;cursor:pointer;">Save GUI fields</button>
-          <span id="config-save-gui-status" style="font-size:12px;color:var(--muted);"></span>
-        </div>
-      </div>
     </div>
 
     <div class="card">

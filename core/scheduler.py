@@ -7,6 +7,7 @@ TODO: add resource availability checks before dispatching (VRAM etc.).
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import TYPE_CHECKING
 
 from core.task import Task, STATUS_QUEUED
@@ -15,9 +16,10 @@ from core import log
 
 if TYPE_CHECKING:
     from core.queue_manager import QueueManager
+    from core.resources import Resources
     from core.worker import BaseWorker
 
-_SUPPORTED_TYPES = ("agent",)  # TODO: extend with request, tool, tts, stt…
+_SUPPORTED_TYPES = ("agent", "tool")  # TODO: extend with request, tts, stt…
 
 
 class Scheduler:
@@ -30,9 +32,15 @@ class Scheduler:
         self,
         queue: "QueueManager",
         workers: dict[str, "BaseWorker"],
+        workers_cfg: dict | None = None,
+        resources: "Resources | None" = None,
+        full_config: dict | None = None,
     ) -> None:
         self._queue = queue
         self._workers = workers
+        self._workers_cfg = workers_cfg or {}
+        self._resources = resources
+        self._full_config = full_config or {}
         self._running = False
         self._wake = asyncio.Event()
 
@@ -58,6 +66,11 @@ class Scheduler:
                     log("system", "warn", f"Task {task_id} popped but not in memory")
                     continue
 
+                # Task is scheduled for later retry.
+                if task.next_retry_at and task.next_retry_at > time.time():
+                    await self._queue.add_task(task)
+                    continue
+
                 worker = self._select_worker(task)
                 if worker is None:
                     # No compatible worker – re-enqueue and skip
@@ -66,7 +79,15 @@ class Scheduler:
                         f"No worker for task {task_id} (type={task_type}), re-queued")
                     continue
 
-                asyncio.create_task(self._run_task(task, worker))
+                reqs = self._resolve_resource_requirements(task, worker.id)
+                if reqs and self._resources and not self._resources.check_available(reqs):
+                    # System busy by resources: postpone task without consuming retry budget.
+                    task.next_retry_at = time.time() + 1
+                    await self._queue.add_task(task)
+                    log("system", "info", f"Task {task.id} delayed: insufficient resources")
+                    continue
+
+                asyncio.create_task(self._run_task(task, worker, reqs))
                 dispatched = True
 
             if not dispatched:
@@ -100,10 +121,19 @@ class Scheduler:
 
         return None
 
-    async def _run_task(self, task: Task, worker: "BaseWorker") -> None:
+    async def _run_task(
+        self,
+        task: Task,
+        worker: "BaseWorker",
+        reserved_reqs: dict[str, dict[str, int]] | None = None,
+    ) -> None:
         """Execute one task; handle timeouts and exceptions."""
         log("worker", "info", f"Starting task {task.id}", worker.id)
         await self._queue.mark_running(task.id, worker.id)
+        consumer_id = f"{task.id}:{worker.id}"
+
+        if self._resources and reserved_reqs:
+            await self._resources.reserve_blind_for(reserved_reqs, consumer_id=consumer_id)
 
         try:
             result: WorkerResult = await asyncio.wait_for(
@@ -112,25 +142,141 @@ class Scheduler:
             )
             if result.ok:
                 task.result = result.data
+                task.retry_attempt = 0
+                task.fallback_index = 0
+                task.next_retry_at = 0.0
                 await self._queue.mark_completed(task)
                 log("worker", "info", f"Task {task.id} completed", worker.id)
             else:
-                await self._queue.mark_failed(
-                    task, result.error or {"code": "WORKER_ERROR", "message": "Worker returned error"}
-                )
-                log("worker", "warn", f"Task {task.id} failed: {result.error}", worker.id)
+                err = result.error or {"code": "WORKER_ERROR", "message": "Worker returned error"}
+                if not await self._handle_reject(task, worker.id, err):
+                    await self._queue.mark_failed(task, err)
+                    log("worker", "warn", f"Task {task.id} failed: {err}", worker.id)
 
         except asyncio.TimeoutError:
             log("worker", "error", f"Task {task.id} timed out", worker.id)
-            await self._queue.mark_failed(
-                task, {"code": "TIMEOUT", "message": "Task run timeout exceeded"}
-            )
+            err = {"code": "TIMEOUT", "message": "Task run timeout exceeded"}
+            if not await self._handle_reject(task, worker.id, err):
+                await self._queue.mark_failed(task, err)
 
         except Exception as exc:
             log("worker", "error", f"Task {task.id} exception: {exc}", worker.id)
-            await self._queue.mark_failed(
-                task, {"code": "EXCEPTION", "message": str(exc)}
-            )
+            err = {"code": "EXCEPTION", "message": str(exc)}
+            if not await self._handle_reject(task, worker.id, err):
+                await self._queue.mark_failed(task, err)
+
+        finally:
+            if self._resources and reserved_reqs:
+                await self._resources.release_for(reserved_reqs, consumer_id=consumer_id)
+
+    def _resolve_resource_requirements(self, task: Task, worker_id: str) -> dict[str, dict[str, int]]:
+        """Resolve resource requirements from task or worker/model config."""
+        if task.resource_requirements:
+            return task.resource_requirements
+
+        merged: dict[str, dict[str, int]] = {}
+
+        wcfg = self._workers_cfg.get(worker_id, {}) or {}
+        for rid, vals in (wcfg.get("resources") or {}).items():
+            merged.setdefault(rid, {})
+            for k, v in (vals or {}).items():
+                merged[rid][k] = int(merged[rid].get(k, 0)) + int(v)
+
+        model_id = (task.payload or {}).get("model")
+        provider_id = wcfg.get("provider")
+        if model_id and provider_id:
+            providers = (((self._full_config or {}).get("models") or {}).get("providers") or {})
+            p = providers.get(provider_id) or {}
+            for model in (p.get("models") or []):
+                if model.get("id") != model_id:
+                    continue
+                for rid, vals in (model.get("resources") or {}).items():
+                    merged.setdefault(rid, {})
+                    for k, v in (vals or {}).items():
+                        merged[rid][k] = int(merged[rid].get(k, 0)) + int(v)
+                break
+
+        task.resource_requirements = merged
+        return merged
+
+    @staticmethod
+    def _reason_from_error(error: dict) -> str:
+        """Map worker error to reject reason: unavailable|busy|error."""
+        code = str((error or {}).get("code", "")).upper()
+        if code in {"UPSTREAM_UNREACHABLE", "CONNECT_ERROR", "CONNECTION_ERROR", "UNAVAILABLE"}:
+            return "unavailable"
+        if code in {"UPSTREAM_BUSY", "RESOURCE_BUSY", "BUSY"}:
+            return "busy"
+        return "error"
+
+    def _effective_policy(self, task: Task, worker_id: str, reason: str) -> dict:
+        """Build effective reject policy from worker config + task overrides."""
+        wcfg = self._workers_cfg.get(worker_id, {}) or {}
+
+        retry_count = int(task.retry_count or wcfg.get("retry_count") or 0)
+        retry_period = int(task.retry_period or wcfg.get("retry_period") or 0)
+        fallbacks = list(task.fallbacks or wcfg.get("fallbacks") or [])
+
+        on_reject = dict(wcfg.get("on_reject") or {})
+        on_reject.update(task.on_reject or {})
+        reason_cfg = (on_reject.get(reason) or {})
+
+        action = str(reason_cfg.get("action") or "cancel").strip().lower()
+        return {
+            "action": action,
+            "retry_count": int(reason_cfg.get("retry_count", retry_count)),
+            "retry_period": int(reason_cfg.get("retry_period", retry_period)),
+            "fallbacks": fallbacks,
+        }
+
+    async def _handle_reject(self, task: Task, worker_id: str, error: dict) -> bool:
+        """Apply reject policy. Return True if task was re-queued, False if should fail now."""
+        reason = self._reason_from_error(error)
+        pol = self._effective_policy(task, worker_id, reason)
+
+        action = pol["action"]
+        retry_count = int(pol["retry_count"])
+        retry_period = int(pol["retry_period"])
+        fallbacks = list(pol["fallbacks"])
+
+        def _schedule_retry() -> None:
+            task.retry_attempt += 1
+            task.next_retry_at = time.time() + max(0, retry_period)
+
+        if action == "retry":
+            if task.retry_attempt >= retry_count:
+                return False
+            _schedule_retry()
+            await self._queue.add_task(task)
+            log("worker", "info", f"Task {task.id} retry scheduled #{task.retry_attempt}", worker_id)
+            return True
+
+        if action in {"fallback", "fallback-retry"}:
+            if not fallbacks:
+                return False
+
+            if task.fallback_index < len(fallbacks):
+                task.worker_id = fallbacks[task.fallback_index]
+                task.fallback_index += 1
+                task.next_retry_at = time.time() + max(0, retry_period)
+                await self._queue.add_task(task)
+                log("worker", "info", f"Task {task.id} fallback -> {task.worker_id}", worker_id)
+                return True
+
+            # End of fallback chain
+            if action == "fallback-retry" and task.retry_attempt < retry_count:
+                _schedule_retry()
+                task.fallback_index = 0
+                task.worker_id = fallbacks[0]
+                task.fallback_index = 1
+                await self._queue.add_task(task)
+                log("worker", "info", f"Task {task.id} fallback cycle retry #{task.retry_attempt}", worker_id)
+                return True
+
+            return False
+
+        # cancel or unknown action
+        return False
 
     @staticmethod
     def _make_emitter(task: Task):

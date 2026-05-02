@@ -56,6 +56,24 @@ class Task:
     queue_timeout: int = 300
     run_timeout: int = 300
 
+    # ── Retry/fallback policy (spec: "Реакция на отказ") ────────────────
+    retry_count: int = 0
+    retry_period: int = 0
+    retry_attempt: int = 0
+    next_retry_at: float = 0.0
+    fallbacks: list[str] = field(default_factory=list)
+    fallback_index: int = 0
+    on_reject: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+    # ── Resource requirements ─────────────────────────────────────────────
+    # Map: resource_id -> {metric: amount}
+    resource_requirements: dict[str, dict[str, int]] = field(default_factory=dict)
+
+    # ── Origin ────────────────────────────────────────────────────────────
+    # True for tasks created by endpoints (from external clients).
+    # External tasks are preserved in Redis after completion and cleaned by cron.
+    external: bool = False
+
     # ── Async primitives (not persisted) ──────────────────────────────────
     # Signaled by QueueManager when task reaches a terminal status
     _done_event: asyncio.Event = field(
@@ -80,4 +98,10 @@ class Task:
             "payload":     json.dumps(self.payload),
             "result":      json.dumps(self.result) if self.result is not None else "",
             "error":       json.dumps(self.error) if self.error else "",
+            "external":    "1" if self.external else "0",
+            "retry_count": str(self.retry_count),
+            "retry_period": str(self.retry_period),
+            "retry_attempt": str(self.retry_attempt),
+            "fallback_index": str(self.fallback_index),
+            "resource_requirements": json.dumps(self.resource_requirements),
         }

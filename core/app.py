@@ -23,9 +23,12 @@ import uvicorn
 from core.config import Config, config as _global_config
 from core.logger import logger
 from core.queue_manager import QueueManager
+from core.resources import Resources
 from core.scheduler import Scheduler
 from core.workers_loader import load_workers
 from core.endpoints.endpoint_ollama import Endpoint_ollama
+from core.endpoints.endpoint_openaix import Endpoint_openaix
+from core.endpoints.endpoint_mcp import Endpoint_mcp
 from core import log
 
 
@@ -44,6 +47,7 @@ class Core:
         self.queue: QueueManager | None = None
         self.scheduler: Scheduler | None = None
         self.workers: dict = {}
+        self.resources = Resources([])
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -72,13 +76,20 @@ class Core:
 
         # ── Workers ────────────────────────────────────────────────────────
         self.workers = load_workers(self.config.raw())
+        self.resources = Resources(self.config.get("resources") or [])
         # Initialize each worker with its config section
         items_cfg = self.config.get("workers", {}).get("items", {}) or {}
         for wid, w in self.workers.items():
             await w.initialize({**items_cfg.get(wid, {}), "_core": self})
 
         # ── Scheduler ─────────────────────────────────────────────────────
-        self.scheduler = Scheduler(self.queue, self.workers)
+        self.scheduler = Scheduler(
+            self.queue,
+            self.workers,
+            workers_cfg=items_cfg,
+            resources=self.resources,
+            full_config=self.config.raw(),
+        )
 
         log("system", "info", "Core started")
 
@@ -122,6 +133,15 @@ class Core:
 
 # ── Server builders ───────────────────────────────────────────────────────────
 
+
+class _Server(uvicorn.Server):
+    """uvicorn Server that does not install its own signal handlers.
+    Allows the main asyncio loop to handle SIGTERM/SIGINT globally.
+    """
+    def install_signal_handlers(self) -> None:
+        pass
+
+
 def _build_ollama_server(core: Core, ep_cfg: dict) -> uvicorn.Server:
     endpoint = Endpoint_ollama(ep_cfg)
     app = endpoint.create_app(core)
@@ -130,7 +150,30 @@ def _build_ollama_server(core: Core, ep_cfg: dict) -> uvicorn.Server:
     host = ep_cfg.get("bindAddress", "0.0.0.0")
     port = int(ep_cfg.get("port", 21434))
     cfg = uvicorn.Config(app, host=host, port=port, log_level="warning")
-    return uvicorn.Server(cfg), endpoint
+    return _Server(cfg), endpoint
+
+
+def _build_openaix_server(core: Core, ep_cfg: dict) -> uvicorn.Server:
+    endpoint = Endpoint_openaix(ep_cfg)
+    app = endpoint.create_app(core)
+    asyncio.get_event_loop().run_until_complete(endpoint.initialize(core)) \
+        if False else None
+    host = ep_cfg.get("bindAddress", "0.0.0.0")
+    port = int(ep_cfg.get("port", 21434))
+    cfg = uvicorn.Config(app, host=host, port=port, log_level="warning")
+    return _Server(cfg), endpoint
+
+
+def _build_mcp_server(core: Core, ep_cfg: dict) -> uvicorn.Server:
+    """Build MCP endpoint server from endpoint config."""
+    endpoint = Endpoint_mcp(ep_cfg)
+    app = endpoint.create_app(core)
+    asyncio.get_event_loop().run_until_complete(endpoint.initialize(core)) \
+        if False else None
+    host = ep_cfg.get("bindAddress", "0.0.0.0")
+    port = int(ep_cfg.get("port", 20001))
+    cfg = uvicorn.Config(app, host=host, port=port, log_level="warning")
+    return _Server(cfg), endpoint
 
 
 async def _init_endpoints(core: Core) -> list[tuple[uvicorn.Server, object]]:
@@ -139,6 +182,14 @@ async def _init_endpoints(core: Core) -> list[tuple[uvicorn.Server, object]]:
         api = ep_cfg.get("api")
         if api == "ollama":
             server, ep = _build_ollama_server(core, ep_cfg)
+            await ep.initialize(core)
+            servers.append((server, ep))
+        elif api == "openaix":
+            server, ep = _build_openaix_server(core, ep_cfg)
+            await ep.initialize(core)
+            servers.append((server, ep))
+        elif api == "mcp":
+            server, ep = _build_mcp_server(core, ep_cfg)
             await ep.initialize(core)
             servers.append((server, ep))
         else:
@@ -153,7 +204,7 @@ def _build_webui_server(core: Core) -> uvicorn.Server:
     host = webui_cfg.get("bind", "127.0.0.1")
     port = int(webui_cfg.get("port", 20080))
     cfg = uvicorn.Config(app, host=host, port=port, log_level="warning")
-    return uvicorn.Server(cfg)
+    return _Server(cfg)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -162,8 +213,9 @@ async def main() -> None:
     core = Core()
     await core.start()
 
-    # SIGHUP → reload config
     loop = asyncio.get_running_loop()
+
+    # SIGHUP → reload config
     try:
         loop.add_signal_handler(signal.SIGHUP, core.reload_config)
     except (NotImplementedError, AttributeError):
@@ -171,6 +223,21 @@ async def main() -> None:
 
     endpoint_servers = await _init_endpoints(core)
     webui_server = _build_webui_server(core)
+    all_servers = [s for s, _ in endpoint_servers] + [webui_server]
+
+    def _shutdown() -> None:
+        """Signal all uvicorn servers and the scheduler to stop immediately."""
+        log("system", "info", "Shutdown signal received")
+        if core.scheduler:
+            core.scheduler.stop()
+        for srv in all_servers:
+            srv.should_exit = True
+
+    try:
+        loop.add_signal_handler(signal.SIGTERM, _shutdown)
+        loop.add_signal_handler(signal.SIGINT, _shutdown)
+    except (NotImplementedError, AttributeError):
+        pass  # Windows
 
     # Gather: scheduler + all servers
     coroutines = [core.scheduler.run()]
