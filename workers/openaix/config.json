@@ -1,0 +1,3 @@
+{
+    api:"openaix"//suppots both openai and ollama providers, configured in workers section below
+}

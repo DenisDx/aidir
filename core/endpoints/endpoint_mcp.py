@@ -143,7 +143,15 @@ class Endpoint_mcp(BaseEndpoint):
             await self._core.on_task_added(task)
         except Exception as exc:
             return JSONResponse(
-                {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32000, "message": str(exc)}},
+                {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "error": {
+                        "code": -32000,
+                        "message": str(exc),
+                        "data": {"reason": getattr(exc, "code", "QUEUE_ERROR")},
+                    },
+                },
                 status_code=503,
             )
 

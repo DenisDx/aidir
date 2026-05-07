@@ -19,6 +19,7 @@ sys.path.insert(0, str(_ROOT))
 # Load config and env before anything else
 from core.config import config  # noqa: E402
 from core import log             # noqa: E402
+from core.app import Core        # noqa: E402
 
 import redis.asyncio as aioredis  # noqa: E402
 
@@ -124,9 +125,38 @@ async def cleanup_expired_tasks(redis: aioredis.Redis) -> None:
         log("system", "info", f"cleanup_expired_tasks: deleted {deleted} expired task(s)")
 
 
+async def run_loop_workers_cycle(redis: aioredis.Redis) -> None:
+    """Run loop() for all workers that expose it, rotating start position each cron cycle."""
+    core = Core()
+    try:
+        await core.start()
+
+        loop_workers = core.loop_workers
+        if not loop_workers:
+            return
+
+        ns = config.get("instance", "aidir")
+        key = f"{ns}:cron:loop_workers:start"
+        raw = await redis.get(key)
+
+        try:
+            start_index = int(raw) if raw is not None else 0
+        except Exception:
+            start_index = 0
+
+        total = len(loop_workers)
+        start_index = start_index % total
+
+        next_index = await core.run_loop_workers_cycle(start_index=start_index)
+        await redis.set(key, str(next_index))
+    finally:
+        await core.stop()
+
+
 async def main() -> None:
     redis = await _connect_redis()
     try:
+        await run_loop_workers_cycle(redis)
         await wipe_logs(redis)
         await health_check(redis)
         await cleanup_stale_tasks(redis)

@@ -174,8 +174,93 @@
       "ollama_local": {
         "baseUrl": "${OLLAMA_BASE_URL:-http://127.0.0.1:11434}",
         "api": "ollama",
-        "models": [] // populated at runtime via /api/tags
-      }
+        "models": [ // populated at runtime via /api/tags
+          {
+              id:"qwen3.5:9b",
+              "name": "smart model",
+              "contextWindow": 80000,
+              resources:{
+                  "local_machine":{
+                      VRAM:9800, 
+                  }
+              },
+          },
+          {
+              id:"qwen3.5:4b",
+              "name": "fast model",
+              "reasoning": false,
+              "input": [
+                  "text",
+                  "image"
+              ],
+              resources:{
+                  "local_machine":{
+                      VRAM:6800, 
+                  }
+              },
+          },
+          {
+              id:"bjoernb/gemma4-e2b-fast:latest",
+              "name": "very fast model",
+              "reasoning": false,
+              "input": [
+                  "text",
+                  "image"
+              ],
+              resources:{
+                  "local_machine":{
+                      VRAM:8000, 
+                  }
+              },
+          },
+          
+        ] 
+      },
+      "ollama_remote": {
+        "baseUrl": "${OLLAMA_REMOTE_BASE_URL:-http://127.0.0.1:11434}",
+        "api": "ollama",
+        "models": [// populated at runtime via /api/tags
+          {
+              id:"qwen3.5:9b",
+              "name": "smart model",
+              "contextWindow": 80000,
+              resources:{
+                  "local_machine":{
+                      VRAM:9800, 
+                  }
+              },
+          },
+          {
+              id:"qwen3.5:4b",
+              "name": "fast model",
+              "reasoning": false,
+              "input": [
+                  "text",
+                  "image"
+              ],
+              resources:{
+                  "local_machine":{
+                      VRAM:6800, 
+                  }
+              },
+          },
+          {
+              id:"bjoernb/gemma4-e2b-fast:latest",
+              "name": "very fast model",
+              "reasoning": false,
+              "input": [
+                  "text",
+                  "image"
+              ],
+              resources:{
+                  "local_machine":{
+                      VRAM:8000, 
+                  }
+              },
+          },
+        ] 
+      },
+
     }
   },
   "webui": {
@@ -196,6 +281,7 @@
     }
   },
   "tasks": {
+    "restart_wait_timeout": ${TASK_RESTART_WAIT_TIMEOUT_SECONDS:-120},
     "queue_timeout": ${TASK_QUEUE_TIMEOUT_SECONDS:-300},
     "run_timeout": ${TASK_RUN_TIMEOUT_SECONDS:-300}
   }

@@ -100,9 +100,10 @@ class Endpoint_ollama(BaseEndpoint):
         try:
             await self._core.on_task_added(task)
         except Exception as exc:
+            error_code = getattr(exc, "code", "QUEUE_ERROR")
             log("http", "error", f"Failed to enqueue task {task.id}: {exc}", self.id)
             return JSONResponse(
-                {"error": {"code": "QUEUE_ERROR", "message": str(exc)}},
+                {"error": {"code": error_code, "message": str(exc)}},
                 status_code=_HTTP_BUSY,
             )
 

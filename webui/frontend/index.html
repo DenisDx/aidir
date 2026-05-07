@@ -59,6 +59,67 @@
   }
   nav button:hover { border-color: var(--accent); color: var(--accent); }
   nav button.active { border-color: var(--accent); color: var(--accent); }
+  nav button:disabled {
+    opacity: 0.6;
+    cursor: wait;
+  }
+  .nav-status {
+    padding: 5px 10px;
+    border-radius: 999px;
+    border: 1px solid rgba(76, 175, 134, 0.35);
+    color: var(--ok);
+    background: rgba(76, 175, 134, 0.08);
+    font-size: 12px;
+    white-space: nowrap;
+  }
+  .nav-status.busy {
+    border-color: rgba(240, 165, 0, 0.35);
+    color: var(--warn);
+    background: rgba(240, 165, 0, 0.08);
+  }
+  .nav-danger {
+    border-color: rgba(224, 85, 85, 0.45);
+    color: #ffb1b1;
+  }
+  .nav-danger:hover {
+    border-color: var(--err);
+    color: #ffd0d0;
+  }
+
+  .runtime-banner {
+    display: none;
+    padding: 10px 20px;
+    border-bottom: 1px solid rgba(240, 165, 0, 0.25);
+    background: linear-gradient(90deg, rgba(240, 165, 0, 0.14), rgba(240, 165, 0, 0.05));
+    color: var(--warn);
+    font-size: 13px;
+  }
+  .runtime-banner.visible { display: block; }
+
+  /* ── Restart drain card ── */
+  .restart-card { border-color: rgba(240, 165, 0, 0.45); }
+  .restart-card .card-title {
+    color: var(--warn);
+    display: flex; align-items: center; gap: 10px;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .restart-spinner {
+    display: inline-block;
+    width: 14px; height: 14px;
+    border: 2px solid rgba(240, 165, 0, 0.3);
+    border-top-color: var(--warn);
+    border-radius: 50%;
+    animation: spin 0.9s linear infinite;
+    flex-shrink: 0;
+  }
+  .restart-card-body { display: flex; flex-direction: column; gap: 8px; margin-top: 12px; }
+  .restart-stat-row { display: flex; justify-content: space-between; align-items: baseline; }
+  .restart-label { color: var(--muted); font-size: 13px; }
+  .restart-value { font-size: 1.6rem; font-weight: 700; color: var(--warn); }
+  .restart-note {
+    margin-top: 4px; font-size: 12px; color: var(--muted);
+    border-top: 1px solid var(--border); padding-top: 8px;
+  }
 
   .page { display: none; padding: 20px; }
   .page.active { display: block; }
@@ -274,6 +335,83 @@
   .log-WARN   { color: var(--warn); }
   .log-ERROR  { color: var(--err); }
   .log-CRIT   { color: #ff6060; font-weight: bold; }
+
+  /* ── TEST LLM ── */
+  .chat-box {
+    height: 380px; overflow-y: auto;
+    border: 1px solid var(--border); border-radius: 6px;
+    padding: 12px; background: #0a0c12;
+    display: flex; flex-direction: column; gap: 10px;
+  }
+  .chat-msg       { display: flex; }
+  .chat-msg-user  { justify-content: flex-end; }
+  .chat-msg-other { justify-content: flex-start; }
+  .chat-col { display: flex; flex-direction: column; max-width: 78%; }
+  .chat-col-right { align-items: flex-end; }
+  .chat-role { font-size: 11px; color: var(--muted); margin-bottom: 3px; }
+  .chat-bubble {
+    padding: 9px 13px; border-radius: 10px;
+    font-size: 13px; line-height: 1.5;
+    white-space: pre-wrap; word-break: break-word;
+  }
+  .chat-bubble-user      { background: rgba(91,138,247,.18); border: 1px solid rgba(91,138,247,.3); color: var(--text); }
+  .chat-bubble-assistant { background: rgba(255,255,255,.04); border: 1px solid var(--border); color: var(--text); }
+  .chat-bubble-tool      { background: rgba(76,175,134,.08); border: 1px solid rgba(76,175,134,.3); color: var(--ok); font-family: monospace; font-size: 12px; }
+  .chat-bubble-error     { background: rgba(224,85,85,.1); border: 1px solid rgba(224,85,85,.3); color: var(--err); }
+  .chat-input-row { display: flex; gap: 10px; align-items: flex-end; margin-top: 10px; }
+  .chat-input-row textarea {
+    flex: 1; min-height: 60px; max-height: 180px; resize: vertical;
+    background: var(--bg); border: 1px solid var(--border);
+    border-radius: 6px; color: var(--text); font-size: 13px;
+    padding: 9px 11px; font-family: inherit;
+  }
+  .chat-input-row textarea:focus { outline: none; border-color: var(--accent); }
+  .btn-primary {
+    padding: 9px 18px; background: var(--accent); border: none;
+    border-radius: 6px; color: #fff; cursor: pointer; font-size: 13px; white-space: nowrap;
+  }
+  .btn-primary:hover { opacity: .9; }
+  .btn-primary:disabled { opacity: .5; cursor: wait; }
+  .btn-sm {
+    padding: 4px 11px; background: transparent;
+    border: 1px solid var(--border); border-radius: 6px;
+    color: var(--text); cursor: pointer; font-size: 12px;
+  }
+  .btn-sm:hover { border-color: var(--accent); color: var(--accent); }
+  .tools-panel { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .tool-chip {
+    display: flex; align-items: center; gap: 6px;
+    padding: 5px 11px; border-radius: 20px;
+    border: 1px solid var(--border); font-size: 12px;
+  }
+  .tool-chip.enabled { border-color: rgba(76,175,134,.4); color: var(--ok); }
+  .form-row { display: flex; gap: 10px; align-items: center; margin-bottom: 10px; flex-wrap: wrap; }
+  .form-row:last-child { margin-bottom: 0; }
+  .form-row label  { min-width: 80px; font-size: 13px; color: var(--muted); }
+  .form-row select, .form-row input[type=text] {
+    flex: 1; padding: 6px 10px; background: var(--bg);
+    border: 1px solid var(--border); border-radius: 6px;
+    color: var(--text); font-size: 13px;
+  }
+
+  /* ── TEST MCP ── */
+  .mcp-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 860px) { .mcp-grid { grid-template-columns: 1fr; } }
+  .result-box {
+    background: #0a0c12; border: 1px solid var(--border); border-radius: 6px;
+    padding: 12px; min-height: 180px; max-height: 480px; overflow-y: auto;
+    font-family: monospace; font-size: 12px; line-height: 1.6;
+    white-space: pre-wrap; word-break: break-all;
+  }
+  .mcp-tools-list { display: flex; flex-direction: column; gap: 6px; }
+  .mcp-tool-row {
+    display: flex; align-items: flex-start; justify-content: space-between;
+    gap: 10px; padding: 8px 10px;
+    border: 1px solid var(--border); border-radius: 6px;
+    background: rgba(255,255,255,.02);
+  }
+  .mcp-tool-name { font-family: monospace; font-size: 13px; }
+  .mcp-tool-desc { font-size: 12px; color: var(--muted); margin-top: 2px; }
 </style>
 </head>
 <body>
@@ -294,13 +432,39 @@
   <nav>
     <span class="brand">AI Director</span>
     <button id="nav-dashboard" class="active" onclick="showPage('dashboard')">Dashboard</button>
+    <button id="nav-llm" onclick="showPage('llm')">Test LLM</button>
+    <button id="nav-mcp" onclick="showPage('mcp')">Test MCP</button>
     <button id="nav-settings" onclick="showPage('settings')">Settings</button>
+    <span id="runtime-status" class="nav-status">Ready</span>
     <span class="spacer"></span>
+    <button id="restart-btn" class="nav-danger">Restart</button>
     <button id="logoff-btn">Log off</button>
   </nav>
 
+  <div id="runtime-banner" class="runtime-banner"></div>
+
   <!-- Dashboard -->
   <div id="page-dashboard" class="page active">
+
+    <!-- Restart drain status card (hidden unless restart is in progress) -->
+    <div id="restart-card" class="card restart-card" style="display:none">
+      <div class="card-title">
+        <span class="restart-spinner"></span>
+        Restart in progress
+      </div>
+      <div class="restart-card-body">
+        <div class="restart-stat-row">
+          <span class="restart-label">Active tasks remaining</span>
+          <span class="restart-value" id="restart-active-count">—</span>
+        </div>
+        <div class="restart-stat-row">
+          <span class="restart-label">Max wait timeout</span>
+          <span class="restart-value" id="restart-timeout-val">—</span>
+        </div>
+        <div class="restart-note">New external tasks are blocked. Service will restart once all active tasks finish or the timeout expires.</div>
+      </div>
+    </div>
+
     <div class="grid-2">
       <div class="card">
         <div class="card-title">Active tasks</div>
@@ -354,6 +518,114 @@
         </label>
       </div>
       <div id="log-box"></div>
+    </div>
+  </div>
+
+  <!-- TEST LLM -->
+  <div id="page-llm" class="page">
+
+    <div class="card">
+      <div class="card-title">Configuration</div>
+      <div class="form-row">
+        <label>Worker</label>
+        <select id="llm-worker-select"><option value="">— select worker —</option></select>
+      </div>
+      <div class="form-row">
+        <label>Model</label>
+        <input type="text" id="llm-model-input" placeholder="type model name or pick from config →" autocomplete="off">
+        <select id="llm-model-select" style="max-width:200px"><option value="">— from config —</option></select>
+      </div>
+      <div class="form-row">
+        <label></label>
+        <button class="btn-sm" id="llm-clear-btn">Clear conversation</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Tools</div>
+      <div class="tools-panel">
+        <label class="tool-chip enabled">
+          <input type="checkbox" id="llm-echo-tool-check" checked>
+          <span>echo_call</span>
+          <span style="color:var(--muted);font-size:11px">— shows tool invocations in dialog</span>
+        </label>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Dialog</div>
+      <div id="llm-chat-box" class="chat-box"></div>
+      <div class="chat-input-row">
+        <textarea id="llm-input" placeholder="Type your message and press Enter or click Send…"></textarea>
+        <div style="display:flex;flex-direction:column;gap:6px;">
+          <button class="btn-primary" id="llm-send-btn">Send</button>
+          <button class="btn-sm" id="llm-show-query-btn">Show query…</button>
+        </div>
+      </div>
+      <div id="llm-status" style="font-size:12px;color:var(--muted);margin-top:6px;"></div>
+    </div>
+
+    <div class="card" id="llm-query-card" style="display:none">
+      <div class="card-title">Query to send</div>
+      <textarea id="llm-query-editor"
+        style="width:100%;min-height:220px;background:#0a0c12;color:var(--text);border:1px solid var(--border);border-radius:6px;padding:12px;font-family:monospace;font-size:12px;resize:vertical;"
+      ></textarea>
+      <div style="margin-top:10px;display:flex;gap:10px;align-items:center;">
+        <button class="btn-primary" id="llm-query-send-btn">Send</button>
+        <span id="llm-query-status" style="font-size:12px;color:var(--muted);"></span>
+      </div>
+    </div>
+  </div>
+
+  <!-- TEST MCP -->
+  <div id="page-mcp" class="page">
+    <div class="mcp-grid">
+
+      <!-- Left column -->
+      <div>
+        <div class="card">
+          <div class="card-title">Settings</div>
+          <div class="form-row">
+            <label>Endpoint</label>
+            <select id="mcp-endpoint-select"></select>
+          </div>
+          <div class="form-row">
+            <label>Method</label>
+            <select id="mcp-method-select">
+              <option value="tools/list">tools/list</option>
+              <option value="tools/call" selected>tools/call</option>
+              <option value="initialize">initialize</option>
+              <option value="ping">ping</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">Available tools</div>
+          <div id="mcp-tools-list" class="mcp-tools-list">
+            <div style="color:var(--muted);font-size:13px">Select an endpoint to see tools</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Right column -->
+      <div>
+        <div class="card">
+          <div class="card-title">Request (JSON-RPC)</div>
+          <textarea id="mcp-request-editor"
+            style="width:100%;min-height:200px;background:#0a0c12;color:var(--text);border:1px solid var(--border);border-radius:6px;padding:12px;font-family:monospace;font-size:12px;resize:vertical;"
+          ></textarea>
+          <div style="margin-top:10px;display:flex;gap:10px;align-items:center;">
+            <button class="btn-primary" id="mcp-send-btn">Send</button>
+            <span id="mcp-status" style="font-size:12px;color:var(--muted);"></span>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">Result</div>
+          <div id="mcp-result-box" class="result-box"></div>
+        </div>
+      </div>
     </div>
   </div>
 

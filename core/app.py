@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import signal
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 # Ensure project root is importable before internal imports when launched as
@@ -25,11 +26,28 @@ from core.logger import logger
 from core.queue_manager import QueueManager
 from core.resources import Resources
 from core.scheduler import Scheduler
-from core.workers_loader import load_workers
+from core.task import STATUS_CREATED, STATUS_QUEUED, STATUS_RUNNING
+from core.workers_loader import load_workers, resolve_worker_configs
 from core.endpoints.endpoint_ollama import Endpoint_ollama
 from core.endpoints.endpoint_openaix import Endpoint_openaix
 from core.endpoints.endpoint_mcp import Endpoint_mcp
 from core import log
+
+
+@dataclass
+class ServiceBusyError(Exception):
+    """Service is temporarily unavailable for new external tasks."""
+
+    message: str
+    code: str = "SERVICE_BUSY"
+
+
+@dataclass
+class ShutdownReport:
+    """Graceful shutdown outcome summary."""
+
+    timed_out: bool
+    active_tasks: int
 
 
 class Core:
@@ -47,7 +65,11 @@ class Core:
         self.queue: QueueManager | None = None
         self.scheduler: Scheduler | None = None
         self.workers: dict = {}
+        self.loop_workers: list[tuple[str, object]] = []
         self.resources = Resources([])
+        self._restart_requested = False
+        self._shutdown_started = False
+        self._shutdown_lock = asyncio.Lock()
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -75,18 +97,31 @@ class Core:
         self.queue = QueueManager(self.redis, instance)
 
         # ── Workers ────────────────────────────────────────────────────────
-        self.workers = load_workers(self.config.raw())
+        workers_cfg = resolve_worker_configs(self.config.raw())
+        self.workers = load_workers(self.config.raw(), workers_cfg=workers_cfg)
         self.resources = Resources(self.config.get("resources") or [])
         # Initialize each worker with its config section
-        items_cfg = self.config.get("workers", {}).get("items", {}) or {}
         for wid, w in self.workers.items():
-            await w.initialize({**items_cfg.get(wid, {}), "_core": self})
+            await w.initialize({**workers_cfg.get(wid, {}), "_core": self})
+
+        self.loop_workers = []
+        for wid, worker in self.workers.items():
+            worker_loop = getattr(worker, "loop", None)
+            if callable(worker_loop):
+                self.loop_workers.append((wid, worker))
+
+        if self.loop_workers:
+            log(
+                "system",
+                "info",
+                f"loop_workers initialized: {[wid for wid, _ in self.loop_workers]}",
+            )
 
         # ── Scheduler ─────────────────────────────────────────────────────
         self.scheduler = Scheduler(
             self.queue,
             self.workers,
-            workers_cfg=items_cfg,
+            workers_cfg=workers_cfg,
             resources=self.resources,
             full_config=self.config.raw(),
         )
@@ -112,9 +147,83 @@ class Core:
 
     async def on_task_added(self, task) -> None:
         """Enqueue task and notify scheduler. Called by endpoints."""
+        if self._restart_requested and getattr(task, "external", False):
+            raise ServiceBusyError(
+                message="Service restart in progress; new tasks are temporarily disabled",
+                code="RESTART_IN_PROGRESS",
+            )
         await self.queue.add_task(task)
         self.scheduler.notify_new_task()
         log("system", "info", f"Task {task.id} queued (type={task.type})")
+
+    def get_runtime_status(self) -> dict:
+        """Return runtime status flags for API/UI."""
+        active_tasks = self.scheduler.active_task_count() if self.scheduler else 0
+        return {
+            "restart_requested": self._restart_requested,
+            "accepting_new_tasks": not self._restart_requested,
+            "active_tasks": active_tasks,
+            "restart_wait_timeout": self.restart_wait_timeout_seconds(),
+        }
+
+    async def request_restart(self) -> None:
+        """Switch service into restart-drain mode."""
+        if self._restart_requested:
+            return
+        self._restart_requested = True
+        await self._cancel_pending_external_tasks()
+        if self.scheduler:
+            self.scheduler.notify_new_task()
+        log("system", "info", "Restart requested; new external tasks are blocked")
+
+    def restart_wait_timeout_seconds(self) -> int:
+        """Return graceful restart wait timeout in seconds."""
+        tasks_cfg = self.config.get("tasks") or {}
+        return max(0, int(tasks_cfg.get("restart_wait_timeout", 120) or 0))
+
+    async def graceful_shutdown(self) -> ShutdownReport:
+        """Stop admission, wait for active tasks, then stop the scheduler."""
+        async with self._shutdown_lock:
+            if self._shutdown_started:
+                active_tasks = self.scheduler.active_task_count() if self.scheduler else 0
+                return ShutdownReport(timed_out=False, active_tasks=active_tasks)
+
+            self._shutdown_started = True
+
+        await self.request_restart()
+
+        timed_out = False
+        active_tasks = 0
+        if self.scheduler:
+            timeout = self.restart_wait_timeout_seconds()
+            timed_out = not await self.scheduler.wait_for_active_tasks(timeout)
+            active_tasks = self.scheduler.active_task_count()
+            self.scheduler.stop()
+
+        if timed_out:
+            log(
+                "system",
+                "warn",
+                f"Graceful shutdown timed out with {active_tasks} active task(s) remaining",
+            )
+        else:
+            log("system", "info", "Graceful shutdown drain completed")
+
+        return ShutdownReport(timed_out=timed_out, active_tasks=active_tasks)
+
+    async def _cancel_pending_external_tasks(self) -> None:
+        """Cancel queued external tasks so they do not get stranded across restart."""
+        if not self.queue:
+            return
+
+        for task in list(self.queue.list_tasks()):
+            if not getattr(task, "external", False):
+                continue
+            if task.status not in {STATUS_CREATED, STATUS_QUEUED}:
+                continue
+            await self.queue.mark_canceled(task)
+            await self.queue.delete_task(task.id)
+            log("system", "info", f"Queued external task canceled for restart: {task.id}")
 
     async def on_task_complete(self, task) -> None:
         """
@@ -129,6 +238,23 @@ class Core:
         TODO: recursively delete child tasks.
         """
         await self.queue.delete_task(task_id)
+
+    async def run_loop_workers_cycle(self, start_index: int = 0) -> int:
+        """Run loop() for all loop workers in rotated order and return next start index."""
+        if not self.loop_workers:
+            return 0
+
+        total = len(self.loop_workers)
+        start = start_index % total
+        ordered = self.loop_workers[start:] + self.loop_workers[:start]
+
+        for wid, worker in ordered:
+            try:
+                await worker.loop()
+            except Exception as exc:
+                log("system", "error", f"loop() failed for worker {wid}: {exc}", "cron")
+
+        return (start + 1) % total
 
 
 # ── Server builders ───────────────────────────────────────────────────────────
@@ -197,9 +323,9 @@ async def _init_endpoints(core: Core) -> list[tuple[uvicorn.Server, object]]:
     return servers
 
 
-def _build_webui_server(core: Core) -> uvicorn.Server:
+def _build_webui_server(core: Core, restart_callback=None) -> uvicorn.Server:
     from webui.backend.app import create_app
-    app = create_app(core)
+    app = create_app(core, restart_callback=restart_callback)
     webui_cfg = core.config.get("webui") or {}
     host = webui_cfg.get("bind", "127.0.0.1")
     port = int(webui_cfg.get("port", 20080))
@@ -214,6 +340,22 @@ async def main() -> None:
     await core.start()
 
     loop = asyncio.get_running_loop()
+    all_servers: list[uvicorn.Server] = []
+    restart_via_self_exit = False
+
+    async def _shutdown_async(source: str) -> None:
+        """Drain active work and then stop all uvicorn servers."""
+        nonlocal restart_via_self_exit
+        log("system", "info", f"Shutdown requested via {source}")
+        if source == "webui":
+            restart_via_self_exit = True
+        await core.graceful_shutdown()
+        for srv in all_servers:
+            srv.should_exit = True
+
+    def _schedule_shutdown(source: str) -> None:
+        """Schedule async shutdown from signal-safe contexts."""
+        loop.create_task(_shutdown_async(source))
 
     # SIGHUP → reload config
     try:
@@ -222,16 +364,15 @@ async def main() -> None:
         pass  # Windows
 
     endpoint_servers = await _init_endpoints(core)
-    webui_server = _build_webui_server(core)
-    all_servers = [s for s, _ in endpoint_servers] + [webui_server]
+    webui_server = _build_webui_server(
+        core,
+        restart_callback=lambda: _shutdown_async("webui"),
+    )
+    all_servers.extend([s for s, _ in endpoint_servers] + [webui_server])
 
     def _shutdown() -> None:
-        """Signal all uvicorn servers and the scheduler to stop immediately."""
-        log("system", "info", "Shutdown signal received")
-        if core.scheduler:
-            core.scheduler.stop()
-        for srv in all_servers:
-            srv.should_exit = True
+        """Start graceful shutdown from SIGTERM/SIGINT."""
+        _schedule_shutdown("signal")
 
     try:
         loop.add_signal_handler(signal.SIGTERM, _shutdown)
@@ -250,6 +391,9 @@ async def main() -> None:
         await asyncio.gather(*coroutines)
     finally:
         await core.stop()
+
+    if restart_via_self_exit:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

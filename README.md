@@ -36,7 +36,7 @@ sudo apt update && sudo apt install -y ca-certificates curl gnupg python3 python
 ## Installation
 
 ```bash
-git clone <repo-url> aidir
+git clone https://github.com/DenisDx/aidir.git
 cd aidir
 ./install.sh
 ```
@@ -81,6 +81,7 @@ Copy from `.env.example`. **Never commit this file** (it is in `.gitignore`).
 | `ROOT_PASSWORD` | `changeme` | WebUI password — **change this** |
 | `LOG_WIPE_PERIOD` | `0` | Log cleanup interval in seconds (0 = disabled) |
 | `CRON_PERIOD` | `1` | Cron run interval in minutes (any integer >= 1) |
+| `TASK_RESTART_WAIT_TIMEOUT_SECONDS` | `120` | Max graceful restart wait for active tasks before shutdown continues |
 | `TASK_QUEUE_TIMEOUT_SECONDS` | `300` | Max time a task waits in queue before cancellation |
 | `TASK_RUN_TIMEOUT_SECONDS` | `300` | Max execution time per task |
 | `TLS_CERT_PATH` | *(optional)* | Path to TLS certificate (handled by nginx) |
@@ -137,6 +138,9 @@ systemctl --user status aidir
 
 # Restart
 systemctl --user restart aidir
+
+# After changing systemd timeout defaults in install.sh, re-run install.sh once
+# to regenerate the unit with TimeoutStopSec=120.
 
 # Reload config (no restart, sends SIGHUP)
 systemctl --user reload aidir

@@ -86,7 +86,7 @@ class Endpoint_openaix(Endpoint_ollama):
             return self._error_response(
                 protocol="openai",
                 status_code=503,
-                code="server_error",
+                code=getattr(exc, "code", "server_error"),
                 message=str(exc),
                 task_id=task.id,
             )

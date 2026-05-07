@@ -16,7 +16,7 @@ import json
 import secrets
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Awaitable, Callable
 
 from fastapi import (
     Cookie, Depends, FastAPI, HTTPException, Request,
@@ -101,9 +101,13 @@ async def _require_session(
 
 # ── App factory ───────────────────────────────────────────────────────────────
 
-def create_app(core: "Core") -> FastAPI:
+def create_app(
+    core: "Core",
+    restart_callback: Callable[[], Awaitable[None]] | None = None,
+) -> FastAPI:
     app = FastAPI(title="aidir WebUI", docs_url=None, redoc_url=None)
     app.state.core = core
+    app.state.restart_callback = restart_callback
 
     # ── Auth ──────────────────────────────────────────────────────────────────
 
@@ -182,6 +186,26 @@ def create_app(core: "Core") -> FastAPI:
             "workers":  workers_info,
             "tasks":    len(core.queue.list_tasks()),
             "resources": core.resources.snapshot() if core.resources else [],
+            "runtime": core.get_runtime_status(),
+        }
+
+    @app.post("/api/restart")
+    async def restart_service(
+        request: Request,
+        session: dict = Depends(_require_session),
+    ):
+        callback = getattr(request.app.state, "restart_callback", None)
+        if callback is None:
+            raise HTTPException(status_code=503, detail="Restart is not available")
+
+        runtime = core.get_runtime_status()
+        if not runtime["restart_requested"]:
+            log("webui", "warn", f"Restart requested by user {session['login']}", "control")
+            asyncio.create_task(callback())
+
+        return {
+            "ok": True,
+            "runtime": {**core.get_runtime_status(), "restart_requested": True},
         }
 
     # ── Logs (REST) ───────────────────────────────────────────────────────────
@@ -192,6 +216,7 @@ def create_app(core: "Core") -> FastAPI:
         lines: int = 200,
         session: dict = Depends(_require_session),
     ):
+        """Return last N lines of a log file."""
         log_file = _LOGS_DIR / f"{file}.log"
         if not log_file.exists():
             return {"lines": []}
@@ -201,8 +226,6 @@ def create_app(core: "Core") -> FastAPI:
             return {"lines": last}
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc))
-
-    # ── Logs (WebSocket) ──────────────────────────────────────────────────────
 
     @app.websocket("/ws/logs")
     async def ws_logs(
@@ -236,8 +259,8 @@ def create_app(core: "Core") -> FastAPI:
                     f.seek(offset)
                     new_data = f.read(size - offset)
                 offset = size
-                lines = new_data.decode("utf-8", errors="replace").splitlines()
-                for line in lines:
+                new_lines = new_data.decode("utf-8", errors="replace").splitlines()
+                for line in new_lines:
                     if line:
                         await websocket.send_text(line)
         except WebSocketDisconnect:
@@ -310,6 +333,142 @@ def create_app(core: "Core") -> FastAPI:
             out[key] = core.config.get_key_text_or_none(key)
 
         return {"fields": out}
+
+    # ── Test: workers / models info ───────────────────────────────────────────
+
+    @app.get("/api/workers/models")
+    async def get_workers_models(session: dict = Depends(_require_session)):
+        """Return workers list and model providers from config (for TEST LLM page)."""
+        workers_list = []
+        for wid, worker in core.workers.items():
+            workers_list.append({
+                "id": wid,
+                "type": worker.task_type,
+                "enabled": worker.enabled,
+            })
+
+        providers_list: list[dict] = []
+        providers_cfg = core.config.get("models.providers") or {}
+        if isinstance(providers_cfg, dict):
+            for pid, pcfg in providers_cfg.items():
+                if not isinstance(pcfg, dict):
+                    continue
+                raw_models = pcfg.get("models") or []
+                models = [
+                    {"id": m.get("id", ""), "name": m.get("name", m.get("id", ""))}
+                    for m in raw_models if isinstance(m, dict)
+                ]
+                providers_list.append({
+                    "id": pid,
+                    "api": pcfg.get("api", ""),
+                    "baseUrl": pcfg.get("baseUrl", ""),
+                    "models": models,
+                })
+
+        return {"workers": workers_list, "providers": providers_list}
+
+    # ── Test: endpoints / MCP tools info ─────────────────────────────────────
+
+    @app.get("/api/endpoints/info")
+    async def get_endpoints_info(session: dict = Depends(_require_session)):
+        """Return all configured endpoints with their tools (for TEST MCP page)."""
+        result: list[dict] = []
+        endpoints_cfg = core.config.get("endpoints") or []
+        if isinstance(endpoints_cfg, list):
+            for ep in endpoints_cfg:
+                if not isinstance(ep, dict):
+                    continue
+                tools_cfg = ep.get("tools") or {}
+                tools_list: list[dict] = []
+                if isinstance(tools_cfg, dict):
+                    for tid, tcfg in tools_cfg.items():
+                        tcfg = tcfg if isinstance(tcfg, dict) else {}
+                        tools_list.append({
+                            "name": tid,
+                            "description": tcfg.get("description", f"Tool {tid}"),
+                            "inputSchema": tcfg.get("inputSchema", {"type": "object", "properties": {}}),
+                        })
+                result.append({
+                    "id": ep.get("id", ""),
+                    "api": ep.get("api", ""),
+                    "port": ep.get("port"),
+                    "tools": tools_list,
+                })
+        return {"endpoints": result}
+
+    # ── Test: LLM proxy ───────────────────────────────────────────────────────
+
+    @app.post("/api/test/llm")
+    async def test_llm(request: Request, session: dict = Depends(_require_session)):
+        """Proxy LLM chat request to the configured ollama endpoint."""
+        import httpx
+
+        body = await request.json()
+
+        endpoints_cfg = core.config.get("endpoints") or []
+        ollama_port: int | None = None
+        for ep in (endpoints_cfg if isinstance(endpoints_cfg, list) else []):
+            if isinstance(ep, dict) and ep.get("api") == "ollama":
+                ollama_port = ep.get("port")
+                break
+
+        if not ollama_port:
+            raise HTTPException(status_code=503, detail="No ollama endpoint configured")
+
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                resp = await client.post(
+                    f"http://127.0.0.1:{ollama_port}/api/chat",
+                    json=body,
+                )
+                try:
+                    data = resp.json()
+                except Exception:
+                    data = {"error": {"code": "PARSE_ERROR", "message": resp.text or "Invalid response"}}
+                return JSONResponse(content=data, status_code=resp.status_code)
+        except httpx.ConnectError:
+            raise HTTPException(status_code=502, detail="Cannot connect to ollama endpoint")
+        except httpx.TimeoutException:
+            raise HTTPException(status_code=504, detail="Ollama endpoint timed out")
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+
+    # ── Test: MCP proxy ───────────────────────────────────────────────────────
+
+    @app.post("/api/test/mcp")
+    async def test_mcp(request: Request, session: dict = Depends(_require_session)):
+        """Proxy MCP JSON-RPC call to the configured MCP endpoint."""
+        import httpx
+
+        body = await request.json()
+        endpoint_id = body.pop("_endpoint_id", None)
+
+        endpoints_cfg = core.config.get("endpoints") or []
+        ep_cfg: dict | None = None
+        for ep in (endpoints_cfg if isinstance(endpoints_cfg, list) else []):
+            if isinstance(ep, dict) and ep.get("api") == "mcp":
+                if endpoint_id is None or ep.get("id") == endpoint_id:
+                    ep_cfg = ep
+                    break
+
+        if not ep_cfg:
+            raise HTTPException(status_code=503, detail="MCP endpoint not found")
+
+        port = ep_cfg.get("port")
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.post(f"http://127.0.0.1:{port}/mcp", json=body)
+                try:
+                    data = resp.json()
+                except Exception:
+                    data = {"error": resp.text or "Invalid response"}
+                return JSONResponse(content=data, status_code=resp.status_code)
+        except httpx.ConnectError:
+            raise HTTPException(status_code=502, detail="Cannot connect to MCP endpoint")
+        except httpx.TimeoutException:
+            raise HTTPException(status_code=504, detail="MCP endpoint timed out")
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
 
     # ── Static files ──────────────────────────────────────────────────────────
     # Served last so API routes take priority

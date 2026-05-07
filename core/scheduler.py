@@ -43,6 +43,9 @@ class Scheduler:
         self._full_config = full_config or {}
         self._running = False
         self._wake = asyncio.Event()
+        self._active_runs: set[asyncio.Task] = set()
+        self._idle = asyncio.Event()
+        self._idle.set()
 
     def notify_new_task(self) -> None:
         """Wake the scheduler loop when a new task is enqueued."""
@@ -87,7 +90,10 @@ class Scheduler:
                     log("system", "info", f"Task {task.id} delayed: insufficient resources")
                     continue
 
-                asyncio.create_task(self._run_task(task, worker, reqs))
+                bg_task = asyncio.create_task(self._run_task(task, worker, reqs))
+                self._active_runs.add(bg_task)
+                self._idle.clear()
+                bg_task.add_done_callback(self._on_run_done)
                 dispatched = True
 
             if not dispatched:
@@ -102,7 +108,28 @@ class Scheduler:
         self._running = False
         self._wake.set()
 
+    def active_task_count(self) -> int:
+        """Return number of currently executing tasks."""
+        return len(self._active_runs)
+
+    async def wait_for_active_tasks(self, timeout: int) -> bool:
+        """Wait until all active tasks finish; return True if drained in time."""
+        if not self._active_runs:
+            return True
+
+        try:
+            await asyncio.wait_for(self._idle.wait(), timeout=timeout or None)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
     # ── Internal ─────────────────────────────────────────────────────────────
+
+    def _on_run_done(self, bg_task: asyncio.Task) -> None:
+        """Track completion of background worker runs."""
+        self._active_runs.discard(bg_task)
+        if not self._active_runs:
+            self._idle.set()
 
     def _select_worker(self, task: Task) -> "BaseWorker | None":
         """

@@ -199,6 +199,9 @@ else
   loginctl enable-linger "$USER" 2>/dev/null || true
 fi
 
+DOCKER_COMPOSE_BIN="$(command -v docker) compose"
+SERVICE_EXEC_START_PRE="ExecStartPre=$DOCKER_COMPOSE_BIN -f $SCRIPT_DIR/docker-compose.yml up -d"
+
 SERVICE_FILE="$SYSTEMD_DIR/$SERVICE_NAME.service"
 
 cat > "$SERVICE_FILE" <<EOF
@@ -210,10 +213,12 @@ $SERVICE_REQUIRES_BLOCK
 [Service]
 Type=simple
 WorkingDirectory=$SCRIPT_DIR
+$SERVICE_EXEC_START_PRE
 ExecStart=$SERVICE_EXEC
 ExecReload=/bin/kill -HUP \$MAINPID
 Restart=on-failure
 RestartSec=5
+TimeoutStopSec=120
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=$SERVICE_NAME
