@@ -120,7 +120,7 @@ class QueueManager:
         if not is_external:
             pipe.delete(self._tk(task_id))
         # Always remove from queue ZSET (task is no longer waiting)
-        for task_type in ("agent", "request", "tool"):
+        for task_type in ("agent", "request", "tool", "context_builder"):
             pipe.zrem(self._q(task_type), task_id)
         await pipe.execute()
 

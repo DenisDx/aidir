@@ -10,6 +10,7 @@ from typing import Any, Awaitable, Callable
 
 import httpx
 
+from core.call_log import save_llm_call
 from core.worker import BaseWorker, WorkerResult
 from core.task import Task
 from core.task_types.task_agent import Task_agent
@@ -60,6 +61,8 @@ class CallOllamaWorker(BaseWorker):
         payload: dict = dict(task.payload)    # shallow copy; we may mutate stream flag
         stream: bool = task.stream
         url = f"{self._base_url}/api/chat"
+        log_opts: dict = (payload.get("log") or {}).get("options") or {}
+        save_call: bool = bool(log_opts.get("save_llm_request", False))
 
         log("worker", "debug",
             f"Forwarding task {task.id} to {url} stream={stream}", "call_ollama")
@@ -67,9 +70,9 @@ class CallOllamaWorker(BaseWorker):
         try:
             async with httpx.AsyncClient(timeout=self._timeout) as client:
                 if stream:
-                    return await self._forward_stream(client, url, payload, task, emit_chunk)
+                    return await self._forward_stream(client, url, payload, task, emit_chunk, save_call)
                 else:
-                    return await self._forward_sync(client, url, payload, task)
+                    return await self._forward_sync(client, url, payload, task, save_call)
 
         except httpx.ConnectError as exc:
             log("worker", "error", f"Upstream Ollama unreachable: {exc}", "call_ollama")
@@ -93,11 +96,11 @@ class CallOllamaWorker(BaseWorker):
     # ── Internal ─────────────────────────────────────────────────────────────
 
     async def _forward_sync(
-        self, client: httpx.AsyncClient, url: str, payload: dict, task: Task_agent
+        self, client: httpx.AsyncClient, url: str, payload: dict, task: Task_agent, save_call: bool = False
     ) -> WorkerResult:
         """Non-streaming: send request, wait for full response, return it."""
-        payload = {**payload, "stream": False}
-        resp = await client.post(url, json=payload)
+        upstream_payload = {**payload, "stream": False}
+        resp = await client.post(url, json=upstream_payload)
 
         if resp.status_code != 200:
             return WorkerResult(
@@ -110,6 +113,8 @@ class CallOllamaWorker(BaseWorker):
             )
 
         data = resp.json()
+        if save_call:
+            save_llm_call(self.id, task.id, upstream_payload, data)
         return WorkerResult(ok=True, data=data, usage=data.get("usage"))
 
     async def _forward_stream(
@@ -119,12 +124,14 @@ class CallOllamaWorker(BaseWorker):
         payload: dict,
         task: Task_agent,
         emit_chunk: Callable[[dict], Awaitable[None]] | None,
+        save_call: bool = False,
     ) -> WorkerResult:
         """Streaming: forward chunks from upstream to emit_chunk; return final state."""
-        payload = {**payload, "stream": True}
+        upstream_payload = {**payload, "stream": True}
         final_data: dict | None = None
+        chunks: list[dict] = [] if save_call else []
 
-        async with client.stream("POST", url, json=payload) as resp:
+        async with client.stream("POST", url, json=upstream_payload) as resp:
             if resp.status_code != 200:
                 return WorkerResult(
                     ok=False,
@@ -144,10 +151,14 @@ class CallOllamaWorker(BaseWorker):
 
                 if emit_chunk:
                     await emit_chunk(chunk)
+                if save_call:
+                    chunks.append(chunk)
 
                 if chunk.get("done"):
                     final_data = chunk
 
+        if save_call:
+            save_llm_call(self.id, task.id, upstream_payload, {"stream_chunks": chunks})
         return WorkerResult(ok=True, data=final_data, usage=(final_data or {}).get("usage"))
 
 

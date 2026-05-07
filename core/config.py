@@ -1,6 +1,6 @@
 """
 Configuration management.
-Loads config.json (JSON5) with ${VAR} / ${VAR:-default} substitution from .env.
+Loads config.json5 (JSON5) with ${VAR} / ${VAR:-default} substitution from .env.
 """
 from __future__ import annotations
 
@@ -396,12 +396,12 @@ def _reapply_raw_values(text: str, raw_values: dict[str, str], skip_paths: set[s
 
 class Config:
     """
-    Loads and caches config.json; supports dot-path access and hot reload.
+    Loads and caches config.json5; supports dot-path access and hot reload.
     Substitutes ${ENV_VAR} tokens from environment / .env before parsing.
     """
 
     def __init__(self, path: Path | None = None) -> None:
-        self._path = path or (_ROOT / "config.json")
+        self._path = path or (_ROOT / "config.json5")
         self._data: dict = {}
         self.load()
 

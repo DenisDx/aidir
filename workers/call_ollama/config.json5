@@ -1,7 +1,7 @@
 // call_ollama worker local config
 // Main config section workers.items.call_ollama overrides values here.
 {
-    // Provider id from config.json models.providers; used to get baseUrl
+    // Provider id from config.json5 models.providers; used to get baseUrl
     provider: "ollama_local",
     enabled: true,
 }

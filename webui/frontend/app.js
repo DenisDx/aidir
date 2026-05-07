@@ -131,6 +131,7 @@ function showPage(name) {
   if (name === 'settings') loadConfig();
   if (name === 'llm')      loadWorkersModels();
   if (name === 'mcp')      loadMcpEndpoints();
+  if (name === 'agent')    loadAgentEndpoints();
 }
 
 function setLoginServerState(isUnavailable, message = '') {
@@ -218,6 +219,7 @@ function onLoggedIn() {
   loadTasks();
   startLiveLogs();
   initTestPages();
+  loadAgentCatalog();
   refreshTimer = setInterval(loadTasks, 3000);
 }
 
@@ -762,24 +764,34 @@ async function handleLlmResponse(res, bodyUsed) {
     return false;
   }
 
-  const assistantMsg = res.data.message || {};
-  const content      = assistantMsg.content || '';
-  const toolCalls    = assistantMsg.tool_calls || [];
+  const msg = res.data?.message || {};
+  const content = msg.content || '';
+  const toolCalls = Array.isArray(msg.tool_calls) ? msg.tool_calls : [];
 
-  const useEchoTool = bodyUsed?.tools?.length > 0;
-  if (useEchoTool && toolCalls.length) {
+  if (toolCalls.length) {
+    llmMessages.push({ role: 'assistant', content: content || '[tool calls]' });
+
     const toolResults = [];
     toolCalls.forEach(tc => {
-      const fn   = tc.function || {};
-      const name = fn.name || '?';
-      let args   = fn.arguments || '';
-      if (typeof args === 'string') { try { args = JSON.parse(args); } catch { /**/ } }
-      llmMessages.push({ role: 'tool', content: `[tool call] ${name}(\n${JSON.stringify(args, null, 2)}\n)` });
-      toolResults.push({
-        role:         'tool',
-        content:      JSON.stringify({ called: name, args }),
+      const name = tc?.function?.name || tc?.name || 'unknown_tool';
+      let args = {};
+      try {
+        args = JSON.parse(tc?.function?.arguments || '{}');
+      } catch {
+        args = { _raw: tc?.function?.arguments || '' };
+      }
+
+      llmMessages.push({
+        role: 'tool',
+        content: JSON.stringify({ called: name, args }),
         tool_call_id: tc.id || name,
         name,
+      });
+
+      toolResults.push({
+        role: 'tool',
+        content: JSON.stringify({ called: name, args }),
+        tool_call_id: tc.id || name,
       });
     });
     renderLlmChat();
@@ -1022,9 +1034,324 @@ function initTestPages() {
   $('mcp-send-btn').addEventListener('click', sendMcpRequest);
   $('mcp-endpoint-select').addEventListener('change', () => { renderMcpTools(); updateMcpRequestTemplate(); });
   $('mcp-method-select').addEventListener('change', updateMcpRequestTemplate);
+
+  $('agent-send-btn').addEventListener('click', sendAgentRequest);
+  $('agent-show-query-btn').addEventListener('click', showAgentQuery);
+  $('agent-query-send-btn').addEventListener('click', sendAgentQueryFromPanel);
+  $('agent-provider-select').addEventListener('change', renderAgentModelsForProvider);
+  $('agent-model-select').addEventListener('change', () => {
+    const value = $('agent-model-select').value;
+    if (value) $('agent-model-input').value = value;
+  });
+  $('agent-clear-btn').addEventListener('click', () => {
+    agentMessages = [];
+    renderAgentChat();
+    renderAgentRawResponse(null);
+    $('agent-status').textContent = '';
+    $('agent-query-card').style.display = 'none';
+  });
+  $('agent-input').addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendAgentRequest(); }
+  });
+
 }
 
+// ── Agent Request ──────────────────────────────────────────────────────────
 
+let agentMessages = [];
+let agentSending  = false;
+let agentEndpoints = [];
+let agentProviders = [];
+
+async function loadAgentCatalog() {
+  const data = await apiGet('/api/test/agent/catalog');
+  if (!data || !Array.isArray(data.providers)) return;
+  agentProviders = data.providers;
+  renderAgentProviderSelect();
+}
+
+function renderAgentProviderSelect() {
+  const providerSel = $('agent-provider-select');
+  const current = providerSel.value;
+
+  providerSel.innerHTML = '<option value="">-- do not set --</option>';
+  agentProviders.forEach(p => {
+    const opt = document.createElement('option');
+    opt.value = p.id;
+    opt.textContent = p.id;
+    providerSel.appendChild(opt);
+  });
+
+  if (current && agentProviders.some(p => p.id === current)) {
+    providerSel.value = current;
+  }
+
+  renderAgentModelsForProvider();
+}
+
+function renderAgentModelsForProvider() {
+  const providerId = $('agent-provider-select').value;
+  const modelSelect = $('agent-model-select');
+  const previous = modelSelect.value;
+
+  modelSelect.innerHTML = '<option value="">— from provider —</option>';
+  if (!providerId) return;
+
+  const provider = agentProviders.find(p => p.id === providerId);
+  const models = Array.isArray(provider?.models) ? provider.models : [];
+
+  models.forEach(modelId => {
+    const opt = document.createElement('option');
+    opt.value = modelId;
+    opt.textContent = modelId;
+    modelSelect.appendChild(opt);
+  });
+
+  if (previous && models.includes(previous)) {
+    modelSelect.value = previous;
+    return;
+  }
+
+  if (!$('agent-model-input').value.trim() && models.length) {
+    modelSelect.value = models[0];
+    $('agent-model-input').value = models[0];
+  }
+}
+
+async function loadAgentEndpoints() {
+  if (!agentProviders.length) await loadAgentCatalog();
+
+  const data = await apiGet('/api/test/agent/endpoints');
+  if (!data) return;
+
+  const sel = $('agent-endpoint-select');
+  sel.innerHTML = '';
+  const endpoints = data.endpoints || [];
+  agentEndpoints = endpoints;
+  if (!endpoints.length) {
+    sel.innerHTML = '<option value="">No endpoints configured</option>';
+    return;
+  }
+  endpoints.forEach(ep => {
+    const opt = document.createElement('option');
+    opt.value = ep.id;
+    opt.textContent = `${ep.id}  [${ep.api}  :${ep.port || '?'}]`;
+    sel.appendChild(opt);
+  });
+}
+
+// Build request body from current UI state. user text already in agentMessages if extraUserText is undefined.
+function buildAgentBody(extraUserText) {
+  const epId      = $('agent-endpoint-select').value;
+  const protocol  = $('agent-protocol-select').value;
+  const modelText = $('agent-model-input').value.trim();
+  const modelPick = $('agent-model-select').value;
+  const model     = modelText || modelPick || undefined;
+  const provider  = $('agent-provider-select').value || undefined;
+  const userTok   = $('agent-token-input').value.trim() || undefined;
+  const envid     = $('agent-envid-input').value.trim() || undefined;
+  const setTools  = $('agent-set-tools-check').checked;
+  const toolsTxt  = $('agent-tools-input').value.trim();
+  const sendCtx   = $('agent-ctx-check').checked;
+  const ctxWorker = $('agent-ctx-worker-input').value.trim();
+  const logSave   = $('agent-log-save-check').checked;
+  const logTypes  = $('agent-log-types-input').value.trim();
+  const keepHistory = $('agent-keep-history-check').checked;
+
+  let messages = [];
+  if (keepHistory) {
+    messages = agentMessages
+      .filter(m => ['user', 'assistant'].includes(m.role))
+      .map(m => ({ role: m.role, content: m.content }));
+    if (extraUserText) messages.push({ role: 'user', content: extraUserText });
+  } else {
+    const latestUserText = extraUserText || [...agentMessages].reverse().find(m => m.role === 'user')?.content || '';
+    if (latestUserText) {
+      messages = [{ role: 'user', content: latestUserText }];
+    }
+  }
+
+  const body = {
+    messages,
+    stream: false,
+    _endpoint_id: epId,
+    _protocol: protocol,
+  };
+
+  if (model)   body.model = model;
+  if (provider) body.provider = provider;
+  if (userTok) body._user_token = userTok;
+  if (envid)   body.envid = envid;
+
+  if (sendCtx) {
+    body.context_builder = {};
+    if (ctxWorker) body.context_builder.worker = ctxWorker;
+
+    if (setTools) {
+      if (!toolsTxt) {
+        body.context_builder.tools_to_inject = [];
+      } else if (toolsTxt === '*' || toolsTxt.toLowerCase() === 'all') {
+        body.context_builder.tools_to_inject = [toolsTxt];
+      } else {
+        body.context_builder.tools_to_inject = toolsTxt.split(',').map(s => s.trim()).filter(Boolean);
+      }
+    }
+  }
+
+  // Build log field when any log option is set
+  const logField = {};
+  if (logSave) logField.options = { save_llm_request: true };
+  if (logTypes) {
+    logTypes.split(',').forEach(pair => {
+      const [k, v] = pair.split('=').map(s => s.trim());
+      if (k && v) logField[k] = v;
+    });
+  }
+  if (Object.keys(logField).length) body.log = logField;
+
+  return body;
+}
+
+function renderAgentRawResponse(res) {
+  const statusEl = $('agent-raw-status');
+  const boxEl = $('agent-raw-box');
+  if (!res) {
+    statusEl.textContent = 'No requests yet.';
+    boxEl.textContent = '';
+    return;
+  }
+
+  const payload = res.data === undefined ? null : res.data;
+  statusEl.textContent = `HTTP ${res.status} ${res.ok ? 'OK' : 'ERROR'}`;
+  boxEl.textContent = JSON.stringify(payload, null, 2);
+}
+
+function renderAgentChat() {
+  const box = $('agent-chat-box');
+  box.innerHTML = '';
+  agentMessages.forEach(m => {
+    const isUser = m.role === 'user';
+    const wrap = document.createElement('div');
+    wrap.className = `chat-msg ${isUser ? 'chat-msg-user' : 'chat-msg-other'}`;
+    const col = document.createElement('div');
+    col.className = `chat-col${isUser ? ' chat-col-right' : ''}`;
+    const label = document.createElement('div');
+    label.className = 'chat-role';
+    label.textContent = m.role;
+    const bubble = document.createElement('div');
+    const bClass = m.role === 'user' ? 'user' : m.role === 'error' ? 'error' : 'assistant';
+    bubble.className = `chat-bubble chat-bubble-${bClass}`;
+    bubble.textContent = m.content;
+    col.appendChild(label);
+    col.appendChild(bubble);
+    wrap.appendChild(col);
+    box.appendChild(wrap);
+  });
+  box.scrollTop = box.scrollHeight;
+}
+
+// Extract response content from response data, handling ollama/openai/anthropic formats.
+function handleAgentResponse(res) {
+  if (!res.ok) {
+    const msg = res.data?.error?.message || res.data?.detail || 'Request failed';
+    agentMessages.push({ role: 'error', content: `Error ${res.status}: ${msg}` });
+    renderAgentChat();
+    return false;
+  }
+
+  const data = res.data;
+  let content = '';
+
+  if (data.choices) {
+    // OpenAI format
+    content = data.choices[0]?.message?.content || '';
+  } else if (data.message) {
+    // Ollama format
+    content = data.message.content || '';
+  } else if (data.content) {
+    // Anthropic format
+    const block = Array.isArray(data.content) ? data.content[0] : data.content;
+    content = typeof block === 'string' ? block : (block?.text || JSON.stringify(data.content));
+  } else {
+    content = JSON.stringify(data, null, 2);
+  }
+
+  agentMessages.push({ role: 'assistant', content });
+  renderAgentChat();
+  return true;
+}
+
+function showAgentQuery() {
+  const text = $('agent-input').value.trim();
+  const body = buildAgentBody(text || undefined);
+  $('agent-query-editor').value = JSON.stringify(body, null, 2);
+  $('agent-query-card').style.display = '';
+  $('agent-query-status').textContent = '';
+}
+
+async function sendAgentRequest() {
+  if (agentSending) return;
+  const text = $('agent-input').value.trim();
+  const epId = $('agent-endpoint-select').value;
+  if (!epId) { $('agent-status').textContent = 'Select an endpoint.'; return; }
+  if (!text) return;
+
+  agentMessages.push({ role: 'user', content: text });
+  renderAgentChat();
+  $('agent-input').value = '';
+  $('agent-status').textContent = 'Sending\u2026';
+  $('agent-send-btn').disabled = true;
+  agentSending = true;
+
+  const body = buildAgentBody(text);
+
+  try {
+    const res = await apiPost('/api/test/agent', body);
+    renderAgentRawResponse(res);
+    const ok  = handleAgentResponse(res);
+    $('agent-status').textContent = ok ? `Done (${res.status})` : `Error (${res.status})`;
+  } catch (err) {
+    agentMessages.push({ role: 'error', content: String(err) });
+    renderAgentChat();
+    renderAgentRawResponse({ ok: false, status: 0, data: { error: { message: String(err) } } });
+    $('agent-status').textContent = 'Network error.';
+  } finally {
+    agentSending = false;
+    $('agent-send-btn').disabled = false;
+  }
+}
+
+async function sendAgentQueryFromPanel() {
+  if (agentSending) return;
+  let body;
+  try {
+    body = JSON.parse($('agent-query-editor').value);
+  } catch {
+    $('agent-query-status').textContent = 'Invalid JSON.';
+    return;
+  }
+
+  $('agent-query-send-btn').disabled = true;
+  $('agent-query-status').textContent = 'Sending\u2026';
+  agentSending = true;
+  $('agent-send-btn').disabled = true;
+
+  try {
+    const res = await apiPost('/api/test/agent', body);
+    renderAgentRawResponse(res);
+    const ok  = handleAgentResponse(res);
+    $('agent-query-status').textContent = ok ? `Done (${res.status})` : `Error (${res.status})`;
+  } catch (err) {
+    agentMessages.push({ role: 'error', content: String(err) });
+    renderAgentChat();
+    renderAgentRawResponse({ ok: false, status: 0, data: { error: { message: String(err) } } });
+    $('agent-query-status').textContent = 'Network error.';
+  } finally {
+    agentSending = false;
+    $('agent-query-send-btn').disabled = false;
+    $('agent-send-btn').disabled = false;
+  }
+}
 
 // Check for existing session before showing login screen
 (async () => {

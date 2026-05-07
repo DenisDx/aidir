@@ -30,8 +30,8 @@ def _deep_merge(base: dict, override: dict) -> dict:
 
 
 def _read_worker_local_config(worker_dir: Path, worker_id: str) -> dict:
-    """Read workers/<id>/config.json as JSON5 (with env placeholders)."""
-    cfg_file = worker_dir / "config.json"
+    """Read workers/<id>/config.json5 as JSON5 (with env placeholders)."""
+    cfg_file = worker_dir / "config.json5"
     if not cfg_file.exists():
         return {}
 
@@ -40,7 +40,7 @@ def _read_worker_local_config(worker_dir: Path, worker_id: str) -> dict:
         parsed = json5.loads(_substitute(raw))
         return parsed if isinstance(parsed, dict) else {}
     except Exception as exc:
-        log("system", "warn", f"Worker {worker_id}: invalid config.json ignored: {exc}")
+        log("system", "warn", f"Worker {worker_id}: invalid config.json5 ignored: {exc}")
         return {}
 
 
@@ -70,7 +70,7 @@ def load_workers(config: dict, workers_cfg: dict[str, dict] | None = None) -> di
     """
     Load all enabled workers from ./workers/<id>/app.py.
     Each app.py must expose a module-level `worker` instance of BaseWorker.
-    Main config section workers.items.<id> overrides worker's local config.json.
+    Main config section workers.items.<id> overrides worker's local config.json5.
     Returns dict of worker_id -> BaseWorker.
     """
     workers: dict[str, BaseWorker] = {}
@@ -91,7 +91,7 @@ def load_workers(config: dict, workers_cfg: dict[str, dict] | None = None) -> di
             continue
         worker_id = worker_dir.name
 
-        # Check enabled flag (main config wins over local config.json)
+        # Check enabled flag (main config wins over local config.json5)
         cfg_override = resolved_cfg.get(worker_id, {})
         if not cfg_override.get("enabled", True):
             log("system", "info", f"Worker {worker_id} disabled, skipping")

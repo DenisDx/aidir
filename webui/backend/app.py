@@ -470,6 +470,165 @@ def create_app(
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc))
 
+    @app.get("/api/test/agent/endpoints")
+    async def list_agent_endpoints(session: dict = Depends(_require_session)):
+        """Return chat-capable endpoints for Agent Request page."""
+        result: list[dict] = []
+        endpoints_cfg = core.config.get("endpoints") or []
+        allowed = {"openaix", "ollama", "openai", "anthropic"}
+
+        if isinstance(endpoints_cfg, list):
+            for ep in endpoints_cfg:
+                if not isinstance(ep, dict):
+                    continue
+                api = str(ep.get("api", ""))
+                if api not in allowed:
+                    continue
+                result.append(
+                    {
+                        "id": ep.get("id", ""),
+                        "api": api,
+                        "port": ep.get("port"),
+                    }
+                )
+
+        return {"endpoints": result}
+
+    @app.get("/api/test/agent/catalog")
+    async def get_agent_catalog(session: dict = Depends(_require_session)):
+        """Return provider and model catalog from config for Agent Request page."""
+        providers: list[dict] = []
+        providers_cfg = core.config.get("models.providers") or {}
+
+        if isinstance(providers_cfg, dict):
+            for provider_id, provider_cfg in providers_cfg.items():
+                if not isinstance(provider_cfg, dict):
+                    continue
+
+                models: list[str] = []
+                raw_models = provider_cfg.get("models") or []
+                if isinstance(raw_models, list):
+                    for model in raw_models:
+                        if isinstance(model, dict) and model.get("id"):
+                            models.append(str(model["id"]))
+
+                providers.append({
+                    "id": str(provider_id),
+                    "models": models,
+                })
+
+        return {"providers": providers}
+
+    @app.get("/api/test/agent/models")
+    async def list_agent_models(
+        endpoint_id: str,
+        protocol: str = "ollama",
+        session: dict = Depends(_require_session),
+    ):
+        """Fetch model list from selected endpoint for chosen protocol."""
+        import httpx
+
+        endpoints_cfg = core.config.get("endpoints") or []
+        ep_cfg: dict | None = None
+        for ep in (endpoints_cfg if isinstance(endpoints_cfg, list) else []):
+            if isinstance(ep, dict) and ep.get("id") == endpoint_id:
+                ep_cfg = ep
+                break
+
+        if not ep_cfg:
+            raise HTTPException(status_code=404, detail="Endpoint not found")
+
+        port = ep_cfg.get("port")
+        if not port:
+            raise HTTPException(status_code=503, detail="Endpoint has no port configured")
+
+        if protocol == "openai":
+            url = f"http://127.0.0.1:{port}/v1/models"
+        else:
+            url = f"http://127.0.0.1:{port}/api/tags"
+
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                resp = await client.get(url)
+                if resp.status_code != 200:
+                    raise HTTPException(status_code=resp.status_code, detail=f"Model list request failed: {resp.text[:200]}")
+                data = resp.json()
+        except httpx.ConnectError:
+            raise HTTPException(status_code=502, detail=f"Cannot connect to endpoint on port {port}")
+        except httpx.TimeoutException:
+            raise HTTPException(status_code=504, detail="Model list request timed out")
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+
+        models: list[str] = []
+        if protocol == "openai":
+            for item in (data.get("data") if isinstance(data, dict) else []) or []:
+                if isinstance(item, dict) and item.get("id"):
+                    models.append(str(item["id"]))
+        else:
+            for item in (data.get("models") if isinstance(data, dict) else []) or []:
+                if isinstance(item, dict) and item.get("name"):
+                    models.append(str(item["name"]))
+
+        return {"models": models}
+
+    @app.post("/api/test/agent")
+    async def test_agent(request: Request, session: dict = Depends(_require_session)):
+        """Proxy agent request to a configured endpoint with chosen protocol."""
+        import httpx
+
+        body = await request.json()
+        endpoint_id = body.pop("_endpoint_id", None)
+        protocol    = body.pop("_protocol", "ollama")
+        user_token  = body.pop("_user_token", None)
+
+        endpoints_cfg = core.config.get("endpoints") or []
+        ep_cfg: dict | None = None
+        for ep in (endpoints_cfg if isinstance(endpoints_cfg, list) else []):
+            if isinstance(ep, dict):
+                if endpoint_id is None or ep.get("id") == endpoint_id:
+                    ep_cfg = ep
+                    break
+
+        if not ep_cfg:
+            raise HTTPException(status_code=503, detail="Endpoint not found")
+
+        ep_api = str(ep_cfg.get("api", ""))
+        if ep_api == "mcp":
+            raise HTTPException(status_code=422, detail="Selected endpoint is MCP and cannot process chat requests")
+
+        port = ep_cfg.get("port")
+        if not port:
+            raise HTTPException(status_code=503, detail="Endpoint has no port configured")
+
+        if protocol == "openai":
+            url = f"http://127.0.0.1:{port}/v1/chat/completions"
+        elif protocol == "anthropic":
+            url = f"http://127.0.0.1:{port}/v1/messages"
+        else:
+            url = f"http://127.0.0.1:{port}/api/chat"
+
+        headers: dict[str, str] = {}
+        if user_token:
+            headers["Authorization"] = f"Bearer {user_token}"
+
+        try:
+            async with httpx.AsyncClient(timeout=45.0) as client:
+                resp = await client.post(url, json=body, headers=headers)
+                try:
+                    data = resp.json()
+                except Exception:
+                    data = {"error": {"code": "PARSE_ERROR", "message": resp.text or "Invalid response"}}
+                return JSONResponse(content=data, status_code=resp.status_code)
+        except httpx.ConnectError:
+            raise HTTPException(status_code=502, detail=f"Cannot connect to endpoint on port {port}")
+        except httpx.TimeoutException:
+            raise HTTPException(status_code=504, detail="Endpoint timed out")
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+
     # ── Static files ──────────────────────────────────────────────────────────
     # Served last so API routes take priority
 

@@ -87,7 +87,7 @@ Copy from `.env.example`. **Never commit this file** (it is in `.gitignore`).
 | `TLS_CERT_PATH` | *(optional)* | Path to TLS certificate (handled by nginx) |
 | `TLS_KEY_PATH` | *(optional)* | Path to TLS private key |
 
-### `config.json` — system configuration
+### `config.json5` — system configuration
 
 JSON5 format (comments and trailing commas allowed). Uses `${VAR}` and `${VAR:-default}` substitution from `.env`. Contains no secrets or machine-specific paths directly.
 

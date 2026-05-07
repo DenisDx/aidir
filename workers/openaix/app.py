@@ -11,6 +11,7 @@ from typing import Awaitable, Callable
 import httpx
 
 from core import log
+from core.call_log import save_llm_call
 from core.task import Task, STATUS_COMPLETED, STATUS_FAILED, STATUS_CANCELED
 from core.task_types.task_agent import Task_agent
 from core.task_types.task_tool import Task_tool
@@ -25,6 +26,7 @@ class OpenAIxWorker(BaseWorker):
     def __init__(self) -> None:
         self._base_url: str = "http://127.0.0.1:11434"
         self._timeout: int = 300
+        self._save_llm_request_default: bool = False
         self._core = None
         self._internal_tools: dict[str, dict] = {}
 
@@ -34,6 +36,8 @@ class OpenAIxWorker(BaseWorker):
         self._core = core
         provider_id = str(config.get("provider", "ollama_local"))
         self._timeout = int(config.get("timeoutSeconds", 300))
+        logging_cfg = config.get("logging") if isinstance(config.get("logging"), dict) else {}
+        self._save_llm_request_default = bool(logging_cfg.get("save_llm_request", False))
 
         if core is not None:
             base_url = core.config.get(f"models.providers.{provider_id}.baseUrl")
@@ -46,7 +50,7 @@ class OpenAIxWorker(BaseWorker):
         log(
             "worker",
             "info",
-            f"openaix initialized; upstream={self._base_url}; internal_tools={list(self._internal_tools.keys())}",
+            f"openaix initialized; upstream={self._base_url}; save_llm_request_default={self._save_llm_request_default}; internal_tools={list(self._internal_tools.keys())}",
             "openaix",
         )
 
@@ -65,6 +69,7 @@ class OpenAIxWorker(BaseWorker):
         payload = self._normalize_payload(task.payload or {}, task.stream)
         payload = self._inject_internal_tools(payload)
         url = f"{self._base_url}/api/chat"
+        save_call = self._resolve_save_llm_request(task.payload or {})
 
         log("worker", "debug", f"Forwarding task {task.id} to {url} stream={task.stream}", "openaix")
 
@@ -72,8 +77,8 @@ class OpenAIxWorker(BaseWorker):
             async with httpx.AsyncClient(timeout=self._timeout) as client:
                 # If no internal tools are configured, keep direct streaming behavior.
                 if task.stream and not self._internal_tools:
-                    return await self._forward_stream(client, url, payload, emit_chunk)
-                return await self._run_with_internal_tools(client, url, payload, task, emit_chunk)
+                    return await self._forward_stream(client, url, payload, emit_chunk, save_call=save_call, task_id=task.id)
+                return await self._run_with_internal_tools(client, url, payload, task, emit_chunk, save_call=save_call)
         except httpx.ConnectError as exc:
             log("worker", "error", f"Upstream unreachable: {exc}", "openaix")
             return WorkerResult(ok=False, error={"code": "UPSTREAM_UNREACHABLE", "message": str(exc)})
@@ -83,6 +88,15 @@ class OpenAIxWorker(BaseWorker):
         except Exception as exc:
             log("worker", "error", f"Unexpected error: {exc}", "openaix")
             return WorkerResult(ok=False, error={"code": "EXCEPTION", "message": str(exc)})
+
+    def _resolve_save_llm_request(self, request_payload: dict) -> bool:
+        """Resolve save_llm_request flag with per-request value overriding worker default."""
+        log_field = request_payload.get("log") if isinstance(request_payload, dict) else None
+        if isinstance(log_field, dict):
+            options = log_field.get("options")
+            if isinstance(options, dict) and "save_llm_request" in options:
+                return bool(options.get("save_llm_request"))
+        return self._save_llm_request_default
 
     @staticmethod
     def _normalize_payload(payload: dict, stream: bool) -> dict:
@@ -190,6 +204,7 @@ class OpenAIxWorker(BaseWorker):
         payload: dict,
         parent_task: Task_agent,
         emit_chunk: Callable[[dict], Awaitable[None]] | None,
+        save_call: bool = False,
     ) -> WorkerResult:
         """Run model loop and intercept internal tool calls.
         If model requests only internal tools, execute them via Task_tool and continue model call.
@@ -202,7 +217,7 @@ class OpenAIxWorker(BaseWorker):
 
         for _ in range(max_turns):
             current_payload["messages"] = messages
-            step = await self._forward_sync(client, url, current_payload)
+            step = await self._forward_sync(client, url, current_payload, save_call=save_call, task_id=parent_task.id)
             if not step.ok:
                 return step
 
@@ -321,9 +336,10 @@ class OpenAIxWorker(BaseWorker):
 
         return WorkerResult(ok=False, error={"code": "TOOL_UNKNOWN_STATE", "message": f"Internal tool unknown state: {task.status}"})
 
-    async def _forward_sync(self, client: httpx.AsyncClient, url: str, payload: dict) -> WorkerResult:
+    async def _forward_sync(self, client: httpx.AsyncClient, url: str, payload: dict, *, save_call: bool = False, task_id: str = "") -> WorkerResult:
         """Send a non-streaming request and return the full JSON body."""
-        resp = await client.post(url, json={**payload, "stream": False})
+        upstream_payload = {**payload, "stream": False}
+        resp = await client.post(url, json=upstream_payload)
         if resp.status_code != 200:
             return WorkerResult(
                 ok=False,
@@ -334,6 +350,8 @@ class OpenAIxWorker(BaseWorker):
                 },
             )
         data = resp.json()
+        if save_call:
+            save_llm_call(self.id, task_id, upstream_payload, data)
         return WorkerResult(ok=True, data=data, usage=data.get("usage"))
 
     async def _forward_stream(
@@ -342,10 +360,15 @@ class OpenAIxWorker(BaseWorker):
         url: str,
         payload: dict,
         emit_chunk: Callable[[dict], Awaitable[None]] | None,
+        *,
+        save_call: bool = False,
+        task_id: str = "",
     ) -> WorkerResult:
         """Forward streaming chunks to the endpoint emitter."""
+        upstream_payload = {**payload, "stream": True}
         final_data: dict | None = None
-        async with client.stream("POST", url, json={**payload, "stream": True}) as resp:
+        chunks: list[dict] = [] if save_call else []
+        async with client.stream("POST", url, json=upstream_payload) as resp:
             if resp.status_code != 200:
                 return WorkerResult(
                     ok=False,
@@ -364,9 +387,13 @@ class OpenAIxWorker(BaseWorker):
                     continue
                 if emit_chunk:
                     await emit_chunk(chunk)
+                if save_call:
+                    chunks.append(chunk)
                 if chunk.get("done"):
                     final_data = chunk
 
+        if save_call:
+            save_llm_call(self.id, task_id, upstream_payload, {"stream_chunks": chunks})
         return WorkerResult(ok=True, data=final_data, usage=(final_data or {}).get("usage"))
 
 

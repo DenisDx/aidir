@@ -434,6 +434,7 @@
     <button id="nav-dashboard" class="active" onclick="showPage('dashboard')">Dashboard</button>
     <button id="nav-llm" onclick="showPage('llm')">Test LLM</button>
     <button id="nav-mcp" onclick="showPage('mcp')">Test MCP</button>
+    <button id="nav-agent" onclick="showPage('agent')">Agent Request</button>
     <button id="nav-settings" onclick="showPage('settings')">Settings</button>
     <span id="runtime-status" class="nav-status">Ready</span>
     <span class="spacer"></span>
@@ -626,6 +627,119 @@
           <div id="mcp-result-box" class="result-box"></div>
         </div>
       </div>
+    </div>
+  </div>
+
+  <!-- Agent Request -->
+  <div id="page-agent" class="page">
+
+    <div class="card">
+      <div class="card-title">Endpoint &amp; Protocol</div>
+      <div class="form-row">
+        <label>Endpoint</label>
+        <select id="agent-endpoint-select"><option value="">Loading…</option></select>
+      </div>
+      <div class="form-row">
+        <label>Protocol</label>
+        <select id="agent-protocol-select">
+          <option value="ollama">ollama</option>
+          <option value="openai">openai</option>
+          <option value="anthropic">anthropic</option>
+        </select>
+      </div>
+      <div class="form-row">
+        <label>Provider</label>
+        <select id="agent-provider-select">
+          <option value="">-- do not set --</option>
+        </select>
+      </div>
+      <div class="form-row">
+        <label>Model</label>
+        <input type="text" id="agent-model-input" placeholder="model name (optional)">
+        <select id="agent-model-select" style="max-width:260px"><option value="">— from provider —</option></select>
+      </div>
+      <div class="form-row">
+        <label>User token</label>
+        <input type="text" id="agent-token-input" placeholder="Bearer token (optional)" autocomplete="off">
+      </div>
+      <div class="form-row">
+        <label>Envid</label>
+        <input type="text" id="agent-envid-input" placeholder="environment id (optional)">
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Context builder</div>
+      <div class="form-row">
+        <label><input type="checkbox" id="agent-ctx-check"> Send context_builder</label>
+        <span style="color:var(--muted);font-size:12px">— include <code style="color:var(--text)">context_builder</code> in request</span>
+      </div>
+      <div class="form-row" id="agent-ctx-worker-row">
+        <label>Worker</label>
+        <input type="text" id="agent-ctx-worker-input"
+          placeholder="context_builder worker id (optional, uses default if omitted)">
+      </div>
+      <div class="form-row">
+        <label><input type="checkbox" id="agent-set-tools-check"> Set context_builder.tools_to_inject</label>
+        <span style="color:var(--muted);font-size:12px">— adds <code style="color:var(--text)">tools_to_inject</code> inside <code style="color:var(--text)">context_builder</code></span>
+      </div>
+      <div class="form-row" id="agent-tools-row">
+        <label>tools_to_inject</label>
+        <input type="text" id="agent-tools-input"
+          placeholder="* or all → inject all; names → inject listed; empty → []">
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Request logging</div>
+      <div class="form-row">
+        <label><input type="checkbox" id="agent-log-save-check"> save_llm_request</label>
+        <span style="color:var(--muted);font-size:12px">— log full upstream request &amp; response to <code style="color:var(--text)">&lt;worker&gt;_call_log.jsonl</code></span>
+      </div>
+      <div class="form-row" style="flex-wrap:wrap;gap:6px;">
+        <label style="min-width:80px">Type overrides</label>
+        <input type="text" id="agent-log-types-input"
+          placeholder='e.g. workers=debug, http=info  (type=level pairs, comma-separated)'
+          style="flex:1;min-width:200px">
+        <span style="color:var(--muted);font-size:12px">— per-type log level overrides for this request</span>
+      </div>
+      <div class="form-row">
+        <label><input type="checkbox" id="agent-keep-history-check" checked> keep history</label>
+        <span style="color:var(--muted);font-size:12px">— include dialog history in request; if disabled, send only current <code style="color:var(--text)">role=user</code> message</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Dialog</div>
+      <div id="agent-chat-box" class="chat-box"></div>
+      <div class="chat-input-row">
+        <textarea id="agent-input" placeholder="Type your message and press Enter or click Send…"></textarea>
+        <div style="display:flex;flex-direction:column;gap:6px;">
+          <button class="btn-primary" id="agent-send-btn">Send</button>
+          <button class="btn-sm" id="agent-show-query-btn">Show query…</button>
+          <button class="btn-sm" id="agent-clear-btn">Clear</button>
+        </div>
+      </div>
+      <div id="agent-status" style="font-size:12px;color:var(--muted);margin-top:6px;"></div>
+    </div>
+
+    <div class="card" id="agent-query-card" style="display:none">
+      <div class="card-title">Query to send</div>
+      <textarea id="agent-query-editor"
+        style="width:100%;min-height:220px;background:#0a0c12;color:var(--text);border:1px solid var(--border);border-radius:6px;padding:12px;font-family:monospace;font-size:12px;resize:vertical;"
+      ></textarea>
+      <div style="margin-top:10px;display:flex;gap:10px;align-items:center;">
+        <button class="btn-primary" id="agent-query-send-btn">Send</button>
+        <span id="agent-query-status" style="font-size:12px;color:var(--muted);"></span>
+      </div>
+    </div>
+
+    <div class="card" id="agent-raw-card">
+      <div class="card-title">Raw error/response</div>
+      <div id="agent-raw-status" style="font-size:12px;color:var(--muted);margin-bottom:8px;">No requests yet.</div>
+      <pre id="agent-raw-box"
+        style="background:#0a0c12;padding:12px;border-radius:6px;overflow:auto;max-height:360px;font-size:12px;white-space:pre-wrap;word-break:break-word;"
+      ></pre>
     </div>
   </div>
 

@@ -56,6 +56,8 @@
       "bindAddress": "${OPENAIX_ENDPOINT_HOST:-0.0.0.0}",
       // worker used for agent tasks; falls back to workers.default if omitted
       "worker": "openaix",
+      // worker used for pre-agent context building
+      "context_builder_worker": "context_builder",
       "middlewares": [] // TODO: add middleware ids here when needed
     },
     {
@@ -114,7 +116,8 @@
         "timeoutSeconds": 300,
         "logging": {
           "level": "debug",
-          "alllevel": "info"
+          "alllevel": "info",
+          "save_llm_request": true,
         },
         tools:{
           "search":{
@@ -162,6 +165,9 @@
         "enabled": true,
         "includeWorkers": true,
         "includeResources": true
+      },
+      "context_builder": {
+        "enabled": true
       }
     },
     "default": "call_ollama"
