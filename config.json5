@@ -17,6 +17,7 @@
     // Seconds between log wipe runs. 0 = never wipe.
     "wipe_period": ${LOG_WIPE_PERIOD:-0},
     // wipe_max_age: 86400,  // seconds; defaults to wipe_period if not set
+    max_log_size: ${MAX_LOG_SIZE:-1000000}, // max size in bytes for individual log files; 0 = unlimited
     "levels": { // thresholds for individual per-type log files
       "workers": "debug",
       "http": "info",
@@ -29,7 +30,12 @@
       "webui": 4
     }
   },
-  // Resources to track (VRAM etc). Empty in MVP1 - resource checks are TODO.
+  // Resources to track (VRAM etc).
+  // alive_time: seconds model stays in VRAM after last task (Ollama default is 300s).
+  //   Memory is considered occupied during this window; scheduler will force-unload if needed.
+  // keep_alive: keep model loaded for this many seconds after last use via cron pings (0=disabled).
+  // keep_alive_period: cron ping interval for keep_alive (should be < Ollama's auto-unload time).
+  // provider: id from models.providers, used to resolve API URL for force-unload/keep-alive calls.
   "resources":[
         {
             "id":"local_machine",
@@ -37,14 +43,22 @@
             "arch": "nvidia",
             "limits":{
                 "VRAM":10000, //Максимум можно использовать 10гб
-            }
+            },
+            "alive_time": 300,       // Ollama keeps models in VRAM ~5min after last call
+            "keep_alive": 5000,      // Keep model loaded for 5000s after last call (0=disabled)
+            "keep_alive_period": 250, // Ping every 250s so model stays before Ollama's 300s unload
+            "provider": "ollama_local" // Provider id for force-unload / keep-alive API calls
         },
         {
             "id":"remote_machine",
             "type":"cuda",
             "limits":{
                 "VRAM":20000,
-            }
+            },
+            "alive_time": 300,
+            "keep_alive": 0,          // No active keep-alive for remote machine
+            "keep_alive_period": 0,
+            "provider": "ollama_remote"
         },
     ],
 
@@ -58,6 +72,8 @@
       "worker": "openaix",
       // worker used for pre-agent context building
       "context_builder_worker": "context_builder",
+      // Timeout for entire request (queue + execution)
+      "request_timeout": ${REQUEST_TIMEOUT:-100},
       "middlewares": [] // TODO: add middleware ids here when needed
     },
     {
@@ -65,9 +81,12 @@
       "api": "mcp",
       "port": ${MCP_ENDPOINT_PORT:-20001},
       "bindAddress": "${MCP_ENDPOINT_HOST:-0.0.0.0}",
+      // Timeout for entire request (queue + execution)
+      "request_timeout": ${REQUEST_TIMEOUT:-100},
       "tools": {
         "search": {
           "worker": "web_search",
+          /*!! REMOVED 
           "description": "Test web search tool",
           "inputSchema": {
             "type": "object",
@@ -76,9 +95,11 @@
               "limit": {"type": "integer"}
             }
           }
+          */
         },
         "fetch": {
           "worker": "web_fetch",
+          /*!! REMOVED
           "description": "Test web fetch tool",
           "inputSchema": {
             "type": "object",
@@ -88,14 +109,17 @@
             },
             "required": ["url"]
           }
+          */
         },
         "selftest": {
           "worker": "selftest",
+          /*!! REMOVED
           "description": "System health self-test tool",
           "inputSchema": {
             "type": "object",
             "properties": {}
           }
+          */
         }
       }
     }
@@ -113,7 +137,8 @@
       "openaix": {
         "enabled": true,
         "provider": "ollama_local",
-        "timeoutSeconds": 300,
+        // Timeout for single HTTP request to upstream LLM
+        "request_timeout": ${REQUEST_TIMEOUT:-100},
         "logging": {
           "level": "debug",
           "alllevel": "info",
@@ -155,11 +180,17 @@
       },
       "web_search": {
         "enabled": true,
-        "provider": "mock"
+        "provider": "brave",
+        "apiKey": "${BRAVE_APIKEY}",
+        // Timeout for Brave API request
+        "request_timeout": ${REQUEST_TIMEOUT:-100}
       },
       "web_fetch": {
         "enabled": true,
-        "timeoutSeconds": 30
+        "provider": "brave",
+        "apiKey": "${BRAVE_APIKEY}",
+        // Timeout for Brave LLM Context API request
+        "request_timeout": ${REQUEST_TIMEOUT:-100}
       },
       "selftest": {
         "enabled": true,
@@ -167,6 +198,13 @@
         "includeResources": true
       },
       "context_builder": {
+        "enabled": true
+      },
+      "context_add_internal_tools": {
+        "enabled": true,
+        "tools": {}  // Dict of internal tools: {tool_name: {description, ...}}
+      },
+      "context_render_openclaw_style": {
         "enabled": true
       }
     },
@@ -270,7 +308,7 @@
     }
   },
   "webui": {
-    "port": ${WEBUI_PORT:-20080},
+    "port": ${WEBUI_PORT:-20082},
     "bind": "${WEBUI_HOST:-127.0.0.1}",
     "auth": {
       "mode": "login",
@@ -284,11 +322,59 @@
           ]
         }
       ]
+    },
+    // Timeout for HTTP requests to backend endpoints from WebUI
+    "request_timeouts": {
+      "ollama_chat":     ${WEBUI_TIMEOUT_OLLAMA_CHAT:-120},   // ollama /api/chat test
+      "mcp_proxy":       ${WEBUI_TIMEOUT_MCP_PROXY:-60},      // MCP endpoint proxy
+      "model_list":      ${WEBUI_TIMEOUT_MODEL_LIST:-20},     // list models from endpoint
+      "agent_test":      ${WEBUI_TIMEOUT_AGENT_TEST:-45}      // test agent request
     }
   },
   "tasks": {
     "restart_wait_timeout": ${TASK_RESTART_WAIT_TIMEOUT_SECONDS:-120},
     "queue_timeout": ${TASK_QUEUE_TIMEOUT_SECONDS:-300},
     "run_timeout": ${TASK_RUN_TIMEOUT_SECONDS:-300}
-  }
+  },
+  "envids": {
+    "check_period_minutes": ${ENVIDS_CHECK_PERIOD_MINUTES:-600},
+    "store_duration_minutes": ${ENVIDS_STORE_DURATION_MINUTES:-60000},
+    "default_context_building": {
+      "bootstrapMaxChars": ${BOOTSTRAP_MAX_CHARS:-32000},
+      "bootstrapTotalMaxChars": ${BOOTSTRAP_TOTAL_MAX_CHARS:-150000}
+    },
+    // Preset envids. Config values override Redis-stored values on startup.
+    "items": {
+//-------------------
+      "test-12345":{
+        description:"Demo env id",
+        context:{ 
+            items:{
+                workspace:{
+                    type:"mcp", //доступ через mcp file access
+                    endid:"default-env-token", //envid for MCP
+                    host:"127.0.0.1:30081",
+                    location:"/root/workspace/",
+                    token:"${WORKSPACE_TOKEN:-changeme}", 
+                },
+            }
+        },
+      },
+      "test-23456":{
+        parent:"test-12345", 
+        description:"Demo envid which uses another envid as a template",
+        context:{
+            files:[//redefile files array
+                    {
+                        "name":"AGENTS.md",
+                        "location": "./AGENTS1.md",//redefine  one field
+                        "token":"${WORKSPACE_TOKEN:-changeme}",
+                    }   
+                ],
+        }
+      },
+//-------------------      
+    }
+  },
+
 }

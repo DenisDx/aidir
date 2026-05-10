@@ -105,8 +105,10 @@ Key sections:
 
 Default config exposes an MCP endpoint with two test tools:
 
-- `search` -> worker `web_search` (returns mock search results)
-- `fetch` -> worker `web_fetch` (downloads URL and returns short content preview)
+- `search` -> worker `web_search` (Brave Web Search API)
+- `fetch` -> worker `web_fetch` (Brave LLM Context API)
+
+These tools require `BRAVE_APIKEY` (via `.env` and `config.json5` mapping).
 
 Quick checks:
 
@@ -118,6 +120,18 @@ curl http://127.0.0.1:20001/mcp \
 curl http://127.0.0.1:20001/mcp \
   -H 'content-type: application/json' \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search","arguments":{"query":"aidir"}}}'
+
+curl http://127.0.0.1:20001/mcp \
+  -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"search","arguments":{"query":"python asyncio task queue","count":5,"country":"US","search_lang":"en","freshness":"pm"}}}'
+
+curl http://127.0.0.1:20001/mcp \
+  -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"fetch","arguments":{"url":"https://docs.python.org/3/library/asyncio.html","query":"python asyncio task group cancellation","maximum_number_of_tokens":4096,"maximum_number_of_urls":8}}}'
+
+curl http://127.0.0.1:20001/mcp \
+  -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"selftest","arguments":{}}}'
 ```
 
 ---
@@ -213,6 +227,30 @@ curl http://localhost:21434/api/chat \
     "messages": [{"role": "user", "content": "Hello"}],
     "stream": false
   }'
+```
+
+### Troubleshooting Brave tools
+
+If MCP `search`/`fetch` tools fail, check these common cases first:
+
+- `MISSING_API_KEY`: `BRAVE_APIKEY` is not set in `.env` (or `workers.items.web_* .apiKey` is missing).
+- `BRAVE_HTTP_ERROR 401/403`: invalid API key or subscription issue.
+- `BRAVE_HTTP_ERROR 429`: rate limit exceeded; retry with backoff.
+- `BRAVE_REQUEST_FAILED`: network/DNS/timeout issue when connecting to `api.search.brave.com`.
+
+Quick diagnostics:
+
+```bash
+# Check env key presence (masked output)
+grep '^BRAVE_APIKEY=' .env | sed 's/=.*/=<set>/'
+
+# Check effective worker config contains brave + apiKey placeholder
+grep -n '"web_search"\|"web_fetch"\|"provider"\|"apiKey"' config.json5
+
+# Run selftest over MCP (includes brave_web_search_api check)
+curl http://127.0.0.1:20001/mcp \
+  -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":91,"method":"tools/call","params":{"name":"selftest","arguments":{}}}'
 ```
 
 ### Log files

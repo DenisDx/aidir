@@ -1,7 +1,8 @@
 """
 Dynamic worker loader.
-Scans ./workers/ directory, imports app.py from each enabled worker,
+Scans ./workers/<type>/<id>/ directories, imports app.py from each enabled worker,
 and returns a dict of worker_id -> BaseWorker instance.
+Layout: workers/<type>/<worker_id>/app.py (e.g. workers/agent/openaix/app.py)
 """
 from __future__ import annotations
 
@@ -30,7 +31,7 @@ def _deep_merge(base: dict, override: dict) -> dict:
 
 
 def _read_worker_local_config(worker_dir: Path, worker_id: str) -> dict:
-    """Read workers/<id>/config.json5 as JSON5 (with env placeholders)."""
+    """Read workers/<type>/<id>/config.json5 as JSON5 (with env placeholders)."""
     cfg_file = worker_dir / "config.json5"
     if not cfg_file.exists():
         return {}
@@ -44,19 +45,28 @@ def _read_worker_local_config(worker_dir: Path, worker_id: str) -> dict:
         return {}
 
 
+def _iter_worker_dirs(workers_dir: Path):
+    """Yield (worker_type, worker_id, worker_dir) for all workers in two-level layout."""
+    if not workers_dir.exists():
+        return
+    for type_dir in sorted(workers_dir.iterdir()):
+        if not type_dir.is_dir() or type_dir.name.startswith("_") or type_dir.name.startswith("."):
+            continue
+        worker_type = type_dir.name
+        for worker_dir in sorted(type_dir.iterdir()):
+            if not worker_dir.is_dir() or worker_dir.name.startswith("_") or worker_dir.name.startswith("."):
+                continue
+            yield worker_type, worker_dir.name, worker_dir
+
+
 def resolve_worker_configs(config: dict) -> dict[str, dict]:
     """Build merged worker configs: local worker config overridden by root workers.items."""
     workers_cfg: dict[str, dict] = {}
     workers_dir = _ROOT / "workers"
-    if not workers_dir.exists():
-        return workers_cfg
 
     items_cfg: dict = config.get("workers", {}).get("items", {}) or {}
 
-    for worker_dir in sorted(workers_dir.iterdir()):
-        if not worker_dir.is_dir():
-            continue
-        worker_id = worker_dir.name
+    for _worker_type, worker_id, worker_dir in _iter_worker_dirs(workers_dir):
         local_cfg = _read_worker_local_config(worker_dir, worker_id)
         root_cfg = items_cfg.get(worker_id, {})
         if not isinstance(root_cfg, dict):
@@ -68,7 +78,7 @@ def resolve_worker_configs(config: dict) -> dict[str, dict]:
 
 def load_workers(config: dict, workers_cfg: dict[str, dict] | None = None) -> dict[str, BaseWorker]:
     """
-    Load all enabled workers from ./workers/<id>/app.py.
+    Load all enabled workers from ./workers/<type>/<id>/app.py.
     Each app.py must expose a module-level `worker` instance of BaseWorker.
     Main config section workers.items.<id> overrides worker's local config.json5.
     Returns dict of worker_id -> BaseWorker.
@@ -86,11 +96,7 @@ def load_workers(config: dict, workers_cfg: dict[str, dict] | None = None) -> di
     if str(_ROOT) not in sys.path:
         sys.path.insert(0, str(_ROOT))
 
-    for worker_dir in sorted(workers_dir.iterdir()):
-        if not worker_dir.is_dir():
-            continue
-        worker_id = worker_dir.name
-
+    for worker_type, worker_id, worker_dir in _iter_worker_dirs(workers_dir):
         # Check enabled flag (main config wins over local config.json5)
         cfg_override = resolved_cfg.get(worker_id, {})
         if not cfg_override.get("enabled", True):
@@ -103,7 +109,7 @@ def load_workers(config: dict, workers_cfg: dict[str, dict] | None = None) -> di
             continue
 
         try:
-            module = importlib.import_module(f"workers.{worker_id}.app")
+            module = importlib.import_module(f"workers.{worker_type}.{worker_id}.app")
             instance: BaseWorker = module.worker  # required export
             instance.id = worker_id
             workers[worker_id] = instance

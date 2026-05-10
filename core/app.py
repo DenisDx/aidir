@@ -22,6 +22,8 @@ import redis.asyncio as aioredis
 import uvicorn
 
 from core.config import Config, config as _global_config
+from core.error_logging import log_exception
+from core.envid import EnvidRegistry
 from core.logger import logger
 from core.queue_manager import QueueManager
 from core.resources import Resources
@@ -67,6 +69,7 @@ class Core:
         self.workers: dict = {}
         self.loop_workers: list[tuple[str, object]] = []
         self.resources = Resources([])
+        self.envid_registry: EnvidRegistry | None = None
         self._restart_requested = False
         self._shutdown_started = False
         self._shutdown_lock = asyncio.Lock()
@@ -96,10 +99,16 @@ class Core:
         instance = self.config.get("instance", "aidir")
         self.queue = QueueManager(self.redis, instance)
 
+        # ── Envid registry ─────────────────────────────────────────────────
+        self.envid_registry = EnvidRegistry(self.redis, instance)
+        await self.envid_registry.load_from_redis()
+        await self.envid_registry.merge_from_config(self.config.raw())
+
         # ── Workers ────────────────────────────────────────────────────────
         workers_cfg = resolve_worker_configs(self.config.raw())
         self.workers = load_workers(self.config.raw(), workers_cfg=workers_cfg)
         self.resources = Resources(self.config.get("resources") or [])
+        self.resources.set_redis(self.redis, instance)
         # Initialize each worker with its config section
         for wid, w in self.workers.items():
             await w.initialize({**workers_cfg.get(wid, {}), "_core": self})
@@ -357,6 +366,17 @@ async def main() -> None:
         """Schedule async shutdown from signal-safe contexts."""
         loop.create_task(_shutdown_async(source))
 
+    def _loop_exception_handler(_loop: asyncio.AbstractEventLoop, context: dict) -> None:
+        """Log unhandled asyncio loop exceptions into application logs."""
+        exc = context.get("exception")
+        message = str(context.get("message") or "Unhandled asyncio loop exception")
+        if exc is not None:
+            log_exception("system", "asyncio", message, exc)
+        else:
+            log("system", "error", f"{message}; context={context}", "asyncio")
+
+    loop.set_exception_handler(_loop_exception_handler)
+
     # SIGHUP → reload config
     try:
         loop.add_signal_handler(signal.SIGHUP, core.reload_config)
@@ -397,4 +417,8 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except BaseException as exc:
+        log_exception("system", "fatal", "Fatal crash in core entrypoint", exc)
+        raise

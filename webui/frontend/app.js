@@ -1043,6 +1043,10 @@ function initTestPages() {
     const value = $('agent-model-select').value;
     if (value) $('agent-model-input').value = value;
   });
+  $('agent-envid-select').addEventListener('change', () => {
+    const value = $('agent-envid-select').value;
+    if (value) $('agent-envid-input').value = value;
+  });
   $('agent-clear-btn').addEventListener('click', () => {
     agentMessages = [];
     renderAgentChat();
@@ -1062,12 +1066,40 @@ let agentMessages = [];
 let agentSending  = false;
 let agentEndpoints = [];
 let agentProviders = [];
+let agentEnvids = [];
 
 async function loadAgentCatalog() {
   const data = await apiGet('/api/test/agent/catalog');
   if (!data || !Array.isArray(data.providers)) return;
   agentProviders = data.providers;
+  agentEnvids = Array.isArray(data.envids) ? data.envids : [];
   renderAgentProviderSelect();
+  renderAgentEnvidSelect();
+}
+
+function renderAgentEnvidSelect() {
+  const envidSel = $('agent-envid-select');
+  if (!envidSel) return;
+
+  const currentSelect = envidSel.value;
+  const currentInput = $('agent-envid-input').value.trim();
+
+  envidSel.innerHTML = '<option value="">-- from config --</option>';
+  agentEnvids.forEach(envid => {
+    const opt = document.createElement('option');
+    opt.value = envid;
+    opt.textContent = envid;
+    envidSel.appendChild(opt);
+  });
+
+  if (currentSelect && agentEnvids.includes(currentSelect)) {
+    envidSel.value = currentSelect;
+    return;
+  }
+
+  if (currentInput && agentEnvids.includes(currentInput)) {
+    envidSel.value = currentInput;
+  }
 }
 
 function renderAgentProviderSelect() {
@@ -1157,6 +1189,7 @@ function buildAgentBody(extraUserText) {
   const logSave   = $('agent-log-save-check').checked;
   const logTypes  = $('agent-log-types-input').value.trim();
   const keepHistory = $('agent-keep-history-check').checked;
+  const timeoutVal = $('agent-timeout-input').value.trim();
 
   let messages = [];
   if (keepHistory) {
@@ -1208,6 +1241,11 @@ function buildAgentBody(extraUserText) {
     });
   }
   if (Object.keys(logField).length) body.log = logField;
+
+  // Add timeout if specified (prefixed with _ for backend filtering)
+  if (timeoutVal) {
+    body._timeout = parseInt(timeoutVal, 10) || undefined;
+  }
 
   return body;
 }

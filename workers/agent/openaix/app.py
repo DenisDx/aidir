@@ -12,6 +12,7 @@ import httpx
 
 from core import log
 from core.call_log import save_llm_call
+from core.context import Context
 from core.task import Task, STATUS_COMPLETED, STATUS_FAILED, STATUS_CANCELED
 from core.task_types.task_agent import Task_agent
 from core.task_types.task_tool import Task_tool
@@ -28,14 +29,13 @@ class OpenAIxWorker(BaseWorker):
         self._timeout: int = 300
         self._save_llm_request_default: bool = False
         self._core = None
-        self._internal_tools: dict[str, dict] = {}
 
     async def initialize(self, config: dict) -> None:
-        """Load upstream provider URL and timeout from config."""
+        """Load upstream provider URL and request timeout from config."""
         core = config.get("_core")
         self._core = core
         provider_id = str(config.get("provider", "ollama_local"))
-        self._timeout = int(config.get("timeoutSeconds", 300))
+        self._timeout = int(config.get("request_timeout", 100))
         logging_cfg = config.get("logging") if isinstance(config.get("logging"), dict) else {}
         self._save_llm_request_default = bool(logging_cfg.get("save_llm_request", False))
 
@@ -44,13 +44,10 @@ class OpenAIxWorker(BaseWorker):
             if base_url:
                 self._base_url = str(base_url).rstrip("/")
 
-            # Internal tools configured specifically for this worker.
-            self._internal_tools = self._load_internal_tools(config)
-
         log(
             "worker",
             "info",
-            f"openaix initialized; upstream={self._base_url}; save_llm_request_default={self._save_llm_request_default}; internal_tools={list(self._internal_tools.keys())}",
+            f"openaix initialized; upstream={self._base_url}; save_llm_request_default={self._save_llm_request_default}",
             "openaix",
         )
 
@@ -66,17 +63,39 @@ class OpenAIxWorker(BaseWorker):
                 error={"code": "WRONG_TASK_TYPE", "message": f"Expected Task_agent, got {type(task).__name__}"},
             )
 
-        payload = self._normalize_payload(task.payload or {}, task.stream)
-        payload = self._inject_internal_tools(payload)
         url = f"{self._base_url}/api/chat"
         save_call = self._resolve_save_llm_request(task.payload or {})
+
+        # Limit message history to prevent context overload
+        # Keep system + last N user/assistant messages
+        payload = dict(task.payload or {})
+        messages = list(payload.get("messages") or [])
+        if len(messages) > 20:  # Keep last 20 messages max
+            system_msgs = [m for m in messages if m.get("role") == "system"]
+            other_msgs = [m for m in messages if m.get("role") != "system"]
+            kept_messages = system_msgs + other_msgs[-18:]  # system + last 18
+            payload["messages"] = kept_messages
+            task.payload = payload
+            log(
+                "worker",
+                "info",
+                f"Task {task.id}: limited messages from {len(messages)} to {len(kept_messages)}",
+                "openaix",
+            )
+
+        context_result = await self._apply_context_chain(task)
+        if not context_result.ok:
+            return context_result
+
+        payload = self._normalize_payload(task.payload or {}, task.stream)
 
         log("worker", "debug", f"Forwarding task {task.id} to {url} stream={task.stream}", "openaix")
 
         try:
             async with httpx.AsyncClient(timeout=self._timeout) as client:
-                # If no internal tools are configured, keep direct streaming behavior.
-                if task.stream and not self._internal_tools:
+                # Check if tools are present in payload (injected by context builder)
+                has_tools = bool(payload.get("tools"))
+                if task.stream and not has_tools:
                     return await self._forward_stream(client, url, payload, emit_chunk, save_call=save_call, task_id=task.id)
                 return await self._run_with_internal_tools(client, url, payload, task, emit_chunk, save_call=save_call)
         except httpx.ConnectError as exc:
@@ -128,74 +147,88 @@ class OpenAIxWorker(BaseWorker):
 
         return out
 
-    def _load_internal_tools(self, worker_cfg: dict) -> dict[str, dict]:
-        """Read worker-local internal tool mapping from config.
-        Supported format:
-        tools: {
-          "search": {"worker": "web_search", "description": "...", "inputSchema": {...}},
-          "fetch":  {"worker": "web_fetch"}
-        }
-        """
-        tools_cfg = worker_cfg.get("tools") or {}
-        if not isinstance(tools_cfg, dict):
-            return {}
+    async def _apply_context_chain(self, task: Task_agent) -> WorkerResult:
+        """Run context workers synchronously before model execution."""
+        if self._core is None:
+            return WorkerResult(ok=False, error={"code": "CORE_NOT_INITIALIZED", "message": "Core is not available"})
 
-        loaded: dict[str, dict] = {}
-        for tool_name, meta in tools_cfg.items():
-            if not isinstance(meta, dict):
+        if task.context is None:
+            task.context = Context.empty()
+
+        source_worker_id = task.worker_id or self.id
+        worker_cfg = self._core.config.get(f"workers.items.{source_worker_id}") or {}
+        worker_tools_cfg = worker_cfg.get("tools")
+        task.config = dict(task.config or {})
+        if isinstance(worker_tools_cfg, dict):
+            task.config["tools"] = worker_tools_cfg
+
+        context_builder_cfg = task.payload.get("context_builder") if isinstance(task.payload, dict) else None
+        if isinstance(context_builder_cfg, dict) and isinstance(context_builder_cfg.get("context_add_internal_tools"), dict):
+            task.config["context_add_internal_tools"] = context_builder_cfg.get("context_add_internal_tools")
+
+        worker_chain = ["context_builder", "context_add_internal_tools", "context_render_openclaw_style"]
+        original_worker_id = task.worker_id
+
+        for worker_name in worker_chain:
+            worker = self._core.workers.get(worker_name)
+            if worker is None:
                 continue
-            worker_id = str(meta.get("worker", "")).strip()
-            if not worker_id:
-                continue
 
-            wk = self._core.workers.get(worker_id) if self._core is not None else None
-            if wk is None or getattr(wk, "task_type", "") != "tool":
-                log("worker", "warn", f"openaix internal tool '{tool_name}' skipped: worker '{worker_id}' is not tool", "openaix")
-                continue
+            task.worker_id = worker_name
+            try:
+                result = await worker.execute(task)
+            except Exception as exc:
+                task.worker_id = original_worker_id
+                return WorkerResult(ok=False, error={"code": "WORKER_EXCEPTION", "message": f"{worker_name}: {exc}"})
 
-            loaded[str(tool_name)] = {
-                "worker": worker_id,
-                "description": str(meta.get("description", f"Internal tool {tool_name}")),
-                "inputSchema": meta.get("inputSchema") or {"type": "object"},
-            }
-        return loaded
+            if not result.ok:
+                task.worker_id = original_worker_id
+                return result
 
-    def _inject_internal_tools(self, payload: dict) -> dict:
-        """Add configured internal tools to payload.tools if they are missing."""
-        if not self._internal_tools:
-            return payload
+        task.worker_id = original_worker_id
+        self._apply_context_to_payload(task)
+        return WorkerResult(ok=True)
 
-        out = dict(payload)
-        existing = out.get("tools")
-        if not isinstance(existing, list):
-            existing = []
+    @staticmethod
+    def _apply_context_to_payload(task: Task_agent) -> None:
+        """Project context data into payload fields consumed by the model."""
+        if task.context is None:
+            return
 
-        existing_names: set[str] = set()
-        for tool in existing:
-            if not isinstance(tool, dict):
-                continue
-            fn = tool.get("function") if isinstance(tool.get("function"), dict) else {}
-            name = fn.get("name") or tool.get("name")
-            if name:
-                existing_names.add(str(name))
+        payload = dict(task.payload or {})
+        messages = list(payload.get("messages") or [])
 
-        merged = list(existing)
-        for name, meta in self._internal_tools.items():
-            if name in existing_names:
-                continue
-            merged.append(
-                {
-                    "type": "function",
-                    "function": {
-                        "name": name,
-                        "description": meta["description"],
-                        "parameters": meta["inputSchema"],
-                    },
-                }
-            )
+        if task.context.system_rendered:
+            rendered = task.context.system_rendered
+            system_found = False
+            for message in messages:
+                if isinstance(message, dict) and message.get("role") == "system":
+                    message["content"] = rendered
+                    system_found = True
+                    break
+            if not system_found:
+                messages.insert(0, {"role": "system", "content": rendered})
 
-        out["tools"] = merged
-        return out
+        if task.context.tools:
+            out_tools = []
+            for tool_name, tool_spec in task.context.tools.items():
+                if not isinstance(tool_spec, dict):
+                    continue
+                out_tools.append(
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": tool_name,
+                            "description": tool_spec.get("description", tool_name),
+                            "parameters": tool_spec.get("inputSchema", {"type": "object"}),
+                        },
+                    }
+                )
+            if out_tools:
+                payload["tools"] = out_tools
+
+        payload["messages"] = messages
+        task.payload = payload
 
     async def _run_with_internal_tools(
         self,
@@ -206,16 +239,30 @@ class OpenAIxWorker(BaseWorker):
         emit_chunk: Callable[[dict], Awaitable[None]] | None,
         save_call: bool = False,
     ) -> WorkerResult:
-        """Run model loop and intercept internal tool calls.
-        If model requests only internal tools, execute them via Task_tool and continue model call.
-        External tools are returned to client as-is.
+        """
+        Run model loop and intercept tool calls that can be executed locally.
+        Tools are pre-injected into payload by context builder.
+        If model requests tools that are available as workers, execute them and continue model call.
+        Otherwise, return response to client as-is.
         """
         current_payload = dict(payload)
         current_payload["stream"] = False
         messages = list(current_payload.get("messages") or [])
         max_turns = 8
+        turn = 0
+
+        # Extract available tool names from payload
+        available_tools = self._extract_available_tool_names(payload)
 
         for _ in range(max_turns):
+            turn += 1
+            roles = [m.get("role") for m in messages]
+            log(
+                "worker",
+                "debug",
+                f"Task {parent_task.id} tool-loop turn={turn} sending {len(messages)} messages: {roles}",
+                "openaix",
+            )
             current_payload["messages"] = messages
             step = await self._forward_sync(client, url, current_payload, save_call=save_call, task_id=parent_task.id)
             if not step.ok:
@@ -225,31 +272,47 @@ class OpenAIxWorker(BaseWorker):
             assistant_msg = data.get("message") if isinstance(data.get("message"), dict) else {}
             calls = self._extract_tool_calls(assistant_msg)
             if not calls:
+                content_preview = str(assistant_msg.get("content", ""))[:300]
+                log(
+                    "worker",
+                    "info",
+                    f"Task {parent_task.id} final response turn={turn} role={assistant_msg.get('role')} content={content_preview!r}",
+                    "openaix",
+                )
                 if parent_task.stream and emit_chunk:
                     await emit_chunk(data)
                 return step
 
-            internal_calls = [c for c in calls if c["name"] in self._internal_tools]
-            external_calls = [c for c in calls if c["name"] not in self._internal_tools]
+            # Separate tool calls into executable (local workers) and pass-through (external)
+            executable_calls = [c for c in calls if c["name"] in available_tools]
+            external_calls = [c for c in calls if c["name"] not in available_tools]
 
-            # If there is any external tool call, pass response to client unchanged.
-            if external_calls or not internal_calls:
+            # If there are external tool calls, pass response to client unchanged
+            if external_calls or not executable_calls:
                 if parent_task.stream and emit_chunk:
                     await emit_chunk(data)
                 return step
 
-            # Continue internally: append assistant tool call message, then tool results.
+            # Continue internally: execute tool calls and append results
             log(
                 "worker",
                 "info",
-                f"Task {parent_task.id} intercepted internal tool calls: {[c['name'] for c in internal_calls]}",
+                f"Task {parent_task.id} executing tool calls: {[c['name'] for c in executable_calls]}",
                 "openaix",
             )
             messages.append(assistant_msg)
-            for call in internal_calls:
+            for call in executable_calls:
                 tool_result = await self._execute_internal_tool(call, parent_task)
                 if not tool_result.ok:
                     return tool_result
+
+                data_preview = json.dumps(tool_result.data or {}, ensure_ascii=False)[:500]
+                log(
+                    "worker",
+                    "info",
+                    f"Task {parent_task.id} tool result: name={call['name']} ok={tool_result.ok} data={data_preview}",
+                    "openaix",
+                )
 
                 tool_message = {
                     "role": "tool",
@@ -262,8 +325,24 @@ class OpenAIxWorker(BaseWorker):
 
         return WorkerResult(
             ok=False,
-            error={"code": "TOOL_LOOP_LIMIT", "message": "Internal tool loop exceeded limit"},
+            error={"code": "TOOL_LOOP_LIMIT", "message": "Tool loop exceeded limit"},
         )
+
+    @staticmethod
+    def _extract_available_tool_names(payload: dict) -> set[str]:
+        """Extract tool names from payload.tools list."""
+        tools_list = payload.get("tools")
+        if not isinstance(tools_list, list):
+            return set()
+        
+        names = set()
+        for tool in tools_list:
+            if not isinstance(tool, dict):
+                continue
+            fn = tool.get("function")
+            if isinstance(fn, dict) and "name" in fn:
+                names.add(str(fn["name"]))
+        return names
 
     @staticmethod
     def _extract_tool_calls(message: dict) -> list[dict]:
@@ -302,7 +381,8 @@ class OpenAIxWorker(BaseWorker):
     async def _execute_internal_tool(self, call: dict, parent_task: Task_agent) -> WorkerResult:
         """Run an internal tool via Task_tool and wait for completion."""
         tool_name = call["name"]
-        meta = self._internal_tools.get(tool_name)
+        tool_context = parent_task.context.tools if parent_task.context and parent_task.context.tools else {}
+        meta = tool_context.get(tool_name)
         if meta is None:
             return WorkerResult(ok=False, error={"code": "TOOL_NOT_FOUND", "message": f"Unknown internal tool: {tool_name}"})
 

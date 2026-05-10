@@ -9,7 +9,9 @@ import json
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Optional
+
+from core.context import Context
 
 # ── Status constants ─────────────────────────────────────────────────────────
 STATUS_CREATED   = "created"
@@ -74,6 +76,12 @@ class Task:
     # External tasks are preserved in Redis after completion and cleaned by cron.
     external: bool = False
 
+    # ── Context and config ────────────────────────────────────────────────
+    # Runtime context for this task (merged from envid context + overrides)
+    context: Optional[Context] = None
+    # Worker config overrides for this task (merged with worker's base config)
+    config: dict[str, Any] = field(default_factory=dict)
+
     # ── Async primitives (not persisted) ──────────────────────────────────
     # Signaled by QueueManager when task reaches a terminal status
     _done_event: asyncio.Event = field(
@@ -86,6 +94,10 @@ class Task:
 
     def to_redis_hash(self) -> dict[str, str]:
         """Serialize task state for Redis HSET (all values must be strings)."""
+        context_json = ""
+        if self.context:
+            context_json = json.dumps(self.context.to_dict())
+        
         return {
             "id":          self.id,
             "type":        self.type,
@@ -104,4 +116,6 @@ class Task:
             "retry_attempt": str(self.retry_attempt),
             "fallback_index": str(self.fallback_index),
             "resource_requirements": json.dumps(self.resource_requirements),
+            "config":      json.dumps(self.config),
+            "context":     context_json,
         }

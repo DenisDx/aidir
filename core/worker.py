@@ -44,3 +44,20 @@ class BaseWorker:
         Raise an exception or return WorkerResult(ok=False) on error.
         """
         raise NotImplementedError(f"Worker {self.id} has no execute() implementation")
+
+
+class BaseToolWorker(BaseWorker):
+    """Base class for tool workers that can self-describe their MCP contract."""
+
+    task_type: str = "tool"
+
+    def get_tool_description(self) -> dict[str, Any]:
+        """
+        Return MCP-style tool metadata.
+        Output keys: name, description, inputSchema.
+        """
+        return {
+            "name": self.id,
+            "description": f"Tool {self.id}",
+            "inputSchema": {"type": "object", "properties": {}},
+        }

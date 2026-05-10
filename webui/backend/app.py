@@ -25,6 +25,7 @@ from fastapi import (
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from core import log
+from core.error_logging import attach_request_id_middleware, get_or_create_request_id, log_exception
 
 if TYPE_CHECKING:
     from core.app import Core
@@ -106,8 +107,26 @@ def create_app(
     restart_callback: Callable[[], Awaitable[None]] | None = None,
 ) -> FastAPI:
     app = FastAPI(title="aidir WebUI", docs_url=None, redoc_url=None)
+    attach_request_id_middleware(app)
     app.state.core = core
     app.state.restart_callback = restart_callback
+
+    @app.exception_handler(Exception)
+    async def unhandled_exception_handler(request: Request, exc: Exception):
+        """Log unhandled exceptions with traceback and request id."""
+        request_id = get_or_create_request_id(request)
+        log_exception(
+            "webui",
+            "unhandled",
+            f"Unhandled exception method={request.method} path={request.url.path}",
+            exc,
+            request_id=request_id,
+        )
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "Internal server error", "request_id": request_id},
+            headers={"X-Request-ID": request_id},
+        )
 
     # ── Auth ──────────────────────────────────────────────────────────────────
 
@@ -415,8 +434,9 @@ def create_app(
         if not ollama_port:
             raise HTTPException(status_code=503, detail="No ollama endpoint configured")
 
+        timeout = float(core.config.get("webui.request_timeouts.ollama_chat") or 120)
         try:
-            async with httpx.AsyncClient(timeout=120.0) as client:
+            async with httpx.AsyncClient(timeout=timeout) as client:
                 resp = await client.post(
                     f"http://127.0.0.1:{ollama_port}/api/chat",
                     json=body,
@@ -442,6 +462,7 @@ def create_app(
 
         body = await request.json()
         endpoint_id = body.pop("_endpoint_id", None)
+        method = str(body.get("method", ""))
 
         endpoints_cfg = core.config.get("endpoints") or []
         ep_cfg: dict | None = None
@@ -454,20 +475,69 @@ def create_app(
         if not ep_cfg:
             raise HTTPException(status_code=503, detail="MCP endpoint not found")
 
+        endpoint_name = str(ep_cfg.get("id") or "mcp")
         port = ep_cfg.get("port")
+
+        if method == "tools/list":
+            log(
+                "webui",
+                "info",
+                f"external_mcp_tools_list request user={session.get('login', 'unknown')} endpoint={endpoint_name} port={port}",
+                "test_mcp",
+            )
+
+        timeout = float(core.config.get("webui.request_timeouts.mcp_proxy") or 60)
         try:
-            async with httpx.AsyncClient(timeout=60.0) as client:
+            async with httpx.AsyncClient(timeout=timeout) as client:
                 resp = await client.post(f"http://127.0.0.1:{port}/mcp", json=body)
                 try:
                     data = resp.json()
                 except Exception:
                     data = {"error": resp.text or "Invalid response"}
+
+                if method == "tools/list":
+                    tools_count = -1
+                    if isinstance(data, dict):
+                        result_obj = data.get("result")
+                        if isinstance(result_obj, dict) and isinstance(result_obj.get("tools"), list):
+                            tools_count = len(result_obj.get("tools"))
+                    log(
+                        "webui",
+                        "info",
+                        (
+                            f"external_mcp_tools_list response endpoint={endpoint_name} "
+                            f"status={resp.status_code} tools_count={tools_count}"
+                        ),
+                        "test_mcp",
+                    )
+
                 return JSONResponse(content=data, status_code=resp.status_code)
         except httpx.ConnectError:
+            if method == "tools/list":
+                log(
+                    "webui",
+                    "info",
+                    f"external_mcp_tools_list error endpoint={endpoint_name} reason=connect_error",
+                    "test_mcp",
+                )
             raise HTTPException(status_code=502, detail="Cannot connect to MCP endpoint")
         except httpx.TimeoutException:
+            if method == "tools/list":
+                log(
+                    "webui",
+                    "info",
+                    f"external_mcp_tools_list error endpoint={endpoint_name} reason=timeout",
+                    "test_mcp",
+                )
             raise HTTPException(status_code=504, detail="MCP endpoint timed out")
         except Exception as exc:
+            if method == "tools/list":
+                log(
+                    "webui",
+                    "info",
+                    f"external_mcp_tools_list error endpoint={endpoint_name} reason=exception detail={exc}",
+                    "test_mcp",
+                )
             raise HTTPException(status_code=500, detail=str(exc))
 
     @app.get("/api/test/agent/endpoints")
@@ -498,7 +568,9 @@ def create_app(
     async def get_agent_catalog(session: dict = Depends(_require_session)):
         """Return provider and model catalog from config for Agent Request page."""
         providers: list[dict] = []
+        envids: list[str] = []
         providers_cfg = core.config.get("models.providers") or {}
+        envids_cfg = core.config.get("envids.items") or {}
 
         if isinstance(providers_cfg, dict):
             for provider_id, provider_cfg in providers_cfg.items():
@@ -517,7 +589,11 @@ def create_app(
                     "models": models,
                 })
 
-        return {"providers": providers}
+        if isinstance(envids_cfg, dict):
+            for envid_id in envids_cfg.keys():
+                envids.append(str(envid_id))
+
+        return {"providers": providers, "envids": sorted(envids)}
 
     @app.get("/api/test/agent/models")
     async def list_agent_models(
@@ -547,8 +623,9 @@ def create_app(
         else:
             url = f"http://127.0.0.1:{port}/api/tags"
 
+        timeout = float(core.config.get("webui.request_timeouts.model_list") or 20)
         try:
-            async with httpx.AsyncClient(timeout=20.0) as client:
+            async with httpx.AsyncClient(timeout=timeout) as client:
                 resp = await client.get(url)
                 if resp.status_code != 200:
                     raise HTTPException(status_code=resp.status_code, detail=f"Model list request failed: {resp.text[:200]}")
@@ -614,8 +691,15 @@ def create_app(
         if user_token:
             headers["Authorization"] = f"Bearer {user_token}"
 
+        # Use timeout from request if specified, otherwise use config default
+        request_timeout = body.pop("_timeout", None)
+        if request_timeout is not None:
+            timeout = float(request_timeout)
+        else:
+            timeout = float(core.config.get("webui.request_timeouts.agent_test") or 45)
+        
         try:
-            async with httpx.AsyncClient(timeout=45.0) as client:
+            async with httpx.AsyncClient(timeout=timeout) as client:
                 resp = await client.post(url, json=body, headers=headers)
                 try:
                     data = resp.json()

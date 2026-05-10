@@ -18,9 +18,9 @@ from typing import AsyncGenerator
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from core.error_logging import attach_request_id_middleware, get_or_create_request_id, log_exception
 from core.endpoints.endpoint_ollama import Endpoint_ollama
 from core.task import STATUS_CANCELED, STATUS_COMPLETED, STATUS_FAILED
-from core.task_types.task_context_builder import Task_context_builder
 
 
 class Endpoint_openaix(Endpoint_ollama):
@@ -35,11 +35,31 @@ class Endpoint_openaix(Endpoint_ollama):
         self._errors_compatibility_mode = bool(
             endpoint_cfg.get("errors_compatibility_mode", True)
         )
+        # Timeout for entire endpoint request (queue + execution)
+        self._request_timeout = int(endpoint_cfg.get("request_timeout", 100))
 
     def create_app(self, core) -> FastAPI:
         """Create FastAPI app exposing both ollama and openai chat endpoints."""
         self._core = core
         app = FastAPI(title=f"aidir-{self.id}", docs_url=None, redoc_url=None)
+        attach_request_id_middleware(app)
+
+        @app.exception_handler(Exception)
+        async def unhandled_exception_handler(request: Request, exc: Exception):
+            """Log unhandled endpoint exceptions with traceback and request id."""
+            request_id = get_or_create_request_id(request)
+            log_exception(
+                "http",
+                self.id,
+                f"Unhandled exception method={request.method} path={request.url.path}",
+                exc,
+                request_id=request_id,
+            )
+            return JSONResponse(
+                status_code=500,
+                content={"error": {"code": "INTERNAL_ERROR", "message": "Internal server error", "request_id": request_id}},
+                headers={"X-Request-ID": request_id},
+            )
 
         @app.post("/api/chat")
         async def api_chat(request: Request):
@@ -65,7 +85,7 @@ class Endpoint_openaix(Endpoint_ollama):
         return app
 
     async def _handle_chat(self, request: Request) -> StreamingResponse | JSONResponse:
-        """Handle Ollama-compatible /api/chat with optional context_builder step."""
+        """Handle Ollama-compatible /api/chat and queue the openaix worker."""
         try:
             body = await request.json()
         except Exception:
@@ -77,11 +97,7 @@ class Endpoint_openaix(Endpoint_ollama):
             )
 
         stream = bool(body.get("stream", False))
-        payload_or_error = await self._apply_context_builder(body, protocol="ollama")
-        if isinstance(payload_or_error, JSONResponse):
-            return payload_or_error
-
-        task = self._build_task_for_payload(payload_or_error, stream)
+        task = self._build_task_for_payload(body, stream)
 
         try:
             await self._core.on_task_added(task)
@@ -116,11 +132,7 @@ class Endpoint_openaix(Endpoint_ollama):
 
         stream = bool(body.get("stream", False))
         ollama_payload = self._openai_request_to_ollama(body)
-        payload_or_error = await self._apply_context_builder(ollama_payload, protocol="openai")
-        if isinstance(payload_or_error, JSONResponse):
-            return payload_or_error
-
-        task = self._build_task_for_payload(payload_or_error, stream)
+        task = self._build_task_for_payload(ollama_payload, stream)
 
         try:
             await self._core.on_task_added(task)
@@ -152,92 +164,15 @@ class Endpoint_openaix(Endpoint_ollama):
             task.worker_id = self._cfg["worker"]
 
         cfg_tasks = self._core.config.get("tasks", {}) or {}
-        task.queue_timeout = int(cfg_tasks.get("queue_timeout", 300))
-        task.run_timeout = int(cfg_tasks.get("run_timeout", 300))
+        # Use timeout from request if specified, otherwise use defaults
+        if "timeout" in payload and payload["timeout"] is not None:
+            timeout_val = int(payload["timeout"])
+            task.queue_timeout = timeout_val
+            task.run_timeout = timeout_val
+        else:
+            task.queue_timeout = int(cfg_tasks.get("queue_timeout", 300))
+            task.run_timeout = int(cfg_tasks.get("run_timeout", 300))
         return task
-
-    async def _apply_context_builder(self, payload: dict, protocol: str) -> dict | JSONResponse:
-        """Run context_builder task synchronously when context_builder is provided."""
-        context_builder_cfg = payload.get("context_builder")
-        if not isinstance(context_builder_cfg, dict):
-            return payload
-
-        worker_id = str(
-            context_builder_cfg.get("worker")
-            or self._cfg.get("context_builder_worker")
-            or "context_builder"
-        )
-
-        task = Task_context_builder(
-            payload={
-                "request_payload": payload,
-                "context_builder": context_builder_cfg,
-            },
-            external=False,
-        )
-        task.worker_id = worker_id
-
-        cfg_tasks = self._core.config.get("tasks", {}) or {}
-        task.queue_timeout = int(cfg_tasks.get("queue_timeout", 300))
-        task.run_timeout = int(cfg_tasks.get("run_timeout", 300))
-
-        try:
-            await self._core.on_task_added(task)
-        except Exception as exc:
-            return self._error_response(
-                protocol=protocol,
-                status_code=503,
-                code=getattr(exc, "code", "QUEUE_ERROR"),
-                message=str(exc),
-                task_id=task.id,
-            )
-
-        timeout = task.queue_timeout + task.run_timeout
-        try:
-            await asyncio.wait_for(task._done_event.wait(), timeout=timeout)
-        except asyncio.TimeoutError:
-            await self._core.queue.mark_canceled(task)
-            await self._core.delete_task(task.id)
-            return self._error_response(
-                protocol=protocol,
-                status_code=504,
-                code="TIMEOUT" if protocol == "ollama" else "timeout_error",
-                message="context_builder timed out",
-                task_id=task.id,
-            )
-
-        await self._core.delete_task(task.id)
-
-        if task.status == STATUS_COMPLETED:
-            result = task.result if isinstance(task.result, dict) else {}
-            built = result.get("payload") if isinstance(result.get("payload"), dict) else None
-            if built is None:
-                return self._error_response(
-                    protocol=protocol,
-                    status_code=502,
-                    code="CONTEXT_BUILDER_INVALID",
-                    message="context_builder returned invalid payload",
-                    task_id=task.id,
-                )
-            return built
-
-        if task.status == STATUS_FAILED:
-            err = task.error or {}
-            return self._error_response(
-                protocol=protocol,
-                status_code=502,
-                code=str(err.get("code") or "CONTEXT_BUILDER_ERROR"),
-                message=str(err.get("message") or "context_builder failed"),
-                task_id=task.id,
-            )
-
-        return self._error_response(
-            protocol=protocol,
-            status_code=503,
-            code="CANCELED" if protocol == "ollama" else "server_error",
-            message="context_builder canceled",
-            task_id=task.id,
-        )
 
     @staticmethod
     def _openai_request_to_ollama(body: dict) -> dict:
@@ -254,6 +189,9 @@ class Endpoint_openaix(Endpoint_ollama):
 
         # Pass through selected optional fields when present.
         passthrough = [
+            "envid",
+            "context_builder",
+            "log",
             "tools",
             "tool_choice",
             "temperature",
@@ -269,7 +207,8 @@ class Endpoint_openaix(Endpoint_ollama):
 
     async def _openai_sync_response(self, task, request_body: dict) -> JSONResponse:
         """Wait for task completion and return OpenAI chat.completion JSON."""
-        timeout = task.queue_timeout + task.run_timeout
+        # Use timeout from task if set by request, otherwise use endpoint default
+        timeout = task.run_timeout if task.run_timeout > 0 else self._request_timeout
         try:
             await asyncio.wait_for(task._done_event.wait(), timeout=timeout)
         except asyncio.TimeoutError:
@@ -314,7 +253,8 @@ class Endpoint_openaix(Endpoint_ollama):
 
     async def _openai_stream_response(self, task, request_body: dict) -> AsyncGenerator[bytes, None]:
         """Stream OpenAI-compatible SSE chunks converted from Ollama chunks."""
-        timeout = task.queue_timeout + task.run_timeout
+        # Use timeout from task if set by request, otherwise use endpoint default
+        timeout = task.run_timeout if task.run_timeout > 0 else self._request_timeout
         deadline = asyncio.get_event_loop().time() + timeout
 
         try:

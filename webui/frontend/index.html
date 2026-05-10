@@ -665,6 +665,9 @@
       <div class="form-row">
         <label>Envid</label>
         <input type="text" id="agent-envid-input" placeholder="environment id (optional)">
+        <select id="agent-envid-select" style="max-width:260px">
+          <option value="">-- from config --</option>
+        </select>
       </div>
     </div>
 
@@ -706,6 +709,15 @@
       <div class="form-row">
         <label><input type="checkbox" id="agent-keep-history-check" checked> keep history</label>
         <span style="color:var(--muted);font-size:12px">— include dialog history in request; if disabled, send only current <code style="color:var(--text)">role=user</code> message</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Request timeout</div>
+      <div class="form-row">
+        <label>Timeout (seconds)</label>
+        <input type="number" id="agent-timeout-input" value="100" min="1" max="3600" placeholder="100">
+        <span style="color:var(--muted);font-size:12px">— request timeout in seconds (affects queue and execution time)</span>
       </div>
     </div>
 

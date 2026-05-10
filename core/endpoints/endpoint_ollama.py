@@ -18,6 +18,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from core.endpoint import BaseEndpoint
+from core.error_logging import attach_request_id_middleware, get_or_create_request_id, log_exception
 from core.task_types.task_agent import Task_agent
 from core.task import STATUS_COMPLETED, STATUS_FAILED, STATUS_CANCELED
 from core import log
@@ -42,6 +43,8 @@ class Endpoint_ollama(BaseEndpoint):
         self.id = endpoint_cfg.get("id", "ollama")
         self._cfg = endpoint_cfg
         self._core: "Core | None" = None
+        # Timeout for entire endpoint request (queue + execution)
+        self._request_timeout = int(endpoint_cfg.get("request_timeout", 100))
 
     async def initialize(self, core: "Core") -> None:
         self._core = core
@@ -50,6 +53,24 @@ class Endpoint_ollama(BaseEndpoint):
     def create_app(self, core: "Core") -> FastAPI:
         self._core = core
         app = FastAPI(title=f"aidir-{self.id}", docs_url=None, redoc_url=None)
+        attach_request_id_middleware(app)
+
+        @app.exception_handler(Exception)
+        async def unhandled_exception_handler(request: Request, exc: Exception):
+            """Log unhandled endpoint exceptions with traceback and request id."""
+            request_id = get_or_create_request_id(request)
+            log_exception(
+                "http",
+                self.id,
+                f"Unhandled exception method={request.method} path={request.url.path}",
+                exc,
+                request_id=request_id,
+            )
+            return JSONResponse(
+                status_code=500,
+                content={"error": {"code": "INTERNAL_ERROR", "message": "Internal server error", "request_id": request_id}},
+                headers={"X-Request-ID": request_id},
+            )
 
         @app.post("/api/chat")
         async def api_chat(request: Request):
@@ -117,7 +138,8 @@ class Endpoint_ollama(BaseEndpoint):
 
     async def _sync_response(self, task: Task_agent) -> JSONResponse:
         """Wait for task completion and return a single JSON response."""
-        timeout = task.queue_timeout + task.run_timeout
+        # Use timeout from task if set by request, otherwise use endpoint default
+        timeout = task.run_timeout if task.run_timeout > 0 else self._request_timeout
         try:
             await asyncio.wait_for(task._done_event.wait(), timeout=timeout)
         except asyncio.TimeoutError:
@@ -146,7 +168,8 @@ class Endpoint_ollama(BaseEndpoint):
     async def _stream_response(self, task: Task_agent) -> AsyncGenerator[bytes, None]:
         """Read chunks from task queue and yield as NDJSON lines."""
         try:
-            timeout = task.queue_timeout + task.run_timeout
+            # Use timeout from task if set by request, otherwise use endpoint default
+            timeout = task.run_timeout if task.run_timeout > 0 else self._request_timeout
             deadline = asyncio.get_event_loop().time() + timeout
 
             while True:

@@ -16,4 +16,4 @@ class Task_context_builder(Task):
     payload contains request_payload and context_builder config.
     """
 
-    type: str = "context_builder"
+    type: str = "context"

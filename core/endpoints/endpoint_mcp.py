@@ -11,8 +11,10 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 
 from core.endpoint import BaseEndpoint
+from core.error_logging import attach_request_id_middleware, get_or_create_request_id, log_exception
 from core.task import STATUS_CANCELED, STATUS_COMPLETED, STATUS_FAILED
 from core.task_types.task_tool import Task_tool
+from core.worker import BaseToolWorker
 from core import log
 
 if TYPE_CHECKING:
@@ -31,6 +33,8 @@ class Endpoint_mcp(BaseEndpoint):
         self._server_name = endpoint_cfg.get("serverName", "aidir-mcp")
         self._server_version = endpoint_cfg.get("serverVersion", "0.1.0")
         self._protocol_version = endpoint_cfg.get("protocolVersion", "2024-11-05")
+        # Timeout for entire endpoint request (queue + execution)
+        self._request_timeout = int(endpoint_cfg.get("request_timeout", 100))
 
     async def initialize(self, core: "Core") -> None:
         """Bind endpoint to core instance and write startup log."""
@@ -41,6 +45,32 @@ class Endpoint_mcp(BaseEndpoint):
         """Create FastAPI app for MCP methods over JSON-RPC style HTTP."""
         self._core = core
         app = FastAPI(title=f"aidir-{self.id}", docs_url=None, redoc_url=None)
+        attach_request_id_middleware(app)
+
+        @app.exception_handler(Exception)
+        async def unhandled_exception_handler(request: Request, exc: Exception):
+            """Log unhandled endpoint exceptions with traceback and request id."""
+            request_id = get_or_create_request_id(request)
+            log_exception(
+                "http",
+                self.id,
+                f"Unhandled exception method={request.method} path={request.url.path}",
+                exc,
+                request_id=request_id,
+            )
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {
+                        "code": -32603,
+                        "message": "Internal server error",
+                        "data": {"request_id": request_id},
+                    },
+                },
+                headers={"X-Request-ID": request_id},
+            )
 
         @app.post("/mcp")
         async def mcp_rpc(request: Request):
@@ -105,27 +135,57 @@ class Endpoint_mcp(BaseEndpoint):
         )
 
     def _build_tools_list(self) -> list[dict]:
-        """Return tools catalog from endpoint config."""
+        """Return tools catalog from endpoint config and worker self-descriptions."""
+        registry = self._resolve_tools_registry()
+        return [
+            {
+                "name": tool_name,
+                "description": spec.get("description", f"Tool {tool_name}"),
+                "inputSchema": spec.get("inputSchema", {"type": "object", "properties": {}}),
+            }
+            for tool_name, spec in registry.items()
+        ]
+
+    def _resolve_tools_registry(self) -> dict[str, dict]:
+        """Resolve published tool names to worker ids and metadata."""
         tools_cfg = self._cfg.get("tools") or {}
-        tools: list[dict] = []
-        for tool_id, tool_meta in tools_cfg.items():
-            tool_meta = tool_meta if isinstance(tool_meta, dict) else {}
-            tools.append(
-                {
-                    "name": tool_id,
-                    "description": tool_meta.get("description", f"Tool {tool_id}"),
-                    "inputSchema": tool_meta.get("inputSchema", {"type": "object"}),
-                }
-            )
-        return tools
+        registry: dict[str, dict] = {}
+
+        for tool_name, raw_meta in tools_cfg.items():
+            worker_id = None
+            if isinstance(raw_meta, str):
+                worker_id = raw_meta
+            elif isinstance(raw_meta, dict):
+                worker_id = raw_meta.get("worker")
+
+            if not worker_id:
+                continue
+
+            spec = {
+                "worker": str(worker_id),
+                "description": f"Tool {tool_name}",
+                "inputSchema": {"type": "object", "properties": {}},
+            }
+
+            worker = self._core.workers.get(str(worker_id)) if self._core else None
+            if isinstance(worker, BaseToolWorker):
+                worker_spec = worker.get_tool_description() or {}
+                if isinstance(worker_spec.get("description"), str):
+                    spec["description"] = worker_spec["description"]
+                if isinstance(worker_spec.get("inputSchema"), dict):
+                    spec["inputSchema"] = worker_spec["inputSchema"]
+
+            registry[str(tool_name)] = spec
+
+        return registry
 
     async def _handle_tool_call(self, req_id, params: dict) -> JSONResponse:
         """Create tool task, wait for completion, and return MCP result."""
         tool_name = params.get("name")
         arguments = params.get("arguments") or {}
 
-        tools_cfg = self._cfg.get("tools") or {}
-        tool_cfg = tools_cfg.get(tool_name)
+        tools_registry = self._resolve_tools_registry()
+        tool_cfg = tools_registry.get(tool_name)
         if not isinstance(tool_cfg, dict):
             return JSONResponse(
                 {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32602, "message": f"Unknown tool: {tool_name}"}},
@@ -155,7 +215,7 @@ class Endpoint_mcp(BaseEndpoint):
                 status_code=503,
             )
 
-        timeout = task.queue_timeout + task.run_timeout
+        timeout = self._request_timeout
         try:
             await asyncio.wait_for(task._done_event.wait(), timeout=timeout)
         except asyncio.TimeoutError:

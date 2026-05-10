@@ -19,7 +19,7 @@ if TYPE_CHECKING:
     from core.resources import Resources
     from core.worker import BaseWorker
 
-_SUPPORTED_TYPES = ("agent", "tool", "context_builder")  # TODO: extend with request, tts, stt…
+_SUPPORTED_TYPES = ("agent", "tool", "context")  # TODO: extend with request, tts, stt…
 
 
 class Scheduler:
@@ -84,11 +84,25 @@ class Scheduler:
 
                 reqs = self._resolve_resource_requirements(task, worker.id)
                 if reqs and self._resources and not self._resources.check_available(reqs):
-                    # System busy by resources: postpone task without consuming retry budget.
-                    task.next_retry_at = time.time() + 1
-                    await self._queue.add_task(task)
-                    log("system", "info", f"Task {task.id} delayed: insufficient resources")
-                    continue
+                    if self._resources.check_available_after_unload(reqs):
+                        # Soft consumers (alive-time models) block the resource; force-unload them.
+                        log("system", "info",
+                            f"Task {task.id} needs force-unload of idle models to free resources")
+                        await self._resources.force_unload_for(reqs, self._full_config)
+                        # After unload, verify (hard check — soft consumers cleared)
+                        if not self._resources.check_available_after_unload(reqs):
+                            task.next_retry_at = time.time() + 5
+                            await self._queue.add_task(task)
+                            log("system", "warn",
+                                f"Task {task.id} delayed: resource unload did not free enough space")
+                            continue
+                        # Fall through — resources are now available
+                    else:
+                        # Not enough even with force unload
+                        task.next_retry_at = time.time() + 1
+                        await self._queue.add_task(task)
+                        log("system", "info", f"Task {task.id} delayed: insufficient resources")
+                        continue
 
                 bg_task = asyncio.create_task(self._run_task(task, worker, reqs))
                 self._active_runs.add(bg_task)
@@ -158,6 +172,8 @@ class Scheduler:
         log("worker", "info", f"Starting task {task.id}", worker.id)
         await self._queue.mark_running(task.id, worker.id)
         consumer_id = f"{task.id}:{worker.id}"
+        # Model id is used to track soft consumers (alive_time) after release
+        model_id: str | None = (task.payload or {}).get("model") or None
 
         if self._resources and reserved_reqs:
             await self._resources.reserve_blind_for(reserved_reqs, consumer_id=consumer_id)
@@ -194,7 +210,7 @@ class Scheduler:
 
         finally:
             if self._resources and reserved_reqs:
-                await self._resources.release_for(reserved_reqs, consumer_id=consumer_id)
+                await self._resources.release_for(reserved_reqs, consumer_id=consumer_id, model_id=model_id)
 
     def _resolve_resource_requirements(self, task: Task, worker_id: str) -> dict[str, dict[str, int]]:
         """Resolve resource requirements from task or worker/model config."""
