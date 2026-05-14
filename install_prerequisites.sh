@@ -169,7 +169,17 @@ ensure_compose() {
   info "Docker Compose is missing, installing..."
   case "$PM" in
     apt)
-      install_packages "$PM" docker-compose-plugin
+      # Ubuntu/Debian package names differ across releases.
+      ensure_sudo_access
+      $SUDO apt-get update -y
+      if $SUDO apt-get install -y docker-compose-plugin; then
+        :
+      elif $SUDO apt-get install -y docker-compose-v2; then
+        warn "Installed docker-compose-v2 fallback package"
+      else
+        warn "Plugin package is unavailable, trying standalone docker-compose..."
+        $SUDO apt-get install -y docker-compose
+      fi
       ;;
     dnf|yum)
       install_packages "$PM" docker-compose-plugin
