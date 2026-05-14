@@ -101,6 +101,11 @@ COMPOSE_FILE="$SCRIPT_DIR/docker-compose.yml"
 CORE_APP="$SCRIPT_DIR/core/app.py"
 CRON_SCRIPT="$SCRIPT_DIR/core/cron.py"
 SERVICE_NAME="aidir"
+ENV_CREATED=0
+VENV_CREATED=0
+DOCKER_BUILT=0
+DOCKER_STARTED=0
+CRON_UPDATED=0
 
 # ── Step 1: Prerequisites check ───────────────────────────────────────────────
 info "Checking prerequisites…"
@@ -174,6 +179,7 @@ if [[ ! -f "$ENV_FILE" ]]; then
 
   chmod 600 "$ENV_FILE"
   info ".env created and initialized"
+  ENV_CREATED=1
 else
   # Keep existing env file, but ensure required root path stays correct.
   set_env_var "$ENV_FILE" "AIDIR_ROOT" "$SCRIPT_DIR"
@@ -206,6 +212,7 @@ fi
 if [[ ! -d "$VENV_DIR" ]]; then
   info "Creating Python virtual environment…"
   python3 -m venv "$VENV_DIR"
+  VENV_CREATED=1
 fi
 
 info "Installing / upgrading Python dependencies…"
@@ -217,9 +224,11 @@ info "Python dependencies OK"
 info "Building Docker images…"
 cd "$SCRIPT_DIR"
 $DOCKER_COMPOSE build
+DOCKER_BUILT=1
 
 info "Starting Docker services (redis, nginx)…"
 $DOCKER_COMPOSE up -d --remove-orphans
+DOCKER_STARTED=1
 
 # Wait for Redis
 info "Waiting for Redis to be healthy…"
@@ -251,6 +260,7 @@ info "Configuring cron job (CRON_PERIOD=${CRON_PERIOD}m)…"
 ( crontab -l 2>/dev/null | grep -v "$CRON_MARKER" ; \
   echo "$CRON_JOB $CRON_MARKER" ) | crontab -
 info "Cron entry set: $CRON_JOB"
+CRON_UPDATED=1
 
 # ── Step 6: Systemd service ───────────────────────────────────────────────────
 info "Registering systemd service ($SERVICE_NAME)…"
@@ -321,6 +331,12 @@ fi
 
 info "Service $SERVICE_NAME started"
 
+if [[ $EUID -eq 0 ]]; then
+  SERVICE_MODE="system"
+else
+  SERVICE_MODE="user"
+fi
+
 # ── Done ──────────────────────────────────────────────────────────────────────
 echo ""
 info "╔═══════════════════════════════════════════════╗"
@@ -328,7 +344,7 @@ info "║  AI Director installed successfully!          ║"
 info "╚═══════════════════════════════════════════════╝"
 echo ""
 info "Ollama endpoint : http://localhost:${OLLAMA_ENDPOINT_PORT:-21434}"
-info "WebUI           : http://localhost:${NGINX_HTTP_PORT:-20080}"
+info "WebUI           : http://localhost:${NGINX_HTTP_PORT:-8080}"
 echo ""
 info "Test:"
 info "  curl http://localhost:\${OLLAMA_ENDPOINT_PORT:-21434}/api/chat \\"
@@ -337,3 +353,41 @@ echo ""
 info "Logs: $SCRIPT_DIR/logs/all.log"
 info "Restart service: $SYSTEMCTL restart $SERVICE_NAME"
 info "Reload config  : $SYSTEMCTL reload $SERVICE_NAME  (or kill -HUP <pid>)"
+echo ""
+info "Install report:"
+if [[ "$ENV_CREATED" -eq 1 ]]; then
+  info "  .env file      : created from .env.example"
+else
+  info "  .env file      : reused existing"
+fi
+if [[ "$VENV_CREATED" -eq 1 ]]; then
+  info "  Python venv    : created"
+else
+  info "  Python venv    : reused existing"
+fi
+if [[ "$DOCKER_BUILT" -eq 1 ]]; then
+  info "  Docker build   : completed"
+fi
+if [[ "$DOCKER_STARTED" -eq 1 ]]; then
+  info "  Docker services: started (redis, nginx)"
+fi
+if [[ "$CRON_UPDATED" -eq 1 ]]; then
+  info "  Cron schedule  : updated (${CRON_PERIOD}m)"
+fi
+info "  Systemd mode   : $SERVICE_MODE"
+info "  Service file   : $SERVICE_FILE"
+
+echo ""
+info "Quick guide:"
+info "  Web UI         : http://localhost:${NGINX_HTTP_PORT:-8080}"
+info "  Main config    : $SCRIPT_DIR/config.json5"
+info "  Environment    : $ENV_FILE"
+info "  Compose file   : $COMPOSE_FILE"
+
+echo ""
+info "Recommended checks after install:"
+info "  1) Check open ports: ss -ltnp | grep -E ':(8080|20082|21434|20001|6379)\\b'"
+info "  2) Check docker services: $DOCKER_COMPOSE ps"
+info "  3) Check core service: $SYSTEMCTL status $SERVICE_NAME --no-pager -n 20"
+info "  4) Check upstream Ollama: curl -fsS ${OLLAMA_BASE_URL:-http://127.0.0.1:11434}/api/tags"
+info "  5) Check app endpoint: curl -fsS http://localhost:${OLLAMA_ENDPOINT_PORT:-21434}/api/models"

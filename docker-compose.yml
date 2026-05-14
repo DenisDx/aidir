@@ -21,12 +21,12 @@ services:
     container_name: aidir_nginx
     restart: unless-stopped
     ports:
-      - "${NGINX_HTTP_PORT:-20080}:80"
+      - "${NGINX_HTTP_PORT:-8080}:80"
     volumes:
       - ./webui/frontend:/usr/share/nginx/html:ro
     environment:
       - WEBUI_HOST=${WEBUI_HOST:-127.0.0.1}
-      - WEBUI_PORT=${WEBUI_PORT:-20080}
+      - WEBUI_PORT=${WEBUI_PORT:-20082}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:

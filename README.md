@@ -74,8 +74,8 @@ Copy from `.env.example`. **Never commit this file** (it is in `.gitignore`).
 | `MCP_ENDPOINT_PORT` | `20001` | Port where aidir listens for MCP JSON-RPC requests |
 | `MCP_ENDPOINT_HOST` | `0.0.0.0` | Bind address for the MCP endpoint |
 | `OLLAMA_BASE_URL` | `http://127.0.0.1:11434` | Upstream Ollama server URL |
-| `WEBUI_PORT` | `20080` | WebUI backend listen port |
-| `WEBUI_HOST` | `127.0.0.1` | WebUI backend bind address |
+| `WEBUI_PORT` | `20082` | WebUI backend listen port |
+| `WEBUI_HOST` | `0.0.0.0` | WebUI backend bind address |
 | `NGINX_HTTP_PORT` | `8080` | Public HTTP port exposed by nginx (must differ from `WEBUI_PORT`) |
 | `ROOT_USER` | `admin` | WebUI login |
 | `ROOT_PASSWORD` | `changeme` | WebUI password — **change this** |
@@ -100,6 +100,109 @@ Key sections:
 - **`tasks`** — queue and run timeouts
 - **`logging`** — log levels per subsystem (0=EMERG … 7=DEBUG)
 - **`resources`** — hardware resources to track (VRAM etc.; enforced in future releases)
+
+### Network ports and routing map
+
+This project uses host services plus two Docker containers (nginx and redis).
+
+#### Effective port map
+
+| Port | Direction | Service | Config source | How to change |
+|---|---|---|---|---|
+| `8080` (default) | host -> docker nginx:80 | Public WebUI entrypoint (HTTP + WS) | `.env: NGINX_HTTP_PORT`, `docker-compose.yml` | Change `NGINX_HTTP_PORT` in `.env`, then `docker compose up -d` |
+| `20082` (default) | host -> core app | WebUI backend (FastAPI) | `.env: WEBUI_PORT`, `config.json5: webui.port` | Change `WEBUI_PORT` in `.env` |
+| `21434` (default) | host -> core app | OpenAIx/Ollama-compatible endpoint | `.env: OPENAIX_ENDPOINT_PORT`, `config.json5: endpoints[api=openaix].port` | Change `OPENAIX_ENDPOINT_PORT` in `.env` |
+| `20001` (default) | host -> core app | MCP JSON-RPC endpoint | `.env: MCP_ENDPOINT_PORT`, `config.json5: endpoints[api=mcp].port` | Change `MCP_ENDPOINT_PORT` in `.env` |
+| `6379` (default) | host -> docker redis:6379 | Redis queue/state | `.env: REDIS_HOST/REDIS_PORT`, `docker-compose.yml` | Change `REDIS_HOST`/`REDIS_PORT` in `.env`, then `docker compose up -d` |
+| `11434` (typical) | core app -> external | Upstream Ollama API | `.env: OLLAMA_BASE_URL`, provider base URL in `config.json5` | Change `OLLAMA_BASE_URL` in `.env` |
+
+Notes:
+
+- Nginx container listens on internal port `80`. Docker publishes it to host `${NGINX_HTTP_PORT}`.
+- WebSocket does not require a separate public port: it is served via the same nginx port as HTML.
+- `WEBUI_PORT` is backend-only and should not equal `NGINX_HTTP_PORT`.
+
+#### Route map
+
+Public via nginx (`http://HOST:${NGINX_HTTP_PORT}`):
+
+| Route | Type | Upstream |
+|---|---|---|
+| `/` | HTTP | Static frontend (`webui/frontend`) |
+| `/api/*` | HTTP proxy | `http://host.docker.internal:${WEBUI_PORT}` |
+| `/ws/*` | WebSocket proxy | `ws://host.docker.internal:${WEBUI_PORT}` |
+
+Direct WebUI backend (`http://HOST:${WEBUI_PORT}`):
+
+| Route | Type | Purpose |
+|---|---|---|
+| `/api/auth/login` | POST | Login |
+| `/api/auth/me` | GET | Session check (`401` without cookie is expected) |
+| `/api/auth/logout` | POST | Logout |
+| `/api/tasks` | GET | Tasks list |
+| `/api/status` | GET | Runtime summary |
+| `/api/logs` | GET | Last log lines |
+| `/api/config` | GET | Effective config |
+| `/api/config/raw` | GET/POST | Raw config read/write |
+| `/api/config/fields` | GET/POST | Field-level config operations |
+| `/api/workers/models` | GET | Workers/providers info |
+| `/api/endpoints/info` | GET | Endpoints/tools info |
+| `/api/test/llm` | POST | Proxy test to ollama endpoint |
+| `/api/test/mcp` | POST | Proxy test to MCP endpoint |
+| `/api/test/agent/endpoints` | GET | Agent test endpoint options |
+| `/api/test/agent/catalog` | GET | Endpoint catalog for agent test |
+| `/api/test/agent/models` | GET | Models for selected endpoint |
+| `/api/test/agent` | POST | End-to-end agent test |
+| `/api/restart` | POST | Request graceful restart |
+| `/ws/logs` | WS | Live log stream (auth required) |
+
+OpenAIx endpoint (`http://HOST:${OPENAIX_ENDPOINT_PORT}`):
+
+| Route | Type | Purpose |
+|---|---|---|
+| `/api/chat` | POST | Ollama-compatible chat |
+| `/api/tags` | GET | Model list (ollama format) |
+| `/v1/chat/completions` | POST | OpenAI-compatible chat |
+| `/v1/models` | GET | Model list (openai format) |
+| `/health` | GET | Health check |
+
+MCP endpoint (`http://HOST:${MCP_ENDPOINT_PORT}`):
+
+| Route | Type | Purpose |
+|---|---|---|
+| `/mcp` | POST | JSON-RPC methods (`initialize`, `ping`, `tools/list`, `tools/call`) |
+| `/health` | GET | Health check |
+
+Redis:
+
+- TCP: `${REDIS_HOST}:${REDIS_PORT}` -> redis container `6379`.
+
+#### Validation checklist
+
+Use these checks after install or after changing ports:
+
+```bash
+# listeners
+ss -ltnp | egrep ':(8080|20082|21434|20001|6379|11434)\\b'
+
+# public WebUI entrypoint
+curl -s -o /dev/null -w 'webui_public:%{http_code}\n' http://127.0.0.1:${NGINX_HTTP_PORT}
+
+# nginx -> webui backend proxy path (401 expected without auth cookie)
+curl -s -o /dev/null -w 'webui_auth_me:%{http_code}\n' http://127.0.0.1:${NGINX_HTTP_PORT}/api/auth/me
+
+# openaix
+curl -s -o /dev/null -w 'openaix_health:%{http_code}\n' http://127.0.0.1:${OPENAIX_ENDPOINT_PORT}/health
+
+# mcp health + ping
+curl -s -o /dev/null -w 'mcp_health:%{http_code}\n' http://127.0.0.1:${MCP_ENDPOINT_PORT}/health
+curl -s http://127.0.0.1:${MCP_ENDPOINT_PORT}/mcp \
+  -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"ping","params":{}}'
+
+# redis
+redis-cli -h ${REDIS_HOST} -p ${REDIS_PORT} ping
+```
 
 ### MCP test tools (included)
 
@@ -189,7 +292,7 @@ curl -s http://localhost:21434/health
 curl -s http://localhost:8080
 
 # WebUI backend direct (local service)
-curl -s http://localhost:20080/health || echo "check WEBUI_PORT / service status"
+curl -s -o /dev/null -w 'status:%{http_code}\n' http://localhost:20082/api/auth/me || echo "check WEBUI_PORT / service status"
 
 # Redis ping
 docker exec aidir_redis redis-cli ping
