@@ -11,6 +11,44 @@ warn()  { echo -e "${YLW}[WARN]${NC}  $*"; }
 error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 die()   { error "$*"; exit 1; }
 
+ensure_snap_path() {
+  if [[ -d /snap/bin ]] && [[ ":$PATH:" != *":/snap/bin:"* ]]; then
+    export PATH="/snap/bin:$PATH"
+  fi
+}
+
+ensure_docker_daemon() {
+  if docker info &>/dev/null; then
+    return
+  fi
+
+  warn "Docker daemon is not accessible, trying to start it..."
+
+  if command -v systemctl &>/dev/null && systemctl list-unit-files 2>/dev/null | grep -q '^docker\.service'; then
+    if [[ $EUID -eq 0 ]]; then
+      systemctl enable --now docker || true
+    elif command -v sudo &>/dev/null; then
+      info "Trying to start docker.service via sudo (password may be requested)..."
+      sudo systemctl enable --now docker || true
+    fi
+  fi
+
+  if docker info &>/dev/null; then
+    return
+  fi
+
+  if command -v snap &>/dev/null && snap list docker &>/dev/null; then
+    if [[ $EUID -eq 0 ]]; then
+      snap start docker || true
+    elif command -v sudo &>/dev/null; then
+      info "Trying to start snap docker service via sudo (password may be requested)..."
+      sudo snap start docker || true
+    fi
+  fi
+
+  docker info &>/dev/null || die "Docker daemon is not running or not accessible for user '$USER'. Try: sudo systemctl enable --now docker (or sudo snap start docker), then ensure user is in docker group: sudo usermod -aG docker $USER"
+}
+
 require_file() {
   [[ -f "$1" ]] || die "Required file not found: $1"
 }
@@ -45,6 +83,8 @@ SERVICE_NAME="aidir"
 # ── Step 1: Prerequisites check ───────────────────────────────────────────────
 info "Checking prerequisites…"
 
+ensure_snap_path
+
 check_cmd() {
   command -v "$1" &>/dev/null || die "Required command not found: $1. Please install it and re-run."
 }
@@ -67,7 +107,7 @@ info "Docker Compose: $DOCKER_COMPOSE"
 python3 -c "import venv" 2>/dev/null || die "python3-venv not available. Install python3-venv package."
 
 # Docker daemon reachable?
-docker info &>/dev/null || die "Docker daemon not running or not accessible. Start Docker and check permissions."
+ensure_docker_daemon
 
 # Required project files
 require_file "$ENV_EXAMPLE"
