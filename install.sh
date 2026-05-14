@@ -148,6 +148,45 @@ generate_password() {
   tr -dc 'A-Za-z0-9!@#%^*_' < /dev/urandom | head -c 20
 }
 
+wait_for_http_status() {
+  local url="$1"
+  local expected_status="$2"
+  local timeout_seconds="$3"
+  local label="$4"
+  local i
+  local code
+
+  for i in $(seq 1 "$timeout_seconds"); do
+    code="$(curl -s -o /dev/null -w '%{http_code}' "$url" || true)"
+    if [[ "$code" == "$expected_status" ]]; then
+      info "$label is ready ($url -> $code)"
+      return 0
+    fi
+    sleep 1
+  done
+
+  warn "$label is not ready ($url expected $expected_status, got ${code:-n/a})"
+  return 1
+}
+
+print_service_diagnostics() {
+  warn "Service diagnostics:"
+  $SYSTEMCTL status "$SERVICE_NAME" --no-pager -n 80 || true
+
+  if command -v journalctl &>/dev/null; then
+    if [[ "$SERVICE_MODE" == "system" ]]; then
+      journalctl -u "$SERVICE_NAME" -n 120 --no-pager || true
+    else
+      journalctl --user -u "$SERVICE_NAME" -n 120 --no-pager || true
+    fi
+  fi
+
+  if docker ps --format '{{.Names}}' | grep -Fxq aidir_nginx; then
+    warn "Last nginx logs:"
+    docker logs --tail 120 aidir_nginx || true
+  fi
+}
+
 # ── Paths ─────────────────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="$SCRIPT_DIR/venv"
@@ -399,22 +438,28 @@ else
   SERVICE_MODE="user"
 fi
 
+HEALTH_OK=1
+if command -v curl &>/dev/null; then
+  info "Running post-install health checks..."
+
+  wait_for_http_status "http://127.0.0.1:${WEBUI_PORT:-20082}/api/auth/me" "401" 30 "WebUI backend" || HEALTH_OK=0
+  wait_for_http_status "http://127.0.0.1:${OPENAIX_ENDPOINT_PORT:-21434}/health" "200" 30 "OpenAIx endpoint" || HEALTH_OK=0
+  wait_for_http_status "http://127.0.0.1:${MCP_ENDPOINT_PORT:-20001}/health" "200" 30 "MCP endpoint" || HEALTH_OK=0
+  wait_for_http_status "http://127.0.0.1:${NGINX_HTTP_PORT:-8080}/api/auth/me" "401" 30 "nginx -> WebUI proxy" || HEALTH_OK=0
+else
+  warn "curl is not available; skipping HTTP health checks"
+fi
+
+if [[ "$HEALTH_OK" -ne 1 ]]; then
+  print_service_diagnostics
+  die "Post-install health checks failed. See diagnostics above; fix the root cause and re-run ./install.sh"
+fi
+
 # ── Done ──────────────────────────────────────────────────────────────────────
 echo ""
 info "╔═══════════════════════════════════════════════╗"
 info "║  AI Director installed successfully!          ║"
 info "╚═══════════════════════════════════════════════╝"
-echo ""
-info "Ollama endpoint : http://localhost:${OLLAMA_ENDPOINT_PORT:-21434}"
-info "WebUI           : http://localhost:${NGINX_HTTP_PORT:-8080}"
-echo ""
-info "Test:"
-info "  curl http://localhost:\${OLLAMA_ENDPOINT_PORT:-21434}/api/chat \\"
-info "    -d '{\"model\":\"llama3\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"stream\":false}'"
-echo ""
-info "Logs: $SCRIPT_DIR/logs/all.log"
-info "Restart service: $SYSTEMCTL restart $SERVICE_NAME"
-info "Reload config  : $SYSTEMCTL reload $SERVICE_NAME  (or kill -HUP <pid>)"
 echo ""
 info "Install report:"
 if [[ "$ENV_CREATED" -eq 1 ]]; then
@@ -440,11 +485,38 @@ info "  Systemd mode   : $SERVICE_MODE"
 info "  Service file   : $SERVICE_FILE"
 
 echo ""
-info "Quick guide:"
-info "  Web UI         : http://localhost:${NGINX_HTTP_PORT:-8080}"
-info "  Main config    : $SCRIPT_DIR/config.json5"
-info "  Environment    : $ENV_FILE"
-info "  Compose file   : $COMPOSE_FILE"
+  info "What is running and where:"
+  info "  Web GUI (nginx)        : http://localhost:${NGINX_HTTP_PORT:-8080}"
+  info "  OpenAIx/Ollama API     : http://localhost:${OPENAIX_ENDPOINT_PORT:-21434}"
+  info "  MCP endpoint           : http://localhost:${MCP_ENDPOINT_PORT:-20001}/mcp"
+  info "  WebUI backend (direct) : http://${WEBUI_HOST:-0.0.0.0}:${WEBUI_PORT:-20082}"
+  info "  Redis                  : ${REDIS_HOST:-127.0.0.1}:${REDIS_PORT:-6379}"
+  info "  Upstream Ollama        : ${OLLAMA_BASE_URL:-http://127.0.0.1:11434}"
+
+  echo ""
+  info "How to open Web GUI:"
+  info "  1) Open in browser: http://localhost:${NGINX_HTTP_PORT:-8080}"
+  info "  2) Login with ROOT_USER / ROOT_PASSWORD from ${ENV_FILE}"
+
+  echo ""
+  info "Key .env values to verify:"
+  info "  AIDIR_ROOT             : project absolute path"
+  info "  ROOT_USER / ROOT_PASSWORD : Web GUI credentials"
+  info "  NGINX_HTTP_PORT        : public Web GUI port"
+  info "  WEBUI_HOST / WEBUI_PORT: internal WebUI backend bind"
+  info "  OPENAIX_ENDPOINT_PORT  : AI HTTP API port"
+  info "  MCP_ENDPOINT_PORT      : MCP API port"
+  info "  REDIS_HOST / REDIS_PORT: Redis connection"
+  info "  OLLAMA_BASE_URL        : upstream Ollama URL"
+
+  echo ""
+  info "Useful paths:"
+  info "  Main config            : $SCRIPT_DIR/config.json5"
+  info "  Environment            : $ENV_FILE"
+  info "  Compose file           : $COMPOSE_FILE"
+  info "  Combined logs          : $SCRIPT_DIR/logs/all.log"
+  info "  Restart service        : $SYSTEMCTL restart $SERVICE_NAME"
+  info "  Reload config          : $SYSTEMCTL reload $SERVICE_NAME  (or kill -HUP <pid>)"
 
 echo ""
 info "Recommended checks after install:"
@@ -452,4 +524,4 @@ info "  1) Check open ports: ss -ltnp | grep -E ':(8080|20082|21434|20001|6379)\
 info "  2) Check docker services: $DOCKER_COMPOSE ps"
 info "  3) Check core service: $SYSTEMCTL status $SERVICE_NAME --no-pager -n 20"
 info "  4) Check upstream Ollama: curl -fsS ${OLLAMA_BASE_URL:-http://127.0.0.1:11434}/api/tags"
-info "  5) Check app endpoint: curl -fsS http://localhost:${OLLAMA_ENDPOINT_PORT:-21434}/api/models"
+  info "  5) Check app endpoint: curl -fsS http://localhost:${OPENAIX_ENDPOINT_PORT:-21434}/health"
