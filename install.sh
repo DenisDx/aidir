@@ -148,6 +148,51 @@ generate_password() {
   tr -dc 'A-Za-z0-9!@#%^*_' < /dev/urandom | head -c 20
 }
 
+diagnose_cron_failure() {
+  warn "Cron diagnostics:"
+
+  if ! command -v crontab &>/dev/null; then
+    warn "  crontab command is not available in PATH"
+    return
+  fi
+
+  local who
+  who="$(id -un 2>/dev/null || echo unknown)"
+  warn "  current user: $who"
+
+  local cron_list_err
+  cron_list_err="$(crontab -l 2>&1 >/dev/null || true)"
+  if [[ -n "$cron_list_err" ]]; then
+    warn "  crontab -l message: $cron_list_err"
+  else
+    warn "  crontab -l: readable"
+  fi
+
+  if [[ -f /etc/cron.allow ]]; then
+    if ! grep -Fxq "$who" /etc/cron.allow; then
+      warn "  /etc/cron.allow exists and user '$who' is not listed"
+    fi
+  fi
+
+  if [[ -f /etc/cron.deny ]]; then
+    if grep -Fxq "$who" /etc/cron.deny; then
+      warn "  /etc/cron.deny contains user '$who'"
+    fi
+  fi
+
+  if command -v systemctl &>/dev/null; then
+    if systemctl list-unit-files 2>/dev/null | grep -q '^cron\.service'; then
+      systemctl status cron --no-pager -n 20 >/dev/null 2>&1 \
+        && warn "  cron.service: present" \
+        || warn "  cron.service: present but status unavailable without elevated rights"
+    elif systemctl list-unit-files 2>/dev/null | grep -q '^crond\.service'; then
+      systemctl status crond --no-pager -n 20 >/dev/null 2>&1 \
+        && warn "  crond.service: present" \
+        || warn "  crond.service: present but status unavailable without elevated rights"
+    fi
+  fi
+}
+
 wait_for_http_status() {
   local url="$1"
   local expected_status="$2"
@@ -201,6 +246,7 @@ VENV_CREATED=0
 DOCKER_BUILT=0
 DOCKER_STARTED=0
 CRON_UPDATED=0
+CRON_STATE="not-configured"
 
 # ── Step 1: Prerequisites check ───────────────────────────────────────────────
 info "Checking prerequisites…"
@@ -357,11 +403,34 @@ CRON_JOB="* * * * * [ \$(( \$(date +\\%s) / 60 % $CRON_PERIOD )) -eq 0 ] && $VEN
 CRON_MARKER="# aidir-cron"
 
 info "Configuring cron job (CRON_PERIOD=${CRON_PERIOD}m)…"
-# Remove old aidir cron entries, add new one
-( crontab -l 2>/dev/null | grep -v "$CRON_MARKER" ; \
-  echo "$CRON_JOB $CRON_MARKER" ) | crontab -
-info "Cron entry set: $CRON_JOB"
-CRON_UPDATED=1
+# Ensure marker entry is present and up-to-date on every run.
+CRON_ENTRY="$CRON_JOB $CRON_MARKER"
+CURRENT_CRONTAB="$(crontab -l 2>/dev/null || true)"
+
+if printf '%s\n' "$CURRENT_CRONTAB" | grep -Fqx "$CRON_ENTRY"; then
+  info "Cron entry already configured"
+  CRON_UPDATED=1
+  CRON_STATE="already-configured"
+else
+  FILTERED_CRONTAB="$(printf '%s\n' "$CURRENT_CRONTAB" | grep -Fv "$CRON_MARKER" || true)"
+  if [[ -n "$FILTERED_CRONTAB" ]]; then
+    NEW_CRONTAB="$FILTERED_CRONTAB"
+    NEW_CRONTAB+=$'\n'
+    NEW_CRONTAB+="$CRON_ENTRY"
+  else
+    NEW_CRONTAB="$CRON_ENTRY"
+  fi
+
+  if printf '%s\n' "$NEW_CRONTAB" | crontab -; then
+    info "Cron entry set: $CRON_JOB"
+    CRON_UPDATED=1
+    CRON_STATE="updated"
+  else
+    warn "Failed to configure cron entry; continuing without periodic cron maintenance"
+    diagnose_cron_failure
+    CRON_STATE="failed"
+  fi
+fi
 
 # ── Step 6: Systemd service ───────────────────────────────────────────────────
 info "Registering systemd service ($SERVICE_NAME)…"
@@ -479,7 +548,9 @@ if [[ "$DOCKER_STARTED" -eq 1 ]]; then
   info "  Docker services: started (redis, nginx)"
 fi
 if [[ "$CRON_UPDATED" -eq 1 ]]; then
-  info "  Cron schedule  : updated (${CRON_PERIOD}m)"
+  info "  Cron schedule  : ${CRON_STATE} (${CRON_PERIOD}m)"
+else
+  info "  Cron schedule  : not configured (see warnings above)"
 fi
 info "  Systemd mode   : $SERVICE_MODE"
 info "  Service file   : $SERVICE_FILE"
