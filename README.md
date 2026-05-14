@@ -41,8 +41,29 @@ cd aidir
 ./install.sh
 ```
 
+Optional config template selection:
+
+```bash
+# uses config.json5.example
+./install.sh
+
+# same as above
+./install.sh config
+
+# uses prod.json5.example
+./install.sh prod
+
+# uses an explicit template filename
+./install.sh prod.json5.example
+```
+
 The script:
 1. Checks prerequisites (Docker, Python, venv).
+2. Creates or replaces `config.json5` from a selected config template when needed.
+  If a template argument is passed explicitly, or if `config.json5` does not exist, the installer:
+  - rotates backups: `config.json5.bak` -> `.bak.bak` -> `.bak.bak.bak`
+  - keeps up to 3 backup generations
+  - copies the selected template into `config.json5`
 2. Creates .env file and fills required field in the dialogue mode 
 3. Creates a Python virtual environment in `./venv/` and installs dependencies.
 4. Builds and starts Docker containers (Redis, nginx).
@@ -87,7 +108,16 @@ Copy from `.env.example`. **Never commit this file** (it is in `.gitignore`).
 | `TLS_CERT_PATH` | *(optional)* | Path to TLS certificate (handled by nginx) |
 | `TLS_KEY_PATH` | *(optional)* | Path to TLS private key |
 
-### `config.json5` — system configuration
+### `config.json5` — active system configuration
+
+This is the live runtime config used by the installed instance.
+It is not tracked in git and may be replaced by `install.sh` from a template when:
+
+- you pass an explicit config template argument to `install.sh`
+- `config.json5` is missing
+
+The tracked template shipped with the repository is `config.json5.example`.
+You can add more templates such as `prod.json5.example`, `lab.json5.example`, and select them at install time.
 
 JSON5 format (comments and trailing commas allowed). Uses `${VAR}` and `${VAR:-default}` substitution from `.env`. Contains no secrets or machine-specific paths directly.
 

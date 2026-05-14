@@ -104,7 +104,10 @@ class Scheduler:
                         log("system", "info", f"Task {task.id} delayed: insufficient resources")
                         continue
 
-                bg_task = asyncio.create_task(self._run_task(task, worker, reqs))
+                bg_task = asyncio.create_task(
+                    self._run_task(task, worker, reqs),
+                    name=f"task:{task.id}:{worker.id}",
+                )
                 self._active_runs.add(bg_task)
                 self._idle.clear()
                 bg_task.add_done_callback(self._on_run_done)
@@ -117,8 +120,11 @@ class Scheduler:
                 except asyncio.TimeoutError:
                     pass
                 self._wake.clear()
+        
+        log("core", "info", "Scheduler run loop exited")
 
     def stop(self) -> None:
+        log("core", "info", f"Scheduler stop requested: _running={self._running} active_tasks={len(self._active_runs)}")
         self._running = False
         self._wake.set()
 
@@ -126,16 +132,59 @@ class Scheduler:
         """Return number of currently executing tasks."""
         return len(self._active_runs)
 
+    def active_task_labels(self) -> list[str]:
+        """Return readable labels for currently executing tasks."""
+        return sorted(run.get_name() for run in self._active_runs)
+
     async def wait_for_active_tasks(self, timeout: int) -> bool:
         """Wait until all active tasks finish; return True if drained in time."""
+        started = time.monotonic()
+        count = len(self._active_runs)
+        
         if not self._active_runs:
+            log("core", "info", "wait_for_active_tasks: no active tasks, returning immediately")
             return True
-
+        
+        log("core", "info", f"wait_for_active_tasks: BEGIN count={count} timeout={timeout}s tasks={self.active_task_labels()}")
+        
         try:
             await asyncio.wait_for(self._idle.wait(), timeout=timeout or None)
+            elapsed = time.monotonic() - started
+            log("core", "info", f"wait_for_active_tasks: SUCCESS all drained in {elapsed:.2f}s")
             return True
         except asyncio.TimeoutError:
+            elapsed = time.monotonic() - started
+            remaining = self.active_task_labels()
+            log("core", "warn", f"wait_for_active_tasks: TIMEOUT after {elapsed:.2f}s count={len(remaining)} remaining={remaining}")
             return False
+
+    async def cancel_active_tasks(self, timeout: float = 5.0) -> int:
+        """Cancel all active task executions and wait briefly for them to finish."""
+        runs = list(self._active_runs)
+        
+        if not runs:
+            log("core", "info", "cancel_active_tasks: no active tasks to cancel")
+            return 0
+        
+        started = time.monotonic()
+        log("core", "info", f"cancel_active_tasks: BEGIN count={len(runs)} timeout={timeout}s tasks={[r.get_name() for r in runs]}")
+        
+        for run in runs:
+            run.cancel()
+
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*runs, return_exceptions=True),
+                timeout=timeout or None,
+            )
+            elapsed = time.monotonic() - started
+            log("core", "info", f"cancel_active_tasks: SUCCESS canceled {len(runs)} tasks in {elapsed:.2f}s")
+        except asyncio.TimeoutError:
+            elapsed = time.monotonic() - started
+            remaining = [r.get_name() for r in runs if not r.done()]
+            log("core", "warn", f"cancel_active_tasks: TIMEOUT after {elapsed:.2f}s canceled attempts={len(runs)} still_running={len(remaining)} tasks={remaining}")
+
+        return len(runs)
 
     # ── Internal ─────────────────────────────────────────────────────────────
 

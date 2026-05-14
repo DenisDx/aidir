@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # install.sh – AI Director full install / re-install script
-# Usage: ./install.sh
+# Usage: ./install.sh [config-template]
 # Can be run on a clean system or for updates (keeps existing data).
 set -euo pipefail
 
@@ -10,6 +10,27 @@ info()  { echo -e "${GRN}[INFO]${NC}  $*"; }
 warn()  { echo -e "${YLW}[WARN]${NC}  $*"; }
 error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 die()   { error "$*"; exit 1; }
+
+resolve_config_template_name() {
+  local raw_name="${1:-config}"
+  if [[ "$raw_name" == *.* ]]; then
+    printf '%s\n' "$raw_name"
+  else
+    printf '%s.json5.example\n' "$raw_name"
+  fi
+}
+
+rotate_config_backups() {
+  local base_file="$1"
+  local bak1="${base_file}.bak"
+  local bak2="${bak1}.bak"
+  local bak3="${bak2}.bak"
+
+  [[ -f "$bak3" ]] && rm -f "$bak3"
+  [[ -f "$bak2" ]] && mv "$bak2" "$bak3"
+  [[ -f "$bak1" ]] && mv "$bak1" "$bak2"
+  [[ -f "$base_file" ]] && mv "$base_file" "$bak1"
+}
 
 ensure_snap_path() {
   if [[ -d /snap/bin ]] && [[ ":$PATH:" != *":/snap/bin:"* ]]; then
@@ -237,6 +258,18 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="$SCRIPT_DIR/venv"
 ENV_FILE="$SCRIPT_DIR/.env"
 ENV_EXAMPLE="$SCRIPT_DIR/.env.example"
+CONFIG_FILE="$SCRIPT_DIR/config.json5"
+CONFIG_TEMPLATE_ARG="${1:-config}"
+CONFIG_TEMPLATE_NAME="$(resolve_config_template_name "$CONFIG_TEMPLATE_ARG")"
+if [[ "$CONFIG_TEMPLATE_NAME" = /* ]]; then
+  CONFIG_TEMPLATE_FILE="$CONFIG_TEMPLATE_NAME"
+else
+  CONFIG_TEMPLATE_FILE="$SCRIPT_DIR/$CONFIG_TEMPLATE_NAME"
+fi
+CONFIG_TEMPLATE_EXPLICIT=0
+if [[ $# -gt 0 ]]; then
+  CONFIG_TEMPLATE_EXPLICIT=1
+fi
 COMPOSE_FILE="$SCRIPT_DIR/docker-compose.yml"
 CORE_APP="$SCRIPT_DIR/core/app.py"
 CRON_SCRIPT="$SCRIPT_DIR/core/cron.py"
@@ -285,7 +318,24 @@ require_file "$CORE_APP"
 require_file "$CRON_SCRIPT"
 require_file "$SCRIPT_DIR/requirements.txt"
 
+if [[ "$CONFIG_TEMPLATE_EXPLICIT" -eq 1 || ! -f "$CONFIG_FILE" ]]; then
+  require_file "$CONFIG_TEMPLATE_FILE"
+fi
+
 info "Prerequisites OK"
+
+# ── Step 1b: Config template setup ───────────────────────────────────────────
+if [[ "$CONFIG_TEMPLATE_EXPLICIT" -eq 1 || ! -f "$CONFIG_FILE" ]]; then
+  if [[ -f "$CONFIG_FILE" ]]; then
+    info "Rotating existing config.json5 backups…"
+    rotate_config_backups "$CONFIG_FILE"
+  else
+    info "No active config.json5 found; creating it from template…"
+  fi
+
+  cp "$CONFIG_TEMPLATE_FILE" "$CONFIG_FILE"
+  info "Active config created from template: $(basename "$CONFIG_TEMPLATE_FILE")"
+fi
 
 # ── Step 2: .env setup ────────────────────────────────────────────────────────
 if [[ ! -f "$ENV_FILE" ]]; then
@@ -370,7 +420,10 @@ info "Python dependencies OK"
 # ── Step 4: Docker images / containers ────────────────────────────────────────
 info "Building Docker images…"
 cd "$SCRIPT_DIR"
-$DOCKER_COMPOSE build
+if ! $DOCKER_COMPOSE build; then
+  warn "Docker build failed (possible containerd cache issue); retrying with --no-cache…"
+  $DOCKER_COMPOSE build --no-cache || die "Docker build failed on retry. Check Docker/containerd state and re-run."
+fi
 DOCKER_BUILT=1
 
 info "Starting Docker services (redis, nginx)…"

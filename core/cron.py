@@ -20,6 +20,7 @@ sys.path.insert(0, str(_ROOT))
 from core.config import config  # noqa: E402
 from core import log             # noqa: E402
 from core.app import Core        # noqa: E402
+from core.workers_loader import resolve_worker_configs  # noqa: E402
 
 import redis.asyncio as aioredis  # noqa: E402
 
@@ -294,10 +295,35 @@ async def keep_alive_ping(redis: aioredis.Redis) -> None:
         log("system", "info", f"keep_alive_ping: sent {pinged} ping(s)")
 
 
+async def refresh_external_mcp_tools(redis: aioredis.Redis) -> None:
+    """Refresh external_mcp tools asynchronously when startup/TTL rules require it."""
+    if not await _should_run(redis, "refresh_external_mcp_tools", 60):
+        return
+
+    workers_cfg = resolve_worker_configs(config.raw())
+    external_cfg = workers_cfg.get("external_mcp") or {}
+    if not external_cfg.get("enabled", True):
+        return
+
+    from workers.tool.external_mcp.app import ExternalMcpWorker
+
+    worker = ExternalMcpWorker()
+    await worker.initialize(
+        {
+            **external_cfg,
+            "_redis": redis,
+            "_instance": config.get("instance", "aidir"),
+            "_mark_startup": False,
+        }
+    )
+    await worker.refresh_tools_if_due(reason="cron")
+
+
 async def main() -> None:
     redis = await _connect_redis()
     try:
         await run_loop_workers_cycle(redis)
+        await refresh_external_mcp_tools(redis)
         await wipe_logs(redis)
         await trim_logs_by_size(redis)
         await health_check(redis)

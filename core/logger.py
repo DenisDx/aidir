@@ -10,6 +10,7 @@ from __future__ import annotations
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 _ROOT = Path(__file__).parent.parent
 _LOGS_DIR = _ROOT / "logs"
@@ -32,8 +33,8 @@ def _level_int(level) -> int:
     return _NAME_TO_INT.get(str(level).upper(), 6)
 
 
-def _format(type_: str, level: int, message: str, tag: str | None) -> str:
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+def _format(type_: str, level: int, message: str, tag: str | None, tzinfo) -> str:
+    ts = datetime.now(tzinfo).isoformat(timespec="milliseconds")
     lvl = _INT_TO_NAME.get(level, str(level))
     tag_part = f":{tag}" if tag else ""
     return f"{ts} [{lvl}] [{type_}{tag_part}] {message}\n"
@@ -55,8 +56,54 @@ class CoreLogger:
             self._cfg = config
         return self._cfg
 
+    def _timezone(self):
+        """Resolve timezone from logging.timezone config (local, UTC, or IANA name)."""
+        cfg = self._config()
+        raw = cfg.get("logging.timezone", "local")
+        name = str(raw or "local").strip()
+
+        if not name:
+            return datetime.now().astimezone().tzinfo or timezone.utc
+
+        lowered = name.lower()
+        if lowered in ("local", "system"):
+            return datetime.now().astimezone().tzinfo or timezone.utc
+        if lowered in ("utc", "gmt", "z"):
+            return timezone.utc
+
+        try:
+            return ZoneInfo(name)
+        except Exception:
+            return timezone.utc
+
+    def _endpoint_cfg_by_id(self, endpoint_id: str) -> dict | None:
+        """Return endpoint config dict by id from root config.endpoints list."""
+        cfg = self._config()
+        endpoints = cfg.get("endpoints") or []
+        if not isinstance(endpoints, list):
+            return None
+        for ep in endpoints:
+            if isinstance(ep, dict) and str(ep.get("id")) == endpoint_id:
+                return ep
+        return None
+
+    def _endpoint_logging_override(self, endpoint_id: str, *, individual: bool) -> int | None:
+        """Resolve per-endpoint logging override from endpoint.logging section."""
+        ep_cfg = self._endpoint_cfg_by_id(endpoint_id)
+        if not isinstance(ep_cfg, dict):
+            return None
+        logging_cfg = ep_cfg.get("logging")
+        if not isinstance(logging_cfg, dict):
+            return None
+
+        key = "level" if individual else "alllevel"
+        value = logging_cfg.get(key)
+        if value is None:
+            return None
+        return _level_int(value)
+
     def _threshold(self, type_: str, tag: str | None, *, individual: bool) -> int:
-        """Resolve effective log threshold for a subsystem / worker / middleware."""
+        """Resolve effective log threshold for subsystem, worker, middleware, or endpoint."""
         cfg = self._config()
 
         if individual:
@@ -70,6 +117,11 @@ class CoreLogger:
                 v = cfg.get(f"middleware.items.{tag}.logging.level")
                 if v is not None:
                     return _level_int(v)
+            # Endpoint-level override (for logs emitted as type=http with endpoint id tag)
+            if type_ in ("http", "endpoint") and tag:
+                v = self._endpoint_logging_override(tag, individual=True)
+                if v is not None:
+                    return v
             # Per-subsystem default
             v = cfg.get(f"logging.levels.{type_}")
             if v is not None:
@@ -80,6 +132,11 @@ class CoreLogger:
                 v = cfg.get(f"workers.items.{tag}.logging.alllevel")
                 if v is not None:
                     return _level_int(v)
+            # all.log: endpoint override
+            if type_ in ("http", "endpoint") and tag:
+                v = self._endpoint_logging_override(tag, individual=False)
+                if v is not None:
+                    return v
             # all.log per-subsystem
             v = cfg.get(f"logging.alllevels.{type_}")
             if v is not None:
@@ -91,7 +148,7 @@ class CoreLogger:
     def log(self, type_: str, level, message: str, tag: str | None = None) -> None:
         """Write message to individual type log and all.log if threshold permits."""
         lvl_int = _level_int(level)
-        line = _format(type_, lvl_int, message, tag)
+        line = _format(type_, lvl_int, message, tag, self._timezone())
 
         # Individual type log (e.g. logs/worker.log)
         if lvl_int <= self._threshold(type_, tag, individual=True):

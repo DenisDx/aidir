@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import signal
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -70,14 +71,34 @@ class Core:
         self.loop_workers: list[tuple[str, object]] = []
         self.resources = Resources([])
         self.envid_registry: EnvidRegistry | None = None
+        self._background_tasks: set[asyncio.Task] = set()
         self._restart_requested = False
         self._shutdown_started = False
         self._shutdown_lock = asyncio.Lock()
 
+    def _track_background_task(self, task: asyncio.Task) -> None:
+        """Track a background task and log unexpected failures."""
+        self._background_tasks.add(task)
+
+        def _done(done_task: asyncio.Task) -> None:
+            self._background_tasks.discard(done_task)
+            try:
+                exc = done_task.exception()
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                log("system", "error", f"Background task status check failed: {exc}")
+                return
+
+            if exc is not None:
+                log("system", "error", f"Background task failed: {exc}")
+
+        task.add_done_callback(_done)
+
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     async def start(self) -> None:
-        log("system", "info", "Core starting")
+        log("core", "info", "Core starting")
 
         # ── Redis ──────────────────────────────────────────────────────────
         redis_cfg = self.config.get("redis") or {}
@@ -90,7 +111,7 @@ class Core:
         self.redis = aioredis.from_url(redis_url, decode_responses=True)
         try:
             await self.redis.ping()
-            log("system", "info", "Redis connected")
+            log("core", "info", "Redis connected")
         except Exception as exc:
             log("system", "error", f"Redis connection failed: {exc}")
             raise
@@ -113,6 +134,12 @@ class Core:
         for wid, w in self.workers.items():
             await w.initialize({**workers_cfg.get(wid, {}), "_core": self})
 
+        external_mcp = self.workers.get("external_mcp")
+        if external_mcp and hasattr(external_mcp, "refresh_tools_if_due"):
+            self._track_background_task(
+                asyncio.create_task(external_mcp.refresh_tools_if_due(reason="startup"))
+            )
+
         self.loop_workers = []
         for wid, worker in self.workers.items():
             worker_loop = getattr(worker, "loop", None)
@@ -121,7 +148,7 @@ class Core:
 
         if self.loop_workers:
             log(
-                "system",
+                "core",
                 "info",
                 f"loop_workers initialized: {[wid for wid, _ in self.loop_workers]}",
             )
@@ -135,14 +162,41 @@ class Core:
             full_config=self.config.raw(),
         )
 
-        log("system", "info", "Core started")
+        log("core", "info", "Core started")
 
     async def stop(self) -> None:
-        log("system", "info", "Core stopping")
+        started_at = time.monotonic()
+        log("core", "info", "Core stopping")
+        
+        cancel_started = time.monotonic()
+        for task in list(self._background_tasks):
+            task.cancel()
+        cancel_elapsed = time.monotonic() - cancel_started
+        log("core", "info", f"Background task cancellation started in {cancel_elapsed:.2f}s")
+        
+        if self._background_tasks:
+            log("core", "info", f"Stopping background tasks: count={len(self._background_tasks)}")
+            gather_started = time.monotonic()
+            await asyncio.gather(*self._background_tasks, return_exceptions=True)
+            gather_elapsed = time.monotonic() - gather_started
+            log("core", "info", f"Background tasks stopped in {gather_elapsed:.2f}s")
+        
         if self.scheduler:
+            log("core", "info", "Stopping scheduler")
+            sched_started = time.monotonic()
             self.scheduler.stop()
+            sched_elapsed = time.monotonic() - sched_started
+            log("core", "info", f"Scheduler stopped in {sched_elapsed:.2f}s")
+        
         if self.redis:
+            log("core", "info", "Closing Redis connection")
+            redis_started = time.monotonic()
             await self.redis.aclose()
+            redis_elapsed = time.monotonic() - redis_started
+            log("core", "info", f"Redis connection closed in {redis_elapsed:.2f}s")
+        
+        total_elapsed = time.monotonic() - started_at
+        log("core", "info", f"Core stopping completed in {total_elapsed:.3f}s")
 
     def reload_config(self) -> None:
         """Reload config from disk (triggered by SIGHUP)."""
@@ -190,8 +244,17 @@ class Core:
         tasks_cfg = self.config.get("tasks") or {}
         return max(0, int(tasks_cfg.get("restart_wait_timeout", 120) or 0))
 
-    async def graceful_shutdown(self) -> ShutdownReport:
+    def stop_wait_timeout_seconds(self) -> int:
+        """Return stop wait timeout for signal-triggered shutdowns in seconds."""
+        tasks_cfg = self.config.get("tasks") or {}
+        configured = tasks_cfg.get("stop_wait_timeout")
+        if configured is not None:
+            return max(0, int(configured or 0))
+        return min(self.restart_wait_timeout_seconds(), 10)
+
+    async def graceful_shutdown(self, source: str = "signal") -> ShutdownReport:
         """Stop admission, wait for active tasks, then stop the scheduler."""
+        started = time.monotonic()
         async with self._shutdown_lock:
             if self._shutdown_started:
                 active_tasks = self.scheduler.active_task_count() if self.scheduler else 0
@@ -200,23 +263,60 @@ class Core:
             self._shutdown_started = True
 
         await self.request_restart()
+        log("core", "info", f"Graceful shutdown: request_restart completed in {time.monotonic() - started:.2f}s")
 
         timed_out = False
         active_tasks = 0
         if self.scheduler:
-            timeout = self.restart_wait_timeout_seconds()
+            timeout = self.stop_wait_timeout_seconds() if source == "signal" else self.restart_wait_timeout_seconds()
+            labels = self.scheduler.active_task_labels()
+            log(
+                "system",
+                "warn",
+                f"Graceful shutdown started via {source}; active_tasks={len(labels)} timeout={timeout}s labels={labels}",
+            )
+            
+            wait_started = time.monotonic()
             timed_out = not await self.scheduler.wait_for_active_tasks(timeout)
+            wait_elapsed = time.monotonic() - wait_started
             active_tasks = self.scheduler.active_task_count()
-            self.scheduler.stop()
+            log("core", "info", f"Graceful shutdown: wait_for_active_tasks returned in {wait_elapsed:.2f}s timed_out={timed_out} active_tasks={active_tasks}")
 
+            if timed_out:
+                remaining = self.scheduler.active_task_labels()
+                log(
+                    "system",
+                    "warn",
+                    f"Graceful shutdown wait expired via {source}; canceling active tasks count={active_tasks} labels={remaining}",
+                )
+                cancel_started = time.monotonic()
+                canceled = await self.scheduler.cancel_active_tasks(timeout=5.0)
+                cancel_elapsed = time.monotonic() - cancel_started
+                active_tasks = self.scheduler.active_task_count()
+                log("core", "info", f"Graceful shutdown: cancel_active_tasks completed in {cancel_elapsed:.2f}s canceled={canceled} remaining={active_tasks}")
+                log(
+                    "system",
+                    "warn",
+                    f"Active task cancellation finished; canceled={canceled} remaining={active_tasks}",
+                )
+
+            stop_started = time.monotonic()
+            self.scheduler.stop()
+            stop_elapsed = time.monotonic() - stop_started
+            log("core", "info", f"Graceful shutdown: scheduler.stop() completed in {stop_elapsed:.2f}s")
+            log("system", "info", f"Scheduler stop requested via {source}")
+
+        total_elapsed = time.monotonic() - started
         if timed_out:
             log(
                 "system",
                 "warn",
-                f"Graceful shutdown timed out with {active_tasks} active task(s) remaining",
+                f"Graceful shutdown timed out via {source} with {active_tasks} active task(s) remaining",
             )
         else:
-            log("system", "info", "Graceful shutdown drain completed")
+            log("system", "info", f"Graceful shutdown drain completed via {source}")
+        
+        log("core", "info", f"Graceful shutdown: total time {total_elapsed:.2f}s timed_out={timed_out} active_tasks={active_tasks}")
 
         return ShutdownReport(timed_out=timed_out, active_tasks=active_tasks)
 
@@ -345,8 +445,10 @@ def _build_webui_server(core: Core, restart_callback=None) -> uvicorn.Server:
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 async def main() -> None:
+    log("core", "info", "=== APPLICATION STARTUP BEGIN ===")
     core = Core()
     await core.start()
+    log("core", "info", "Core initialization completed")
 
     loop = asyncio.get_running_loop()
     all_servers: list[uvicorn.Server] = []
@@ -355,12 +457,25 @@ async def main() -> None:
     async def _shutdown_async(source: str) -> None:
         """Drain active work and then stop all uvicorn servers."""
         nonlocal restart_via_self_exit
-        log("system", "info", f"Shutdown requested via {source}")
+        shutdown_started = time.monotonic()
+        log("core", "info", f"Graceful shutdown BEGIN (source={source})")
         if source == "webui":
             restart_via_self_exit = True
-        await core.graceful_shutdown()
+        
+        drain_started = time.monotonic()
+        report = await core.graceful_shutdown(source=source)
+        drain_elapsed = time.monotonic() - drain_started
+        log("core", "info", f"Graceful shutdown drain complete in {drain_elapsed:.2f}s: timed_out={report.timed_out} active_tasks={report.active_tasks}")
+        
+        servers_started = time.monotonic()
         for srv in all_servers:
+            log("core", "info", f"Requesting server stop: {type(srv).__name__}")
             srv.should_exit = True
+        servers_elapsed = time.monotonic() - servers_started
+        log("core", "info", f"All server stop requests sent in {servers_elapsed:.2f}s (source={source})")
+        
+        total_elapsed = time.monotonic() - shutdown_started
+        log("core", "info", f"_shutdown_async total: {total_elapsed:.2f}s")
 
     def _schedule_shutdown(source: str) -> None:
         """Schedule async shutdown from signal-safe contexts."""
@@ -392,6 +507,7 @@ async def main() -> None:
 
     def _shutdown() -> None:
         """Start graceful shutdown from SIGTERM/SIGINT."""
+        log("core", "info", "SIGTERM/SIGINT received; initiating graceful shutdown")
         _schedule_shutdown("signal")
 
     try:
@@ -406,19 +522,24 @@ async def main() -> None:
         coroutines.append(server.serve())
     coroutines.append(webui_server.serve())
 
-    log("system", "info", "All services started")
+    log("core", "info", "All services starting")
     try:
         await asyncio.gather(*coroutines)
     finally:
+        log("core", "info", "Application shutdown: executing core.stop()")
         await core.stop()
+        log("core", "info", "=== APPLICATION SHUTDOWN COMPLETE ===")
 
     if restart_via_self_exit:
         raise SystemExit(1)
 
 
 if __name__ == "__main__":
+    log("core", "info", "=== PROCESS STARTED ===")
     try:
         asyncio.run(main())
     except BaseException as exc:
         log_exception("system", "fatal", "Fatal crash in core entrypoint", exc)
         raise
+    finally:
+        log("core", "info", "=== PROCESS EXITED ===")

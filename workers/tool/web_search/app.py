@@ -10,8 +10,8 @@ from urllib.parse import urlencode
 
 import httpx
 
-from core.worker import BaseToolWorker, WorkerResult
 from core.task import Task
+from core.worker import BaseToolWorker, WorkerResult
 
 
 class WebSearchWorker(BaseToolWorker):
@@ -19,9 +19,9 @@ class WebSearchWorker(BaseToolWorker):
 
     task_type = "tool"
 
-    def get_tool_description(self) -> dict:
-        """Return MCP-compatible tool description."""
-        return {
+    def get_tool_description(self) -> list[dict]:
+        """Return MCP-compatible tool description as a list."""
+        return [{
             "name": "search",
             "description": "Search the web via Brave Search API and return ranked results.",
             "inputSchema": {
@@ -80,7 +80,7 @@ class WebSearchWorker(BaseToolWorker):
                 },
                 "required": ["query"],
             },
-        }
+        }]
 
     async def initialize(self, config: dict) -> None:
         """Read Brave API settings and request timeout."""
@@ -104,37 +104,47 @@ class WebSearchWorker(BaseToolWorker):
         task: Task,
         emit_chunk: Callable[[dict], Awaitable[None]] | None = None,
     ) -> WorkerResult:
-        """Run Brave web search and return normalized results."""
+        """Perform Brave web search and return normalized result items."""
         if self._provider != "brave":
-            return WorkerResult(ok=False, error={"code": "UNSUPPORTED_PROVIDER", "message": f"Unsupported provider: {self._provider}"})
+            return WorkerResult(
+                ok=False,
+                error={"code": "UNSUPPORTED_PROVIDER", "message": f"Unsupported provider: {self._provider}"},
+            )
+
         if not self._api_key:
-            return WorkerResult(ok=False, error={"code": "MISSING_API_KEY", "message": "BRAVE_APIKEY/apiKey is not configured"})
+            return WorkerResult(
+                ok=False,
+                error={"code": "MISSING_API_KEY", "message": "BRAVE_APIKEY/apiKey is not configured"},
+            )
 
         payload = task.payload or {}
         args = payload.get("arguments") or {}
+
         query = str(args.get("query", "")).strip()
         if not query:
             return WorkerResult(ok=False, error={"code": "INVALID_ARGUMENT", "message": "query is required"})
 
-        count = self._int_arg(args.get("count", args.get("limit", 10)), 10, 1, 20)
+        count = self._int_arg(args.get("count", 10), 10, 1, 20)
         offset = self._int_arg(args.get("offset", 0), 0, 0, 9)
 
-        params: dict[str, str | int | bool] = {
+        params: dict[str, str | int] = {
             "q": query,
             "count": count,
             "offset": offset,
-            "spellcheck": bool(args.get("spellcheck", True)),
-            "extra_snippets": bool(args.get("extra_snippets", True)),
+            "country": str(args.get("country", "us") or "us"),
+            "search_lang": str(args.get("search_lang", "en") or "en"),
+            "ui_lang": str(args.get("ui_lang", "en-US") or "en-US"),
+            "safesearch": str(args.get("safesearch", "moderate") or "moderate"),
         }
 
-        safesearch = str(args.get("safesearch", "moderate") or "moderate").lower()
-        if safesearch in {"off", "moderate", "strict"}:
-            params["safesearch"] = safesearch
+        freshness = args.get("freshness")
+        if isinstance(freshness, str) and freshness.strip():
+            params["freshness"] = freshness.strip()
 
-        for key in ("country", "search_lang", "ui_lang", "freshness"):
-            val = args.get(key)
-            if isinstance(val, str) and val.strip():
-                params[key] = val.strip()
+        if "spellcheck" in args:
+            params["spellcheck"] = 1 if bool(args.get("spellcheck")) else 0
+        if "extra_snippets" in args:
+            params["extra_snippets"] = 1 if bool(args.get("extra_snippets")) else 0
 
         result_filter = args.get("result_filter")
         if isinstance(result_filter, list):
@@ -147,8 +157,8 @@ class WebSearchWorker(BaseToolWorker):
             "Accept-Encoding": "gzip",
             "X-Subscription-Token": self._api_key,
         }
-        url = f"{self._base_url}/res/v1/web/search"
 
+        url = f"{self._base_url}/res/v1/web/search"
         try:
             async with httpx.AsyncClient(timeout=self._timeout) as client:
                 response = await client.get(url, params=params, headers=headers)
@@ -167,6 +177,7 @@ class WebSearchWorker(BaseToolWorker):
 
         body = response.json()
         web_results = ((body.get("web") or {}).get("results") or []) if isinstance(body, dict) else []
+
         items: list[dict] = []
         for row in web_results:
             if not isinstance(row, dict):

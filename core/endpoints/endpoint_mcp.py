@@ -161,21 +161,26 @@ class Endpoint_mcp(BaseEndpoint):
             if not worker_id:
                 continue
 
-            spec = {
-                "worker": str(worker_id),
-                "description": f"Tool {tool_name}",
-                "inputSchema": {"type": "object", "properties": {}},
-            }
-
             worker = self._core.workers.get(str(worker_id)) if self._core else None
+            tool_descs = []
             if isinstance(worker, BaseToolWorker):
-                worker_spec = worker.get_tool_description() or {}
-                if isinstance(worker_spec.get("description"), str):
-                    spec["description"] = worker_spec["description"]
-                if isinstance(worker_spec.get("inputSchema"), dict):
-                    spec["inputSchema"] = worker_spec["inputSchema"]
+                descs = worker.get_tool_description()
+                if isinstance(descs, list):
+                    tool_descs.extend(descs)
+                elif isinstance(descs, dict):
+                    tool_descs.append(descs)
+            else:
+                # Fallback: synthesize minimal spec
+                tool_descs.append({
+                    "name": tool_name,
+                    "description": f"Tool {tool_name}",
+                    "inputSchema": {"type": "object", "properties": {}},
+                    "worker": str(worker_id),
+                })
 
-            registry[str(tool_name)] = spec
+            for desc in tool_descs:
+                desc["worker"] = str(worker_id)
+                registry[desc["name"]] = desc
 
         return registry
 

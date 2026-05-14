@@ -123,27 +123,31 @@ class ContextAddInternalToolsWorker(BaseWorker):
             if not worker_id:
                 continue
 
-            spec = {
-                "worker": str(worker_id),
-                "description": str(meta.get("description", tool_name)),
-                "inputSchema": meta.get("inputSchema", {"type": "object", "properties": {}}),
-            }
-
             worker = self._core.workers.get(str(worker_id)) if self._core else None
+            tool_descs = []
             if isinstance(worker, BaseToolWorker):
-                worker_spec = worker.get_tool_description() or {}
-                if isinstance(worker_spec.get("description"), str):
-                    spec["description"] = worker_spec["description"]
-                if isinstance(worker_spec.get("inputSchema"), dict):
-                    spec["inputSchema"] = worker_spec["inputSchema"]
+                descs = worker.get_tool_description()
+                if isinstance(descs, list):
+                    tool_descs.extend(descs)
+                elif isinstance(descs, dict):
+                    tool_descs.append(descs)
+            else:
+                # Fallback: synthesize minimal spec
+                tool_descs.append({
+                    "name": tool_name,
+                    "description": str(meta.get("description", tool_name)),
+                    "inputSchema": meta.get("inputSchema", {"type": "object", "properties": {}}),
+                    "worker": str(worker_id),
+                })
 
-            # Explicit per-task overrides still win over worker defaults.
-            if isinstance(meta.get("description"), str):
-                spec["description"] = meta["description"]
-            if isinstance(meta.get("inputSchema"), dict):
-                spec["inputSchema"] = meta["inputSchema"]
-
-            resolved[str(tool_name)] = spec
+            for desc in tool_descs:
+                # Explicit per-task overrides still win over worker defaults.
+                if isinstance(meta.get("description"), str):
+                    desc["description"] = meta["description"]
+                if isinstance(meta.get("inputSchema"), dict):
+                    desc["inputSchema"] = meta["inputSchema"]
+                desc["worker"] = str(worker_id)
+                resolved[desc["name"]] = desc
 
         return resolved
 

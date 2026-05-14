@@ -92,6 +92,68 @@ class WebFetchWorker(BaseToolWorker):
                 "required": ["url"],
             },
         }
+        def get_tool_description(self) -> list[dict]:
+            """Return MCP-compatible tool description as a list."""
+            return [{
+                "name": "fetch",
+                "description": "Fetch URL-relevant grounding snippets via Brave LLM Context API.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "url": {
+                            "type": "string",
+                            "description": "Target URL to fetch context for.",
+                        },
+                        "query": {
+                            "type": "string",
+                            "description": "Optional focused query. If omitted, URL-driven retrieval is used.",
+                        },
+                        "maximum_number_of_urls": {
+                            "type": "integer",
+                            "description": "Brave URL budget (1-50).",
+                            "minimum": 1,
+                            "maximum": 50,
+                        },
+                        "maximum_number_of_tokens": {
+                            "type": "integer",
+                            "description": "Total token budget (1024-32768).",
+                            "minimum": 1024,
+                            "maximum": 32768,
+                        },
+                        "maximum_number_of_snippets": {
+                            "type": "integer",
+                            "description": "Total snippet budget (1-100).",
+                            "minimum": 1,
+                            "maximum": 100,
+                        },
+                        "maximum_number_of_tokens_per_url": {
+                            "type": "integer",
+                            "description": "Per-URL token budget (512-8192).",
+                            "minimum": 512,
+                            "maximum": 8192,
+                        },
+                        "maximum_number_of_snippets_per_url": {
+                            "type": "integer",
+                            "description": "Per-URL snippet budget (1-100).",
+                            "minimum": 1,
+                            "maximum": 100,
+                        },
+                        "context_threshold_mode": {
+                            "type": "string",
+                            "enum": ["strict", "balanced", "lenient", "disabled"],
+                            "description": "Brave relevance threshold mode.",
+                        },
+                        "freshness": {
+                            "type": "string",
+                            "description": "Date filter: pd, pw, pm, py, or YYYY-MM-DDtoYYYY-MM-DD.",
+                        },
+                        "country": {
+                            "type": "string",
+                            "description": "Two-letter country code (e.g. US, DE).",
+                        },
+                    },
+                },
+            }]
 
     async def initialize(self, config: dict) -> None:
         """Read Brave API settings and request timeout."""

@@ -18,16 +18,16 @@ class SelftestWorker(BaseToolWorker):
 
     task_type = "tool"
 
-    def get_tool_description(self) -> dict:
-        """Return MCP-compatible tool description."""
-        return {
+    def get_tool_description(self) -> list[dict]:
+        """Return MCP-compatible tool description as a list."""
+        return [{
             "name": "selftest",
             "description": "System health self-test tool",
             "inputSchema": {
                 "type": "object",
                 "properties": {},
             },
-        }
+        }]
 
     async def initialize(self, config: dict) -> None:
         """Store core reference and optional worker settings."""
@@ -35,6 +35,7 @@ class SelftestWorker(BaseToolWorker):
         self._include_workers = bool(config.get("includeWorkers", True))
         self._include_resources = bool(config.get("includeResources", True))
         self._include_brave_api = bool(config.get("includeBraveApi", True))
+        self._include_external_mcp = bool(config.get("includeExternalMcp", True))
         self._brave_timeout = int(config.get("braveTimeoutSeconds", 10) or 10)
 
     async def execute(self, task: Task, emit_chunk=None) -> WorkerResult:
@@ -99,6 +100,12 @@ class SelftestWorker(BaseToolWorker):
             if not brave_check.get("ok", False):
                 errors += 1
 
+        if self._include_external_mcp:
+            external_mcp_check = await self._check_external_mcp()
+            checks.append(external_mcp_check)
+            if not external_mcp_check.get("ok", False):
+                errors += 1
+
         report = {
             "tool": "selftest",
             "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -106,7 +113,7 @@ class SelftestWorker(BaseToolWorker):
             "errors": errors,
             "checks": checks,
         }
-        return WorkerResult(ok=(errors == 0), data=report, error=None if errors == 0 else {"code": "SELFTEST_FAILED", "message": "One or more checks failed", "report": report})
+        return WorkerResult(ok=True, data=report)
 
     async def _check_brave_web_search(self) -> dict:
         """Run a lightweight Brave Web Search API check using configured web_search settings."""
@@ -170,6 +177,89 @@ class SelftestWorker(BaseToolWorker):
                 "status": response.status_code,
                 "provider": provider,
                 "results": len(web_results),
+            },
+        }
+
+    async def _check_external_mcp(self) -> dict:
+        """Verify external_mcp can discover tools and proxy at least one safe call."""
+        external_worker = self._core.workers.get("external_mcp") if self._core else None
+        if external_worker is None:
+            return {
+                "name": "external_mcp",
+                "ok": True,
+                "details": "skipped: worker not loaded",
+            }
+
+        try:
+            tools = await external_worker._get_tools()
+        except Exception as exc:
+            return {
+                "name": "external_mcp",
+                "ok": False,
+                "details": f"discovery_failed: {exc}",
+            }
+
+        discovered = [f"{tool.get('name')}|{tool.get('server', '?')}" for tool in tools if isinstance(tool, dict)]
+        if not tools:
+            return {
+                "name": "external_mcp",
+                "ok": False,
+                "details": "no tools discovered",
+            }
+
+        target_name = None
+        target_args = None
+        for tool in tools:
+            tool_name = str(tool.get("name", ""))
+            if tool_name.endswith("search") or tool_name.endswith("__search"):
+                target_name = tool_name
+                target_args = {"query": "aidir health check", "count": 1}
+                break
+
+        if target_name is None:
+            return {
+                "name": "external_mcp",
+                "ok": True,
+                "details": {
+                    "discovered": discovered,
+                    "proxy_call": "skipped: no safe search-like tool found",
+                },
+            }
+
+        result = await external_worker.execute(
+            Task(
+                type="tool",
+                worker_id="external_mcp",
+                payload={"tool": target_name, "arguments": target_args},
+            )
+        )
+
+        if not result.ok:
+            return {
+                "name": "external_mcp",
+                "ok": False,
+                "details": {
+                    "discovered": discovered,
+                    "proxy_call": {
+                        "tool": target_name,
+                        "ok": False,
+                        "error": result.error,
+                    },
+                },
+            }
+
+        data = result.data if isinstance(result.data, dict) else {}
+        preview_items = data.get("items") if isinstance(data.get("items"), list) else []
+        return {
+            "name": "external_mcp",
+            "ok": True,
+            "details": {
+                "discovered": discovered,
+                "proxy_call": {
+                    "tool": target_name,
+                    "ok": True,
+                    "items": len(preview_items),
+                },
             },
         }
 

@@ -13,21 +13,24 @@
   },
   "logging": {
     // Default level for all subsystems. String or int (0-7, systemd-journald scale).
-    "level": "${LOG_LEVEL:-info}",
+    "level": "${LOG_LEVEL:-error}",
+    // Timezone for log timestamps.
+    // Use "local" for server local timezone, "UTC", or IANA name (e.g. "Europe/Moscow").
+    "timezone": "${LOG_TIMEZONE:-local}",
     // Seconds between log wipe runs. 0 = never wipe.
     "wipe_period": ${LOG_WIPE_PERIOD:-0},
     // wipe_max_age: 86400,  // seconds; defaults to wipe_period if not set
     max_log_size: ${MAX_LOG_SIZE:-1000000}, // max size in bytes for individual log files; 0 = unlimited
     "levels": { // thresholds for individual per-type log files
-      "workers": "debug",
-      "http": "info",
-      "webui": "info"
+      "workers": "warning",
+      "http": "warning",
+      "webui": "warning",
     },
     "alllevels": { // thresholds for all.log
-      "core": 4, // WARNING
-      "workers": 4,
-      "http": 6, // INFO
-      "webui": 4
+      "core": 3, // WARNING
+      "workers": 3,
+      "http": 3, // INFO
+      "webui": 3
     }
   },
   // Resources to track (VRAM etc).
@@ -68,6 +71,11 @@
       "api": "openaix",
       "port": ${OPENAIX_ENDPOINT_PORT:-21434},
       "bindAddress": "${OPENAIX_ENDPOINT_HOST:-0.0.0.0}",
+      "logging": {
+        // Per-endpoint log levels (overrides logging.levels.http / logging.alllevels.http)
+        "level": "info",
+        "alllevel": "warning"
+      },
       // worker used for agent tasks; falls back to workers.default if omitted
       "worker": "openaix",
       // worker used for pre-agent context building
@@ -81,6 +89,11 @@
       "api": "mcp",
       "port": ${MCP_ENDPOINT_PORT:-20001},
       "bindAddress": "${MCP_ENDPOINT_HOST:-0.0.0.0}",
+      "logging": {
+        // Example: keep endpoint logs more verbose for MCP debugging
+        "level": "debug",
+        "alllevel": "info"
+      },
       // Timeout for entire request (queue + execution)
       "request_timeout": ${REQUEST_TIMEOUT:-100},
       "tools": {
@@ -131,7 +144,7 @@
         "provider": "ollama_local",
         "logging": {
           "level": "debug",
-          "alllevel": "info"
+          "alllevel": "warning"
         }
       },
       "openaix": {
@@ -141,7 +154,7 @@
         "request_timeout": ${REQUEST_TIMEOUT:-100},
         "logging": {
           "level": "debug",
-          "alllevel": "info",
+          "alllevel": "warning",
           "save_llm_request": true,
         },
         tools:{
@@ -206,7 +219,25 @@
       },
       "context_render_openclaw_style": {
         "enabled": true
-      }
+      },
+      "external_mcp": {
+        "enabled": true,
+        "tools_ttl": 300,
+        "logging": {
+          "level": "debug",
+          "alllevel": "info",
+        },
+        "servers": {
+          "sndbx": {
+              "type": "http",
+              "url": "http://127.0.0.1:30081/mcp",
+          },
+          "filesystem": {
+            "type": "http",
+            "url": "http://127.0.0.1:20001/mcp"
+          },
+        },
+      },    
     },
     "default": "call_ollama"
   },

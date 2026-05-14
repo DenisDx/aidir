@@ -51,13 +51,14 @@ class BaseToolWorker(BaseWorker):
 
     task_type: str = "tool"
 
-    def get_tool_description(self) -> dict[str, Any]:
+    def get_tool_description(self) -> list[dict[str, Any]]:
         """
-        Return MCP-style tool metadata.
-        Output keys: name, description, inputSchema.
+        Return a list of MCP-style tool metadata dicts.
+        Each dict: name, description, inputSchema, etc.
+        For single-tool workers, return a list with one dict.
         """
-        return {
+        return [{
             "name": self.id,
             "description": f"Tool {self.id}",
             "inputSchema": {"type": "object", "properties": {}},
-        }
+        }]

@@ -1,5 +1,7 @@
 .env
 !.env.example
+config.json5
+!config.json5.example
 __pycache__/
 *.py[cod]
 venv/
