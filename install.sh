@@ -17,6 +17,62 @@ ensure_snap_path() {
   fi
 }
 
+install_python_venv_pkg_apt() {
+  local sudo_cmd=""
+  local versioned_venv_pkg
+
+  if [[ $EUID -ne 0 ]]; then
+    command -v sudo &>/dev/null || return 1
+    info "Trying to install python venv package via sudo (password may be requested)..."
+    sudo -v || return 1
+    sudo_cmd="sudo"
+  fi
+
+  $sudo_cmd apt-get update -y || return 1
+  if $sudo_cmd apt-get install -y python3-venv; then
+    return 0
+  fi
+
+  versioned_venv_pkg="$(python3 -c 'import sys; print(f"python{sys.version_info.major}.{sys.version_info.minor}-venv")' 2>/dev/null || true)"
+  [[ -n "$versioned_venv_pkg" ]] || return 1
+  warn "python3-venv package unavailable, trying ${versioned_venv_pkg}..."
+  $sudo_cmd apt-get install -y "$versioned_venv_pkg"
+}
+
+python_venv_works_with_pip() {
+  local probe_root
+  local probe_env
+  probe_root="$(mktemp -d)"
+  probe_env="$probe_root/venv-probe"
+
+  if python3 -m venv "$probe_env" >/dev/null 2>&1 && [[ -x "$probe_env/bin/pip" ]]; then
+    rm -rf "$probe_root"
+    return 0
+  fi
+
+  rm -rf "$probe_root"
+  return 1
+}
+
+ensure_python_venv_ready() {
+  if python_venv_works_with_pip; then
+    return
+  fi
+
+  warn "Python can import venv, but creating venv with pip failed (ensurepip may be missing)."
+
+  if command -v apt-get &>/dev/null; then
+    if install_python_venv_pkg_apt && python_venv_works_with_pip; then
+      info "Python venv package installed and verified"
+      return
+    fi
+  fi
+
+  local hint_pkg
+  hint_pkg="$(python3 -c 'import sys; print(f"python{sys.version_info.major}.{sys.version_info.minor}-venv")' 2>/dev/null || echo 'python3-venv')"
+  die "Python virtual environment creation failed (ensurepip unavailable). Install venv support package (for Debian/Ubuntu: sudo apt install ${hint_pkg}), then re-run ./install.sh"
+}
+
 ensure_docker_daemon() {
   if docker info &>/dev/null; then
     return
@@ -132,6 +188,7 @@ info "Docker Compose: $DOCKER_COMPOSE"
 
 # Check python3-venv
 python3 -c "import venv" 2>/dev/null || die "python3-venv not available. Install python3-venv package."
+ensure_python_venv_ready
 
 # Docker daemon reachable?
 ensure_docker_daemon
