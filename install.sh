@@ -46,6 +46,28 @@ ensure_docker_daemon() {
     fi
   fi
 
+  if docker info &>/dev/null; then
+    return
+  fi
+
+  # Common case after fresh Docker install: daemon is running, but user session
+  # does not yet have docker group membership until re-login.
+  if [[ $EUID -ne 0 ]] && command -v sudo &>/dev/null; then
+    if sudo docker info &>/dev/null; then
+      if command -v getent &>/dev/null && getent group docker >/dev/null; then
+        if ! id -nG "$USER" 2>/dev/null | grep -qw docker; then
+          if getent group docker | awk -F: '{print $4}' | tr ',' '\n' | grep -Fxq "$USER"; then
+            die "Docker is running, but current session does not see docker group yet. Please log out and log in again, then re-run ./install.sh"
+          fi
+          info "Adding user '$USER' to docker group via sudo (password may be requested)..."
+          sudo usermod -aG docker "$USER" || true
+          die "User '$USER' was added to docker group. Please log out and log in again, then re-run ./install.sh"
+        fi
+      fi
+      die "Docker daemon is running, but access is denied for user '$USER'. Re-login may be required after adding docker group membership."
+    fi
+  fi
+
   docker info &>/dev/null || die "Docker daemon is not running or not accessible for user '$USER'. Try: sudo systemctl enable --now docker (or sudo snap start docker), then ensure user is in docker group: sudo usermod -aG docker $USER"
 }
 
@@ -126,14 +148,28 @@ if [[ ! -f "$ENV_FILE" ]]; then
   # Auto-fill required runtime values.
   set_env_var "$ENV_FILE" "AIDIR_ROOT" "$SCRIPT_DIR"
 
-  # Ask only for essential interactive value required by SPEC.
-  echo
-  read -r -s -p "Enter ROOT_PASSWORD for WebUI admin (leave empty to auto-generate): " ROOT_PASSWORD_INPUT
-  echo
-  if [[ -z "$ROOT_PASSWORD_INPUT" ]]; then
-    ROOT_PASSWORD_INPUT="$(generate_password)"
-    info "ROOT_PASSWORD auto-generated. Save it now: $ROOT_PASSWORD_INPUT"
-  fi
+  # Ask for admin password twice and verify both entries match.
+  ROOT_PASSWORD_INPUT=""
+  while true; do
+    echo
+    read -r -s -p "Enter ROOT_PASSWORD for WebUI admin (leave empty to auto-generate): " ROOT_PASSWORD_FIRST
+    echo
+    read -r -s -p "Repeat ROOT_PASSWORD for WebUI admin: " ROOT_PASSWORD_SECOND
+    echo
+
+    if [[ "$ROOT_PASSWORD_FIRST" != "$ROOT_PASSWORD_SECOND" ]]; then
+      warn "Passwords do not match. Please try again."
+      continue
+    fi
+
+    if [[ -z "$ROOT_PASSWORD_FIRST" ]]; then
+      ROOT_PASSWORD_INPUT="$(generate_password)"
+      info "ROOT_PASSWORD auto-generated. Save it now: $ROOT_PASSWORD_INPUT"
+    else
+      ROOT_PASSWORD_INPUT="$ROOT_PASSWORD_FIRST"
+    fi
+    break
+  done
   set_env_var "$ENV_FILE" "ROOT_PASSWORD" "$ROOT_PASSWORD_INPUT"
 
   chmod 600 "$ENV_FILE"
