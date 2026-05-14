@@ -103,79 +103,81 @@ Key sections:
 
 ### Network ports and routing map
 
-This project uses host services plus two Docker containers (nginx and redis).
+Runtime topology:
 
-#### Effective port map
+```text
+browser/client
+  -> host:8080 (nginx in docker, public HTTP + WS)
+  -> host:21434 (OpenAIx/Ollama-compatible endpoint)
+  -> host:20001 (MCP endpoint)
 
-| Port | Direction | Service | Config source | How to change |
+nginx:80 in container
+  -> host:${WEBUI_PORT} (WebUI backend, default 20082)
+
+core app
+  -> host:${REDIS_HOST}:${REDIS_PORT} (Redis, default 127.0.0.1:6379)
+  -> ${OLLAMA_BASE_URL} (upstream Ollama, usually 127.0.0.1:11434)
+```
+
+#### Ports
+
+| Port | Service | Traffic | Source of truth | Change path |
 |---|---|---|---|---|
-| `8080` (default) | host -> docker nginx:80 | Public WebUI entrypoint (HTTP + WS) | `.env: NGINX_HTTP_PORT`, `docker-compose.yml` | Change `NGINX_HTTP_PORT` in `.env`, then `docker compose up -d` |
-| `20082` (default) | host -> core app | WebUI backend (FastAPI) | `.env: WEBUI_PORT`, `config.json5: webui.port` | Change `WEBUI_PORT` in `.env` |
-| `21434` (default) | host -> core app | OpenAIx/Ollama-compatible endpoint | `.env: OPENAIX_ENDPOINT_PORT`, `config.json5: endpoints[api=openaix].port` | Change `OPENAIX_ENDPOINT_PORT` in `.env` |
-| `20001` (default) | host -> core app | MCP JSON-RPC endpoint | `.env: MCP_ENDPOINT_PORT`, `config.json5: endpoints[api=mcp].port` | Change `MCP_ENDPOINT_PORT` in `.env` |
-| `6379` (default) | host -> docker redis:6379 | Redis queue/state | `.env: REDIS_HOST/REDIS_PORT`, `docker-compose.yml` | Change `REDIS_HOST`/`REDIS_PORT` in `.env`, then `docker compose up -d` |
-| `11434` (typical) | core app -> external | Upstream Ollama API | `.env: OLLAMA_BASE_URL`, provider base URL in `config.json5` | Change `OLLAMA_BASE_URL` in `.env` |
+| `8080` | nginx public entrypoint | HTTP + WebSocket | `.env: NGINX_HTTP_PORT`, `docker-compose.yml` | Change `.env`, then `docker compose up -d nginx` |
+| `20082` | WebUI backend | HTTP + WS upstream for nginx | `.env: WEBUI_PORT`, `config.json5` | Change `.env`, then restart aidir |
+| `21434` | OpenAIx endpoint | HTTP | `.env: OPENAIX_ENDPOINT_PORT`, `config.json5` | Change `.env`, then restart aidir |
+| `20001` | MCP endpoint | HTTP JSON-RPC | `.env: MCP_ENDPOINT_PORT`, `config.json5` | Change `.env`, then restart aidir |
+| `6379` | Redis | TCP | `.env: REDIS_HOST`, `.env: REDIS_PORT`, `docker-compose.yml` | Change `.env`, then `docker compose up -d redis` |
+| `11434` | Ollama upstream | HTTP | `.env: OLLAMA_BASE_URL` | Change `.env`, then restart aidir if needed |
 
-Notes:
+Rules:
 
-- Nginx container listens on internal port `80`. Docker publishes it to host `${NGINX_HTTP_PORT}`.
-- WebSocket does not require a separate public port: it is served via the same nginx port as HTML.
-- `WEBUI_PORT` is backend-only and should not equal `NGINX_HTTP_PORT`.
+- nginx always listens on container port `80`; Docker publishes it to host `${NGINX_HTTP_PORT}`.
+- HTML and WebSocket share the same public nginx port. WS uses `/ws/*`; it does not need a separate port.
+- `WEBUI_PORT` is the backend port behind nginx and must not equal `NGINX_HTTP_PORT`.
 
-#### Route map
+#### Routes
 
-Public via nginx (`http://HOST:${NGINX_HTTP_PORT}`):
+Public nginx entrypoint: `http://HOST:${NGINX_HTTP_PORT}`
 
-| Route | Type | Upstream |
+| Route | Type | Destination |
 |---|---|---|
-| `/` | HTTP | Static frontend (`webui/frontend`) |
+| `/` | HTTP | Static frontend from `webui/frontend` |
 | `/api/*` | HTTP proxy | `http://host.docker.internal:${WEBUI_PORT}` |
 | `/ws/*` | WebSocket proxy | `ws://host.docker.internal:${WEBUI_PORT}` |
 
-Direct WebUI backend (`http://HOST:${WEBUI_PORT}`):
+WebUI backend: `http://HOST:${WEBUI_PORT}`
 
-| Route | Type | Purpose |
+| Route group | Type | Purpose |
 |---|---|---|
-| `/api/auth/login` | POST | Login |
-| `/api/auth/me` | GET | Session check (`401` without cookie is expected) |
-| `/api/auth/logout` | POST | Logout |
-| `/api/tasks` | GET | Tasks list |
-| `/api/status` | GET | Runtime summary |
-| `/api/logs` | GET | Last log lines |
-| `/api/config` | GET | Effective config |
-| `/api/config/raw` | GET/POST | Raw config read/write |
-| `/api/config/fields` | GET/POST | Field-level config operations |
-| `/api/workers/models` | GET | Workers/providers info |
-| `/api/endpoints/info` | GET | Endpoints/tools info |
-| `/api/test/llm` | POST | Proxy test to ollama endpoint |
-| `/api/test/mcp` | POST | Proxy test to MCP endpoint |
-| `/api/test/agent/endpoints` | GET | Agent test endpoint options |
-| `/api/test/agent/catalog` | GET | Endpoint catalog for agent test |
-| `/api/test/agent/models` | GET | Models for selected endpoint |
-| `/api/test/agent` | POST | End-to-end agent test |
-| `/api/restart` | POST | Request graceful restart |
-| `/ws/logs` | WS | Live log stream (auth required) |
+| `/api/auth/login`, `/api/auth/me`, `/api/auth/logout` | HTTP | Session management |
+| `/api/tasks`, `/api/status`, `/api/logs` | HTTP | Runtime state and logs |
+| `/api/config`, `/api/config/raw`, `/api/config/fields` | HTTP | Config read/write |
+| `/api/workers/models`, `/api/endpoints/info` | HTTP | Catalog and metadata |
+| `/api/test/llm`, `/api/test/mcp`, `/api/test/agent/*`, `/api/test/agent` | HTTP | UI-side test/proxy routes |
+| `/api/restart` | HTTP | Graceful restart request |
+| `/ws/logs` | WebSocket | Live log stream |
 
-OpenAIx endpoint (`http://HOST:${OPENAIX_ENDPOINT_PORT}`):
+OpenAIx endpoint: `http://HOST:${OPENAIX_ENDPOINT_PORT}`
 
 | Route | Type | Purpose |
 |---|---|---|
 | `/api/chat` | POST | Ollama-compatible chat |
-| `/api/tags` | GET | Model list (ollama format) |
+| `/api/tags` | GET | Ollama-style models list |
 | `/v1/chat/completions` | POST | OpenAI-compatible chat |
-| `/v1/models` | GET | Model list (openai format) |
+| `/v1/models` | GET | OpenAI-style models list |
 | `/health` | GET | Health check |
 
-MCP endpoint (`http://HOST:${MCP_ENDPOINT_PORT}`):
+MCP endpoint: `http://HOST:${MCP_ENDPOINT_PORT}`
 
 | Route | Type | Purpose |
 |---|---|---|
-| `/mcp` | POST | JSON-RPC methods (`initialize`, `ping`, `tools/list`, `tools/call`) |
+| `/mcp` | POST | JSON-RPC methods: `initialize`, `ping`, `tools/list`, `tools/call` |
 | `/health` | GET | Health check |
 
 Redis:
 
-- TCP: `${REDIS_HOST}:${REDIS_PORT}` -> redis container `6379`.
+- TCP `${REDIS_HOST}:${REDIS_PORT}` -> redis container `6379`
 
 #### Validation checklist
 

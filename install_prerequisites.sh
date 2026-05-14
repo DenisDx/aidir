@@ -104,6 +104,7 @@ install_packages() {
 ensure_python() {
   if has_cmd python3; then
     info "Python found: $(python3 --version 2>/dev/null || true)"
+    ensure_python_venv
     return
   fi
 
@@ -119,6 +120,50 @@ ensure_python() {
 
   has_cmd python3 || die "Python installation failed: python3 command not found"
   info "Python installed: $(python3 --version 2>/dev/null || true)"
+  ensure_python_venv
+}
+
+# Install Python venv module package for the current python3 if missing.
+ensure_python_venv() {
+  if python3 -c "import venv" >/dev/null 2>&1; then
+    info "Python venv module is available"
+    return
+  fi
+
+  info "Python venv module is missing, installing..."
+  case "$PM" in
+    apt)
+      ensure_sudo_access
+      $SUDO apt-get update -y
+      if $SUDO apt-get install -y python3-venv; then
+        :
+      else
+        local versioned_venv_pkg
+        versioned_venv_pkg="$(python3 -c 'import sys; print(f"python{sys.version_info.major}.{sys.version_info.minor}-venv")' 2>/dev/null || true)"
+        [[ -n "$versioned_venv_pkg" ]] || die "Failed to detect version-specific python venv package"
+        warn "python3-venv package unavailable, trying ${versioned_venv_pkg}..."
+        $SUDO apt-get install -y "$versioned_venv_pkg"
+      fi
+      ;;
+    dnf|yum)
+      install_packages "$PM" python3
+      ;;
+    pacman)
+      install_packages "$PM" python
+      ;;
+    zypper)
+      install_packages "$PM" python3
+      ;;
+    apk)
+      install_packages "$PM" python3
+      ;;
+    *)
+      die "Cannot install Python venv support automatically for package manager: $PM"
+      ;;
+  esac
+
+  python3 -c "import venv" >/dev/null 2>&1 || die "Python venv installation failed: python3 -c 'import venv' still fails"
+  info "Python venv module installed"
 }
 
 # Install Docker engine/CLI if missing.

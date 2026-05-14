@@ -209,6 +209,11 @@ if [[ "${NGINX_HTTP_PORT}" == "${WEBUI_PORT}" ]]; then
 fi
 
 # ── Step 3: venv + dependencies ───────────────────────────────────────────────
+if [[ -d "$VENV_DIR" ]] && [[ ! -x "$VENV_DIR/bin/python" || ! -x "$VENV_DIR/bin/pip" ]]; then
+  warn "Existing venv is incomplete (missing bin/python or bin/pip); recreating it..."
+  rm -rf "$VENV_DIR"
+fi
+
 if [[ ! -d "$VENV_DIR" ]]; then
   info "Creating Python virtual environment…"
   python3 -m venv "$VENV_DIR"
@@ -216,8 +221,8 @@ if [[ ! -d "$VENV_DIR" ]]; then
 fi
 
 info "Installing / upgrading Python dependencies…"
-"$VENV_DIR/bin/pip" install --quiet --upgrade pip
-"$VENV_DIR/bin/pip" install --quiet -r "$SCRIPT_DIR/requirements.txt"
+"$VENV_DIR/bin/python" -m pip install --quiet --upgrade pip
+"$VENV_DIR/bin/python" -m pip install --quiet -r "$SCRIPT_DIR/requirements.txt"
 info "Python dependencies OK"
 
 # ── Step 4: Docker images / containers ────────────────────────────────────────
