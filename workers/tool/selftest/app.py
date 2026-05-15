@@ -227,10 +227,14 @@ class SelftestWorker(BaseToolWorker):
             }
 
         result = await external_worker.execute(
-            Task(
-                type="tool",
-                worker_id="external_mcp",
-                payload={"tool": target_name, "arguments": target_args},
+            self.bind_child_task(
+                Task(
+                    type="tool",
+                    worker_id="external_mcp",
+                    payload={"tool": target_name, "arguments": target_args},
+                ),
+                parent_task=task,
+                parent_context={"tool": target_name, "origin": "selftest"},
             )
         )
 

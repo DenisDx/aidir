@@ -11,6 +11,7 @@ import signal
 import sys
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 # Ensure project root is importable before internal imports when launched as
@@ -30,6 +31,7 @@ from core.queue_manager import QueueManager
 from core.resources import Resources
 from core.scheduler import Scheduler
 from core.task import STATUS_CREATED, STATUS_QUEUED, STATUS_RUNNING
+from core.task import STATUS_CANCELED, STATUS_COMPLETED, STATUS_FAILED
 from core.workers_loader import load_workers, resolve_worker_configs
 from core.endpoints.endpoint_ollama import Endpoint_ollama
 from core.endpoints.endpoint_openaix import Endpoint_openaix
@@ -118,7 +120,7 @@ class Core:
 
         # ── Queue ──────────────────────────────────────────────────────────
         instance = self.config.get("instance", "aidir")
-        self.queue = QueueManager(self.redis, instance)
+        self.queue = QueueManager(self.redis, instance, status_change_callback=self._on_task_status_change)
 
         # ── Envid registry ─────────────────────────────────────────────────
         self.envid_registry = EnvidRegistry(self.redis, instance)
@@ -132,6 +134,7 @@ class Core:
         self.resources.set_redis(self.redis, instance)
         # Initialize each worker with its config section
         for wid, w in self.workers.items():
+            setattr(w, "_core", self)
             await w.initialize({**workers_cfg.get(wid, {}), "_core": self})
 
         external_mcp = self.workers.get("external_mcp")
@@ -215,6 +218,22 @@ class Core:
                 message="Service restart in progress; new tasks are temporarily disabled",
                 code="RESTART_IN_PROGRESS",
             )
+
+        max_depth = self.task_parent_chain_max_depth()
+        depth = self._task_parent_chain_depth(task)
+        if depth > max_depth:
+            error = {
+                "code": "TASK_PARENT_CHAIN_TOO_DEEP",
+                "message": f"Task parent chain depth {depth} exceeds limit {max_depth}",
+            }
+            task.status = STATUS_FAILED
+            task.error = error
+            task.finished_at = datetime.now(timezone.utc)
+            if self.queue:
+                await self.queue.mark_failed(task, error)
+                await self.queue.delete_task(task.id)
+            raise ServiceBusyError(message=error["message"], code=error["code"])
+
         await self.queue.add_task(task)
         self.scheduler.notify_new_task()
         log("system", "info", f"Task {task.id} queued (type={task.type})")
@@ -347,6 +366,46 @@ class Core:
         TODO: recursively delete child tasks.
         """
         await self.queue.delete_task(task_id)
+
+    def task_parent_chain_max_depth(self) -> int:
+        """Return the maximum allowed parent callback chain depth."""
+        tasks_cfg = self.config.get("tasks") or {}
+        return max(1, int(tasks_cfg.get("task_parent_chain_max_depth", 100) or 100))
+
+    def _task_parent_chain_depth(self, task) -> int:
+        """Count nested parent_context.history links for a task."""
+        depth = 0
+        history = task.parent_context if isinstance(getattr(task, "parent_context", None), dict) else {}
+        parent_worker = getattr(task, "parent_worker", None)
+
+        while parent_worker:
+            depth += 1
+            if depth > 1000:
+                break
+            if not isinstance(history, dict):
+                break
+            history = history.get("history")
+            if not isinstance(history, dict):
+                break
+            parent_worker = history.get("parent_worker")
+
+        return depth
+
+    async def _on_task_status_change(self, task) -> None:
+        """Notify the top-level parent worker about any task status transition."""
+        parent_worker_id = getattr(task, "parent_worker", None)
+        if not parent_worker_id:
+            return
+
+        worker = self.workers.get(parent_worker_id)
+        if worker is None:
+            log("system", "critical", f"parent_worker {parent_worker_id} not found for task {task.id}")
+            return
+
+        try:
+            await worker.on_child_task(task)
+        except Exception as exc:
+            log("system", "error", f"parent_worker callback failed for task {task.id}: {exc}")
 
     async def run_loop_workers_cycle(self, start_index: int = 0) -> int:
         """Run loop() for all loop workers in rotated order and return next start index."""

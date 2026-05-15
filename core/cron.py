@@ -165,11 +165,16 @@ async def cleanup_stale_tasks(redis: aioredis.Redis) -> None:
 
 async def cleanup_expired_tasks(redis: aioredis.Redis) -> None:
     """Delete completed external tasks older than config.external_task_live seconds."""
-    interval = 86400  # run once per day
+    interval = int(config.get("cron_period") or 60)
+    interval = max(10, interval)
     if not await _should_run(redis, "cleanup_expired_tasks", interval):
         return
 
-    max_age = int(config.get("external_task_live") or 0)
+    max_age = int(
+        config.get("tasks.external_task_live")
+        or config.get("external_task_live")
+        or 2500000
+    )
     if max_age <= 0:
         return
 
@@ -192,7 +197,10 @@ async def cleanup_expired_tasks(redis: aioredis.Redis) -> None:
                 if not finished_at:
                     continue
                 from datetime import datetime, timezone
-                ft = datetime.fromisoformat(finished_at).timestamp()
+                ft_dt = datetime.fromisoformat(finished_at.replace("Z", "+00:00"))
+                if ft_dt.tzinfo is None:
+                    ft_dt = ft_dt.replace(tzinfo=timezone.utc)
+                ft = ft_dt.timestamp()
                 if ft < cutoff:
                     await redis.delete(key)
                     deleted += 1

@@ -365,7 +365,8 @@
   "tasks": {
     "restart_wait_timeout": ${TASK_RESTART_WAIT_TIMEOUT_SECONDS:-120},
     "queue_timeout": ${TASK_QUEUE_TIMEOUT_SECONDS:-300},
-    "run_timeout": ${TASK_RUN_TIMEOUT_SECONDS:-300}
+    "run_timeout": ${TASK_RUN_TIMEOUT_SECONDS:-300},
+    "external_task_live": ${EXTERNAL_TASK_LIVE_SECONDS:-2500000}
   },
   "envids": {
     "check_period_minutes": ${ENVIDS_CHECK_PERIOD_MINUTES:-600},

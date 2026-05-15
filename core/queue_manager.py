@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Awaitable, Callable, Optional
 
 import redis.asyncio as aioredis
 
@@ -27,10 +27,16 @@ class QueueManager:
     In-memory registry holds live Task objects for event signaling.
     """
 
-    def __init__(self, redis_client: aioredis.Redis, instance: str = "aidir") -> None:
+    def __init__(
+        self,
+        redis_client: aioredis.Redis,
+        instance: str = "aidir",
+        status_change_callback: Callable[[Task], Awaitable[None]] | None = None,
+    ) -> None:
         self._redis = redis_client
         self._ns = instance                        # key namespace
         self._tasks: dict[str, Task] = {}          # task_id -> Task
+        self._status_change_callback = status_change_callback
 
     # ── Key helpers ──────────────────────────────────────────────────────────
 
@@ -45,11 +51,13 @@ class QueueManager:
     async def add_task(self, task: Task) -> None:
         """Enqueue task atomically: ZADD to queue + HSET state. status→queued."""
         task.status = STATUS_QUEUED
+        task.updated_at = datetime.now(timezone.utc)
         pipe = self._redis.pipeline(transaction=True)
         pipe.zadd(self._q(task.type), {task.id: task.priority})
         pipe.hset(self._tk(task.id), mapping=task.to_redis_hash())
         await pipe.execute()
         self._tasks[task.id] = task
+        await self._notify_status_change(task)
 
     async def pop_next(self, task_type: str) -> Optional[str]:
         """Pop the highest-priority (lowest score) task id from the queue."""
@@ -65,49 +73,65 @@ class QueueManager:
         task = self._tasks.get(task_id)
         if task:
             task.status = STATUS_RUNNING
+            task.updated_at = now
             task.started_at = now
             task.worker_id = worker_id
         await self._redis.hset(self._tk(task_id), mapping={
             "status":     STATUS_RUNNING,
+            "updated_at": now.isoformat(),
             "started_at": now.isoformat(),
             "worker_id":  worker_id,
         })
+        if task:
+            await self._notify_status_change(task)
 
     async def mark_completed(self, task: Task) -> None:
         """Finalize task as completed; signal endpoint and push stream sentinel."""
+        now = datetime.now(timezone.utc)
         task.status = STATUS_COMPLETED
-        task.finished_at = datetime.now(timezone.utc)
+        task.updated_at = now
+        task.finished_at = now
         await self._redis.hset(self._tk(task.id), mapping={
             "status":      STATUS_COMPLETED,
+            "updated_at":  now.isoformat(),
             "finished_at": task.finished_at.isoformat(),
             "result":      json.dumps(task.result) if task.result is not None else "",
         })
         await task._chunk_queue.put(None)   # stream sentinel
         task._done_event.set()
+        await self._notify_status_change(task)
 
     async def mark_failed(self, task: Task, error: dict) -> None:
         """Finalize task as failed; signal endpoint."""
+        now = datetime.now(timezone.utc)
         task.status = STATUS_FAILED
-        task.finished_at = datetime.now(timezone.utc)
+        task.updated_at = now
+        task.finished_at = now
         task.error = error
         await self._redis.hset(self._tk(task.id), mapping={
             "status":      STATUS_FAILED,
+            "updated_at":  now.isoformat(),
             "finished_at": task.finished_at.isoformat(),
             "error":       json.dumps(error),
         })
         await task._chunk_queue.put(None)   # stream sentinel
         task._done_event.set()
+        await self._notify_status_change(task)
 
     async def mark_canceled(self, task: Task) -> None:
         """Finalize task as canceled; signal endpoint."""
+        now = datetime.now(timezone.utc)
         task.status = STATUS_CANCELED
-        task.finished_at = datetime.now(timezone.utc)
+        task.updated_at = now
+        task.finished_at = now
         await self._redis.hset(self._tk(task.id), mapping={
             "status":      STATUS_CANCELED,
+            "updated_at":  now.isoformat(),
             "finished_at": task.finished_at.isoformat(),
         })
         await task._chunk_queue.put(None)   # stream sentinel
         task._done_event.set()
+        await self._notify_status_change(task)
 
     async def delete_task(self, task_id: str) -> None:
         """Remove task from memory and ZSET queue.
@@ -129,3 +153,13 @@ class QueueManager:
 
     def list_tasks(self) -> list[Task]:
         return list(self._tasks.values())
+
+    async def _notify_status_change(self, task: Task) -> None:
+        """Notify the configured callback after a task status transition."""
+        if self._status_change_callback is None:
+            return
+        try:
+            await self._status_change_callback(task)
+        except Exception:
+            # Status updates must stay best-effort; callback failures are logged upstream.
+            return

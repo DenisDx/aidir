@@ -387,6 +387,11 @@ class OpenAIxWorker(BaseWorker):
             return WorkerResult(ok=False, error={"code": "TOOL_NOT_FOUND", "message": f"Unknown internal tool: {tool_name}"})
 
         task = Task_tool(payload={"tool": tool_name, "arguments": call.get("arguments") or {}})
+        self.bind_child_task(
+            task,
+            parent_task=parent_task,
+            parent_context={"tool": tool_name},
+        )
         task.worker_id = meta["worker"]
         task.queue_timeout = int(parent_task.queue_timeout or 300)
         task.run_timeout = int(parent_task.run_timeout or 300)

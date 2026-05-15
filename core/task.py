@@ -49,6 +49,9 @@ class Task:
 
     # ── Lifecycle ─────────────────────────────────────────────────────────
     status: str = STATUS_CREATED
+    updated_at: datetime = field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
     started_at: datetime | None = None
     finished_at: datetime | None = None
     result: Any = None
@@ -76,6 +79,12 @@ class Task:
     # External tasks are preserved in Redis after completion and cleaned by cron.
     external: bool = False
 
+    # ── Parent callback chain ─────────────────────────────────────────────
+    # Worker id to notify when this task changes status.
+    parent_worker: str | None = None
+    # JSON-serializable payload passed through the callback chain unchanged.
+    parent_context: dict[str, Any] = field(default_factory=dict)
+
     # ── Context and config ────────────────────────────────────────────────
     # Runtime context for this task (merged from envid context + overrides)
     context: Optional[Context] = None
@@ -102,6 +111,7 @@ class Task:
             "id":          self.id,
             "type":        self.type,
             "status":      self.status,
+            "updated_at":  self.updated_at.isoformat(),
             "priority":    str(self.priority),
             "worker_id":   self.worker_id or "",
             "created_at":  self.created_at.isoformat(),
@@ -111,6 +121,8 @@ class Task:
             "result":      json.dumps(self.result) if self.result is not None else "",
             "error":       json.dumps(self.error) if self.error else "",
             "external":    "1" if self.external else "0",
+            "parent_worker": self.parent_worker or "",
+            "parent_context": json.dumps(self.parent_context) if self.parent_context else "",
             "retry_count": str(self.retry_count),
             "retry_period": str(self.retry_period),
             "retry_attempt": str(self.retry_attempt),

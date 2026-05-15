@@ -16,7 +16,7 @@ import json
 import secrets
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from fastapi import (
     Cookie, Depends, FastAPI, HTTPException, Request,
@@ -40,6 +40,118 @@ _SESSION_PREFIX = "aidir:session:"
 def _constant_eq(a: str, b: str) -> bool:
     """Constant-time string comparison (prevents timing attacks)."""
     return hmac.compare_digest(a.encode(), b.encode())
+
+
+def _parse_dt(value: str | None) -> datetime | None:
+    """Parse ISO8601 datetime string into timezone-aware datetime when possible."""
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
+def _parse_json_field(value: str | None) -> Any:
+    """Parse JSON field from Redis task hash and fall back to raw string."""
+    if value in (None, ""):
+        return None
+    try:
+        return json.loads(value)
+    except Exception:
+        return value
+
+
+def _find_envid(value: Any, depth: int = 0) -> str:
+    """Find first non-empty envid in nested JSON-like dict/list structures."""
+    if depth > 5:
+        return ""
+    if isinstance(value, dict):
+        envid = value.get("envid")
+        if envid:
+            return str(envid)
+        for nested in value.values():
+            found = _find_envid(nested, depth + 1)
+            if found:
+                return found
+    elif isinstance(value, list):
+        for nested in value:
+            found = _find_envid(nested, depth + 1)
+            if found:
+                return found
+    return ""
+
+
+def _task_envid(task: dict[str, Any]) -> str:
+    """Extract envid from task payload/context, including nested structures."""
+    for source_name in ("context", "payload", "parent_context"):
+        source = task.get(source_name)
+        found = _find_envid(source)
+        if found:
+            return found
+    return ""
+
+
+def _task_last_operation_at(task: dict[str, Any]) -> datetime | None:
+    """Return the latest status transition timestamp for a task."""
+    for key in ("updated_at", "finished_at", "started_at", "created_at"):
+        dt = _parse_dt(task.get(key))
+        if dt is not None:
+            return dt
+    return None
+
+
+def _task_to_view_item(task: dict[str, Any]) -> dict[str, Any]:
+    """Project a raw task record to a compact viewer row and keep full JSON-ready data."""
+    created_at = _parse_dt(task.get("created_at"))
+    updated_at = _parse_dt(task.get("updated_at"))
+    started_at = _parse_dt(task.get("started_at"))
+    finished_at = _parse_dt(task.get("finished_at"))
+    last_op = _task_last_operation_at(task)
+
+    return {
+        "id": task.get("id", ""),
+        "type": task.get("type", ""),
+        "status": task.get("status", ""),
+        "worker_id": task.get("worker_id") or "",
+        "envid": _task_envid(task),
+        "priority": task.get("priority"),
+        "created_at": created_at.isoformat() if created_at else None,
+        "updated_at": updated_at.isoformat() if updated_at else None,
+        "started_at": started_at.isoformat() if started_at else None,
+        "finished_at": finished_at.isoformat() if finished_at else None,
+        "last_operation_at": last_op.isoformat() if last_op else None,
+        "parent_worker": task.get("parent_worker") or "",
+        "task": task,
+    }
+
+
+def _task_from_hash(task_hash: dict[str, str]) -> dict[str, Any]:
+    """Decode Redis task hash into JSON-friendly dict for API responses."""
+    task: dict[str, Any] = dict(task_hash)
+    task["priority"] = int(task.get("priority") or 0)
+    task["external"] = str(task.get("external") or "0") in {"1", "true", "True"}
+    for key in ("payload", "result", "error", "parent_context", "config", "context", "resource_requirements"):
+        task[key] = _parse_json_field(task.get(key))
+    return task
+
+
+def _normalize_filter_values(values: list[str] | str | None) -> list[str]:
+    """Normalize comma-separated or repeated query values into a flat string list."""
+    if values is None:
+        return []
+    if isinstance(values, str):
+        values = [values]
+    out: list[str] = []
+    for value in values:
+        for part in str(value).split(","):
+            part = part.strip()
+            if part:
+                out.append(part)
+    return out
 
 
 def _find_user(core: "Core", login: str, password: str) -> dict | None:
@@ -191,6 +303,89 @@ def create_app(
                 for t in tasks
             ]
         }
+
+    @app.get("/api/tasks/viewer/meta")
+    async def task_viewer_meta(session: dict = Depends(_require_session)):
+        """Return available task viewer filter values."""
+        workers = [
+            {"id": wid, "task_type": w.task_type, "enabled": bool(w.enabled)}
+            for wid, w in core.workers.items()
+        ]
+        envids: list[str] = []
+        if core.envid_registry is not None:
+            envids = sorted(e.id for e in core.envid_registry.all())
+        return {
+            "status_options": ["created", "queued", "running", "completed", "failed", "canceled"],
+            "workers": workers,
+            "envids": envids,
+        }
+
+    @app.get("/api/tasks/viewer/search")
+    async def task_viewer_search(request: Request, session: dict = Depends(_require_session)):
+        """Search tasks across Redis with status/time/envid/worker filters."""
+        query = request.query_params
+        statuses = {
+            value.lower()
+            for value in _normalize_filter_values(query.getlist("status") or query.get("status"))
+        }
+        workers = set(_normalize_filter_values(query.getlist("worker") or query.get("worker")))
+        envid = (query.get("envid") or "").strip()
+        created_from = _parse_dt(query.get("created_from"))
+        created_to = _parse_dt(query.get("created_to"))
+        op_from = _parse_dt(query.get("last_operation_from"))
+        op_to = _parse_dt(query.get("last_operation_to"))
+        limit = int(query.get("limit") or 300)
+        limit = max(1, min(limit, 1000))
+
+        ns = core.config.get("instance", "aidir")
+        items: list[dict[str, Any]] = []
+
+        async for key in core.redis.scan_iter(match=f"{ns}:task:*", count=200):
+            raw = await core.redis.hgetall(key)
+            if not raw:
+                continue
+
+            task = _task_from_hash(raw)
+            task_envid = _task_envid(task)
+            if envid and task_envid != envid:
+                continue
+            if statuses and str(task.get("status") or "").lower() not in statuses:
+                continue
+            if workers and str(task.get("worker_id") or "") not in workers:
+                continue
+
+            created_at = _parse_dt(task.get("created_at"))
+            last_op = _task_last_operation_at(task)
+
+            if created_from and created_at and created_at < created_from:
+                continue
+            if created_to and created_at and created_at > created_to:
+                continue
+            if op_from and last_op and last_op < op_from:
+                continue
+            if op_to and last_op and last_op > op_to:
+                continue
+
+            items.append(_task_to_view_item(task))
+
+        items.sort(key=lambda item: item.get("last_operation_at") or item.get("created_at") or "", reverse=True)
+        return {
+            "tasks": items[:limit],
+            "count": len(items),
+        }
+
+    @app.get("/api/tasks/viewer/{task_id}")
+    async def task_viewer_item(task_id: str, session: dict = Depends(_require_session)):
+        """Return full JSON for one task, from live memory or Redis."""
+        live_task = core.queue.get_task(task_id) if core.queue else None
+        if live_task is not None:
+            return {"task": _task_from_hash(live_task.to_redis_hash())}
+
+        ns = core.config.get("instance", "aidir")
+        raw = await core.redis.hgetall(f"{ns}:task:{task_id}")
+        if not raw:
+            raise HTTPException(status_code=404, detail="Task not found")
+        return {"task": _task_from_hash(raw)}
 
     # ── Status ────────────────────────────────────────────────────────────────
 

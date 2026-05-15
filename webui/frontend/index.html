@@ -155,6 +155,128 @@
   .badge-canceled { background: #3a3a3a; color: var(--muted); }
   .badge-created  { background: #3a3a2a; color: var(--warn); }
 
+  /* ── Task viewer ── */
+  .task-viewer-filters {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+  .task-viewer-group {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .task-viewer-group-title {
+    font-size: 12px;
+    letter-spacing: .04em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+  .task-checklist {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px 14px;
+  }
+  .task-checklist label {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px;
+    color: var(--text);
+  }
+  .task-date-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
+  }
+  @media (max-width: 760px) {
+    .task-date-grid { grid-template-columns: 1fr; }
+  }
+  .task-date-grid input,
+  .task-viewer-group input[type=text],
+  .task-viewer-group select {
+    width: 100%;
+    padding: 6px 10px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    font-size: 13px;
+  }
+  .task-viewer-toolbar {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+  .task-viewer-summary {
+    font-size: 13px;
+    color: var(--muted);
+  }
+  .task-viewer-actions {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    justify-content: flex-end;
+  }
+  .task-json-modal {
+    position: fixed;
+    inset: 0;
+    z-index: 400;
+    display: none;
+  }
+  .task-json-modal.is-open { display: block; }
+  .task-json-modal-backdrop {
+    position: absolute;
+    inset: 0;
+    background: rgba(5, 7, 11, 0.76);
+    backdrop-filter: blur(3px);
+  }
+  .task-json-modal-panel {
+    position: relative;
+    z-index: 1;
+    width: min(980px, calc(100vw - 32px));
+    max-height: calc(100vh - 32px);
+    margin: 16px auto;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    box-shadow: 0 24px 64px rgba(0, 0, 0, 0.5);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .task-json-modal-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 16px 18px 12px;
+    border-bottom: 1px solid var(--border);
+  }
+  .task-json-modal-title {
+    font-size: 16px;
+    font-weight: 700;
+  }
+  .task-json-modal-subtitle {
+    margin-top: 4px;
+    color: var(--muted);
+    font-size: 12px;
+  }
+  .task-json-modal-body {
+    margin: 0;
+    padding: 16px 18px 18px;
+    overflow: auto;
+    max-height: calc(100vh - 120px);
+    background: #0a0c12;
+    font-family: monospace;
+    font-size: 12px;
+    line-height: 1.6;
+    white-space: pre-wrap;
+    word-break: break-word;
+    color: var(--text);
+  }
+
   /* ── Log viewer ── */
   .log-controls {
     display: flex; gap: 10px; align-items: center; margin-bottom: 10px; flex-wrap: wrap;
@@ -432,6 +554,7 @@
   <nav>
     <span class="brand">AI Director</span>
     <button id="nav-dashboard" class="active" onclick="showPage('dashboard')">Dashboard</button>
+    <button id="nav-task-viewer" onclick="showPage('task-viewer')">Task Viewer</button>
     <button id="nav-llm" onclick="showPage('llm')">Test LLM</button>
     <button id="nav-mcp" onclick="showPage('mcp')">Test MCP</button>
     <button id="nav-agent" onclick="showPage('agent')">Agent Request</button>
@@ -519,6 +642,75 @@
         </label>
       </div>
       <div id="log-box"></div>
+    </div>
+  </div>
+
+  <!-- Task Viewer -->
+  <div id="page-task-viewer" class="page">
+    <div class="card">
+      <div class="card-title">Filters</div>
+      <div class="task-viewer-filters">
+        <div class="task-viewer-group">
+          <div class="task-viewer-group-title">Status</div>
+          <div id="task-viewer-status-list" class="task-checklist"></div>
+        </div>
+        <div class="task-viewer-group">
+          <div class="task-viewer-group-title">Created at</div>
+          <div class="task-date-grid">
+            <input id="task-viewer-created-from" type="datetime-local" placeholder="From">
+            <input id="task-viewer-created-to" type="datetime-local" placeholder="To">
+          </div>
+        </div>
+        <div class="task-viewer-group">
+          <div class="task-viewer-group-title">Last operation</div>
+          <div class="task-date-grid">
+            <input id="task-viewer-op-from" type="datetime-local" placeholder="From">
+            <input id="task-viewer-op-to" type="datetime-local" placeholder="To">
+          </div>
+        </div>
+        <div class="task-viewer-group">
+          <div class="task-viewer-group-title">Environment</div>
+          <input id="task-viewer-envid" type="text" placeholder="Optional envid filter" list="task-viewer-envid-list">
+          <datalist id="task-viewer-envid-list"></datalist>
+        </div>
+        <div class="task-viewer-group">
+          <div class="task-viewer-group-title">Worker type</div>
+          <select id="task-viewer-worker-type">
+            <option value="all">all</option>
+            <option value="agent">agent</option>
+            <option value="tool">tool</option>
+            <option value="context">context</option>
+          </select>
+        </div>
+        <div class="task-viewer-group">
+          <div class="task-viewer-group-title">Worker</div>
+          <div id="task-viewer-worker-list" class="task-checklist"></div>
+        </div>
+        <div class="task-viewer-toolbar">
+          <button class="btn-primary" id="task-viewer-show-btn">Show</button>
+          <button class="btn-sm" id="task-viewer-clear-btn">Clear filters</button>
+          <div id="task-viewer-summary" class="task-viewer-summary">Choose filters and press Show.</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Tasks</div>
+      <table id="task-viewer-table">
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Status</th>
+            <th>Worker</th>
+            <th>Envid</th>
+            <th>Type</th>
+            <th>Created</th>
+            <th>Last op</th>
+            <th>JSON</th>
+          </tr>
+        </thead>
+        <tbody id="task-viewer-body"></tbody>
+      </table>
     </div>
   </div>
 
@@ -861,6 +1053,20 @@
       <pre id="config-pre"
         style="background:#0a0c12;padding:12px;border-radius:6px;overflow:auto;max-height:600px;font-size:12px;"></pre>
     </div>
+  </div>
+</div>
+
+<div id="task-json-modal" class="task-json-modal" aria-hidden="true">
+  <div class="task-json-modal-backdrop" id="task-json-modal-backdrop"></div>
+  <div class="task-json-modal-panel" role="dialog" aria-modal="true" aria-labelledby="task-json-modal-title">
+    <div class="task-json-modal-header">
+      <div>
+        <div id="task-json-modal-title" class="task-json-modal-title">Task JSON</div>
+        <div id="task-json-modal-subtitle" class="task-json-modal-subtitle"></div>
+      </div>
+      <button class="btn-sm" id="task-json-modal-close">Close</button>
+    </div>
+    <pre id="task-json-modal-body" class="task-json-modal-body"></pre>
   </div>
 </div>
 

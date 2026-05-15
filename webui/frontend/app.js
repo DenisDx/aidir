@@ -16,6 +16,14 @@ let runtimeState = {
 const SERVER_UNAVAILABLE_STATUSES = new Set([502, 503, 504]);
 let loginServerUnavailable = false;
 
+const TASK_VIEWER_STATUSES = ['created', 'queued', 'running', 'completed', 'failed', 'canceled'];
+
+let taskViewerMetaLoaded = false;
+let taskViewerMetaLoading = null;
+let taskViewerRows = [];
+let taskViewerWorkersMeta = [];
+let taskViewerUiBound = false;
+
 const TEXT_PICKERS = [
   {
     id: 'cfg-logging-level',
@@ -129,6 +137,7 @@ function showPage(name) {
   $(`nav-${name}`).classList.add('active');
 
   if (name === 'settings') loadConfig();
+  if (name === 'task-viewer') ensureTaskViewerMeta();
   if (name === 'llm')      loadWorkersModels();
   if (name === 'mcp')      loadMcpEndpoints();
   if (name === 'agent')    loadAgentEndpoints();
@@ -217,6 +226,7 @@ function onLoggedIn() {
   showScreen('app');
   showPage('dashboard');
   loadTasks();
+  ensureTaskViewerMeta();
   startLiveLogs();
   initTestPages();
   loadAgentCatalog();
@@ -366,6 +376,221 @@ function fmtTime(iso) {
   return d.toLocaleTimeString();
 }
 
+function fmtDateTime(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  return d.toLocaleString();
+}
+
+function normalizeTaskViewerDate(value) {
+  if (!value) return '';
+  const dt = new Date(value);
+  return Number.isNaN(dt.getTime()) ? '' : dt.toISOString();
+}
+
+function getCheckedValues(containerId) {
+  return Array.from(document.querySelectorAll(`#${containerId} input[type=checkbox]:checked`)).map(input => input.value);
+}
+
+function setAllTaskViewerChecks(containerId, checked) {
+  document.querySelectorAll(`#${containerId} input[type=checkbox]`).forEach(input => {
+    input.checked = checked;
+  });
+}
+
+function renderTaskViewerChecklist(containerId, values, groupName) {
+  const box = $(containerId);
+  if (!box) return;
+
+  box.innerHTML = values.map(value => {
+    const label = typeof value === 'string' ? value : value.label;
+    const itemValue = typeof value === 'string' ? value : value.value;
+    const extra = typeof value === 'string' ? '' : (value.extra || '');
+    return `
+      <label>
+        <input type="checkbox" name="${groupName}" value="${escapeHtml(itemValue)}" checked>
+        <span>${escapeHtml(label)}${extra ? ` <span style="color:var(--muted)">${escapeHtml(extra)}</span>` : ''}</span>
+      </label>
+    `;
+  }).join('');
+}
+
+function renderTaskViewerMeta(meta) {
+  const statuses = Array.isArray(meta?.status_options) && meta.status_options.length ? meta.status_options : TASK_VIEWER_STATUSES;
+  const workers = Array.isArray(meta?.workers) ? meta.workers : [];
+  const envids = Array.isArray(meta?.envids) ? meta.envids : [];
+
+  taskViewerWorkersMeta = workers.map(worker => ({
+    id: String(worker.id || ''),
+    task_type: String(worker.task_type || ''),
+    enabled: !!worker.enabled,
+  }));
+
+  renderTaskViewerChecklist('task-viewer-status-list', statuses, 'task-viewer-status');
+
+  const workerItems = taskViewerWorkersMeta.map(worker => ({
+    label: worker.id,
+    value: worker.id,
+    extra: worker.enabled ? '' : '[disabled]',
+  }));
+  renderTaskViewerChecklist('task-viewer-worker-list', workerItems, 'task-viewer-worker');
+
+  applyTaskViewerWorkerTypeFilter();
+
+  const envidList = $('task-viewer-envid-list');
+  if (envidList) {
+    envidList.innerHTML = envids
+      .map(envid => `<option value="${escapeHtml(String(envid))}"></option>`)
+      .join('');
+  }
+}
+
+async function ensureTaskViewerMeta() {
+  if (taskViewerMetaLoaded) return true;
+  if (taskViewerMetaLoading) return taskViewerMetaLoading;
+
+  taskViewerMetaLoading = (async () => {
+    const data = await apiGet('/api/tasks/viewer/meta');
+    if (!data) return false;
+    renderTaskViewerMeta(data);
+    taskViewerMetaLoaded = true;
+    return true;
+  })();
+
+  try {
+    return await taskViewerMetaLoading;
+  } finally {
+    taskViewerMetaLoading = null;
+  }
+}
+
+function applyTaskViewerWorkerTypeFilter() {
+  const typeSelect = $('task-viewer-worker-type');
+  if (!typeSelect) return;
+
+  const selectedType = (typeSelect.value || 'all').trim();
+  const wantedType = selectedType === 'all' ? '' : selectedType;
+  const allowedTypes = wantedType === 'context' ? new Set(['context', 'context_builder']) : new Set([wantedType]);
+
+  document.querySelectorAll('#task-viewer-worker-list input[type=checkbox]').forEach(input => {
+    const workerId = input.value;
+    const meta = taskViewerWorkersMeta.find(worker => worker.id === workerId);
+    if (!meta) {
+      input.checked = selectedType === 'all';
+      return;
+    }
+    if (selectedType === 'all') {
+      input.checked = true;
+      return;
+    }
+    input.checked = allowedTypes.has(meta.task_type);
+  });
+}
+
+function buildTaskViewerQuery() {
+  const params = new URLSearchParams();
+
+  getCheckedValues('task-viewer-status-list').forEach(value => params.append('status', value));
+  getCheckedValues('task-viewer-worker-list').forEach(value => params.append('worker', value));
+
+  const envid = $('task-viewer-envid').value.trim();
+  if (envid) params.set('envid', envid);
+
+  const createdFrom = normalizeTaskViewerDate($('task-viewer-created-from').value);
+  const createdTo = normalizeTaskViewerDate($('task-viewer-created-to').value);
+  const opFrom = normalizeTaskViewerDate($('task-viewer-op-from').value);
+  const opTo = normalizeTaskViewerDate($('task-viewer-op-to').value);
+
+  if (createdFrom) params.set('created_from', createdFrom);
+  if (createdTo) params.set('created_to', createdTo);
+  if (opFrom) params.set('last_operation_from', opFrom);
+  if (opTo) params.set('last_operation_to', opTo);
+
+  params.set('limit', '300');
+  return params;
+}
+
+function renderTaskViewerRows(tasks) {
+  const body = $('task-viewer-body');
+  if (!body) return;
+
+  body.innerHTML = '';
+  if (!tasks.length) {
+    const tr = document.createElement('tr');
+    tr.innerHTML = '<td colspan="8" style="color:var(--muted)">No tasks match the current filters.</td>';
+    body.appendChild(tr);
+    return;
+  }
+
+  tasks.forEach(task => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td style="font-family:monospace;font-size:11px">${escapeHtml((task.id || '').slice(0, 8))}…</td>
+      <td><span class="badge badge-${escapeHtml(task.status || 'created')}">${escapeHtml(task.status || 'created')}</span></td>
+      <td>${escapeHtml(task.worker_id || '—')}</td>
+      <td>${escapeHtml(task.envid || '—')}</td>
+      <td>${escapeHtml(task.type || '—')}</td>
+      <td style="color:var(--muted);font-size:12px">${escapeHtml(fmtDateTime(task.created_at))}</td>
+      <td style="color:var(--muted);font-size:12px">${escapeHtml(fmtDateTime(task.last_operation_at))}</td>
+      <td><button class="btn-sm" data-task-id="${escapeHtml(task.id || '')}">Show JSON</button></td>
+    `;
+    tr.querySelector('button').addEventListener('click', () => openTaskViewerJson(task.id));
+    body.appendChild(tr);
+  });
+}
+
+async function loadTaskViewerTasks() {
+  if (!await ensureTaskViewerMeta()) return;
+
+  const params = buildTaskViewerQuery();
+  $('task-viewer-summary').textContent = 'Loading tasks…';
+
+  const data = await apiGet(`/api/tasks/viewer/search?${params.toString()}`);
+  if (!data) return;
+
+  taskViewerRows = Array.isArray(data.tasks) ? data.tasks : [];
+  renderTaskViewerRows(taskViewerRows);
+  $('task-viewer-summary').textContent = `Showing ${taskViewerRows.length} of ${data.count ?? taskViewerRows.length} task(s).`;
+}
+
+function resetTaskViewerFilters() {
+  $('task-viewer-created-from').value = '';
+  $('task-viewer-created-to').value = '';
+  $('task-viewer-op-from').value = '';
+  $('task-viewer-op-to').value = '';
+  $('task-viewer-envid').value = '';
+  $('task-viewer-worker-type').value = 'all';
+  setAllTaskViewerChecks('task-viewer-status-list', true);
+  setAllTaskViewerChecks('task-viewer-worker-list', true);
+  $('task-viewer-summary').textContent = 'Filters cleared.';
+}
+
+function openTaskViewerModal(task) {
+  const modal = $('task-json-modal');
+  $('task-json-modal-title').textContent = `Task ${task.id || ''}`;
+  $('task-json-modal-subtitle').textContent = `${task.status || 'created'} · ${task.worker_id || 'no worker'}${task.envid ? ` · envid ${task.envid}` : ''}`;
+  $('task-json-modal-body').textContent = JSON.stringify(task, null, 2);
+  modal.classList.add('is-open');
+  modal.setAttribute('aria-hidden', 'false');
+}
+
+function closeTaskViewerModal() {
+  const modal = $('task-json-modal');
+  if (!modal) return;
+  modal.classList.remove('is-open');
+  modal.setAttribute('aria-hidden', 'true');
+}
+
+async function openTaskViewerJson(taskId) {
+  if (!taskId) return;
+  const data = await apiGet(`/api/tasks/viewer/${encodeURIComponent(taskId)}`);
+  if (!data || !data.task) {
+    window.alert('Task not found');
+    return;
+  }
+  openTaskViewerModal(data.task);
+}
+
 // ── Live logs ──────────────────────────────────────────────────────────────
 function startLiveLogs() {
   connectLogWs();
@@ -466,6 +691,23 @@ function toggleTextPicker(picker) {
   } else {
     openTextPicker(picker);
   }
+}
+
+function bindTaskViewerUi() {
+  if (taskViewerUiBound) return;
+  taskViewerUiBound = true;
+
+  $('task-viewer-show-btn').addEventListener('click', loadTaskViewerTasks);
+  $('task-viewer-clear-btn').addEventListener('click', resetTaskViewerFilters);
+  $('task-viewer-worker-type').addEventListener('change', applyTaskViewerWorkerTypeFilter);
+  $('task-json-modal-close').addEventListener('click', closeTaskViewerModal);
+  $('task-json-modal-backdrop').addEventListener('click', closeTaskViewerModal);
+
+  document.addEventListener('keydown', event => {
+    if (event.key === 'Escape' && $('task-json-modal').classList.contains('is-open')) {
+      closeTaskViewerModal();
+    }
+  });
 }
 
 function renderTextPickerOptions(picker) {
@@ -653,6 +895,7 @@ async function saveGuiConfig() {
 
 // ── Boot ───────────────────────────────────────────────────────────────────
 bindSettingsUi();
+bindTaskViewerUi();
 
 // ── TEST LLM ───────────────────────────────────────────────────────────────
 
@@ -1341,7 +1584,7 @@ async function sendAgentRequest() {
   $('agent-send-btn').disabled = true;
   agentSending = true;
 
-  const body = buildAgentBody(text);
+  const body = buildAgentBody();  // user text already pushed to agentMessages above
 
   try {
     const res = await apiPost('/api/test/agent', body);
