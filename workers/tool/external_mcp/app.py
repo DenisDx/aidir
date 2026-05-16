@@ -46,6 +46,9 @@ class ExternalMcpWorker(BaseToolWorker):
         self._tools_cache = {}
         self._cache_time = 0.0
 
+        # Build the initial tool list before any context injection runs.
+        await self.refresh_tools_if_due(reason="startup", force=True)
+
         if self._mark_startup and self._redis is not None:
             await self._redis.set(self._startup_key(), str(self._startup_time))
 

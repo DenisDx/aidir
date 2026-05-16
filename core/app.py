@@ -137,12 +137,6 @@ class Core:
             setattr(w, "_core", self)
             await w.initialize({**workers_cfg.get(wid, {}), "_core": self})
 
-        external_mcp = self.workers.get("external_mcp")
-        if external_mcp and hasattr(external_mcp, "refresh_tools_if_due"):
-            self._track_background_task(
-                asyncio.create_task(external_mcp.refresh_tools_if_due(reason="startup"))
-            )
-
         self.loop_workers = []
         for wid, worker in self.workers.items():
             worker_loop = getattr(worker, "loop", None)

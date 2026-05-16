@@ -86,6 +86,34 @@ class ContextAddInternalToolsWorker(BaseWorker):
             if isinstance(legacy_ctx_override, dict) and isinstance(legacy_ctx_override.get("tools"), dict):
                 effective_tools = update_config(effective_tools, legacy_ctx_override["tools"])
 
+        # Auto-include discovered tools from loaded tool workers.
+        # Config-defined tools keep priority; discovered ones fill the gaps.
+        if self._core and isinstance(getattr(self._core, "workers", None), dict):
+            for worker_id, worker in self._core.workers.items():
+                if not isinstance(worker, BaseToolWorker):
+                    continue
+
+                descs = worker.get_tool_description()
+                if isinstance(descs, dict):
+                    descs = [descs]
+                if not isinstance(descs, list):
+                    continue
+
+                for desc in descs:
+                    if not isinstance(desc, dict):
+                        continue
+                    tool_name = desc.get("name")
+                    if not isinstance(tool_name, str) or not tool_name:
+                        continue
+                    effective_tools.setdefault(
+                        tool_name,
+                        {
+                            "worker": worker_id,
+                            "description": desc.get("description", tool_name),
+                            "inputSchema": desc.get("inputSchema", {"type": "object", "properties": {}}),
+                        },
+                    )
+
         resolved_tools = self._resolve_tools_map(effective_tools)
 
         before_names = set(task.context.tools.keys())
@@ -128,7 +156,8 @@ class ContextAddInternalToolsWorker(BaseWorker):
             if isinstance(worker, BaseToolWorker):
                 descs = worker.get_tool_description()
                 if isinstance(descs, list):
-                    tool_descs.extend(descs)
+                    matched_descs = [desc for desc in descs if isinstance(desc, dict) and desc.get("name") == tool_name]
+                    tool_descs.extend(matched_descs or descs)
                 elif isinstance(descs, dict):
                     tool_descs.append(descs)
             else:
