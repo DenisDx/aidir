@@ -13,6 +13,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+import copy
 
 # Ensure project root is importable before internal imports when launched as
 # `python /path/to/core/app.py` from systemd.
@@ -33,6 +34,7 @@ from core.scheduler import Scheduler
 from core.task import STATUS_CREATED, STATUS_QUEUED, STATUS_RUNNING
 from core.task import STATUS_CANCELED, STATUS_COMPLETED, STATUS_FAILED
 from core.workers_loader import load_workers, resolve_worker_configs
+from core.config_merger import update_config
 from core.endpoints.endpoint_ollama import Endpoint_ollama
 from core.endpoints.endpoint_openaix import Endpoint_openaix
 from core.endpoints.endpoint_mcp import Endpoint_mcp
@@ -70,6 +72,7 @@ class Core:
         self.queue: QueueManager | None = None
         self.scheduler: Scheduler | None = None
         self.workers: dict = {}
+        self.workers_cfg: dict[str, dict] = {}
         self.loop_workers: list[tuple[str, object]] = []
         self.resources = Resources([])
         self.envid_registry: EnvidRegistry | None = None
@@ -129,6 +132,7 @@ class Core:
 
         # ── Workers ────────────────────────────────────────────────────────
         workers_cfg = resolve_worker_configs(self.config.raw())
+        self.workers_cfg = workers_cfg
         self.workers = load_workers(self.config.raw(), workers_cfg=workers_cfg)
         self.resources = Resources(self.config.get("resources") or [])
         self.resources.set_redis(self.redis, instance)
@@ -241,6 +245,23 @@ class Core:
             "active_tasks": active_tasks,
             "restart_wait_timeout": self.restart_wait_timeout_seconds(),
         }
+
+    def get_effective_worker_config(self, worker_id: str, envid_id: str | None = None) -> dict:
+        """Return worker config merged with envid-specific workers override when available."""
+        base_cfg = copy.deepcopy(self.workers_cfg.get(worker_id, {}) or {})
+        if not envid_id or self.envid_registry is None:
+            return base_cfg
+
+        envid = self.envid_registry.get(envid_id)
+        if envid is None or not isinstance(envid.workers, dict):
+            return base_cfg
+
+        override = envid.workers.get(worker_id)
+        if not isinstance(override, dict):
+            return base_cfg
+
+        update_config(base_cfg, copy.deepcopy(override))
+        return base_cfg
 
     async def request_restart(self) -> None:
         """Switch service into restart-drain mode."""

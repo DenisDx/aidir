@@ -18,8 +18,8 @@
     // Use "local" for server local timezone, "UTC", or IANA name (e.g. "Europe/Moscow").
     "timezone": "${LOG_TIMEZONE:-local}",
     // Seconds between log wipe runs. 0 = never wipe.
-    "wipe_period": ${LOG_WIPE_PERIOD:-0},
-    // wipe_max_age: 86400,  // seconds; defaults to wipe_period if not set
+    "wipe_period": ${LOG_WIPE_PERIOD:-10000},
+    "wipe_max_age": ${LOG_WIPE_MAX_AGE:-1000000}, 
     max_log_size: ${MAX_LOG_SIZE:-1000000}, // max size in bytes for individual log files; 0 = unlimited
     "levels": { // thresholds for individual per-type log files
       "workers": "warning",
@@ -138,6 +138,9 @@
     }
   ],
   "workers": {
+    // Max turns for internal tool loop in agent workers that support tools.
+    // Can be overridden per worker via workers.items.<worker_id>.tools_max_turns.
+    "tools_max_turns": 50,
     "items": {
       "call_ollama": {
         // Upstream ollama provider id from models.providers
@@ -150,6 +153,8 @@
       "openaix": {
         "enabled": true,
         "provider": "ollama_local",
+        // Optional override for this worker only (falls back to workers.tools_max_turns)
+        // "tools_max_turns": 50,
         // Timeout for single HTTP request to upstream LLM
         "request_timeout": ${REQUEST_TIMEOUT:-100},
         "logging": {
@@ -223,6 +228,12 @@
       "external_mcp": {
         "enabled": true,
         "tools_ttl": 300,
+        // Optional default auth for all remote MCP servers of this worker.
+        // Per-server servers.<id>.auth overrides this object.
+        "auth": {
+          "type": "bearer",
+          "token": "${WORKSPACE_TOKEN:-changeme}"
+        },
         "logging": {
           "level": "debug",
           "alllevel": "info",
@@ -361,6 +372,17 @@
       "model_list":      ${WEBUI_TIMEOUT_MODEL_LIST:-20},     // list models from endpoint
       "agent_test":      ${WEBUI_TIMEOUT_AGENT_TEST:-45}      // test agent request
     }
+  },
+  "users": {
+    // API users for OpenAI/Ollama-compatible endpoints (not WebUI users).
+    "items": [
+      {
+        "login": "api-test-user",
+        "token": "${API_USER_TOKEN:-test-token-123456789}",
+        "envids": ["test-12345", "test-23456"],
+        "autoassign_envid": "test-12345"
+      }
+    ]
   },
   "tasks": {
     "restart_wait_timeout": ${TASK_RESTART_WAIT_TIMEOUT_SECONDS:-120},

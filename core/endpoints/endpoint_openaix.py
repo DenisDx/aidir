@@ -18,6 +18,7 @@ from typing import AsyncGenerator
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from core import log
 from core.error_logging import attach_request_id_middleware, get_or_create_request_id, log_exception
 from core.endpoints.endpoint_ollama import Endpoint_ollama
 from core.task import STATUS_CANCELED, STATUS_COMPLETED, STATUS_FAILED
@@ -96,6 +97,10 @@ class Endpoint_openaix(Endpoint_ollama):
                 message="Invalid JSON body",
             )
 
+        auth_error = self._authorize_and_apply_envid(request, body)
+        if auth_error is not None:
+            return auth_error
+
         stream = bool(body.get("stream", False))
         task = self._build_task_for_payload(body, stream)
 
@@ -115,8 +120,17 @@ class Endpoint_openaix(Endpoint_ollama):
                 self._stream_response(task),
                 media_type="application/x-ndjson",
             )
-
-        return await self._sync_response(task)
+        response = await self._sync_response(task)
+        log(
+            "http",
+            "info",
+            (
+                f"{self.id} /api/chat sync response: task={task.id} status={task.status} "
+                f"http_status={response.status_code} error_code={(task.error or {}).get('code') if isinstance(task.error, dict) else ''}"
+            ),
+            self.id,
+        )
+        return response
 
     async def _handle_openai_chat(self, request: Request) -> StreamingResponse | JSONResponse:
         """Handle OpenAI chat completions request and map it to Task_agent flow."""
@@ -129,6 +143,10 @@ class Endpoint_openaix(Endpoint_ollama):
                 code="invalid_request_error",
                 message="Invalid JSON body",
             )
+
+        auth_error = self._authorize_and_apply_envid(request, body)
+        if auth_error is not None:
+            return auth_error
 
         stream = bool(body.get("stream", False))
         ollama_payload = self._openai_request_to_ollama(body)
@@ -214,6 +232,7 @@ class Endpoint_openaix(Endpoint_ollama):
         except asyncio.TimeoutError:
             await self._core.queue.mark_canceled(task)
             asyncio.create_task(self._core.delete_task(task.id))
+            log("http", "warning", f"{self.id} /v1/chat/completions timeout: task={task.id}", self.id)
             return self._error_response(
                 protocol="openai",
                 status_code=504,
@@ -225,8 +244,30 @@ class Endpoint_openaix(Endpoint_ollama):
         asyncio.create_task(self._core.delete_task(task.id))
 
         if task.status == STATUS_COMPLETED:
+            result = task.result or {}
+            usage = result.get("usage") if isinstance(result, dict) else {}
+            log(
+                "http",
+                "info",
+                (
+                    f"{self.id} /v1/chat/completions success: task={task.id} "
+                    f"prompt_tokens={(usage or {}).get('prompt_eval_count')} "
+                    f"completion_tokens={(usage or {}).get('eval_count')}"
+                ),
+                self.id,
+            )
             return JSONResponse(self._ollama_sync_to_openai(task.result or {}, task.id, request_body))
         if task.status == STATUS_FAILED:
+            err = task.error or {}
+            log(
+                "http",
+                "warning",
+                (
+                    f"{self.id} /v1/chat/completions failed: task={task.id} "
+                    f"code={err.get('code', 'server_error')} message={err.get('message', 'Worker error')}"
+                ),
+                self.id,
+            )
             return self._error_response(
                 protocol="openai",
                 status_code=502,
@@ -235,6 +276,7 @@ class Endpoint_openaix(Endpoint_ollama):
                 task_id=task.id,
             )
         if task.status == STATUS_CANCELED:
+            log("http", "warning", f"{self.id} /v1/chat/completions canceled: task={task.id}", self.id)
             return self._error_response(
                 protocol="openai",
                 status_code=503,
@@ -243,6 +285,7 @@ class Endpoint_openaix(Endpoint_ollama):
                 task_id=task.id,
             )
 
+        log("http", "warning", f"{self.id} /v1/chat/completions unknown_state: task={task.id} state={task.status}", self.id)
         return self._error_response(
             protocol="openai",
             status_code=500,

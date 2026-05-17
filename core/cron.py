@@ -122,12 +122,16 @@ def _trim_log_file(log_file: Path, max_bytes: int) -> int:
 
 async def trim_logs_by_size(redis: aioredis.Redis) -> None:
     """Trim log files that exceed configured max_log_size."""
+    wipe_period = int(config.get("logging.wipe_period") or 0)
+    if wipe_period <= 0:
+        return
+
     max_log_size = int(config.get("logging.max_log_size") or 0)
     if max_log_size <= 0:
         return
-    
-    # Check every 3600 seconds (1 hour)
-    if not await _should_run(redis, "trim_logs_by_size", 3600):
+
+    # Run with the same cadence as age-based wipe settings.
+    if not await _should_run(redis, "trim_logs_by_size", wipe_period):
         return
     
     total_trimmed = 0

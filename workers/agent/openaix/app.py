@@ -28,6 +28,7 @@ class OpenAIxWorker(BaseWorker):
         self._base_url: str = "http://127.0.0.1:11434"
         self._timeout: int = 300
         self._save_llm_request_default: bool = False
+        self._tools_max_turns: int = 50
         self._core = None
 
     async def initialize(self, config: dict) -> None:
@@ -39,6 +40,20 @@ class OpenAIxWorker(BaseWorker):
         logging_cfg = config.get("logging") if isinstance(config.get("logging"), dict) else {}
         self._save_llm_request_default = bool(logging_cfg.get("save_llm_request", False))
 
+        global_tools_max_turns = 50
+        if core is not None:
+            raw_global_tools_max_turns = core.config.get("workers.tools_max_turns", 50)
+            try:
+                global_tools_max_turns = max(1, int(raw_global_tools_max_turns))
+            except (TypeError, ValueError):
+                global_tools_max_turns = 50
+
+        raw_tools_max_turns = config.get("tools_max_turns", global_tools_max_turns)
+        try:
+            self._tools_max_turns = max(1, int(raw_tools_max_turns))
+        except (TypeError, ValueError):
+            self._tools_max_turns = global_tools_max_turns
+
         if core is not None:
             base_url = core.config.get(f"models.providers.{provider_id}.baseUrl")
             if base_url:
@@ -47,7 +62,11 @@ class OpenAIxWorker(BaseWorker):
         log(
             "worker",
             "info",
-            f"openaix initialized; upstream={self._base_url}; save_llm_request_default={self._save_llm_request_default}",
+            (
+                f"openaix initialized; upstream={self._base_url}; "
+                f"save_llm_request_default={self._save_llm_request_default}; "
+                f"tools_max_turns={self._tools_max_turns}"
+            ),
             "openaix",
         )
 
@@ -62,6 +81,13 @@ class OpenAIxWorker(BaseWorker):
                 ok=False,
                 error={"code": "WRONG_TASK_TYPE", "message": f"Expected Task_agent, got {type(task).__name__}"},
             )
+
+        log(
+            "worker",
+            "info",
+            f"Task {task.id}: received request payload={json.dumps(task.payload, ensure_ascii=False, default=str)}",
+            "openaix",
+        )
 
         url = f"{self._base_url}/api/chat"
         save_call = self._resolve_save_llm_request(task.payload or {})
@@ -248,8 +274,9 @@ class OpenAIxWorker(BaseWorker):
         current_payload = dict(payload)
         current_payload["stream"] = False
         messages = list(current_payload.get("messages") or [])
-        max_turns = 8
+        max_turns = self._tools_max_turns
         turn = 0
+        last_step_data: dict | None = None
 
         # Extract available tool names from payload
         available_tools = self._extract_available_tool_names(payload)
@@ -269,10 +296,29 @@ class OpenAIxWorker(BaseWorker):
                 return step
 
             data = step.data or {}
+            last_step_data = data if isinstance(data, dict) else None
             assistant_msg = data.get("message") if isinstance(data.get("message"), dict) else {}
             calls = self._extract_tool_calls(assistant_msg)
             if not calls:
-                content_preview = str(assistant_msg.get("content", ""))[:300]
+                content = assistant_msg.get("content") or ""
+                thinking = assistant_msg.get("thinking") or ""
+                # Thinking-mode models (e.g. qwen3) sometimes output the answer
+                # only in 'thinking' and leave 'content' empty.  Fall back to
+                # 'thinking' so the client receives a non-empty response.
+                if not content.strip() and thinking.strip():
+                    log(
+                        "worker",
+                        "warning",
+                        f"Task {parent_task.id} final response has empty content but non-empty thinking; using thinking as content",
+                        "openaix",
+                    )
+                    data = dict(data)
+                    patched_msg = dict(assistant_msg)
+                    patched_msg["content"] = thinking
+                    data["message"] = patched_msg
+                    content = thinking
+
+                content_preview = content[:300]
                 log(
                     "worker",
                     "info",
@@ -281,7 +327,7 @@ class OpenAIxWorker(BaseWorker):
                 )
                 if parent_task.stream and emit_chunk:
                     await emit_chunk(data)
-                return step
+                return WorkerResult(ok=True, data=data, usage=data.get("usage"))
 
             # Separate tool calls into executable (local workers) and pass-through (external)
             executable_calls = [c for c in calls if c["name"] in available_tools]
@@ -300,7 +346,7 @@ class OpenAIxWorker(BaseWorker):
                 f"Task {parent_task.id} executing tool calls: {[c['name'] for c in executable_calls]}",
                 "openaix",
             )
-            messages.append(assistant_msg)
+            messages.append(self._normalize_assistant_message_for_history(assistant_msg))
             for call in executable_calls:
                 tool_result = await self._execute_internal_tool(call, parent_task)
                 if not tool_result.ok:
@@ -316,17 +362,61 @@ class OpenAIxWorker(BaseWorker):
 
                 tool_message = {
                     "role": "tool",
-                    "tool_name": call["name"],
-                    "content": json.dumps(tool_result.data or {}, ensure_ascii=False),
+                    "name": call["name"],
+                    "content": self._extract_tool_content_text(tool_result.data),
                 }
                 if call.get("id"):
                     tool_message["tool_call_id"] = call["id"]
                 messages.append(tool_message)
 
-        return WorkerResult(
-            ok=False,
-            error={"code": "TOOL_LOOP_LIMIT", "message": "Tool loop exceeded limit"},
+        # Fallback: request one final answer without tools instead of hard failing.
+        log(
+            "worker",
+            "warning",
+            f"Task {parent_task.id} tool-loop reached limit ({max_turns}); requesting final answer without tools",
+            "openaix",
         )
+
+        fallback_payload = dict(current_payload)
+        fallback_payload.pop("tools", None)
+        fallback_payload.pop("tool_choice", None)
+        fallback_messages = list(messages)
+        fallback_messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "Tool loop limit reached. Provide a final user-facing answer based on the conversation "
+                    "and tool outputs already available. Do not call tools."
+                ),
+            }
+        )
+        fallback_payload["messages"] = fallback_messages
+
+        fallback_step = await self._forward_sync(
+            client,
+            url,
+            fallback_payload,
+            save_call=save_call,
+            task_id=parent_task.id,
+        )
+        if fallback_step.ok:
+            fd = fallback_step.data or {}
+            fb_msg = fd.get("message") if isinstance(fd.get("message"), dict) else {}
+            fb_content = fb_msg.get("content") or ""
+            fb_thinking = fb_msg.get("thinking") or ""
+            if not fb_content.strip() and fb_thinking.strip():
+                fd = dict(fd)
+                fd["message"] = dict(fb_msg)
+                fd["message"]["content"] = fb_thinking
+                fallback_step = WorkerResult(ok=True, data=fd, usage=fd.get("usage"))
+            if parent_task.stream and emit_chunk and isinstance(fd, dict):
+                await emit_chunk(fd)
+            return fallback_step
+
+        if last_step_data is not None:
+            return WorkerResult(ok=True, data=last_step_data, usage=last_step_data.get("usage"))
+
+        return WorkerResult(ok=False, error={"code": "TOOL_LOOP_LIMIT", "message": "Tool loop exceeded limit"})
 
     @staticmethod
     def _extract_available_tool_names(payload: dict) -> set[str]:
@@ -378,6 +468,77 @@ class OpenAIxWorker(BaseWorker):
             )
         return out
 
+    @staticmethod
+    def _normalize_assistant_message_for_history(message: dict) -> dict:
+        """Keep only Ollama-required fields for follow-up tool turns."""
+        normalized: dict = {"role": "assistant", "content": ""}
+
+        content = message.get("content") if isinstance(message, dict) else ""
+        if isinstance(content, str):
+            normalized["content"] = content
+        elif content is None:
+            normalized["content"] = ""
+        else:
+            normalized["content"] = str(content)
+
+        calls = message.get("tool_calls") if isinstance(message, dict) else None
+        if not isinstance(calls, list):
+            return normalized
+
+        normalized_calls: list[dict] = []
+        for raw_call in calls:
+            if not isinstance(raw_call, dict):
+                continue
+
+            fn = raw_call.get("function") if isinstance(raw_call.get("function"), dict) else {}
+            name = fn.get("name") or raw_call.get("name")
+            if not name:
+                continue
+
+            # Ollama /api/chat expects arguments as a dict (object), not a JSON string.
+            # OpenAI-style (string) would cause Ollama to fail with JSON parse error.
+            args = fn.get("arguments") or raw_call.get("arguments") or {}
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except Exception:
+                    args = {}
+            if not isinstance(args, dict):
+                args = {}
+
+            call_entry: dict = {
+                "function": {
+                    "name": str(name),
+                    "arguments": args,
+                },
+            }
+            call_id = raw_call.get("id")
+            if call_id:
+                call_entry["id"] = str(call_id)
+            normalized_calls.append(call_entry)
+
+        if normalized_calls:
+            normalized["tool_calls"] = normalized_calls
+        return normalized
+
+    @staticmethod
+    def _extract_tool_content_text(data: dict | None) -> str:
+        """Extract plain text from MCP tool result for Ollama tool message content."""
+        if not isinstance(data, dict):
+            return str(data or "")
+        # MCP standard: content array with text items
+        content_arr = data.get("content")
+        if isinstance(content_arr, list):
+            texts = [
+                item.get("text", "")
+                for item in content_arr
+                if isinstance(item, dict) and item.get("type") == "text"
+            ]
+            if texts:
+                return "\n".join(texts)
+        # Fallback: serialize the whole thing
+        return json.dumps(data, ensure_ascii=False)
+
     async def _execute_internal_tool(self, call: dict, parent_task: Task_agent) -> WorkerResult:
         """Run an internal tool via Task_tool and wait for completion."""
         tool_name = call["name"]
@@ -424,17 +585,68 @@ class OpenAIxWorker(BaseWorker):
     async def _forward_sync(self, client: httpx.AsyncClient, url: str, payload: dict, *, save_call: bool = False, task_id: str = "") -> WorkerResult:
         """Send a non-streaming request and return the full JSON body."""
         upstream_payload = {**payload, "stream": False}
+        messages = upstream_payload.get("messages")
+        msg_count = len(messages) if isinstance(messages, list) else 0
+        last_role = ""
+        if isinstance(messages, list) and messages:
+            last_msg = messages[-1]
+            if isinstance(last_msg, dict):
+                last_role = str(last_msg.get("role", ""))
+
+        log(
+            "worker",
+            "debug",
+            (
+                f"Task {task_id or '-'} upstream sync request: "
+                f"messages={msg_count} last_role={last_role!r} "
+                f"tools={bool(upstream_payload.get('tools'))}"
+            ),
+            "openaix",
+        )
+
         resp = await client.post(url, json=upstream_payload)
         if resp.status_code != 200:
+            body_preview = resp.text[:512]
+            log(
+                "worker",
+                "warning",
+                (
+                    f"Task {task_id or '-'} upstream sync error: status={resp.status_code} "
+                    f"messages={msg_count} last_role={last_role!r} body={body_preview!r}"
+                ),
+                "openaix",
+            )
             return WorkerResult(
                 ok=False,
                 error={
                     "code": "UPSTREAM_ERROR",
                     "message": f"Upstream returned HTTP {resp.status_code}",
-                    "body": resp.text[:512],
+                    "body": body_preview,
                 },
             )
-        data = resp.json()
+
+        try:
+            data = resp.json()
+        except json.JSONDecodeError:
+            body_preview = resp.text[:512]
+            log(
+                "worker",
+                "warning",
+                (
+                    f"Task {task_id or '-'} upstream sync invalid json: "
+                    f"messages={msg_count} last_role={last_role!r} body={body_preview!r}"
+                ),
+                "openaix",
+            )
+            return WorkerResult(
+                ok=False,
+                error={
+                    "code": "UPSTREAM_INVALID_JSON",
+                    "message": "Upstream returned invalid JSON",
+                    "body": body_preview,
+                },
+            )
+
         if save_call:
             save_llm_call(self.id, task_id, upstream_payload, data)
         return WorkerResult(ok=True, data=data, usage=data.get("usage"))

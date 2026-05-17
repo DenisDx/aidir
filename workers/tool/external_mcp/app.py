@@ -4,6 +4,8 @@ Discovers and proxies tools from remote MCP servers (HTTP only, MVP).
 """
 from __future__ import annotations
 import asyncio
+import base64
+import copy
 import time
 from typing import Any
 
@@ -11,6 +13,7 @@ import httpx
 
 from core.worker import BaseToolWorker, WorkerResult
 from core.task import Task
+from core.config_merger import update_config
 from core import log
 
 class ExternalMcpWorker(BaseToolWorker):
@@ -29,6 +32,8 @@ class ExternalMcpWorker(BaseToolWorker):
         self._cache_time = 0.0
         self._ttl = 300
         self._servers: dict[str, dict[str, Any]] = {}
+        self._worker_auth: dict[str, Any] = {}
+        self._base_worker_config: dict[str, Any] = {}
         self._lock = asyncio.Lock()
 
     async def initialize(self, config: dict) -> None:
@@ -41,8 +46,12 @@ class ExternalMcpWorker(BaseToolWorker):
         )
         self._mark_startup = bool(config.get("_mark_startup", self._core is not None))
         self._startup_time = time.time()
-        self._ttl = int(config.get("tools_ttl", 300))
-        self._servers = dict(config.get("servers", {}) or {})
+        self._base_worker_config = {
+            k: v for k, v in dict(config).items() if not str(k).startswith("_")
+        }
+        self._ttl = int(self._base_worker_config.get("tools_ttl", 300))
+        self._servers = dict(self._base_worker_config.get("servers", {}) or {})
+        self._worker_auth = dict(self._base_worker_config.get("auth", {}) or {})
         self._tools_cache = {}
         self._cache_time = 0.0
 
@@ -126,8 +135,14 @@ class ExternalMcpWorker(BaseToolWorker):
 
             log("worker", "info", f"Reading tools list from server={srv_name} url={url}", self.id)
             try:
+                auth_cfg = self._resolve_auth_config(self._worker_auth, srv.get("auth"))
+                headers = self._build_auth_headers(auth_cfg)
                 async with httpx.AsyncClient(timeout=10) as client:
-                    resp = await client.post(url, json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+                    resp = await client.post(
+                        url,
+                        json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+                        headers=headers,
+                    )
                     resp.raise_for_status()
                     data = resp.json()
                     for tool in (data.get("result", {}).get("tools", []) if isinstance(data.get("result"), dict) else []):
@@ -189,10 +204,86 @@ class ExternalMcpWorker(BaseToolWorker):
         # For context injection, allow sync fallback (may be stale)
         return list(self._tools_cache.values())
 
+    @staticmethod
+    def _resolve_auth_config(worker_auth: Any, server_auth: Any) -> dict[str, Any]:
+        """Merge worker-level auth with per-server auth (server auth wins)."""
+        merged: dict[str, Any] = {}
+        if isinstance(worker_auth, dict):
+            update_config(merged, copy.deepcopy(worker_auth))
+        if isinstance(server_auth, dict):
+            update_config(merged, copy.deepcopy(server_auth))
+        return merged
+
+    @staticmethod
+    def _build_auth_headers(auth_cfg: dict[str, Any]) -> dict[str, str]:
+        """Build HTTP headers from auth config.
+
+        Supported formats:
+          - {token: "..."} -> Bearer
+          - {type: "bearer", token: "..."}
+          - {type: "basic", username: "...", password: "..."}
+          - {authorization: "<raw value>"}
+          - {headers: {"X-...": "..."}}
+        """
+        if not isinstance(auth_cfg, dict):
+            return {}
+
+        headers: dict[str, str] = {}
+        raw_headers = auth_cfg.get("headers")
+        if isinstance(raw_headers, dict):
+            for key, value in raw_headers.items():
+                if isinstance(key, str) and isinstance(value, str):
+                    headers[key] = value
+
+        raw_authorization = auth_cfg.get("authorization")
+        if isinstance(raw_authorization, str) and raw_authorization.strip():
+            headers["Authorization"] = raw_authorization.strip()
+
+        auth_type = str(auth_cfg.get("type", "bearer")).strip().lower()
+        token = auth_cfg.get("token")
+        if isinstance(token, str) and token.strip() and auth_type in {"bearer", "token", ""}:
+            headers["Authorization"] = f"Bearer {token.strip()}"
+
+        if auth_type == "basic":
+            username = auth_cfg.get("username")
+            password = auth_cfg.get("password")
+            if isinstance(username, str) and isinstance(password, str):
+                raw = f"{username}:{password}".encode("utf-8")
+                headers["Authorization"] = f"Basic {base64.b64encode(raw).decode('ascii')}"
+
+        return headers
+
+    def _effective_worker_config_for_task(self, task: Task) -> dict[str, Any]:
+        """Resolve effective worker config for task envid using core-provided merge logic."""
+        payload = task.payload if isinstance(task.payload, dict) else {}
+        envid_id = payload.get("envid")
+        if not isinstance(envid_id, str) or not envid_id.strip() or self._core is None:
+            return copy.deepcopy(self._base_worker_config)
+
+        getter = getattr(self._core, "get_effective_worker_config", None)
+        if not callable(getter):
+            return copy.deepcopy(self._base_worker_config)
+
+        merged = getter(self.id, envid_id.strip())
+        if not isinstance(merged, dict):
+            return copy.deepcopy(self._base_worker_config)
+        return copy.deepcopy(merged)
+
+    def _effective_servers_for_task(self, task: Task) -> dict[str, dict[str, Any]]:
+        """Resolve servers map for current task, including envid worker overrides."""
+        effective_cfg = self._effective_worker_config_for_task(task)
+        merged = copy.deepcopy(self._base_worker_config)
+        update_config(merged, effective_cfg)
+        servers = merged.get("servers", {})
+        return dict(servers) if isinstance(servers, dict) else {}
+
     async def execute(self, task: Task, emit_chunk=None) -> WorkerResult:
         """Proxy tool call to remote MCP server."""
         args = (task.payload or {}).get("arguments", {})
         tool_id = (task.payload or {}).get("tool")
+        effective_cfg = self._effective_worker_config_for_task(task)
+        worker_auth = effective_cfg.get("auth") if isinstance(effective_cfg, dict) else {}
+        servers = self._effective_servers_for_task(task)
 
         await self._get_tools()  # Ensure cache is fresh
         tool = self._tools_cache.get(tool_id)
@@ -200,7 +291,7 @@ class ExternalMcpWorker(BaseToolWorker):
             return WorkerResult(ok=False, error={"code": "TOOL_NOT_FOUND", "message": f"Tool {tool_id} not found"})
 
         srv_name = tool.get("_server")
-        srv = self._servers.get(srv_name)
+        srv = servers.get(srv_name) or self._servers.get(srv_name)
         if not srv or srv.get("type") != "http":
             return WorkerResult(ok=False, error={"code": "SERVER_NOT_FOUND", "message": f"Server for tool {tool_id} not found"})
 
@@ -208,19 +299,83 @@ class ExternalMcpWorker(BaseToolWorker):
         if not url:
             return WorkerResult(ok=False, error={"code": "SERVER_URL_MISSING", "message": f"No URL for server {srv_name}"})
 
+        remote_tool_name = str(tool.get("name") or tool_id)
+
         try:
+            auth_cfg = self._resolve_auth_config(worker_auth, srv.get("auth"))
+            headers = self._build_auth_headers(auth_cfg)
             async with httpx.AsyncClient(timeout=30) as client:
                 resp = await client.post(url, json={
                     "jsonrpc": "2.0",
                     "id": 1,
                     "method": "tools/call",
-                    "params": {"name": tool_id, "arguments": args}
-                })
-                data = resp.json()
+                    "params": {"name": remote_tool_name, "arguments": args}
+                }, headers=headers)
+
+                try:
+                    data = resp.json()
+                except ValueError:
+                    body_preview = (resp.text or "")[:500]
+                    log(
+                        "worker",
+                        "warn",
+                        f"Remote MCP returned non-JSON response server={srv_name} tool={remote_tool_name} status={resp.status_code}",
+                        self.id,
+                    )
+                    return WorkerResult(
+                        ok=False,
+                        error={
+                            "code": "REMOTE_INVALID_RESPONSE",
+                            "message": "Remote server returned non-JSON response",
+                            "status": resp.status_code,
+                            "body": body_preview,
+                        },
+                    )
+
+                if not isinstance(data, dict):
+                    return WorkerResult(
+                        ok=False,
+                        error={
+                            "code": "REMOTE_INVALID_RESPONSE",
+                            "message": "Remote server returned invalid JSON payload",
+                            "status": resp.status_code,
+                        },
+                    )
+
+                if "error" in data:
+                    remote_error = data.get("error")
+                    normalized_error = remote_error if isinstance(remote_error, dict) else {"message": str(remote_error)}
+                    normalized_error.setdefault("code", "REMOTE_ERROR")
+                    normalized_error.setdefault("message", "Remote MCP server returned an error")
+                    normalized_error["status"] = resp.status_code
+                    return WorkerResult(ok=False, error=normalized_error)
+
+                if resp.status_code >= 400:
+                    return WorkerResult(
+                        ok=False,
+                        error={
+                            "code": "REMOTE_HTTP_ERROR",
+                            "message": f"Remote server returned HTTP {resp.status_code}",
+                            "status": resp.status_code,
+                            "body": str(data)[:500],
+                        },
+                    )
+
                 if "result" in data:
                     return WorkerResult(ok=True, data=data["result"])
-                return WorkerResult(ok=False, error=data.get("error", {"code": "REMOTE_ERROR", "message": str(data)}))
-        except Exception as exc:
+
+                return WorkerResult(
+                    ok=False,
+                    error={
+                        "code": "REMOTE_INVALID_RESPONSE",
+                        "message": "Remote server response has no result or error",
+                        "status": resp.status_code,
+                        "body": str(data)[:500],
+                    },
+                )
+        except httpx.RequestError as exc:
             return WorkerResult(ok=False, error={"code": "NETWORK_ERROR", "message": str(exc)})
+        except Exception as exc:
+            return WorkerResult(ok=False, error={"code": "REMOTE_CALL_ERROR", "message": str(exc)})
 
 worker = ExternalMcpWorker()

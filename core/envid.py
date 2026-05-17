@@ -11,6 +11,7 @@ Separate from Envid config, per-envid conversation contexts are stored under
 """
 from __future__ import annotations
 
+import copy
 import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -20,6 +21,7 @@ if TYPE_CHECKING:
     import redis.asyncio as aioredis
 
 from core import log
+from core.config_merger import update_config
 
 
 def _now() -> datetime:
@@ -50,6 +52,7 @@ class Envid:
     description: str = ""
     parent: str | None = None          # reference to another envid used as template
     context: dict = field(default_factory=dict)  # context building config
+    workers: dict = field(default_factory=dict)  # per-worker config overrides for this envid
     saved_at: datetime | None = None   # last time this envid was saved to Redis
     used_at: datetime | None = None    # last time this envid was used
     extra: dict = field(default_factory=dict)    # any additional config fields
@@ -63,6 +66,7 @@ class Envid:
             "description": self.description,
             "parent":      self.parent or "",
             "context":     json.dumps(self.context, ensure_ascii=False),
+            "workers":     json.dumps(self.workers, ensure_ascii=False),
             "saved_at":    self.saved_at.isoformat() if self.saved_at else "",
             "used_at":     self.used_at.isoformat() if self.used_at else "",
             "extra":       json.dumps(self.extra, ensure_ascii=False),
@@ -76,6 +80,7 @@ class Envid:
             description=data.get("description", ""),
             parent=data.get("parent") or None,
             context=_safe_json(data.get("context", "")),
+            workers=_safe_json(data.get("workers", "")),
             saved_at=_parse_dt(data.get("saved_at")),
             used_at=_parse_dt(data.get("used_at")),
             extra=_safe_json(data.get("extra", "")),
@@ -84,12 +89,13 @@ class Envid:
     @classmethod
     def from_config(cls, envid_id: str, cfg: dict) -> "Envid":
         """Build Envid from a config.envids.items.<id> entry."""
-        known = {"description", "parent", "context"}
+        known = {"description", "parent", "context", "workers"}
         return cls(
             id=envid_id,
             description=cfg.get("description", ""),
             parent=cfg.get("parent") or None,
             context=cfg.get("context", {}),
+            workers=cfg.get("workers", {}),
             extra={k: v for k, v in cfg.items() if k not in known},
         )
 
@@ -101,7 +107,9 @@ class Envid:
             self.parent = cfg["parent"] or None
         if "context" in cfg:
             self.context = cfg["context"]
-        known = {"description", "parent", "context"}
+        if "workers" in cfg:
+            self.workers = cfg["workers"]
+        known = {"description", "parent", "context", "workers"}
         for k, v in cfg.items():
             if k not in known:
                 self.extra[k] = v
@@ -156,7 +164,10 @@ class EnvidRegistry:
         items = config.get("envids", {}).get("items", {}) or {}
         if not isinstance(items, dict):
             return
-        for envid_id, cfg in items.items():
+
+        resolved_items = self._resolve_config_inheritance(items)
+
+        for envid_id, cfg in resolved_items.items():
             if not isinstance(cfg, dict):
                 continue
             if envid_id in self._envids:
@@ -168,6 +179,41 @@ class EnvidRegistry:
                 self._envids[envid_id] = envid
                 await self.save(envid)
                 log("system", "info", f"EnvidRegistry: added envid '{envid_id}' from config")
+
+    def _resolve_config_inheritance(self, items: dict[str, dict]) -> dict[str, dict]:
+        """Resolve envid parent chains using standard config merge rules."""
+        resolved: dict[str, dict] = {}
+        states: dict[str, str] = {}
+
+        def _resolve(envid_id: str) -> dict:
+            state = states.get(envid_id)
+            if state == "done":
+                return copy.deepcopy(resolved[envid_id])
+            if state == "processing":
+                log("system", "warn", f"EnvidRegistry: parent cycle detected at '{envid_id}', using local config only")
+                return copy.deepcopy(items.get(envid_id, {}) or {})
+
+            states[envid_id] = "processing"
+            current = copy.deepcopy(items.get(envid_id, {}) or {})
+            parent_id = current.get("parent")
+            if parent_id and isinstance(parent_id, str):
+                parent_cfg = items.get(parent_id)
+                if isinstance(parent_cfg, dict):
+                    merged = _resolve(parent_id)
+                    update_config(merged, current)
+                    current = merged
+                else:
+                    log("system", "warn", f"EnvidRegistry: parent '{parent_id}' for envid '{envid_id}' not found")
+
+            resolved[envid_id] = current
+            states[envid_id] = "done"
+            return copy.deepcopy(current)
+
+        for envid_id in items:
+            if isinstance(items.get(envid_id), dict):
+                _resolve(str(envid_id))
+
+        return resolved
 
     # ── Envid CRUD ────────────────────────────────────────────────────────
 

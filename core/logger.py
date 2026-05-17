@@ -7,6 +7,7 @@ Level scale: 0=EMERG … 7=DEBUG (systemd-journald compatible).
 """
 from __future__ import annotations
 
+import json
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -159,10 +160,11 @@ class CoreLogger:
             (_LOGS_DIR / "all.log").open("a", encoding="utf-8").write(line)
 
     def wipe_logs(self, max_age_seconds: int) -> None:
-        """Remove log lines older than max_age_seconds from all *.log files."""
+        """Remove log lines older than max_age_seconds from *.log and *.jsonl files."""
         cutoff = time.time() - max_age_seconds
-        for log_file in _LOGS_DIR.glob("*.log"):
-            _wipe_file(log_file, cutoff)
+        for pattern in ("*.log", "*.jsonl"):
+            for log_file in _LOGS_DIR.glob(pattern):
+                _wipe_file(log_file, cutoff)
 
 
 def _wipe_file(path: Path, cutoff: float) -> None:
@@ -170,9 +172,14 @@ def _wipe_file(path: Path, cutoff: float) -> None:
     try:
         lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
         kept = []
+        is_jsonl = path.suffix.lower() == ".jsonl"
+
         for line in lines:
             try:
-                ts_str = line.split(" ")[0]
+                ts_str = _extract_timestamp_from_line(line, is_jsonl=is_jsonl)
+                if not ts_str:
+                    kept.append(line)
+                    continue
                 ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00")).timestamp()
                 if ts >= cutoff:
                     kept.append(line)
@@ -181,6 +188,25 @@ def _wipe_file(path: Path, cutoff: float) -> None:
         path.write_text("".join(kept), encoding="utf-8")
     except Exception:
         pass
+
+
+def _extract_timestamp_from_line(line: str, *, is_jsonl: bool) -> str | None:
+    """Extract ISO timestamp from logger or JSONL line."""
+    if not is_jsonl:
+        return line.split(" ")[0]
+
+    raw = line.strip()
+    if not raw:
+        return None
+
+    payload = json.loads(raw)
+    if not isinstance(payload, dict):
+        return None
+
+    ts = payload.get("ts")
+    if not isinstance(ts, str) or not ts.strip():
+        return None
+    return ts.strip()
 
 
 # Global singleton
