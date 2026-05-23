@@ -29,6 +29,7 @@ class OpenAIxWorker(BaseWorker):
         self._timeout: int = 300
         self._save_llm_request_default: bool = False
         self._tools_max_turns: int = 50
+        self._provider_id: str = "ollama_local"
         self._core = None
 
     async def initialize(self, config: dict) -> None:
@@ -36,6 +37,7 @@ class OpenAIxWorker(BaseWorker):
         core = config.get("_core")
         self._core = core
         provider_id = str(config.get("provider", "ollama_local"))
+        self._provider_id = provider_id
         self._timeout = int(config.get("request_timeout", 100))
         logging_cfg = config.get("logging") if isinstance(config.get("logging"), dict) else {}
         self._save_llm_request_default = bool(logging_cfg.get("save_llm_request", False))
@@ -113,7 +115,8 @@ class OpenAIxWorker(BaseWorker):
         if not context_result.ok:
             return context_result
 
-        payload = self._normalize_payload(task.payload or {}, task.stream)
+        payload_with_ctx = self._apply_model_context_window(dict(task.payload or {}))
+        payload = self._normalize_payload(payload_with_ctx, task.stream)
 
         log("worker", "debug", f"Forwarding task {task.id} to {url} stream={task.stream}", "openaix")
 
@@ -173,6 +176,59 @@ class OpenAIxWorker(BaseWorker):
 
         return out
 
+    def _apply_model_context_window(self, payload: dict) -> dict:
+        """Set options.num_ctx from model config contextWindow when not explicitly provided."""
+        if not isinstance(payload, dict):
+            return payload
+
+        model_name = payload.get("model")
+        if not isinstance(model_name, str) or not model_name.strip():
+            return payload
+
+        options = payload.get("options")
+        if not isinstance(options, dict):
+            options = {}
+
+        # Explicit request value always wins.
+        if options.get("num_ctx") is not None:
+            return payload
+
+        cfg_window = self._resolve_model_context_window(model_name)
+        if cfg_window is None:
+            return payload
+
+        options["num_ctx"] = cfg_window
+        payload["options"] = options
+        return payload
+
+    def _resolve_model_context_window(self, model_name: str) -> int | None:
+        """Return configured contextWindow for model from active provider, if available."""
+        if self._core is None:
+            return None
+
+        provider_models = self._core.config.get(f"models.providers.{self._provider_id}.models") or []
+        if not isinstance(provider_models, list):
+            return None
+
+        for model_cfg in provider_models:
+            if not isinstance(model_cfg, dict):
+                continue
+            cfg_id = model_cfg.get("id")
+            cfg_name = model_cfg.get("name")
+            if model_name not in {cfg_id, cfg_name}:
+                continue
+
+            raw_ctx = model_cfg.get("contextWindow")
+            if raw_ctx is None:
+                return None
+            try:
+                parsed = int(raw_ctx)
+            except (TypeError, ValueError):
+                return None
+            return parsed if parsed > 0 else None
+
+        return None
+
     async def _apply_context_chain(self, task: Task_agent) -> WorkerResult:
         """Run context workers synchronously before model execution."""
         if self._core is None:
@@ -229,7 +285,15 @@ class OpenAIxWorker(BaseWorker):
             system_found = False
             for message in messages:
                 if isinstance(message, dict) and message.get("role") == "system":
-                    message["content"] = rendered
+                    current_content = message.get("content", "")
+                    if not isinstance(current_content, str):
+                        current_content = str(current_content)
+
+                    # Keep caller-provided system prompt and append injected context.
+                    if current_content.strip() and rendered.strip() and rendered not in current_content:
+                        message["content"] = f"{current_content}\n\n{rendered}"
+                    elif rendered.strip() and not current_content.strip():
+                        message["content"] = rendered
                     system_found = True
                     break
             if not system_found:
