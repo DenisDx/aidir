@@ -248,10 +248,33 @@ class OpenAIxWorker(BaseWorker):
         if isinstance(context_builder_cfg, dict) and isinstance(context_builder_cfg.get("context_add_internal_tools"), dict):
             task.config["context_add_internal_tools"] = context_builder_cfg.get("context_add_internal_tools")
 
+        request_payload = task.payload if isinstance(task.payload, dict) else {}
+        request_has_tools_field = "tools" in request_payload
+        request_tools_value = request_payload.get("tools") if request_has_tools_field else None
+        disable_internal_tools_injection = request_has_tools_field and (
+            request_tools_value is None
+            or (isinstance(request_tools_value, list) and len(request_tools_value) == 0)
+        )
+
+        if disable_internal_tools_injection:
+            log(
+                "worker",
+                "info",
+                f"Task {task.id}: explicit tools={request_tools_value!r}; internal tools injection disabled",
+                "openaix",
+            )
+
         worker_chain = ["context_builder", "context_add_internal_tools", "context_render_openclaw_style"]
         original_worker_id = task.worker_id
 
         for worker_name in worker_chain:
+            if worker_name == "context_add_internal_tools" and disable_internal_tools_injection:
+                continue
+
+            if worker_name == "context_render_openclaw_style" and disable_internal_tools_injection and task.context is not None:
+                # Ensure rendered prompt does not advertise internal tools when caller explicitly disables tools.
+                task.context.tools = {}
+
             worker = self._core.workers.get(worker_name)
             if worker is None:
                 continue
@@ -279,6 +302,7 @@ class OpenAIxWorker(BaseWorker):
 
         payload = dict(task.payload or {})
         messages = list(payload.get("messages") or [])
+        request_has_tools_field = "tools" in payload
 
         if task.context.system_rendered:
             rendered = task.context.system_rendered
@@ -299,7 +323,11 @@ class OpenAIxWorker(BaseWorker):
             if not system_found:
                 messages.insert(0, {"role": "system", "content": rendered})
 
-        if task.context.tools:
+        if request_has_tools_field:
+            # Respect caller-provided tools control. Explicit null/[] means no tools.
+            if payload.get("tools") is None:
+                payload["tools"] = []
+        elif task.context.tools:
             out_tools = []
             for tool_name, tool_spec in task.context.tools.items():
                 if not isinstance(tool_spec, dict):
