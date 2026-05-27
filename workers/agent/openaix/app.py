@@ -4,6 +4,7 @@ Accepts extended OpenAIx payload and forwards it to an upstream Ollama-compatibl
 """
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 from typing import Awaitable, Callable
@@ -527,6 +528,42 @@ class OpenAIxWorker(BaseWorker):
         return names
 
     @staticmethod
+    def _parse_tool_arguments(raw_args: object) -> dict:
+        """Parse tool arguments from dict/string formats into a dict."""
+        if isinstance(raw_args, dict):
+            return raw_args
+
+        if not isinstance(raw_args, str):
+            return {}
+
+        text = raw_args.strip()
+        if not text:
+            return {}
+
+        # 1) Standard JSON object in string form.
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, dict):
+                return parsed
+            # 2) Some models return a JSON string that itself contains a JSON object.
+            if isinstance(parsed, str):
+                nested = json.loads(parsed)
+                if isinstance(nested, dict):
+                    return nested
+        except Exception:
+            pass
+
+        # 3) Best-effort fallback for python-literal style objects with quotes.
+        try:
+            parsed = ast.literal_eval(text)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+
+        return {}
+
+    @staticmethod
     def _extract_tool_calls(message: dict) -> list[dict]:
         """Normalize tool call list from assistant message."""
         out: list[dict] = []
@@ -542,14 +579,8 @@ class OpenAIxWorker(BaseWorker):
             if not name:
                 continue
 
-            args = fn.get("arguments") or call.get("arguments") or {}
-            if isinstance(args, str):
-                try:
-                    args = json.loads(args)
-                except Exception:
-                    args = {}
-            if not isinstance(args, dict):
-                args = {}
+            raw_args = fn.get("arguments") or call.get("arguments") or {}
+            args = OpenAIxWorker._parse_tool_arguments(raw_args)
 
             out.append(
                 {
@@ -589,14 +620,8 @@ class OpenAIxWorker(BaseWorker):
 
             # Ollama /api/chat expects arguments as a dict (object), not a JSON string.
             # OpenAI-style (string) would cause Ollama to fail with JSON parse error.
-            args = fn.get("arguments") or raw_call.get("arguments") or {}
-            if isinstance(args, str):
-                try:
-                    args = json.loads(args)
-                except Exception:
-                    args = {}
-            if not isinstance(args, dict):
-                args = {}
+            raw_args = fn.get("arguments") or raw_call.get("arguments") or {}
+            args = OpenAIxWorker._parse_tool_arguments(raw_args)
 
             call_entry: dict = {
                 "function": {
