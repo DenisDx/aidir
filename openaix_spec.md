@@ -20,7 +20,8 @@ Base URL (example): `http://127.0.0.1:21434`
 2. `GET /api/tags` - Ollama-compatible models listing
 3. `POST /v1/chat/completions` - OpenAI-compatible chat endpoint (with OpenAIx extensions)
 4. `GET /v1/models` - OpenAI-compatible models listing
-5. `GET /health` - health check (`{"status":"ok"}`)
+5. `GET /api/providers/{provider}/models/{model}/queue-state` and `GET /v1/providers/{provider}/models/{model}/queue-state` - read-only queue state for a provider/model pair
+6. `GET /health` - health check (`{"status":"ok"}`)
 
 ## 3. Authentication and envid behavior
 
@@ -279,6 +280,40 @@ Ollama-like:
    5. `digest` (empty)
    6. `details` (object)
 
+  ## 6.6 Queue state
+
+  ### `GET /v1/providers/{provider}/models/{model}/queue-state`
+
+  Also exposed as `GET /api/providers/{provider}/models/{model}/queue-state`.
+
+  This endpoint returns the current queue state for the resource requirements of the selected provider/model pair.
+
+  Path parameters:
+
+  1. `provider` - provider id from `models.providers`
+  2. `model` - model `id` or `name` from that provider
+
+  Query parameters:
+
+  1. `priority: integer` - optional, defaults to `5`
+
+  Semantics:
+
+  1. The model is resolved from `models.providers.<provider>.models[]`.
+  2. Queue counts include queued tasks whose serialized `resource_requirements` exactly match the resolved model resource requirements.
+  3. `can_run_now` is `true` only when the target resources are currently available and there are no queued tasks with priority equal to or higher than the requested one.
+  4. Lower numeric value means higher priority, same as task queue ordering.
+
+  Response fields:
+
+  1. `provider`
+  2. `model`
+  3. `priority`
+  4. `can_run_now`
+  5. `queued_count_below_priority` - queued tasks for this resource with priority numerically greater than the requested one
+  6. `queued_count_total` - total queued tasks for this resource
+  7. `priority_counts` - sorted list of `{priority, count}` objects for all queued tasks on this resource
+
 ## 7. Error format
 
 Endpoint has compatibility mode (`errors_compatibility_mode`, default `true`).
@@ -441,4 +476,11 @@ curl -N "$BASE/v1/chat/completions" \
 ```bash
 curl -s "$BASE/v1/models"
 curl -s "$BASE/api/tags"
+```
+
+### 10.8 Queue state for a provider/model
+
+```bash
+curl -s "$BASE/v1/providers/ollama_local/models/qwen3.5:9b/queue-state?priority=5"
+curl -s "$BASE/api/providers/ollama_local/models/qwen3.5:9b/queue-state?priority=5"
 ```

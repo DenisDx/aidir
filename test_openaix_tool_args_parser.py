@@ -5,6 +5,9 @@ from __future__ import annotations
 import json
 import unittest
 
+import httpx
+
+from core.task_types.task_agent import Task_agent
 from workers.agent.openaix.app import OpenAIxWorker
 
 
@@ -89,6 +92,38 @@ class TestOpenAIxToolArgsParser(unittest.TestCase):
                     }
                 ],
             },
+        )
+
+
+class TestOpenAIxTimeoutBehavior(unittest.TestCase):
+    """Regression checks for timeout behavior in OpenAIx worker."""
+
+    def test_resolve_upstream_timeout_prefers_task_run_timeout(self) -> None:
+        """Uses task.run_timeout so upstream timeout matches task execution budget."""
+        worker = OpenAIxWorker()
+        worker._timeout = 100
+        task = Task_agent(payload={}, stream=False)
+        task.run_timeout = 300
+
+        self.assertEqual(worker._resolve_upstream_timeout(task), 300)
+
+    def test_resolve_upstream_timeout_falls_back_to_worker_timeout(self) -> None:
+        """Uses worker timeout when task timeout is not set."""
+        worker = OpenAIxWorker()
+        worker._timeout = 45
+        task = Task_agent(payload={}, stream=False)
+        task.run_timeout = 0
+
+        self.assertEqual(worker._resolve_upstream_timeout(task), 45)
+
+    def test_build_timeout_message_non_empty_for_blank_exception(self) -> None:
+        """Produces diagnostic text even when timeout exception string is empty."""
+        request = httpx.Request("POST", "http://127.0.0.1:11434/api/chat")
+        exc = httpx.ReadTimeout("", request=request)
+
+        self.assertEqual(
+            OpenAIxWorker._build_timeout_message(exc),
+            "ReadTimeout: POST http://127.0.0.1:11434/api/chat",
         )
 
 

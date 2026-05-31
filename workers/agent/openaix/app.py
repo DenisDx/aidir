@@ -118,11 +118,12 @@ class OpenAIxWorker(BaseWorker):
 
         payload_with_ctx = self._apply_model_context_window(dict(task.payload or {}))
         payload = self._normalize_payload(payload_with_ctx, task.stream)
+        upstream_timeout = self._resolve_upstream_timeout(task)
 
         log("worker", "debug", f"Forwarding task {task.id} to {url} stream={task.stream}", "openaix")
 
         try:
-            async with httpx.AsyncClient(timeout=self._timeout) as client:
+            async with httpx.AsyncClient(timeout=upstream_timeout) as client:
                 # Check if tools are present in payload (injected by context builder)
                 has_tools = bool(payload.get("tools"))
                 if task.stream and not has_tools:
@@ -132,11 +133,46 @@ class OpenAIxWorker(BaseWorker):
             log("worker", "error", f"Upstream unreachable: {exc}", "openaix")
             return WorkerResult(ok=False, error={"code": "UPSTREAM_UNREACHABLE", "message": str(exc)})
         except httpx.TimeoutException as exc:
-            log("worker", "error", f"Upstream timeout: {exc}", "openaix")
-            return WorkerResult(ok=False, error={"code": "UPSTREAM_TIMEOUT", "message": str(exc)})
+            timeout_message = self._build_timeout_message(exc)
+            log("worker", "error", f"Upstream timeout: {timeout_message}", "openaix")
+            return WorkerResult(ok=False, error={"code": "UPSTREAM_TIMEOUT", "message": timeout_message})
         except Exception as exc:
             log("worker", "error", f"Unexpected error: {exc}", "openaix")
             return WorkerResult(ok=False, error={"code": "EXCEPTION", "message": str(exc)})
+
+    def _resolve_upstream_timeout(self, task: Task) -> int:
+        """Use task timeout for upstream request when available to avoid premature failures."""
+        try:
+            configured_timeout = int(self._timeout)
+        except (TypeError, ValueError):
+            configured_timeout = 100
+        configured_timeout = max(1, configured_timeout)
+
+        task_timeout = getattr(task, "run_timeout", 0)
+        try:
+            task_timeout_int = int(task_timeout)
+        except (TypeError, ValueError):
+            task_timeout_int = 0
+
+        if task_timeout_int > 0:
+            return task_timeout_int
+        return configured_timeout
+
+    @staticmethod
+    def _build_timeout_message(exc: httpx.TimeoutException) -> str:
+        """Build a non-empty timeout message for diagnostics."""
+        detail = str(exc).strip()
+        if detail:
+            return detail
+
+        request = getattr(exc, "request", None)
+        if request is not None:
+            method = getattr(request, "method", "") or ""
+            url = getattr(request, "url", None)
+            if method and url is not None:
+                return f"{exc.__class__.__name__}: {method} {url}"
+
+        return exc.__class__.__name__
 
     def _resolve_save_llm_request(self, request_payload: dict) -> bool:
         """Resolve save_llm_request flag with per-request value overriding worker default."""

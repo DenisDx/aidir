@@ -79,6 +79,24 @@ class Endpoint_openaix(Endpoint_ollama):
         async def openai_models():
             return self._openai_models_response()
 
+        @app.get("/v1/providers/{provider_id}/models/{model_id:path}/queue-state")
+        async def openai_model_queue_state(provider_id: str, model_id: str, priority: int = 5):
+            return await self._model_queue_state_response(
+                protocol="openai",
+                provider_id=provider_id,
+                model_id=model_id,
+                priority=priority,
+            )
+
+        @app.get("/api/providers/{provider_id}/models/{model_id:path}/queue-state")
+        async def ollama_model_queue_state(provider_id: str, model_id: str, priority: int = 5):
+            return await self._model_queue_state_response(
+                protocol="ollama",
+                provider_id=provider_id,
+                model_id=model_id,
+                priority=priority,
+            )
+
         @app.get("/health")
         async def health():
             return {"status": "ok"}
@@ -383,6 +401,129 @@ class Endpoint_openaix(Endpoint_ollama):
                 for model_id in self._collect_models()
             ]
         }
+
+    async def _model_queue_state_response(
+        self,
+        *,
+        protocol: str,
+        provider_id: str,
+        model_id: str,
+        priority: int,
+    ) -> JSONResponse:
+        """Return queue state for a provider/model pair."""
+        if priority < 0:
+            return self._error_response(
+                protocol=protocol,
+                status_code=400,
+                code="INVALID_REQUEST",
+                message="priority must be greater than or equal to 0",
+            )
+
+        resolved = self._resolve_model_resource_requirements(provider_id, model_id)
+        if resolved is None:
+            return self._error_response(
+                protocol=protocol,
+                status_code=404,
+                code="INVALID_MODEL",
+                message=f"Unknown provider/model pair: {provider_id}/{model_id}",
+            )
+
+        if self._core.queue is None:
+            return self._error_response(
+                protocol=protocol,
+                status_code=503,
+                code="QUEUE_UNAVAILABLE",
+                message="Queue is not available",
+            )
+
+        queue_state = await self._core.queue.get_resource_queue_state(resolved, priority=priority)
+        resource_ready = bool(self._core.resources and self._core.resources.check_available(resolved))
+        blocked_by_same_or_higher = queue_state["queued_count_total"] - queue_state["queued_count_below_priority"]
+
+        payload = {
+            "provider": provider_id,
+            "model": model_id,
+            "priority": priority,
+            "can_run_now": resource_ready and blocked_by_same_or_higher == 0,
+            "queued_count_below_priority": queue_state["queued_count_below_priority"],
+            "queued_count_total": queue_state["queued_count_total"],
+            "priority_counts": queue_state["priority_counts"],
+        }
+        return JSONResponse(payload)
+
+    def _resolve_model_resource_requirements(self, provider_id: str, model_id: str) -> dict | None:
+        """Resolve configured resource requirements for a provider/model pair."""
+        providers = self._config_get("models.providers") or {}
+        if not providers:
+            models_cfg = self._config_get("models") or {}
+            if isinstance(models_cfg, dict):
+                providers = models_cfg.get("providers") or {}
+        if not isinstance(providers, dict):
+            return None
+
+        provider_cfg = providers.get(provider_id)
+        if not isinstance(provider_cfg, dict):
+            return None
+
+        models = provider_cfg.get("models") or []
+        if not isinstance(models, list):
+            return None
+
+        normalized_model_id = str(model_id).strip()
+        for model in models:
+            if not isinstance(model, dict):
+                continue
+            candidate_id = str(model.get("id") or "").strip()
+            candidate_name = str(model.get("name") or "").strip()
+            if normalized_model_id not in {candidate_id, candidate_name}:
+                continue
+            resources = model.get("resources") or {}
+            if not isinstance(resources, dict):
+                return {}
+            return self._normalize_resource_requirements(resources)
+
+        return None
+
+    def _config_get(self, key: str, default=None):
+        """Read config keys from either Config objects or nested dicts."""
+        cfg = getattr(self, "_core", None)
+        cfg = getattr(cfg, "config", None)
+        if cfg is None:
+            return default
+        getter = getattr(cfg, "get", None)
+        if callable(getter):
+            try:
+                value = getter(key)
+            except Exception:
+                value = default
+            else:
+                if value is not None:
+                    return value
+        if isinstance(cfg, dict):
+            current = cfg
+            for part in key.split("."):
+                if not isinstance(current, dict) or part not in current:
+                    return default
+                current = current[part]
+            return current
+        return default
+
+    @staticmethod
+    def _normalize_resource_requirements(resources: dict | None) -> dict[str, dict[str, int]]:
+        """Normalize resource requirements to integer values."""
+        normalized: dict[str, dict[str, int]] = {}
+        for resource_id, metrics in (resources or {}).items():
+            if not isinstance(metrics, dict):
+                continue
+            normalized_metrics: dict[str, int] = {}
+            for metric_name, amount in metrics.items():
+                try:
+                    normalized_metrics[str(metric_name)] = int(amount)
+                except Exception:
+                    continue
+            if normalized_metrics:
+                normalized[str(resource_id)] = normalized_metrics
+        return normalized
 
     def _openai_error_payload(self, code: str, message: str, task_id: str | None = None) -> dict:
         """OpenAI-style error payload."""

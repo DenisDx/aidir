@@ -190,12 +190,16 @@ WebUI backend: `http://HOST:${WEBUI_PORT}`
 
 OpenAIx endpoint: `http://HOST:${OPENAIX_ENDPOINT_PORT}`
 
+Use the queue-state endpoint to inspect whether a provider/model resource can start immediately and how many queued tasks already target that resource.
+
 | Route | Type | Purpose |
 |---|---|---|
 | `/api/chat` | POST | Ollama-compatible chat |
 | `/api/tags` | GET | Ollama-style models list |
 | `/v1/chat/completions` | POST | OpenAI-compatible chat |
 | `/v1/models` | GET | OpenAI-style models list |
+| `/api/providers/{provider}/models/{model}/queue-state` | GET | Read-only queue state for a provider/model pair |
+| `/v1/providers/{provider}/models/{model}/queue-state` | GET | Read-only queue state for a provider/model pair |
 | `/health` | GET | Health check |
 
 MCP endpoint: `http://HOST:${MCP_ENDPOINT_PORT}`
