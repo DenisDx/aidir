@@ -382,6 +382,27 @@ class Core:
         """
         await self.queue.delete_task(task_id)
 
+    async def terminate_task(self, task_id: str) -> dict | None:
+        """Cancel or remove one live task by id and return its latest state."""
+        if not self.queue:
+            return None
+
+        task = self.queue.get_task(task_id)
+        if task is None:
+            return None
+
+        if task.status in {STATUS_CREATED, STATUS_QUEUED}:
+            await self.queue.mark_canceled(task)
+            await self.queue.delete_task(task.id)
+            return task.to_redis_hash()
+
+        if task.status == STATUS_RUNNING and self.scheduler is not None:
+            await self.scheduler.cancel_task(task.id, timeout=5.0)
+            await self.queue.delete_task(task.id)
+            return task.to_redis_hash()
+
+        return task.to_redis_hash()
+
     def task_parent_chain_max_depth(self) -> int:
         """Return the maximum allowed parent callback chain depth."""
         tasks_cfg = self.config.get("tasks") or {}

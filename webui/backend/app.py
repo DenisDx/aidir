@@ -387,6 +387,16 @@ def create_app(
             raise HTTPException(status_code=404, detail="Task not found")
         return {"task": _task_from_hash(raw)}
 
+    @app.post("/api/tasks/{task_id}/terminate")
+    async def terminate_task(task_id: str, session: dict = Depends(_require_session)):
+        """Terminate one live task visible on the dashboard/task viewer."""
+        task_hash = await core.terminate_task(task_id)
+        if task_hash is None:
+            raise HTTPException(status_code=404, detail="Task not found")
+
+        log("webui", "warn", f"Task termination requested by user {session['login']}: {task_id}", "control")
+        return {"ok": True, "task": _task_from_hash(task_hash)}
+
     # ── Status ────────────────────────────────────────────────────────────────
 
     @app.get("/api/status")

@@ -186,6 +186,27 @@ class Scheduler:
 
         return len(runs)
 
+    async def cancel_task(self, task_id: str, timeout: float = 5.0) -> bool:
+        """Cancel one active task by id and wait briefly for its runner to finish."""
+        target_run = None
+        prefix = f"task:{task_id}:"
+        for run in self._active_runs:
+            if run.get_name().startswith(prefix):
+                target_run = run
+                break
+
+        if target_run is None:
+            return False
+
+        log("core", "info", f"cancel_task: BEGIN task_id={task_id} timeout={timeout}s run={target_run.get_name()}")
+        target_run.cancel()
+        try:
+            await asyncio.wait_for(asyncio.gather(target_run, return_exceptions=True), timeout=timeout or None)
+            log("core", "info", f"cancel_task: SUCCESS task_id={task_id}")
+        except asyncio.TimeoutError:
+            log("core", "warn", f"cancel_task: TIMEOUT task_id={task_id} timeout={timeout}s")
+        return True
+
     # ── Internal ─────────────────────────────────────────────────────────────
 
     def _on_run_done(self, bg_task: asyncio.Task) -> None:
@@ -211,6 +232,28 @@ class Scheduler:
 
         return None
 
+    @staticmethod
+    def _run_timeout_source(task: Task) -> str:
+        """Describe where the effective task run timeout came from."""
+        payload = task.payload if isinstance(task.payload, dict) else {}
+        if payload.get("timeout") is not None:
+            return "payload.timeout"
+        return "tasks.run_timeout / TASK_RUN_TIMEOUT_SECONDS"
+
+    @classmethod
+    def _build_run_timeout_message(cls, task: Task, elapsed_seconds: float) -> str:
+        """Build an informative task run-timeout message for logs and API errors."""
+        try:
+            timeout_limit = int(task.run_timeout)
+        except (TypeError, ValueError):
+            timeout_limit = 0
+
+        timeout_source = cls._run_timeout_source(task)
+        return (
+            f"Task run timeout exceeded after {elapsed_seconds:.2f}s "
+            f"(limit={timeout_limit}s, parameter=task.run_timeout, source={timeout_source})"
+        )
+
     async def _run_task(
         self,
         task: Task,
@@ -226,6 +269,8 @@ class Scheduler:
 
         if self._resources and reserved_reqs:
             await self._resources.reserve_blind_for(reserved_reqs, consumer_id=consumer_id)
+
+        started = time.monotonic()
 
         try:
             result: WorkerResult = await asyncio.wait_for(
@@ -246,10 +291,17 @@ class Scheduler:
                     log("worker", "warn", f"Task {task.id} failed: {err}", worker.id)
 
         except asyncio.TimeoutError:
-            log("worker", "error", f"Task {task.id} timed out", worker.id)
-            err = {"code": "TIMEOUT", "message": "Task run timeout exceeded"}
+            elapsed = time.monotonic() - started
+            timeout_message = self._build_run_timeout_message(task, elapsed)
+            log("worker", "error", f"Task {task.id} timed out: {timeout_message}", worker.id)
+            err = {"code": "TIMEOUT", "message": timeout_message}
             if not await self._handle_reject(task, worker.id, err):
                 await self._queue.mark_failed(task, err)
+
+        except asyncio.CancelledError:
+            log("worker", "warn", f"Task {task.id} canceled", worker.id)
+            await self._queue.mark_canceled(task)
+            raise
 
         except Exception as exc:
             log("worker", "error", f"Task {task.id} exception: {exc}", worker.id)

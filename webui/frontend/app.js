@@ -308,13 +308,26 @@ async function loadTasks() {
   body.innerHTML = '';
   data.tasks.forEach(t => {
     const tr = document.createElement('tr');
+    const canTerminate = ['created', 'queued', 'running'].includes(String(t.status || '').toLowerCase());
     tr.innerHTML = `
       <td style="font-family:monospace;font-size:11px">${t.id.slice(0, 8)}…</td>
       <td>${t.type}</td>
       <td><span class="badge badge-${t.status}">${t.status}</span></td>
       <td>${t.worker_id || '—'}</td>
       <td style="color:var(--muted);font-size:12px">${fmtTime(t.created_at)}</td>
+      <td style="color:var(--muted);font-size:12px">${fmtTaskDuration(t.started_at)}</td>
+      <td><button class="btn-sm" data-dashboard-json="${escapeHtml(t.id || '')}">Show JSON</button></td>
+      <td>
+        <div class="task-viewer-actions">
+          <button class="btn-sm" data-dashboard-terminate="${escapeHtml(t.id || '')}" ${canTerminate ? '' : 'disabled'}>Terminate</button>
+        </div>
+      </td>
     `;
+    tr.querySelector('[data-dashboard-json]').addEventListener('click', () => openTaskViewerJson(t.id));
+    const terminateBtn = tr.querySelector('[data-dashboard-terminate]');
+    if (terminateBtn) {
+      terminateBtn.addEventListener('click', () => terminateDashboardTask(t.id, terminateBtn));
+    }
     body.appendChild(tr);
   });
 
@@ -322,6 +335,24 @@ async function loadTasks() {
     $('stat-workers').textContent = Object.keys(status.workers).length;
     renderResources(status.resources || []);
   }
+}
+
+async function terminateDashboardTask(taskId, buttonEl) {
+  if (!taskId) return;
+
+  const confirmed = window.confirm(`Terminate task ${taskId}?`);
+  if (!confirmed) return;
+
+  if (buttonEl) buttonEl.disabled = true;
+
+  const res = await apiPost(`/api/tasks/${encodeURIComponent(taskId)}/terminate`, {});
+  if (!res.ok) {
+    if (buttonEl) buttonEl.disabled = false;
+    window.alert(res.data.detail || 'Failed to terminate task');
+    return;
+  }
+
+  await loadTasks();
 }
 
 function renderResources(resources) {
@@ -380,6 +411,27 @@ function fmtDateTime(iso) {
   if (!iso) return '—';
   const d = new Date(iso);
   return d.toLocaleString();
+}
+
+function fmtTaskDuration(startedAt) {
+  if (!startedAt) return '—';
+
+  const started = new Date(startedAt);
+  if (Number.isNaN(started.getTime())) return '—';
+
+  const elapsedMs = Date.now() - started.getTime();
+  if (elapsedMs < 0) return '0s';
+
+  const totalSeconds = Math.floor(elapsedMs / 1000);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+
+  if (hours > 0) {
+    return `${hours}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+  }
+
+  return `${minutes}:${String(seconds).padStart(2, '0')}`;
 }
 
 function normalizeTaskViewerDate(value) {
