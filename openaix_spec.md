@@ -286,9 +286,12 @@ OpenAI-like:
 1. `object: "list"`
 2. `data[]` items:
    1. `id`
-   2. `object: "model"`
-   3. `created`
-   4. `owned_by: "aidir"`
+  2. `real_id` - internal non-alias model id selected by current endpoint routing rules
+  3. `object: "model"`
+  4. `created`
+  5. `owned_by: "aidir"`
+
+`id` is always the externally callable model name: `alias` when configured, otherwise `id`.
 
 ### `GET /api/tags`
 
@@ -297,10 +300,13 @@ Ollama-like:
 1. `models[]` items:
    1. `name`
    2. `model`
-   3. `modified_at`
-   4. `size` (0)
-   5. `digest` (empty)
-   6. `details` (object)
+  3. `real_id` - internal non-alias model id selected by current endpoint routing rules
+  4. `modified_at`
+  5. `size` (0)
+  6. `digest` (empty)
+  7. `details` (object)
+
+`name` and `model` are always the externally callable model name: `alias` when configured, otherwise `id`.
 
   ## 6.6 Queue state
 

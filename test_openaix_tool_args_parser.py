@@ -7,8 +7,13 @@ import unittest
 
 import httpx
 
+from core.context import Context
+from core.scheduler import Scheduler
+from core.worker import WorkerResult
 from core.task_types.task_agent import Task_agent
+from core.endpoints.endpoint_ollama import Endpoint_ollama
 from core.endpoints.endpoint_openaix import Endpoint_openaix
+from workers.agent.call_ollama.app import CallOllamaWorker
 from workers.agent.openaix.app import OpenAIxWorker
 
 
@@ -118,6 +123,136 @@ class TestOpenAIxToolArgsParser(unittest.TestCase):
                 ],
             },
         )
+
+
+class TestOpenAIxToolInjection(unittest.IsolatedAsyncioTestCase):
+    """Regression checks for selective tool injection and execution ownership."""
+
+    def test_apply_context_to_payload_injects_all_internal_tools_when_request_omits_tools(self) -> None:
+        """Injects all internal tools when caller does not provide a tools field."""
+        task = Task_agent(payload={"messages": []}, stream=False)
+        task.context = Context.empty()
+        task.context.tools = {
+            "internal_echo": {
+                "worker": "echo_tool",
+                "description": "Echo input",
+                "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}},
+            }
+        }
+
+        OpenAIxWorker._apply_context_to_payload(task)
+
+        self.assertEqual(task.config["injected_tool_names"], ["internal_echo"])
+        self.assertEqual(
+            task.payload["tools"],
+            [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "internal_echo",
+                        "description": "Echo input",
+                        "parameters": {"type": "object", "properties": {"text": {"type": "string"}}},
+                    },
+                }
+            ],
+        )
+
+    def test_apply_context_to_payload_replaces_only_string_tool_selectors(self) -> None:
+        """Preserves caller tool objects and replaces only string selectors with injected internal tools."""
+        caller_tool = {
+            "type": "function",
+            "function": {
+                "name": "caller_tool",
+                "description": "Caller supplied",
+                "parameters": {"type": "object"},
+            },
+        }
+        task = Task_agent(payload={"messages": [], "tools": [caller_tool, "internal_echo", "missing_tool"]}, stream=False)
+        task.context = Context.empty()
+        task.context.tools = {
+            "internal_echo": {
+                "worker": "echo_tool",
+                "description": "Echo input",
+                "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}},
+            },
+            "other_tool": {
+                "worker": "other_tool",
+                "description": "Other",
+                "inputSchema": {"type": "object"},
+            },
+        }
+
+        OpenAIxWorker._apply_context_to_payload(task)
+
+        self.assertEqual(task.config["injected_tool_names"], ["internal_echo"])
+        self.assertEqual(task.payload["tools"][0], caller_tool)
+        self.assertEqual(task.payload["tools"][1]["function"]["name"], "internal_echo")
+        self.assertEqual(len(task.payload["tools"]), 2)
+
+    async def test_run_with_internal_tools_does_not_execute_non_injected_tool(self) -> None:
+        """Passes through tool calls when the tool was caller-provided rather than injected by aidir."""
+        worker = OpenAIxWorker()
+
+        async def fake_forward_sync(client, url, payload, *, save_call=False, task_id=""):
+            return WorkerResult(
+                ok=True,
+                data={
+                    "message": {
+                        "tool_calls": [
+                            {
+                                "id": "call-1",
+                                "function": {
+                                    "name": "caller_tool",
+                                    "arguments": {},
+                                },
+                            }
+                        ]
+                    }
+                },
+            )
+
+        async def fail_execute_internal_tool(call, parent_task):
+            raise AssertionError("caller-provided tool must not be executed by aidir")
+
+        worker._forward_sync = fake_forward_sync
+        worker._execute_internal_tool = fail_execute_internal_tool
+
+        parent_task = Task_agent(
+            payload={
+                "messages": [{"role": "user", "content": "Hi"}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "caller_tool",
+                            "description": "Caller supplied",
+                            "parameters": {"type": "object"},
+                        },
+                    }
+                ],
+            },
+            stream=False,
+        )
+        parent_task.context = Context.empty()
+        parent_task.context.tools = {
+            "caller_tool": {
+                "worker": "echo_tool",
+                "description": "Internal collision",
+                "inputSchema": {"type": "object"},
+            }
+        }
+        parent_task.config = {"injected_tool_names": []}
+
+        result = await worker._run_with_internal_tools(
+            client=None,
+            url="http://example.test/api/chat",
+            payload=parent_task.payload,
+            parent_task=parent_task,
+            emit_chunk=None,
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.data["message"]["tool_calls"][0]["function"]["name"], "caller_tool")
 
 
 class TestOpenAIxTimeoutBehavior(unittest.TestCase):
@@ -265,6 +400,374 @@ class TestOpenAIxGenerationParameters(unittest.TestCase):
                 "min_p": 0.04,
             },
         )
+
+
+class TestOpenAIxModelRouting(unittest.TestCase):
+    """Regression checks for alias-based provider/model resolution."""
+
+    def test_build_task_for_payload_prefers_worker_provider_for_duplicate_model_ids(self) -> None:
+        """Uses worker provider as priority provider when several providers expose the same model id."""
+        endpoint = Endpoint_openaix({"id": "openaix", "worker": "openaix"})
+        endpoint._core = _FakeCore(
+            {
+                "workers": {
+                    "default": "openaix",
+                    "items": {
+                        "openaix": {
+                            "provider": "ollama_local",
+                        }
+                    },
+                },
+                "tasks": {"queue_timeout": 300, "run_timeout": 300},
+                "models": {
+                    "providers": {
+                        "ollama_remote": {
+                            "models": [
+                                {"id": "qwen3.5:9b", "resources": {"remote": {"VRAM": 9000}}},
+                            ]
+                        },
+                        "ollama_local": {
+                            "models": [
+                                {"id": "qwen3.5:9b", "resources": {"local": {"VRAM": 16000}}},
+                            ]
+                        },
+                    }
+                },
+            }
+        )
+
+        task = endpoint._build_task_for_payload(
+            {
+                "model": "qwen3.5:9b",
+                "messages": [{"role": "user", "content": "Hi"}],
+            },
+            stream=False,
+        )
+
+        self.assertEqual(task.payload["model"], "qwen3.5:9b")
+        self.assertEqual(task.config["route"]["resolved_provider"], "ollama_local")
+        self.assertEqual(task.config["route"]["resolved_model"], "qwen3.5:9b")
+
+    def test_build_task_for_payload_resolves_alias_to_concrete_provider_and_model(self) -> None:
+        """Resolves explicit alias before raw model ids and stores concrete route metadata."""
+        endpoint = Endpoint_openaix({"id": "openaix", "worker": "openaix"})
+        endpoint._core = _FakeCore(
+            {
+                "workers": {
+                    "default": "openaix",
+                    "items": {
+                        "openaix": {
+                            "provider": "ollama_local",
+                        }
+                    },
+                },
+                "tasks": {"queue_timeout": 300, "run_timeout": 300},
+                "models": {
+                    "providers": {
+                        "ollama_local": {
+                            "models": [
+                                {"id": "qwen3.5:9b"},
+                            ]
+                        },
+                        "ollama_remote": {
+                            "models": [
+                                {"id": "fred-large", "alias": "smart_chat"},
+                            ]
+                        },
+                    }
+                },
+            }
+        )
+
+        task = endpoint._build_task_for_payload(
+            {
+                "model": "smart_chat",
+                "messages": [{"role": "user", "content": "Hi"}],
+            },
+            stream=False,
+        )
+
+        self.assertEqual(task.payload["model"], "fred-large")
+        self.assertEqual(task.config["route"]["resolved_provider"], "ollama_remote")
+        self.assertEqual(task.config["route"]["resolved_model"], "fred-large")
+        self.assertEqual(task.config["route"]["selection"], "alias")
+
+    def test_collect_models_exposes_alias_when_present(self) -> None:
+        """Lists alias as the external model id while keeping unaliased ids visible."""
+        endpoint = Endpoint_openaix({"id": "openaix", "worker": "openaix"})
+        endpoint._core = _FakeCore(
+            {
+                "models": {
+                    "providers": {
+                        "ollama_local": {
+                            "models": [
+                                {"id": "qwen3.5:9b", "alias": "smart_chat"},
+                                {"id": "qwen3.5:0.8b"},
+                            ]
+                        },
+                        "ollama_remote": {
+                            "models": [
+                                {"id": "qwen3.5:9b"},
+                            ]
+                        },
+                    }
+                }
+            }
+        )
+
+        self.assertEqual(endpoint._collect_models(), ["smart_chat", "qwen3.5:0.8b", "qwen3.5:9b"])
+
+    def test_openai_models_response_includes_real_id_for_alias(self) -> None:
+        """Lists callable external id and resolved internal id in the OpenAI models response."""
+        endpoint = Endpoint_openaix({"id": "openaix", "worker": "openaix"})
+        endpoint._core = _FakeCore(
+            {
+                "workers": {
+                    "default": "openaix",
+                    "items": {
+                        "openaix": {
+                            "provider": "ollama_remote",
+                        }
+                    },
+                },
+                "models": {
+                    "providers": {
+                        "ollama_local": {
+                            "models": [
+                                {"id": "qwen3.5:9b", "alias": "smart_chat"},
+                            ]
+                        },
+                        "ollama_remote": {
+                            "models": [
+                                {"id": "fred-large", "alias": "smart_chat"},
+                            ]
+                        },
+                    }
+                },
+            }
+        )
+
+        response = endpoint._openai_models_response()
+
+        self.assertEqual(
+            response["data"],
+            [
+                {
+                    "id": "smart_chat",
+                    "real_id": "fred-large",
+                    "object": "model",
+                    "created": response["data"][0]["created"],
+                    "owned_by": "aidir",
+                }
+            ],
+        )
+
+    def test_ollama_tags_response_includes_real_id_for_alias(self) -> None:
+        """Lists callable external id and resolved internal id in the Ollama tags response."""
+        endpoint = Endpoint_openaix({"id": "openaix", "worker": "openaix"})
+        endpoint._core = _FakeCore(
+            {
+                "workers": {
+                    "default": "openaix",
+                    "items": {
+                        "openaix": {
+                            "provider": "ollama_remote",
+                        }
+                    },
+                },
+                "models": {
+                    "providers": {
+                        "ollama_local": {
+                            "models": [
+                                {"id": "qwen3.5:9b", "alias": "smart_chat"},
+                            ]
+                        },
+                        "ollama_remote": {
+                            "models": [
+                                {"id": "fred-large", "alias": "smart_chat"},
+                            ]
+                        },
+                    }
+                },
+            }
+        )
+
+        response = endpoint._ollama_tags_response()
+
+        self.assertEqual(response["models"][0]["name"], "smart_chat")
+        self.assertEqual(response["models"][0]["model"], "smart_chat")
+        self.assertEqual(response["models"][0]["real_id"], "fred-large")
+
+    def test_worker_uses_task_route_provider_override(self) -> None:
+        """Uses resolved provider override for base URL and model context lookup."""
+        worker = OpenAIxWorker()
+        worker._provider_id = "ollama_local"
+        worker._base_url = "http://127.0.0.1:11434"
+        worker._core = _FakeCore(
+            {
+                "models": {
+                    "providers": {
+                        "ollama_local": {
+                            "baseUrl": "http://127.0.0.1:11434",
+                            "models": [{"id": "qwen3.5:9b", "contextWindow": 128000}],
+                        },
+                        "ollama_remote": {
+                            "baseUrl": "http://10.0.0.2:21434",
+                            "models": [{"id": "fred-large", "contextWindow": 64000}],
+                        },
+                    }
+                }
+            }
+        )
+        task = Task_agent(payload={"model": "fred-large"}, stream=False)
+        task.config = {"route": {"resolved_provider": "ollama_remote", "resolved_model": "fred-large"}}
+
+        self.assertEqual(worker._resolve_task_provider_id(task), "ollama_remote")
+        self.assertEqual(worker._resolve_base_url("ollama_remote"), "http://10.0.0.2:21434")
+        self.assertEqual(worker._resolve_model_context_window("fred-large", provider_id="ollama_remote"), 64000)
+
+    def test_scheduler_resource_resolution_prefers_task_route_provider(self) -> None:
+        """Resolves resource requirements from the routed provider instead of worker default provider."""
+        scheduler = Scheduler(
+            queue=None,
+            workers={},
+            workers_cfg={"openaix": {"provider": "ollama_local"}},
+            resources=None,
+            full_config={
+                "models": {
+                    "providers": {
+                        "ollama_local": {
+                            "models": [{"id": "qwen3.5:9b", "resources": {"local": {"VRAM": 16000}}}],
+                        },
+                        "ollama_remote": {
+                            "models": [{"id": "qwen3.5:9b", "resources": {"remote": {"VRAM": 9000}}}],
+                        },
+                    }
+                }
+            },
+        )
+        task = Task_agent(payload={"model": "qwen3.5:9b"}, stream=False)
+        task.config = {"route": {"resolved_provider": "ollama_remote", "resolved_model": "qwen3.5:9b"}}
+
+        self.assertEqual(
+            scheduler._resolve_resource_requirements(task, "openaix"),
+            {"remote": {"VRAM": 9000}},
+        )
+
+
+class TestOllamaModelRouting(unittest.TestCase):
+    """Regression checks for alias-based provider/model resolution on the Ollama path."""
+
+    def test_build_task_for_payload_prefers_worker_provider_for_duplicate_model_ids(self) -> None:
+        """Uses worker provider as priority provider when several providers expose the same model id."""
+        endpoint = Endpoint_ollama({"id": "ollama", "worker": "call_ollama"})
+        endpoint._core = _FakeCore(
+            {
+                "workers": {
+                    "default": "call_ollama",
+                    "items": {
+                        "call_ollama": {
+                            "provider": "ollama_local",
+                        }
+                    },
+                },
+                "models": {
+                    "providers": {
+                        "ollama_remote": {
+                            "models": [
+                                {"id": "qwen3.5:9b"},
+                            ]
+                        },
+                        "ollama_local": {
+                            "models": [
+                                {"id": "qwen3.5:9b"},
+                            ]
+                        },
+                    }
+                },
+            }
+        )
+
+        task = endpoint._build_task_for_payload(
+            {
+                "model": "qwen3.5:9b",
+                "messages": [{"role": "user", "content": "Hi"}],
+            },
+            stream=False,
+        )
+
+        self.assertEqual(task.payload["model"], "qwen3.5:9b")
+        self.assertEqual(task.config["route"]["resolved_provider"], "ollama_local")
+
+    def test_build_task_for_payload_resolves_alias_to_concrete_provider_and_model(self) -> None:
+        """Resolves explicit alias before raw model ids and stores concrete route metadata."""
+        endpoint = Endpoint_ollama({"id": "ollama", "worker": "call_ollama"})
+        endpoint._core = _FakeCore(
+            {
+                "workers": {
+                    "default": "call_ollama",
+                    "items": {
+                        "call_ollama": {
+                            "provider": "ollama_local",
+                        }
+                    },
+                },
+                "models": {
+                    "providers": {
+                        "ollama_local": {
+                            "models": [
+                                {"id": "qwen3.5:9b"},
+                            ]
+                        },
+                        "ollama_remote": {
+                            "models": [
+                                {"id": "fred-large", "alias": "smart_chat"},
+                            ]
+                        },
+                    }
+                },
+            }
+        )
+
+        task = endpoint._build_task_for_payload(
+            {
+                "model": "smart_chat",
+                "messages": [{"role": "user", "content": "Hi"}],
+            },
+            stream=False,
+        )
+
+        self.assertEqual(task.payload["model"], "fred-large")
+        self.assertEqual(task.config["route"]["resolved_provider"], "ollama_remote")
+        self.assertEqual(task.config["route"]["resolved_model"], "fred-large")
+
+    def test_call_ollama_worker_uses_task_route_provider_override(self) -> None:
+        """Uses resolved provider override for base URL and model context lookup."""
+        worker = CallOllamaWorker()
+        worker._provider_id = "ollama_local"
+        worker._base_url = "http://127.0.0.1:11434"
+        worker._core = _FakeCore(
+            {
+                "models": {
+                    "providers": {
+                        "ollama_local": {
+                            "baseUrl": "http://127.0.0.1:11434",
+                            "models": [{"id": "qwen3.5:9b", "contextWindow": 128000}],
+                        },
+                        "ollama_remote": {
+                            "baseUrl": "http://10.0.0.3:11434",
+                            "models": [{"id": "fred-large", "contextWindow": 64000}],
+                        },
+                    }
+                }
+            }
+        )
+        task = Task_agent(payload={"model": "fred-large"}, stream=False)
+        task.config = {"route": {"resolved_provider": "ollama_remote", "resolved_model": "fred-large"}}
+
+        self.assertEqual(worker._resolve_task_provider_id(task), "ollama_remote")
+        self.assertEqual(worker._resolve_base_url("ollama_remote"), "http://10.0.0.3:11434")
+        self.assertEqual(worker._resolve_model_context_window("fred-large", provider_id="ollama_remote"), 64000)
 
 
 if __name__ == "__main__":

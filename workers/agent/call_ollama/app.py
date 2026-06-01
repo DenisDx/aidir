@@ -63,14 +63,16 @@ class CallOllamaWorker(BaseWorker):
             )
 
         payload: dict = dict(task.payload)    # shallow copy; we may mutate stream/options
-        payload = self._apply_model_context_window(payload)
+        provider_id = self._resolve_task_provider_id(task)
+        base_url = self._resolve_base_url(provider_id)
+        payload = self._apply_model_context_window(payload, provider_id=provider_id)
         stream: bool = task.stream
-        url = f"{self._base_url}/api/chat"
+        url = f"{base_url}/api/chat"
         log_opts: dict = (payload.get("log") or {}).get("options") or {}
         save_call: bool = bool(log_opts.get("save_llm_request", False))
 
         log("worker", "debug",
-            f"Forwarding task {task.id} to {url} stream={stream}", "call_ollama")
+            f"Forwarding task {task.id} to {url} provider={provider_id} stream={stream}", "call_ollama")
 
         try:
             async with httpx.AsyncClient(timeout=self._timeout) as client:
@@ -98,7 +100,7 @@ class CallOllamaWorker(BaseWorker):
                 error={"code": "EXCEPTION", "message": str(exc)},
             )
 
-    def _apply_model_context_window(self, payload: dict) -> dict:
+    def _apply_model_context_window(self, payload: dict, provider_id: str | None = None) -> dict:
         """Set options.num_ctx from model config contextWindow when not explicitly provided."""
         if not isinstance(payload, dict):
             return payload
@@ -115,7 +117,7 @@ class CallOllamaWorker(BaseWorker):
         if options.get("num_ctx") is not None:
             return payload
 
-        cfg_window = self._resolve_model_context_window(model_name)
+        cfg_window = self._resolve_model_context_window(model_name, provider_id=provider_id)
         if cfg_window is None:
             return payload
 
@@ -123,12 +125,13 @@ class CallOllamaWorker(BaseWorker):
         payload["options"] = options
         return payload
 
-    def _resolve_model_context_window(self, model_name: str) -> int | None:
-        """Return configured contextWindow for model from active provider, if available."""
+    def _resolve_model_context_window(self, model_name: str, provider_id: str | None = None) -> int | None:
+        """Return configured contextWindow for model from effective provider, if available."""
         if self._core is None:
             return None
 
-        provider_models = self._core.config.get(f"models.providers.{self._provider_id}.models") or []
+        effective_provider_id = str(provider_id or self._provider_id or "").strip()
+        provider_models = self._core.config.get(f"models.providers.{effective_provider_id}.models") or []
         if not isinstance(provider_models, list):
             return None
 
@@ -150,6 +153,24 @@ class CallOllamaWorker(BaseWorker):
             return parsed if parsed > 0 else None
 
         return None
+
+    def _resolve_task_provider_id(self, task: Task) -> str:
+        """Return effective provider id for a task using route metadata when present."""
+        route_cfg = (task.config or {}).get("route") if isinstance(task.config, dict) else None
+        if isinstance(route_cfg, dict):
+            provider_id = str(route_cfg.get("resolved_provider") or "").strip()
+            if provider_id:
+                return provider_id
+        return self._provider_id
+
+    def _resolve_base_url(self, provider_id: str) -> str:
+        """Resolve provider base URL for the effective task provider."""
+        if self._core is None:
+            return self._base_url
+        base_url = self._core.config.get(f"models.providers.{provider_id}.baseUrl")
+        if not base_url:
+            return self._base_url
+        return str(base_url).rstrip("/")
 
     # ── Internal ─────────────────────────────────────────────────────────────
 

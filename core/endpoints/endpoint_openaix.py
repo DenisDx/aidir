@@ -49,6 +49,7 @@ class Endpoint_openaix(Endpoint_ollama):
         )
         # Timeout for entire endpoint request (queue + execution)
         self._request_timeout = int(endpoint_cfg.get("request_timeout", 100))
+        self._model_resolution_warnings_emitted: set[str] = set()
 
     def create_app(self, core) -> FastAPI:
         """Create FastAPI app exposing both ollama and openai chat endpoints."""
@@ -205,10 +206,18 @@ class Endpoint_openaix(Endpoint_ollama):
         from core.task_types.task_agent import Task_agent
 
         payload = self._apply_generation_defaults(payload)
-        task = Task_agent(payload=payload, stream=stream, external=True)
         worker_id = self._resolve_worker_id(payload)
+        route = self._resolve_model_route((payload or {}).get("model"), worker_id)
+        if route is not None:
+            payload = dict(payload or {})
+            payload["model"] = route["resolved_model"]
+
+        task = Task_agent(payload=payload, stream=stream, external=True)
         if worker_id:
             task.worker_id = worker_id
+        if route is not None:
+            task.config = dict(task.config or {})
+            task.config["route"] = route
 
         cfg_tasks = self._core.config.get("tasks", {}) or {}
         # Use timeout from request if specified, otherwise use defaults
@@ -406,26 +415,147 @@ class Endpoint_openaix(Endpoint_ollama):
             asyncio.create_task(self._core.delete_task(task.id))
 
     def _collect_models(self) -> list[str]:
-        """Collect unique model ids from configured providers."""
-        providers = self._core.config.get("models.providers") or {}
-        out: list[str] = []
-        seen: set[str] = set()
+        """Collect unique externally visible model ids from configured providers."""
+        return [item["id"] for item in self._collect_model_entries()]
 
-        for provider in providers.values():
-            models = provider.get("models", []) if isinstance(provider, dict) else []
-            for model in models:
-                if not isinstance(model, dict):
-                    continue
-                model_id = model.get("id") or model.get("name")
-                if not model_id:
-                    continue
-                model_id = str(model_id)
-                if model_id in seen:
-                    continue
-                seen.add(model_id)
-                out.append(model_id)
+    def _collect_model_entries(self) -> list[dict[str, str]]:
+        """Collect unique externally visible model ids plus resolved internal ids."""
+        out: list[dict[str, str]] = []
+        seen: set[str] = set()
+        worker_id = self._resolve_worker_id({})
+
+        for _, model in self._iter_provider_models():
+            external_id = self._external_model_id(model)
+            if not external_id or external_id in seen:
+                continue
+            seen.add(external_id)
+
+            route = self._resolve_model_route(external_id, worker_id)
+            real_id = route["resolved_model"] if isinstance(route, dict) and route.get("resolved_model") else self._model_id(model)
+            out.append({"id": external_id, "real_id": real_id or external_id})
 
         return out
+
+    def _iter_provider_models(self) -> list[tuple[str, dict]]:
+        """Return configured provider/model pairs in config order."""
+        providers = self._core.config.get("models.providers") or {}
+        out: list[tuple[str, dict]] = []
+        if not isinstance(providers, dict):
+            return out
+
+        for provider_id, provider in providers.items():
+            if not isinstance(provider, dict):
+                continue
+            models = provider.get("models", [])
+            if not isinstance(models, list):
+                continue
+            for model in models:
+                if isinstance(model, dict):
+                    out.append((str(provider_id), model))
+        return out
+
+    @staticmethod
+    def _model_alias(model_cfg: dict) -> str:
+        """Return explicit external alias for a model or empty string when missing."""
+        alias = model_cfg.get("alias") if isinstance(model_cfg, dict) else None
+        return str(alias).strip() if alias is not None else ""
+
+    @staticmethod
+    def _model_id(model_cfg: dict) -> str:
+        """Return internal model id, falling back to configured name when needed."""
+        if not isinstance(model_cfg, dict):
+            return ""
+        return str(model_cfg.get("id") or model_cfg.get("name") or "").strip()
+
+    def _external_model_id(self, model_cfg: dict) -> str:
+        """Return externally visible model name used by clients."""
+        return self._model_alias(model_cfg) or self._model_id(model_cfg)
+
+    def _preferred_provider_for_worker(self, worker_id: str) -> str:
+        """Return preferred provider configured for the selected worker."""
+        if not worker_id or self._core is None:
+            return ""
+        provider_id = self._core.config.get(f"workers.items.{worker_id}.provider")
+        return str(provider_id).strip() if provider_id is not None else ""
+
+    def _warn_model_resolution(self, warning_key: str, message: str) -> None:
+        """Emit a model-resolution warning once per endpoint instance."""
+        if warning_key in self._model_resolution_warnings_emitted:
+            return
+        self._model_resolution_warnings_emitted.add(warning_key)
+        log("http", "warning", message, self.id)
+
+    def _resolve_model_route(self, requested_model: object, worker_id: str) -> dict | None:
+        """Resolve external model id to provider/model using alias-aware precedence."""
+        requested = str(requested_model or "").strip()
+        if not requested:
+            return None
+
+        preferred_provider = self._preferred_provider_for_worker(worker_id)
+        matches: list[dict] = []
+
+        for order, (provider_id, model_cfg) in enumerate(self._iter_provider_models()):
+            alias = self._model_alias(model_cfg)
+            model_id = self._model_id(model_cfg)
+            if not model_id:
+                continue
+
+            rank: int | None = None
+            if alias and requested == alias:
+                rank = 0
+            elif not alias and requested == model_id:
+                rank = 1
+            elif alias and requested == model_id:
+                rank = 2
+
+            if rank is None:
+                continue
+
+            matches.append(
+                {
+                    "rank": rank,
+                    "order": order,
+                    "provider": provider_id,
+                    "model_id": model_id,
+                }
+            )
+
+        if not matches:
+            return None
+
+        alias_matches = [item for item in matches if item["rank"] == 0]
+        if len(alias_matches) > 1:
+            self._warn_model_resolution(
+                f"duplicate-alias:{requested}",
+                (
+                    f"Duplicate model alias '{requested}' in config; using preferred provider "
+                    f"'{preferred_provider or 'first-configured'}' and config order fallback"
+                ),
+            )
+
+        unaliased_id_matches = [item for item in matches if item["rank"] == 1]
+        if len(unaliased_id_matches) > 1:
+            self._warn_model_resolution(
+                f"duplicate-unaliased-id:{requested}",
+                (
+                    f"Duplicate unaliased model id '{requested}' in config; using preferred provider "
+                    f"'{preferred_provider or 'first-configured'}' and config order fallback"
+                ),
+            )
+
+        def _sort_key(item: dict) -> tuple[int, int, int]:
+            preferred_penalty = 0 if preferred_provider and item["provider"] == preferred_provider else 1
+            return int(item["rank"]), preferred_penalty, int(item["order"])
+
+        selected = min(matches, key=_sort_key)
+        return {
+            "requested_model": requested,
+            "requested_alias": requested,
+            "resolved_provider": selected["provider"],
+            "resolved_model": selected["model_id"],
+            "selection": "alias" if selected["rank"] == 0 else "model_id",
+            "worker_preferred_provider": preferred_provider,
+        }
 
     def _openai_models_response(self) -> dict:
         """Build OpenAI-compatible models list response."""
@@ -434,12 +564,13 @@ class Endpoint_openaix(Endpoint_ollama):
             "object": "list",
             "data": [
                 {
-                    "id": model_id,
+                    "id": model_info["id"],
+                    "real_id": model_info["real_id"],
                     "object": "model",
                     "created": now,
                     "owned_by": "aidir",
                 }
-                for model_id in self._collect_models()
+                for model_info in self._collect_model_entries()
             ],
         }
 
@@ -449,14 +580,15 @@ class Endpoint_openaix(Endpoint_ollama):
         return {
             "models": [
                 {
-                    "name": model_id,
-                    "model": model_id,
+                    "name": model_info["id"],
+                    "model": model_info["id"],
+                    "real_id": model_info["real_id"],
                     "modified_at": now_iso,
                     "size": 0,
                     "digest": "",
                     "details": {},
                 }
-                for model_id in self._collect_models()
+                for model_info in self._collect_model_entries()
             ]
         }
 
@@ -533,7 +665,8 @@ class Endpoint_openaix(Endpoint_ollama):
                 continue
             candidate_id = str(model.get("id") or "").strip()
             candidate_name = str(model.get("name") or "").strip()
-            if normalized_model_id not in {candidate_id, candidate_name}:
+            candidate_alias = self._model_alias(model)
+            if normalized_model_id not in {candidate_id, candidate_name, candidate_alias}:
                 continue
             resources = model.get("resources") or {}
             if not isinstance(resources, dict):

@@ -46,6 +46,7 @@ class Endpoint_ollama(BaseEndpoint):
         self._core: "Core | None" = None
         # Timeout for entire endpoint request (queue + execution)
         self._request_timeout = int(endpoint_cfg.get("request_timeout", 100))
+        self._model_resolution_warnings_emitted: set[str] = set()
 
     async def initialize(self, core: "Core") -> None:
         self._core = core
@@ -102,16 +103,7 @@ class Endpoint_ollama(BaseEndpoint):
         stream: bool = bool(body.get("stream", False))
 
         # Build task
-        task = Task_agent(
-            payload=body,
-            stream=stream,
-            external=True,
-        )
-        # Honour explicit worker override from request body (extended syntax)
-        if "worker" in body:
-            task.worker_id = body["worker"]
-        elif self._cfg.get("worker"):
-            task.worker_id = self._cfg["worker"]
+        task = self._build_task_for_payload(body, stream)
 
         # Apply timeouts from config
         cfg_tasks = self._core.config.get("tasks", {}) or {}
@@ -218,6 +210,155 @@ class Endpoint_ollama(BaseEndpoint):
             return False
         normalized = {str(item).strip() for item in allowed if str(item).strip()}
         return envid in normalized
+
+    def _build_task_for_payload(self, payload: dict, stream: bool) -> Task_agent:
+        """Create Task_agent and resolve model/provider route using alias-aware rules."""
+        worker_id = self._resolve_worker_id(payload)
+        route = self._resolve_model_route((payload or {}).get("model"), worker_id)
+        if route is not None:
+            payload = dict(payload or {})
+            payload["model"] = route["resolved_model"]
+
+        task = Task_agent(
+            payload=payload,
+            stream=stream,
+            external=True,
+        )
+        if worker_id:
+            task.worker_id = worker_id
+        if route is not None:
+            task.config = dict(task.config or {})
+            task.config["route"] = route
+        return task
+
+    def _resolve_worker_id(self, payload: dict) -> str:
+        """Resolve worker id for a request using payload override, endpoint cfg, or global default."""
+        if isinstance(payload, dict) and payload.get("worker"):
+            return str(payload["worker"])
+        if self._cfg.get("worker"):
+            return str(self._cfg["worker"])
+        if self._core is not None:
+            default_worker = self._core.config.get("workers.default")
+            if default_worker:
+                return str(default_worker)
+        return ""
+
+    def _iter_provider_models(self) -> list[tuple[str, dict]]:
+        """Return configured provider/model pairs in config order."""
+        providers = self._core.config.get("models.providers") or {}
+        out: list[tuple[str, dict]] = []
+        if not isinstance(providers, dict):
+            return out
+
+        for provider_id, provider in providers.items():
+            if not isinstance(provider, dict):
+                continue
+            models = provider.get("models", [])
+            if not isinstance(models, list):
+                continue
+            for model in models:
+                if isinstance(model, dict):
+                    out.append((str(provider_id), model))
+        return out
+
+    @staticmethod
+    def _model_alias(model_cfg: dict) -> str:
+        """Return explicit external alias for a model or empty string when missing."""
+        alias = model_cfg.get("alias") if isinstance(model_cfg, dict) else None
+        return str(alias).strip() if alias is not None else ""
+
+    @staticmethod
+    def _model_id(model_cfg: dict) -> str:
+        """Return internal model id, falling back to configured name when needed."""
+        if not isinstance(model_cfg, dict):
+            return ""
+        return str(model_cfg.get("id") or model_cfg.get("name") or "").strip()
+
+    def _preferred_provider_for_worker(self, worker_id: str) -> str:
+        """Return preferred provider configured for the selected worker."""
+        if not worker_id or self._core is None:
+            return ""
+        provider_id = self._core.config.get(f"workers.items.{worker_id}.provider")
+        return str(provider_id).strip() if provider_id is not None else ""
+
+    def _warn_model_resolution(self, warning_key: str, message: str) -> None:
+        """Emit a model-resolution warning once per endpoint instance."""
+        if warning_key in self._model_resolution_warnings_emitted:
+            return
+        self._model_resolution_warnings_emitted.add(warning_key)
+        log("http", "warning", message, self.id)
+
+    def _resolve_model_route(self, requested_model: object, worker_id: str) -> dict | None:
+        """Resolve external model id to provider/model using alias-aware precedence."""
+        requested = str(requested_model or "").strip()
+        if not requested:
+            return None
+
+        preferred_provider = self._preferred_provider_for_worker(worker_id)
+        matches: list[dict] = []
+
+        for order, (provider_id, model_cfg) in enumerate(self._iter_provider_models()):
+            alias = self._model_alias(model_cfg)
+            model_id = self._model_id(model_cfg)
+            if not model_id:
+                continue
+
+            rank: int | None = None
+            if alias and requested == alias:
+                rank = 0
+            elif not alias and requested == model_id:
+                rank = 1
+            elif alias and requested == model_id:
+                rank = 2
+
+            if rank is None:
+                continue
+
+            matches.append(
+                {
+                    "rank": rank,
+                    "order": order,
+                    "provider": provider_id,
+                    "model_id": model_id,
+                }
+            )
+
+        if not matches:
+            return None
+
+        alias_matches = [item for item in matches if item["rank"] == 0]
+        if len(alias_matches) > 1:
+            self._warn_model_resolution(
+                f"duplicate-alias:{requested}",
+                (
+                    f"Duplicate model alias '{requested}' in config; using preferred provider "
+                    f"'{preferred_provider or 'first-configured'}' and config order fallback"
+                ),
+            )
+
+        unaliased_id_matches = [item for item in matches if item["rank"] == 1]
+        if len(unaliased_id_matches) > 1:
+            self._warn_model_resolution(
+                f"duplicate-unaliased-id:{requested}",
+                (
+                    f"Duplicate unaliased model id '{requested}' in config; using preferred provider "
+                    f"'{preferred_provider or 'first-configured'}' and config order fallback"
+                ),
+            )
+
+        def _sort_key(item: dict) -> tuple[int, int, int]:
+            preferred_penalty = 0 if preferred_provider and item["provider"] == preferred_provider else 1
+            return int(item["rank"]), preferred_penalty, int(item["order"])
+
+        selected = min(matches, key=_sort_key)
+        return {
+            "requested_model": requested,
+            "requested_alias": requested,
+            "resolved_provider": selected["provider"],
+            "resolved_model": selected["model_id"],
+            "selection": "alias" if selected["rank"] == 0 else "model_id",
+            "worker_preferred_provider": preferred_provider,
+        }
 
     async def _sync_response(self, task: Task_agent) -> JSONResponse:
         """Wait for task completion and return a single JSON response."""

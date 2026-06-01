@@ -22,9 +22,9 @@ STATUS_FAILED    = "failed"
 STATUS_CANCELED  = "canceled"
 
 # ── Priority constants ───────────────────────────────────────────────────────
-PRIORITY_URGENT = 5
-PRIORITY_NORMAL = 10
-PRIORITY_IDLE   = 20
+PRIORITY_URGENT = 0
+PRIORITY_NORMAL = 5
+PRIORITY_IDLE   = 10
 
 
 @dataclass

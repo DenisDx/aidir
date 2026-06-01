@@ -326,13 +326,17 @@ class Scheduler:
             for k, v in (vals or {}).items():
                 merged[rid][k] = int(merged[rid].get(k, 0)) + int(v)
 
-        model_id = (task.payload or {}).get("model")
-        provider_id = wcfg.get("provider")
+        route_cfg = (task.config or {}).get("route") if isinstance(task.config, dict) else None
+        if not isinstance(route_cfg, dict):
+            route_cfg = {}
+
+        model_id = route_cfg.get("resolved_model") or (task.payload or {}).get("model")
+        provider_id = route_cfg.get("resolved_provider") or wcfg.get("provider")
         if model_id and provider_id:
             providers = (((self._full_config or {}).get("models") or {}).get("providers") or {})
             p = providers.get(provider_id) or {}
             for model in (p.get("models") or []):
-                if model.get("id") != model_id:
+                if model_id not in {model.get("id"), model.get("name"), model.get("alias")}:
                     continue
                 for rid, vals in (model.get("resources") or {}).items():
                     merged.setdefault(rid, {})

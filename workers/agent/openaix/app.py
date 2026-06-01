@@ -102,6 +102,8 @@ class OpenAIxWorker(BaseWorker):
 
         payload = self._apply_generation_defaults(dict(task.payload or {}))
         task.payload = payload
+        provider_id = self._resolve_task_provider_id(task)
+        base_url = self._resolve_base_url(provider_id)
 
         log(
             "worker",
@@ -110,7 +112,7 @@ class OpenAIxWorker(BaseWorker):
             "openaix",
         )
 
-        url = f"{self._base_url}/api/chat"
+        url = f"{base_url}/api/chat"
         save_call = self._resolve_save_llm_request(task.payload or {})
 
         # Limit message history to prevent context overload
@@ -133,11 +135,16 @@ class OpenAIxWorker(BaseWorker):
         if not context_result.ok:
             return context_result
 
-        payload_with_ctx = self._apply_model_context_window(dict(task.payload or {}))
+        payload_with_ctx = self._apply_model_context_window(dict(task.payload or {}), provider_id=provider_id)
         payload = self._normalize_payload(payload_with_ctx, task.stream)
         upstream_timeout = self._resolve_upstream_timeout(task)
 
-        log("worker", "debug", f"Forwarding task {task.id} to {url} stream={task.stream}", "openaix")
+        log(
+            "worker",
+            "debug",
+            f"Forwarding task {task.id} to {url} provider={provider_id} stream={task.stream}",
+            "openaix",
+        )
 
         try:
             async with httpx.AsyncClient(timeout=upstream_timeout) as client:
@@ -253,7 +260,7 @@ class OpenAIxWorker(BaseWorker):
 
         return out
 
-    def _apply_model_context_window(self, payload: dict) -> dict:
+    def _apply_model_context_window(self, payload: dict, provider_id: str | None = None) -> dict:
         """Set options.num_ctx from model config contextWindow when not explicitly provided."""
         if not isinstance(payload, dict):
             return payload
@@ -270,7 +277,7 @@ class OpenAIxWorker(BaseWorker):
         if options.get("num_ctx") is not None:
             return payload
 
-        cfg_window = self._resolve_model_context_window(model_name)
+        cfg_window = self._resolve_model_context_window(model_name, provider_id=provider_id)
         if cfg_window is None:
             return payload
 
@@ -278,12 +285,13 @@ class OpenAIxWorker(BaseWorker):
         payload["options"] = options
         return payload
 
-    def _resolve_model_context_window(self, model_name: str) -> int | None:
-        """Return configured contextWindow for model from active provider, if available."""
+    def _resolve_model_context_window(self, model_name: str, provider_id: str | None = None) -> int | None:
+        """Return configured contextWindow for model from effective provider, if available."""
         if self._core is None:
             return None
 
-        provider_models = self._core.config.get(f"models.providers.{self._provider_id}.models") or []
+        effective_provider_id = str(provider_id or self._provider_id or "").strip()
+        provider_models = self._core.config.get(f"models.providers.{effective_provider_id}.models") or []
         if not isinstance(provider_models, list):
             return None
 
@@ -305,6 +313,24 @@ class OpenAIxWorker(BaseWorker):
             return parsed if parsed > 0 else None
 
         return None
+
+    def _resolve_task_provider_id(self, task: Task) -> str:
+        """Return effective provider id for a task using route metadata when present."""
+        route_cfg = (task.config or {}).get("route") if isinstance(task.config, dict) else None
+        if isinstance(route_cfg, dict):
+            provider_id = str(route_cfg.get("resolved_provider") or "").strip()
+            if provider_id:
+                return provider_id
+        return self._provider_id
+
+    def _resolve_base_url(self, provider_id: str) -> str:
+        """Resolve provider base URL for the effective task provider."""
+        if self._core is None:
+            return self._base_url
+        base_url = self._core.config.get(f"models.providers.{provider_id}.baseUrl")
+        if not base_url:
+            return self._base_url
+        return str(base_url).rstrip("/")
 
     async def _apply_context_chain(self, task: Task_agent) -> WorkerResult:
         """Run context workers synchronously before model execution."""
@@ -328,6 +354,7 @@ class OpenAIxWorker(BaseWorker):
         request_payload = task.payload if isinstance(task.payload, dict) else {}
         request_has_tools_field = "tools" in request_payload
         request_tools_value = request_payload.get("tools") if request_has_tools_field else None
+        requested_internal_tool_names = self._extract_requested_internal_tool_names(request_tools_value)
         disable_internal_tools_injection = request_has_tools_field and (
             request_tools_value is None
             or (isinstance(request_tools_value, list) and len(request_tools_value) == 0)
@@ -348,9 +375,16 @@ class OpenAIxWorker(BaseWorker):
             if worker_name == "context_add_internal_tools" and disable_internal_tools_injection:
                 continue
 
-            if worker_name == "context_render_openclaw_style" and disable_internal_tools_injection and task.context is not None:
-                # Ensure rendered prompt does not advertise internal tools when caller explicitly disables tools.
-                task.context.tools = {}
+            if worker_name == "context_render_openclaw_style" and task.context is not None and request_has_tools_field:
+                # When caller controls the tools list, advertise only explicitly requested internal tools.
+                if disable_internal_tools_injection:
+                    task.context.tools = {}
+                else:
+                    task.context.tools = {
+                        name: spec
+                        for name, spec in task.context.tools.items()
+                        if name in requested_internal_tool_names
+                    }
 
             worker = self._core.workers.get(worker_name)
             if worker is None:
@@ -378,8 +412,10 @@ class OpenAIxWorker(BaseWorker):
             return
 
         payload = dict(task.payload or {})
+        task.config = dict(task.config or {})
         messages = list(payload.get("messages") or [])
         request_has_tools_field = "tools" in payload
+        injected_tool_names: list[str] = []
 
         if task.context.system_rendered:
             rendered = task.context.system_rendered
@@ -401,29 +437,65 @@ class OpenAIxWorker(BaseWorker):
                 messages.insert(0, {"role": "system", "content": rendered})
 
         if request_has_tools_field:
-            # Respect caller-provided tools control. Explicit null/[] means no tools.
-            if payload.get("tools") is None:
+            request_tools = payload.get("tools")
+            if request_tools is None:
                 payload["tools"] = []
+            elif isinstance(request_tools, list):
+                out_tools = []
+                for raw_tool in request_tools:
+                    if isinstance(raw_tool, dict):
+                        out_tools.append(raw_tool)
+                        continue
+                    if not isinstance(raw_tool, str):
+                        continue
+
+                    tool_name = raw_tool.strip()
+                    if not tool_name:
+                        continue
+                    tool_spec = task.context.tools.get(tool_name)
+                    if not isinstance(tool_spec, dict):
+                        continue
+
+                    out_tools.append(OpenAIxWorker._tool_payload_entry(tool_name, tool_spec))
+                    injected_tool_names.append(tool_name)
+
+                payload["tools"] = out_tools
         elif task.context.tools:
             out_tools = []
             for tool_name, tool_spec in task.context.tools.items():
                 if not isinstance(tool_spec, dict):
                     continue
-                out_tools.append(
-                    {
-                        "type": "function",
-                        "function": {
-                            "name": tool_name,
-                            "description": tool_spec.get("description", tool_name),
-                            "parameters": tool_spec.get("inputSchema", {"type": "object"}),
-                        },
-                    }
-                )
+                out_tools.append(OpenAIxWorker._tool_payload_entry(tool_name, tool_spec))
+                injected_tool_names.append(tool_name)
             if out_tools:
                 payload["tools"] = out_tools
 
+        task.config["injected_tool_names"] = injected_tool_names
         payload["messages"] = messages
         task.payload = payload
+
+    @staticmethod
+    def _tool_payload_entry(tool_name: str, tool_spec: dict) -> dict:
+        """Build one OpenAI/Ollama-compatible tool descriptor from internal tool metadata."""
+        return {
+            "type": "function",
+            "function": {
+                "name": tool_name,
+                "description": tool_spec.get("description", tool_name),
+                "parameters": tool_spec.get("inputSchema", {"type": "object"}),
+            },
+        }
+
+    @staticmethod
+    def _extract_requested_internal_tool_names(request_tools_value: object) -> set[str]:
+        """Return internal-tool names explicitly requested via string items in payload.tools."""
+        if not isinstance(request_tools_value, list):
+            return set()
+        return {
+            item.strip()
+            for item in request_tools_value
+            if isinstance(item, str) and item.strip()
+        }
 
     async def _run_with_internal_tools(
         self,
@@ -447,8 +519,8 @@ class OpenAIxWorker(BaseWorker):
         turn = 0
         last_step_data: dict | None = None
 
-        # Extract available tool names from payload
-        available_tools = self._extract_available_tool_names(payload)
+        # Execute only tools that were actually injected by aidir for this request.
+        available_tools = self._extract_injected_tool_names(parent_task)
 
         for _ in range(max_turns):
             turn += 1
@@ -499,8 +571,7 @@ class OpenAIxWorker(BaseWorker):
                 return WorkerResult(ok=True, data=data, usage=data.get("usage"))
 
             # Separate tool calls into executable (local workers) and pass-through (external)
-            executable_calls = [c for c in calls if c["name"] in available_tools]
-            external_calls = [c for c in calls if c["name"] not in available_tools]
+            executable_calls, external_calls = self._split_tool_calls(calls, available_tools)
 
             # If there are external tool calls, pass response to client unchanged
             if external_calls or not executable_calls:
@@ -588,20 +659,24 @@ class OpenAIxWorker(BaseWorker):
         return WorkerResult(ok=False, error={"code": "TOOL_LOOP_LIMIT", "message": "Tool loop exceeded limit"})
 
     @staticmethod
-    def _extract_available_tool_names(payload: dict) -> set[str]:
-        """Extract tool names from payload.tools list."""
-        tools_list = payload.get("tools")
-        if not isinstance(tools_list, list):
+    def _extract_injected_tool_names(task: Task) -> set[str]:
+        """Return the names of tools that were injected by aidir for this task."""
+        task_cfg = task.config if isinstance(task.config, dict) else {}
+        raw_names = task_cfg.get("injected_tool_names")
+        if not isinstance(raw_names, list):
             return set()
-        
-        names = set()
-        for tool in tools_list:
-            if not isinstance(tool, dict):
-                continue
-            fn = tool.get("function")
-            if isinstance(fn, dict) and "name" in fn:
-                names.add(str(fn["name"]))
-        return names
+        return {
+            name.strip()
+            for name in raw_names
+            if isinstance(name, str) and name.strip()
+        }
+
+    @staticmethod
+    def _split_tool_calls(calls: list[dict], available_tools: set[str]) -> tuple[list[dict], list[dict]]:
+        """Split model tool calls into aidir-executable and pass-through groups."""
+        executable_calls = [call for call in calls if call["name"] in available_tools]
+        external_calls = [call for call in calls if call["name"] not in available_tools]
+        return executable_calls, external_calls
 
     @staticmethod
     def _parse_tool_arguments(raw_args: object) -> dict:
