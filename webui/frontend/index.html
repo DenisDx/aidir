@@ -235,7 +235,10 @@
   .task-json-modal-panel {
     position: relative;
     z-index: 1;
-    width: min(980px, calc(100vw - 32px));
+    width: min(95vw, 1800px);
+    min-width: min(720px, calc(100vw - 32px));
+    max-width: calc(100vw - 16px);
+    min-height: 320px;
     max-height: calc(100vh - 32px);
     margin: 16px auto;
     background: var(--panel);
@@ -245,6 +248,7 @@
     display: flex;
     flex-direction: column;
     overflow: hidden;
+    resize: both;
   }
   .task-json-modal-header {
     display: flex;
@@ -253,6 +257,7 @@
     gap: 12px;
     padding: 16px 18px 12px;
     border-bottom: 1px solid var(--border);
+    flex: 0 0 auto;
   }
   .task-json-modal-title {
     font-size: 16px;
@@ -266,15 +271,203 @@
   .task-json-modal-body {
     margin: 0;
     padding: 16px 18px 18px;
-    overflow: auto;
-    max-height: calc(100vh - 120px);
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    overflow-x: auto;
+    max-height: none;
+    background: var(--panel);
+    color: var(--text);
+    overscroll-behavior: contain;
+  }
+  .task-json-modal-body.is-text {
     background: #0a0c12;
     font-family: monospace;
     font-size: 12px;
     line-height: 1.6;
     white-space: pre-wrap;
     word-break: break-word;
+  }
+  .task-steps-view {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+  .task-steps-summary-grid {
+    display: grid;
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    gap: 12px;
+  }
+  @media (max-width: 1100px) {
+    .task-steps-summary-grid {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+  }
+  @media (max-width: 640px) {
+    .task-steps-summary-grid {
+      grid-template-columns: 1fr;
+    }
+  }
+  .task-steps-summary-card {
+    background: #0a0c12;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px 14px;
+  }
+  .task-steps-summary-label {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: .05em;
+    color: var(--muted);
+    margin-bottom: 6px;
+  }
+  .task-steps-summary-value {
+    font-size: 1.35rem;
+    font-weight: 700;
     color: var(--text);
+  }
+  .task-steps-table-wrap {
+    overflow: auto;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: #0a0c12;
+  }
+  .task-steps-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+  }
+  .task-steps-table th,
+  .task-steps-table td {
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--border);
+    text-align: left;
+    vertical-align: top;
+  }
+  .task-steps-table th {
+    color: var(--muted);
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  .task-steps-table tr:last-child td {
+    border-bottom: none;
+  }
+  .task-steps-records {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+  .task-step-entry {
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: #10131b;
+    overflow: hidden;
+  }
+  .task-step-entry summary {
+    list-style: none;
+    cursor: pointer;
+    padding: 12px 14px;
+  }
+  .task-step-entry summary::-webkit-details-marker {
+    display: none;
+  }
+  .task-step-entry[open] summary {
+    border-bottom: 1px solid var(--border);
+  }
+  .task-step-entry-title {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    flex-wrap: wrap;
+    font-size: 13px;
+    font-weight: 600;
+  }
+  .task-step-entry-meta {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-top: 6px;
+    color: var(--muted);
+    font-size: 12px;
+  }
+  .task-step-entry-preview {
+    margin-top: 8px;
+    color: var(--text);
+    font-size: 12px;
+    line-height: 1.5;
+  }
+  .task-step-entry-body {
+    padding: 12px 14px 14px;
+    background: #0a0c12;
+  }
+  .task-steps-note {
+    color: var(--muted);
+    font-size: 12px;
+  }
+  .task-steps-empty {
+    padding: 18px;
+    border: 1px dashed var(--border);
+    border-radius: 10px;
+    color: var(--muted);
+    background: #0a0c12;
+  }
+  .json-tree {
+    font-family: monospace;
+    font-size: 12px;
+    line-height: 1.55;
+    color: var(--text);
+  }
+  .json-tree details {
+    margin: 2px 0;
+  }
+  .json-tree summary {
+    list-style: none;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .json-tree summary::-webkit-details-marker {
+    display: none;
+  }
+  .json-tree-children {
+    margin-left: 16px;
+    padding-left: 12px;
+    border-left: 1px dashed rgba(208, 212, 232, 0.15);
+  }
+  .json-tree-line {
+    margin: 2px 0;
+  }
+  .json-key {
+    color: #8ab4f8;
+  }
+  .json-string {
+    color: #9ad27b;
+  }
+  .json-number {
+    color: #f8c471;
+  }
+  .json-boolean {
+    color: #f5b7b1;
+  }
+  .json-null {
+    color: #b39ddb;
+  }
+  .json-brace {
+    color: var(--muted);
+  }
+  .json-raw-fallback {
+    margin: 0;
+    padding: 10px 12px;
+    border-radius: 8px;
+    background: #121620;
+    color: var(--text);
+    font-family: monospace;
+    font-size: 12px;
+    line-height: 1.55;
+    white-space: pre-wrap;
+    word-break: break-word;
   }
 
   /* ── Log viewer ── */
@@ -705,8 +898,10 @@
             <th>Envid</th>
             <th>Type</th>
             <th>Created</th>
+            <th>Duration</th>
             <th>Last op</th>
             <th>JSON</th>
+            <th>Steps</th>
           </tr>
         </thead>
         <tbody id="task-viewer-body"></tbody>
@@ -1066,10 +1261,11 @@
       </div>
       <button class="btn-sm" id="task-json-modal-close">Close</button>
     </div>
-    <pre id="task-json-modal-body" class="task-json-modal-body"></pre>
+    <div id="task-json-modal-body" class="task-json-modal-body is-text"></div>
   </div>
 </div>
 
 <script src="app.js"></script>
+<script src="task_steps_viewer.js"></script>
 </body>
 </html>

@@ -28,6 +28,17 @@ class Endpoint_openaix(Endpoint_ollama):
     """Endpoint implementing OpenAI-compatible API plus limited /api/chat."""
 
     api = "openaix"
+    _GENERATION_OPTION_FIELDS = {
+        "temperature": "temperature",
+        "top_p": "top_p",
+        "repetition_penalty": "repeat_penalty",
+        "max_tokens": "num_predict",
+        "seed": "seed",
+        "presence_penalty": "presence_penalty",
+        "frequency_penalty": "frequency_penalty",
+        "top_k": "top_k",
+        "min_p": "min_p",
+    }
 
     def __init__(self, endpoint_cfg: dict) -> None:
         super().__init__(endpoint_cfg)
@@ -193,11 +204,11 @@ class Endpoint_openaix(Endpoint_ollama):
         """Create Task_agent with standard timeout and worker selection rules."""
         from core.task_types.task_agent import Task_agent
 
+        payload = self._apply_generation_defaults(payload)
         task = Task_agent(payload=payload, stream=stream, external=True)
-        if "worker" in payload:
-            task.worker_id = payload["worker"]
-        elif self._cfg.get("worker"):
-            task.worker_id = self._cfg["worker"]
+        worker_id = self._resolve_worker_id(payload)
+        if worker_id:
+            task.worker_id = worker_id
 
         cfg_tasks = self._core.config.get("tasks", {}) or {}
         # Use timeout from request if specified, otherwise use defaults
@@ -209,6 +220,46 @@ class Endpoint_openaix(Endpoint_ollama):
             task.queue_timeout = int(cfg_tasks.get("queue_timeout", 300))
             task.run_timeout = int(cfg_tasks.get("run_timeout", 300))
         return task
+
+    def _resolve_worker_id(self, payload: dict) -> str:
+        """Resolve worker id for a request using payload override, endpoint cfg, or global default."""
+        if isinstance(payload, dict) and payload.get("worker"):
+            return str(payload["worker"])
+        if self._cfg.get("worker"):
+            return str(self._cfg["worker"])
+        if self._core is not None:
+            default_worker = self._core.config.get("workers.default")
+            if default_worker:
+                return str(default_worker)
+        return ""
+
+    def _apply_generation_defaults(self, payload: dict) -> dict:
+        """Apply per-worker generation defaults unless request already overrides them."""
+        if not isinstance(payload, dict):
+            return payload
+
+        worker_id = self._resolve_worker_id(payload)
+        if not worker_id or self._core is None:
+            return payload
+
+        defaults = self._core.config.get(f"workers.items.{worker_id}.generation_defaults") or {}
+        if not isinstance(defaults, dict):
+            return payload
+
+        out = dict(payload)
+        options = out.get("options") if isinstance(out.get("options"), dict) else {}
+        for field_name, option_name in self._GENERATION_OPTION_FIELDS.items():
+            if out.get(field_name) is not None:
+                continue
+            if options.get(option_name) is not None:
+                continue
+
+            default_value = defaults.get(field_name)
+            if default_value is None and option_name != field_name:
+                default_value = defaults.get(option_name)
+            if default_value is not None:
+                out[field_name] = default_value
+        return out
 
     @staticmethod
     def _openai_request_to_ollama(body: dict) -> dict:
@@ -228,11 +279,18 @@ class Endpoint_openaix(Endpoint_ollama):
             "envid",
             "context_builder",
             "log",
+            "options",
             "tools",
             "tool_choice",
             "temperature",
             "top_p",
+            "repetition_penalty",
             "max_tokens",
+            "seed",
+            "presence_penalty",
+            "frequency_penalty",
+            "top_k",
+            "min_p",
             "stop",
         ]
         for key in passthrough:

@@ -24,6 +24,17 @@ class OpenAIxWorker(BaseWorker):
     """Proxy worker for the extended OpenAIx syntax."""
 
     task_type = "agent"
+    _GENERATION_OPTION_FIELDS = {
+        "temperature": "temperature",
+        "top_p": "top_p",
+        "repetition_penalty": "repeat_penalty",
+        "max_tokens": "num_predict",
+        "seed": "seed",
+        "presence_penalty": "presence_penalty",
+        "frequency_penalty": "frequency_penalty",
+        "top_k": "top_k",
+        "min_p": "min_p",
+    }
 
     def __init__(self) -> None:
         self._base_url: str = "http://127.0.0.1:11434"
@@ -31,6 +42,7 @@ class OpenAIxWorker(BaseWorker):
         self._save_llm_request_default: bool = False
         self._tools_max_turns: int = 50
         self._provider_id: str = "ollama_local"
+        self._generation_defaults: dict[str, object] = {}
         self._core = None
 
     async def initialize(self, config: dict) -> None:
@@ -56,6 +68,9 @@ class OpenAIxWorker(BaseWorker):
             self._tools_max_turns = max(1, int(raw_tools_max_turns))
         except (TypeError, ValueError):
             self._tools_max_turns = global_tools_max_turns
+
+        raw_generation_defaults = config.get("generation_defaults")
+        self._generation_defaults = dict(raw_generation_defaults) if isinstance(raw_generation_defaults, dict) else {}
 
         if core is not None:
             base_url = core.config.get(f"models.providers.{provider_id}.baseUrl")
@@ -85,6 +100,9 @@ class OpenAIxWorker(BaseWorker):
                 error={"code": "WRONG_TASK_TYPE", "message": f"Expected Task_agent, got {type(task).__name__}"},
             )
 
+        payload = self._apply_generation_defaults(dict(task.payload or {}))
+        task.payload = payload
+
         log(
             "worker",
             "info",
@@ -97,7 +115,6 @@ class OpenAIxWorker(BaseWorker):
 
         # Limit message history to prevent context overload
         # Keep system + last N user/assistant messages
-        payload = dict(task.payload or {})
         messages = list(payload.get("messages") or [])
         if len(messages) > 20:  # Keep last 20 messages max
             system_msgs = [m for m in messages if m.get("role") == "system"]
@@ -183,8 +200,28 @@ class OpenAIxWorker(BaseWorker):
                 return bool(options.get("save_llm_request"))
         return self._save_llm_request_default
 
-    @staticmethod
-    def _normalize_payload(payload: dict, stream: bool) -> dict:
+    def _apply_generation_defaults(self, payload: dict) -> dict:
+        """Apply worker-configured generation defaults to payload when request omits them."""
+        if not isinstance(payload, dict) or not self._generation_defaults:
+            return payload
+
+        out = dict(payload)
+        options = out.get("options") if isinstance(out.get("options"), dict) else {}
+        for field_name, option_name in self._GENERATION_OPTION_FIELDS.items():
+            if out.get(field_name) is not None:
+                continue
+            if options.get(option_name) is not None:
+                continue
+
+            default_value = self._generation_defaults.get(field_name)
+            if default_value is None and option_name != field_name:
+                default_value = self._generation_defaults.get(option_name)
+            if default_value is not None:
+                out[field_name] = default_value
+        return out
+
+    @classmethod
+    def _normalize_payload(cls, payload: dict, stream: bool) -> dict:
         """Convert extended OpenAIx payload into upstream Ollama-compatible chat payload."""
         out = {
             "model": payload.get("model", ""),
@@ -196,20 +233,23 @@ class OpenAIxWorker(BaseWorker):
             "worker",
             "tools",
             "tool_choice",
-            "temperature",
-            "top_p",
-            "max_tokens",
             "stop",
             "response_format",
-            "seed",
         ]
         for key in passthrough:
             if key in payload:
                 out[key] = payload[key]
 
         options = payload.get("options")
-        if isinstance(options, dict):
-            out["options"] = dict(options)
+        out_options = dict(options) if isinstance(options, dict) else {}
+        for field_name, option_name in cls._GENERATION_OPTION_FIELDS.items():
+            field_value = payload.get(field_name)
+            if field_value is None or out_options.get(option_name) is not None:
+                continue
+            out_options[option_name] = field_value
+
+        if out_options:
+            out["options"] = out_options
 
         return out
 

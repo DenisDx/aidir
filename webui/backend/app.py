@@ -65,6 +65,25 @@ def _parse_json_field(value: str | None) -> Any:
         return value
 
 
+def _resolve_log_file(file_name: str) -> Path:
+    """Resolve a requested log file name safely under the logs directory."""
+    requested = (file_name or "").strip()
+    if not requested:
+        requested = "all.log"
+    elif "." not in requested:
+        requested = f"{requested}.log"
+
+    if Path(requested).name != requested:
+        raise HTTPException(status_code=400, detail="Invalid log file name")
+
+    resolved = (_LOGS_DIR / requested).resolve()
+    logs_root = _LOGS_DIR.resolve()
+    if resolved.parent != logs_root:
+        raise HTTPException(status_code=400, detail="Invalid log file path")
+
+    return resolved
+
+
 def _find_envid(value: Any, depth: int = 0) -> str:
     """Find first non-empty envid in nested JSON-like dict/list structures."""
     if depth > 5:
@@ -441,7 +460,7 @@ def create_app(
         session: dict = Depends(_require_session),
     ):
         """Return last N lines of a log file."""
-        log_file = _LOGS_DIR / f"{file}.log"
+        log_file = _resolve_log_file(file)
         if not log_file.exists():
             return {"lines": []}
         try:
@@ -450,6 +469,45 @@ def create_app(
             return {"lines": last}
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc))
+
+    @app.get("/api/logs/search")
+    async def search_logs(
+        file: str,
+        contains: str,
+        limit: int = 200,
+        session: dict = Depends(_require_session),
+    ):
+        """Return matching lines from a log file using plain substring filtering."""
+        log_file = _resolve_log_file(file)
+        if not contains:
+            raise HTTPException(status_code=400, detail="contains query parameter is required")
+
+        if not log_file.exists():
+            return {"file": log_file.name, "contains": contains, "lines": [], "count": 0}
+
+        limit = max(1, min(int(limit or 200), 2000))
+
+        matched_lines: list[str] = []
+        total_count = 0
+        try:
+            with log_file.open("r", encoding="utf-8", errors="replace") as handle:
+                for raw_line in handle:
+                    line = raw_line.rstrip("\n")
+                    if contains not in line:
+                        continue
+                    total_count += 1
+                    if len(matched_lines) < limit:
+                        matched_lines.append(line)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+
+        return {
+            "file": log_file.name,
+            "contains": contains,
+            "lines": matched_lines,
+            "count": total_count,
+            "truncated": total_count > len(matched_lines),
+        }
 
     @app.websocket("/ws/logs")
     async def ws_logs(

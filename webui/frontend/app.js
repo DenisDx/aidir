@@ -413,13 +413,15 @@ function fmtDateTime(iso) {
   return d.toLocaleString();
 }
 
-function fmtTaskDuration(startedAt) {
+function fmtTaskDuration(startedAt, finishedAt = null) {
   if (!startedAt) return '—';
 
   const started = new Date(startedAt);
   if (Number.isNaN(started.getTime())) return '—';
 
-  const elapsedMs = Date.now() - started.getTime();
+  const finished = finishedAt ? new Date(finishedAt) : null;
+  const endMs = finished && !Number.isNaN(finished.getTime()) ? finished.getTime() : Date.now();
+  const elapsedMs = endMs - started.getTime();
   if (elapsedMs < 0) return '0s';
 
   const totalSeconds = Math.floor(elapsedMs / 1000);
@@ -569,7 +571,7 @@ function renderTaskViewerRows(tasks) {
   body.innerHTML = '';
   if (!tasks.length) {
     const tr = document.createElement('tr');
-    tr.innerHTML = '<td colspan="8" style="color:var(--muted)">No tasks match the current filters.</td>';
+    tr.innerHTML = '<td colspan="10" style="color:var(--muted)">No tasks match the current filters.</td>';
     body.appendChild(tr);
     return;
   }
@@ -583,10 +585,13 @@ function renderTaskViewerRows(tasks) {
       <td>${escapeHtml(task.envid || '—')}</td>
       <td>${escapeHtml(task.type || '—')}</td>
       <td style="color:var(--muted);font-size:12px">${escapeHtml(fmtDateTime(task.created_at))}</td>
+      <td style="color:var(--muted);font-size:12px">${escapeHtml(fmtTaskDuration(task.started_at, task.finished_at))}</td>
       <td style="color:var(--muted);font-size:12px">${escapeHtml(fmtDateTime(task.last_operation_at))}</td>
-      <td><button class="btn-sm" data-task-id="${escapeHtml(task.id || '')}">Show JSON</button></td>
+      <td><button class="btn-sm" data-task-json-id="${escapeHtml(task.id || '')}">Show JSON</button></td>
+      <td><button class="btn-sm" data-task-steps-id="${escapeHtml(task.id || '')}">Show steps</button></td>
     `;
-    tr.querySelector('button').addEventListener('click', () => openTaskViewerJson(task.id));
+    tr.querySelector('[data-task-json-id]').addEventListener('click', () => openTaskViewerJson(task.id));
+    tr.querySelector('[data-task-steps-id]').addEventListener('click', () => openTaskViewerSteps(task));
     body.appendChild(tr);
   });
 }
@@ -617,13 +622,38 @@ function resetTaskViewerFilters() {
   $('task-viewer-summary').textContent = 'Filters cleared.';
 }
 
-function openTaskViewerModal(task) {
+function openTaskViewerTextModal(title, subtitle, bodyText) {
   const modal = $('task-json-modal');
-  $('task-json-modal-title').textContent = `Task ${task.id || ''}`;
-  $('task-json-modal-subtitle').textContent = `${task.status || 'created'} · ${task.worker_id || 'no worker'}${task.envid ? ` · envid ${task.envid}` : ''}`;
-  $('task-json-modal-body').textContent = JSON.stringify(task, null, 2);
+  const body = $('task-json-modal-body');
+  $('task-json-modal-title').textContent = title;
+  $('task-json-modal-subtitle').textContent = subtitle;
+  body.classList.add('is-text');
+  body.textContent = bodyText;
+  body.replaceChildren(document.createTextNode(bodyText));
   modal.classList.add('is-open');
   modal.setAttribute('aria-hidden', 'false');
+}
+
+function openTaskViewerNodeModal(title, subtitle, bodyNode) {
+  const modal = $('task-json-modal');
+  const body = $('task-json-modal-body');
+  $('task-json-modal-title').textContent = title;
+  $('task-json-modal-subtitle').textContent = subtitle;
+  body.classList.remove('is-text');
+  body.replaceChildren();
+  if (bodyNode) {
+    body.appendChild(bodyNode);
+  }
+  modal.classList.add('is-open');
+  modal.setAttribute('aria-hidden', 'false');
+}
+
+function openTaskViewerModal(task) {
+  openTaskViewerTextModal(
+    `Task ${task.id || ''}`,
+    `${task.status || 'created'} · ${task.worker_id || 'no worker'}${task.envid ? ` · envid ${task.envid}` : ''}`,
+    JSON.stringify(task, null, 2),
+  );
 }
 
 function closeTaskViewerModal() {
@@ -641,6 +671,61 @@ async function openTaskViewerJson(taskId) {
     return;
   }
   openTaskViewerModal(data.task);
+}
+
+function taskViewerLogFile(task) {
+  const workerId = String(task?.worker_id || '').trim();
+  if (!workerId) return 'openaix_call_log.jsonl';
+  return `${workerId}_call_log.jsonl`;
+}
+
+function formatTaskViewerStepLines(lines) {
+  if (!Array.isArray(lines) || !lines.length) {
+    return 'No matching log entries found.';
+  }
+
+  return lines.map((line, index) => {
+    try {
+      const parsed = JSON.parse(line);
+      return `#${index + 1}\n${JSON.stringify(parsed, null, 2)}`;
+    } catch (error) {
+      return `#${index + 1} [parse error: ${error.message}]\n${line}`;
+    }
+  }).join('\n\n============================================================\n\n');
+}
+
+async function openTaskViewerSteps(task) {
+  const taskId = task?.id;
+  if (!taskId) return;
+
+  const logFile = taskViewerLogFile(task);
+  const contains = `"task_id": "${taskId}"`;
+  const params = new URLSearchParams({
+    file: logFile,
+    contains,
+    limit: '200',
+  });
+
+  const data = await apiGet(`/api/logs/search?${params.toString()}`);
+  if (!data) return;
+
+  const subtitleParts = [logFile, `${data.count ?? 0} entr${(data.count ?? 0) === 1 ? 'y' : 'ies'}`];
+  if (data.truncated) {
+    subtitleParts.push(`showing first ${(data.lines || []).length}`);
+  }
+
+  const viewer = window.TaskStepsViewer;
+  if (viewer && typeof viewer.renderStepsView === 'function') {
+    const rendered = viewer.renderStepsView(task, data);
+    openTaskViewerNodeModal(rendered.title, rendered.subtitle, rendered.bodyNode);
+    return;
+  }
+
+  openTaskViewerTextModal(
+    `Task ${taskId} steps`,
+    subtitleParts.join(' · '),
+    formatTaskViewerStepLines(data.lines || []),
+  );
 }
 
 // ── Live logs ──────────────────────────────────────────────────────────────

@@ -155,6 +155,19 @@
         "provider": "ollama_local",
         // Optional override for this worker only (falls back to workers.tools_max_turns)
         // "tools_max_turns": 50,
+        // Optional default generation params for OpenAI / OpenAIx requests.
+        // Request top-level fields or options.* override these values.
+        "generation_defaults": {
+          // "temperature": ${OPENAIX_TEMPERATURE:-0.7},
+          // "top_p": ${OPENAIX_TOP_P:-0.9},
+          // "repetition_penalty": ${OPENAIX_REPETITION_PENALTY:-1.1},
+          // "max_tokens": ${OPENAIX_MAX_TOKENS:-1024},
+          // "seed": ${OPENAIX_SEED:-42},
+          // "presence_penalty": ${OPENAIX_PRESENCE_PENALTY:-0.0},
+          // "frequency_penalty": ${OPENAIX_FREQUENCY_PENALTY:-0.0},
+          // "top_k": ${OPENAIX_TOP_K:-40},
+          // "min_p": ${OPENAIX_MIN_P:-0.0}
+        },
         // Timeout for single HTTP request to upstream LLM
         "request_timeout": ${REQUEST_TIMEOUT:-100},
         "logging": {

@@ -60,11 +60,16 @@ The implementation does not hard-validate message shape, but the following forms
 2. `tool_choice: string|object`
 3. `temperature: number`
 4. `top_p: number`
-5. `max_tokens: number`
-6. `stop: string|array`
-7. `response_format: object`
-8. `seed: integer`
-9. `options: object` - forwarded to upstream Ollama `/api/chat` options
+5. `repetition_penalty: number`
+6. `max_tokens: number`
+7. `seed: integer`
+8. `presence_penalty: number`
+9. `frequency_penalty: number`
+10. `top_k: integer`
+11. `min_p: number`
+12. `stop: string|array`
+13. `response_format: object`
+14. `options: object` - forwarded to upstream Ollama `/api/chat` options
 
 ### 4.4 OpenAIx extensions (`/api/chat`)
 
@@ -74,6 +79,13 @@ The implementation does not hard-validate message shape, but the following forms
 4. `context_builder: object` - per-request context behavior override
 5. `log: object`
 6. `log.options.save_llm_request: boolean` - per-request LLM call logging override
+
+Generation parameter handling:
+
+1. OpenAIx accepts top-level `temperature`, `top_p`, `repetition_penalty`, `max_tokens`, `seed`, `presence_penalty`, `frequency_penalty`, `top_k`, and `min_p`.
+2. Before sending to Ollama, these fields are mapped into `options.temperature`, `options.top_p`, `options.repeat_penalty`, `options.num_predict`, `options.seed`, `options.presence_penalty`, `options.frequency_penalty`, `options.top_k`, and `options.min_p`.
+3. If the caller already supplied the corresponding `options.*` value, `options.*` wins.
+4. Worker config may define overrideable defaults under `workers.items.<worker_id>.generation_defaults` using the same OpenAIx field names.
 
 ### 4.5 Processing notes
 
@@ -169,8 +181,15 @@ This endpoint accepts OpenAI-like chat payload, then maps it to internal Ollama-
 5. `tool_choice: string|object`
 6. `temperature: number`
 7. `top_p: number`
-8. `max_tokens: number`
-9. `stop: string|array`
+9. `repetition_penalty: number`
+10. `max_tokens: number`
+11. `seed: integer`
+12. `presence_penalty: number`
+13. `frequency_penalty: number`
+14. `top_k: integer`
+15. `min_p: number`
+16. `stop: string|array`
+17. `options: object` (OpenAIx extension passthrough)
 
 ### 5.2 OpenAIx extensions supported on `/v1/chat/completions`
 
@@ -179,11 +198,14 @@ This endpoint accepts OpenAI-like chat payload, then maps it to internal Ollama-
 3. `context_builder: object`
 4. `log: object`
 5. `log.options.save_llm_request: boolean`
+6. `options: object`
+7. `top_k: integer`
+8. `min_p: number`
 
 ### 5.3 Important limitations for `/v1/chat/completions`
 
 1. `timeout` is not mapped from OpenAI request body in current implementation.
-2. Many OpenAI fields are not implemented (for example `n`, `presence_penalty`, `frequency_penalty`, `logprobs`, etc.).
+2. Many OpenAI fields are not implemented (for example `n`, `logprobs`, etc.).
 3. Unknown fields are ignored by the mapping layer.
 
 ## 6. Responses
