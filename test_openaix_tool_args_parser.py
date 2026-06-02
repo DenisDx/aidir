@@ -439,6 +439,87 @@ class TestWorkerWarningLogs(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any(level == "warning" and "status=502" in message for _, level, message, _ in records))
 
 
+class TestRawCallLogs(unittest.IsolatedAsyncioTestCase):
+    """Regression checks for raw request/response call logging."""
+
+    async def test_call_ollama_forward_sync_writes_raw_request_and_response(self) -> None:
+        """Writes one raw request line and one raw response line for sync Ollama calls."""
+        worker = CallOllamaWorker()
+        task = Task_agent(payload={"model": "qwen3.5:9b", "messages": []}, stream=False)
+        response_text = '{"message":{"role":"assistant","content":"ok"},"done":true}'
+
+        class FakeResponse:
+            status_code = 200
+
+            async def aread(self):
+                return response_text.encode("utf-8")
+
+        class FakeClient:
+            def build_request(self, method, url, json):
+                return httpx.Request(method, url, json=json)
+
+            async def send(self, request):
+                return FakeResponse()
+
+        with patch("workers.agent.call_ollama.app.save_llm_raw_call") as raw_log, patch("workers.agent.call_ollama.app.save_llm_call") as parsed_log:
+            result = await worker._forward_sync(FakeClient(), "http://127.0.0.1:11434/api/chat", {"model": "qwen3.5:9b"}, task, save_call=True)
+
+        self.assertTrue(result.ok)
+        self.assertEqual(raw_log.call_count, 2)
+        self.assertIn(b'"stream":false', raw_log.call_args_list[0].args[1])
+        self.assertEqual(raw_log.call_args_list[1].args[1], response_text.encode("utf-8"))
+        parsed_log.assert_called_once()
+
+    async def test_openaix_forward_stream_writes_raw_request_and_response(self) -> None:
+        """Writes one raw request line and one raw response line for streaming OpenAIx calls."""
+        worker = OpenAIxWorker()
+        raw_line_1 = '{"message":{"role":"assistant","content":"hi"},"done":false}\n'
+        raw_line_2 = '{"message":{"role":"assistant","content":"there"},"done":true}\n'
+
+        class FakeStreamResponse:
+            status_code = 200
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def aiter_raw(self):
+                yield raw_line_1.encode("utf-8")
+                yield raw_line_2.encode("utf-8")
+
+        class FakeClient:
+            def build_request(self, method, url, json):
+                return httpx.Request(method, url, json=json)
+
+            async def send(self, request, stream=False):
+                self.last_stream = stream
+                return FakeStreamResponse()
+
+        emitted: list[dict] = []
+
+        async def emit_chunk(chunk: dict) -> None:
+            emitted.append(chunk)
+
+        with patch("workers.agent.openaix.app.save_llm_raw_call") as raw_log, patch("workers.agent.openaix.app.save_llm_call") as parsed_log:
+            result = await worker._forward_stream(
+                FakeClient(),
+                "http://127.0.0.1:11434/api/chat",
+                {"model": "qwen3.5:9b"},
+                emit_chunk,
+                save_call=True,
+                task_id="task-1",
+            )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(len(emitted), 2)
+        self.assertEqual(raw_log.call_count, 2)
+        self.assertIn(b'"stream":true', raw_log.call_args_list[0].args[1])
+        self.assertEqual(raw_log.call_args_list[1].args[1], (raw_line_1 + raw_line_2).encode("utf-8"))
+        parsed_log.assert_called_once()
+
+
 class TestOpenAIxAuthHeaders(unittest.IsolatedAsyncioTestCase):
     """Regression checks for provider auth and incoming bearer precedence."""
 
@@ -1212,6 +1293,176 @@ class TestOpenAIxModelOnlyQueueState(unittest.IsolatedAsyncioTestCase):
         payload = json.loads(response.body)
         self.assertEqual(payload["provider"], "ollama_local")
         self.assertEqual(payload["model"], "qwen3.5:9b")
+        self.assertTrue(payload["can_run_now"])
+
+    async def test_model_only_queue_state_resolves_smart_alias_to_concrete_provider_and_model(self) -> None:
+        """Resolves smart aliases through the same candidate-selection logic as inference."""
+        endpoint = Endpoint_openaix({"id": "openaix", "worker": "openaix"})
+        endpoint._core = _FakeCore(
+            {
+                "workers": {
+                    "default": "openaix",
+                    "items": {
+                        "openaix": {
+                            "provider": "smart",
+                        }
+                    },
+                },
+                "models": {
+                    "providers": {
+                        "smart": {
+                            "api": "smart",
+                            "models": [
+                                {
+                                    "id": "smart_chat",
+                                    "alias": "smart_chat",
+                                    "type": "first_available",
+                                    "items": [
+                                        {"provider": "ollama_busy", "model": "slow-model", "fallback_prio": 5},
+                                        {"provider": "ollama_ready", "model": "fast-model", "fallback_prio": 10},
+                                    ],
+                                }
+                            ],
+                        },
+                        "ollama_busy": {
+                            "api": "ollama",
+                            "models": [
+                                {"id": "slow-model", "resources": {"busy": {"VRAM": 8000}}},
+                            ],
+                        },
+                        "ollama_ready": {
+                            "api": "ollama",
+                            "models": [
+                                {"id": "fast-model", "resources": {"ready": {"VRAM": 4000}}},
+                            ],
+                        },
+                    }
+                },
+            },
+            queue=_SmartFakeQueue(
+                {
+                    '{"busy":{"VRAM":8000}}': {
+                        "queued_count_total": 1,
+                        "queued_count_below_priority": 0,
+                        "priority_counts": [{"priority": 5, "count": 1}],
+                    },
+                    '{"ready":{"VRAM":4000}}': {
+                        "queued_count_total": 0,
+                        "queued_count_below_priority": 0,
+                        "priority_counts": [],
+                    },
+                }
+            ),
+            resources=_SmartFakeResources({
+                '{"busy":{"VRAM":8000}}': True,
+                '{"ready":{"VRAM":4000}}': True,
+            }),
+        )
+
+        async def fake_ollama_probe(provider_id, model_id, *, timeout_ms, incoming_bearer_token=""):
+            return True
+
+        endpoint._probe_ollama_model_availability = fake_ollama_probe
+
+        response = await endpoint._model_only_queue_state_response(
+            protocol="openai",
+            model_id="smart_chat",
+            priority=5,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = json.loads(response.body)
+        self.assertEqual(payload["requested_model"], "smart_chat")
+        self.assertEqual(payload["provider"], "ollama_ready")
+        self.assertEqual(payload["model"], "fast-model")
+        self.assertTrue(payload["can_run_now"])
+
+
+class TestOpenAIxProviderQueueState(unittest.IsolatedAsyncioTestCase):
+    """Regression checks for provider-aware queue-state compatibility behavior."""
+
+    async def test_provider_queue_state_default_resolves_smart_alias_to_concrete_provider_and_model(self) -> None:
+        """Treats provider=default as inference-style model resolution before smart queue-state evaluation."""
+        endpoint = Endpoint_openaix({"id": "openaix", "worker": "openaix"})
+        endpoint._core = _FakeCore(
+            {
+                "workers": {
+                    "default": "openaix",
+                    "items": {
+                        "openaix": {
+                            "provider": "smart",
+                        }
+                    },
+                },
+                "models": {
+                    "providers": {
+                        "smart": {
+                            "api": "smart",
+                            "models": [
+                                {
+                                    "id": "smart_chat",
+                                    "alias": "smart_chat",
+                                    "type": "first_available",
+                                    "items": [
+                                        {"provider": "ollama_busy", "model": "slow-model", "fallback_prio": 5},
+                                        {"provider": "ollama_ready", "model": "fast-model", "fallback_prio": 10},
+                                    ],
+                                }
+                            ],
+                        },
+                        "ollama_busy": {
+                            "api": "ollama",
+                            "models": [
+                                {"id": "slow-model", "resources": {"busy": {"VRAM": 8000}}},
+                            ],
+                        },
+                        "ollama_ready": {
+                            "api": "ollama",
+                            "models": [
+                                {"id": "fast-model", "resources": {"ready": {"VRAM": 4000}}},
+                            ],
+                        },
+                    }
+                },
+            },
+            queue=_SmartFakeQueue(
+                {
+                    '{"busy":{"VRAM":8000}}': {
+                        "queued_count_total": 1,
+                        "queued_count_below_priority": 0,
+                        "priority_counts": [{"priority": 8, "count": 1}],
+                    },
+                    '{"ready":{"VRAM":4000}}': {
+                        "queued_count_total": 0,
+                        "queued_count_below_priority": 0,
+                        "priority_counts": [],
+                    },
+                }
+            ),
+            resources=_SmartFakeResources({
+                '{"busy":{"VRAM":8000}}': True,
+                '{"ready":{"VRAM":4000}}': True,
+            }),
+        )
+
+        async def fake_ollama_probe(provider_id, model_id, *, timeout_ms, incoming_bearer_token=""):
+            return True
+
+        endpoint._probe_ollama_model_availability = fake_ollama_probe
+
+        response = await endpoint._model_queue_state_response(
+            protocol="openai",
+            provider_id="default",
+            model_id="smart_chat",
+            priority=8,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = json.loads(response.body)
+        self.assertEqual(payload["requested_provider"], "default")
+        self.assertEqual(payload["requested_model"], "smart_chat")
+        self.assertEqual(payload["provider"], "ollama_ready")
+        self.assertEqual(payload["model"], "fast-model")
         self.assertTrue(payload["can_run_now"])
 
 

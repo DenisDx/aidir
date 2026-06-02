@@ -825,6 +825,17 @@ class Endpoint_openaix(Endpoint_ollama):
                 message="priority must be greater than or equal to 0",
             )
 
+        requested_provider_id = str(provider_id)
+        requested_model_id = str(model_id)
+        resolved_route = await self._resolve_queue_state_route(
+            provider_id=provider_id,
+            model_id=model_id,
+            priority=priority,
+        )
+        if isinstance(resolved_route, dict):
+            provider_id = str(resolved_route.get("resolved_provider") or provider_id)
+            model_id = str(resolved_route.get("resolved_model") or model_id)
+
         resolved = self._resolve_model_resource_requirements(provider_id, model_id)
         if resolved is None:
             return self._error_response(
@@ -855,7 +866,49 @@ class Endpoint_openaix(Endpoint_ollama):
             "queued_count_total": queue_state["queued_count_total"],
             "priority_counts": queue_state["priority_counts"],
         }
+        if provider_id != requested_provider_id or model_id != requested_model_id:
+            payload["requested_provider"] = requested_provider_id
+            payload["requested_model"] = requested_model_id
         return JSONResponse(payload)
+
+    async def _resolve_queue_state_route(
+        self,
+        *,
+        provider_id: str,
+        model_id: str,
+        priority: int,
+    ) -> dict | None:
+        """Resolve default and smart queue-state requests into a concrete provider/model pair."""
+        worker_id = self._resolve_worker_id({})
+        normalized_provider_id = str(provider_id or "").strip()
+        normalized_model_id = str(model_id or "").strip()
+        route: dict | None = None
+
+        if normalized_provider_id == "default":
+            route = self._resolve_model_route(normalized_model_id, worker_id)
+        elif self._provider_api(normalized_provider_id) == "smart":
+            smart_model_cfg = self._find_provider_model_cfg(normalized_provider_id, normalized_model_id)
+            if isinstance(smart_model_cfg, dict):
+                route = {
+                    "requested_model": normalized_model_id,
+                    "requested_alias": normalized_model_id,
+                    "resolved_provider": normalized_provider_id,
+                    "resolved_model": self._model_id(smart_model_cfg) or normalized_model_id,
+                    "selection": "provider_model",
+                    "worker_preferred_provider": self._preferred_provider_for_worker(worker_id),
+                }
+
+        if not isinstance(route, dict):
+            return None
+
+        if self._provider_api(str(route.get("resolved_provider") or "")) != "smart":
+            return route
+
+        return await self._resolve_smart_route(
+            route,
+            worker_id=worker_id,
+            payload={"model": route.get("requested_model") or normalized_model_id, "priority": priority},
+        )
 
     async def _model_only_queue_state_response(
         self,

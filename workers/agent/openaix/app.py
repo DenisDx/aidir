@@ -7,13 +7,14 @@ from __future__ import annotations
 import ast
 import asyncio
 import base64
+import codecs
 import json
 from typing import Awaitable, Callable
 
 import httpx
 
 from core import log
-from core.call_log import save_llm_call
+from core.call_log import save_llm_call, save_llm_raw_call
 from core.context import Context
 from core.task import Task, STATUS_COMPLETED, STATUS_FAILED, STATUS_CANCELED
 from core.task_types.task_agent import Task_agent
@@ -1006,7 +1007,15 @@ class OpenAIxWorker(BaseWorker):
             "openaix",
         )
 
-        resp = await client.post(url, json=upstream_payload)
+        request = self._build_json_request(client, url, upstream_payload)
+        if save_call:
+            save_llm_raw_call(self.id, request.content)
+
+        resp = await self._send_json_request(client, request, upstream_payload)
+        raw_response = await self._read_response_body(resp)
+        if save_call:
+            save_llm_raw_call(self.id, raw_response)
+
         if resp.status_code != 200:
             body_preview = resp.text[:512]
             log(
@@ -1028,7 +1037,7 @@ class OpenAIxWorker(BaseWorker):
             )
 
         try:
-            data = resp.json()
+            data = json.loads(raw_response)
         except json.JSONDecodeError:
             body_preview = resp.text[:512]
             log(
@@ -1067,8 +1076,17 @@ class OpenAIxWorker(BaseWorker):
         upstream_payload = {**payload, "stream": True}
         final_data: dict | None = None
         chunks: list[dict] = [] if save_call else []
-        async with client.stream("POST", url, json=upstream_payload) as resp:
+        request = self._build_json_request(client, url, upstream_payload)
+        if save_call:
+            save_llm_raw_call(self.id, request.content)
+
+        stream_context = await self._open_stream_request(client, request, upstream_payload)
+        raw_parts: list[bytes] = [] if save_call else []
+        async with stream_context as resp:
             if resp.status_code != 200:
+                raw_error = await self._read_response_body(resp)
+                if save_call:
+                    save_llm_raw_call(self.id, raw_error)
                 log(
                     "worker",
                     "warning",
@@ -1083,7 +1101,106 @@ class OpenAIxWorker(BaseWorker):
                     },
                 )
 
-            async for line in resp.aiter_lines():
+            final_data = await self._consume_stream_response(resp, emit_chunk, chunks, raw_parts, save_call)
+
+        if save_call:
+            save_llm_raw_call(self.id, b"".join(raw_parts))
+
+        if save_call:
+            save_llm_call(self.id, task_id, upstream_payload, {"stream_chunks": chunks})
+        return WorkerResult(ok=True, data=final_data, usage=(final_data or {}).get("usage"))
+
+    @staticmethod
+    def _build_json_request(client: httpx.AsyncClient, url: str, payload: dict) -> httpx.Request:
+        """Build the exact JSON request object when supported by the client."""
+        build_request = getattr(client, "build_request", None)
+        if callable(build_request):
+            return build_request("POST", url, json=payload)
+        return httpx.Request("POST", url, json=payload)
+
+    @staticmethod
+    async def _send_json_request(client: httpx.AsyncClient, request: httpx.Request, payload: dict):
+        """Send one non-streaming request using either real httpx or a test double."""
+        send = getattr(client, "send", None)
+        if callable(send):
+            return await send(request)
+        return await client.post(str(request.url), json=payload)
+
+    @staticmethod
+    async def _open_stream_request(client: httpx.AsyncClient, request: httpx.Request, payload: dict):
+        """Open one streaming request using either real httpx or a test double."""
+        send = getattr(client, "send", None)
+        if callable(send):
+            return await send(request, stream=True)
+        return client.stream(request.method, str(request.url), json=payload)
+
+    @staticmethod
+    async def _read_response_body(resp) -> bytes | str:
+        """Read a full response body without altering it when bytes are available."""
+        aread = getattr(resp, "aread", None)
+        if callable(aread):
+            return await aread()
+
+        text = getattr(resp, "text", None)
+        if isinstance(text, str):
+            return text
+
+        content = getattr(resp, "content", b"")
+        if isinstance(content, (bytes, str)):
+            return content
+        return str(content)
+
+    @staticmethod
+    async def _consume_stream_response(resp, emit_chunk, chunks: list[dict], raw_parts: list[bytes], save_call: bool) -> dict | None:
+        """Parse Ollama NDJSON stream while preserving raw bytes for logging."""
+        final_data: dict | None = None
+
+        aiter_raw = getattr(resp, "aiter_raw", None)
+        if callable(aiter_raw):
+            decoder = codecs.getincrementaldecoder("utf-8")()
+            text_buffer = ""
+            async for raw_chunk in aiter_raw():
+                if save_call:
+                    raw_parts.append(raw_chunk)
+                decoded = decoder.decode(raw_chunk)
+                text_buffer += decoded
+                while "\n" in text_buffer:
+                    line, text_buffer = text_buffer.split("\n", 1)
+                    if not line.strip():
+                        continue
+                    try:
+                        chunk = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if emit_chunk:
+                        await emit_chunk(chunk)
+                    if save_call:
+                        chunks.append(chunk)
+                    if chunk.get("done"):
+                        final_data = chunk
+
+            tail = decoder.decode(b"", final=True)
+            if tail:
+                text_buffer += tail
+            if text_buffer.strip():
+                try:
+                    chunk = json.loads(text_buffer)
+                except json.JSONDecodeError:
+                    chunk = None
+                if isinstance(chunk, dict):
+                    if emit_chunk:
+                        await emit_chunk(chunk)
+                    if save_call:
+                        chunks.append(chunk)
+                    if chunk.get("done"):
+                        final_data = chunk
+            return final_data
+
+        aiter_lines = getattr(resp, "aiter_lines", None)
+        if callable(aiter_lines):
+            async for line in aiter_lines():
+                if save_call:
+                    raw_parts.append(line.encode("utf-8") + b"\n")
                 if not line.strip():
                     continue
                 try:
@@ -1097,9 +1214,7 @@ class OpenAIxWorker(BaseWorker):
                 if chunk.get("done"):
                     final_data = chunk
 
-        if save_call:
-            save_llm_call(self.id, task_id, upstream_payload, {"stream_chunks": chunks})
-        return WorkerResult(ok=True, data=final_data, usage=(final_data or {}).get("usage"))
+        return final_data
 
 
 worker = OpenAIxWorker()
