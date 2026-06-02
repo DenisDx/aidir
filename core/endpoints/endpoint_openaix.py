@@ -855,13 +855,16 @@ class Endpoint_openaix(Endpoint_ollama):
 
         queue_state = await self._core.queue.get_resource_queue_state(resolved, priority=priority)
         resource_ready = bool(self._core.resources and self._core.resources.check_available(resolved))
+        resource_ready_after_unload = bool(
+            self._core.resources and self._core.resources.check_available_after_unload(resolved)
+        )
         blocked_by_same_or_higher = queue_state["queued_count_total"] - queue_state["queued_count_below_priority"]
 
         payload = {
             "provider": provider_id,
             "model": model_id,
             "priority": priority,
-            "can_run_now": resource_ready and blocked_by_same_or_higher == 0,
+            "can_run_now": resource_ready_after_unload and blocked_by_same_or_higher == 0,
             "queued_count_below_priority": queue_state["queued_count_below_priority"],
             "queued_count_total": queue_state["queued_count_total"],
             "priority_counts": queue_state["priority_counts"],

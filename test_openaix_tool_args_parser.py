@@ -6,6 +6,7 @@ import json
 import unittest
 import base64
 from unittest.mock import patch
+from types import SimpleNamespace
 
 import httpx
 
@@ -58,11 +59,15 @@ class _FakeQueue:
 class _FakeResources:
     """Resources stub with deterministic availability checks."""
 
-    def __init__(self, available: bool) -> None:
+    def __init__(self, available: bool, after_unload: bool | None = None) -> None:
         self._available = available
+        self._after_unload = available if after_unload is None else after_unload
 
     def check_available(self, requirements) -> bool:
         return self._available
+
+    def check_available_after_unload(self, requirements) -> bool:
+        return self._after_unload
 
 
 def _requirements_key(requirements: dict | None) -> str:
@@ -92,11 +97,27 @@ class _SmartFakeQueue:
 class _SmartFakeResources:
     """Resources stub that reports availability by normalized requirements."""
 
-    def __init__(self, availability_by_requirements: dict[str, bool]) -> None:
+    def __init__(self, availability_by_requirements: dict[str, bool], availability_after_unload_by_requirements: dict[str, bool] | None = None) -> None:
         self._availability_by_requirements = availability_by_requirements
+        self._availability_after_unload_by_requirements = availability_by_requirements if availability_after_unload_by_requirements is None else availability_after_unload_by_requirements
 
     def check_available(self, requirements) -> bool:
         return bool(self._availability_by_requirements.get(_requirements_key(requirements), False))
+
+    def check_available_after_unload(self, requirements) -> bool:
+        return bool(self._availability_after_unload_by_requirements.get(_requirements_key(requirements), False))
+
+
+class _SchedulerFakeWorker:
+    """Minimal enabled worker stub for scheduler tests."""
+
+    def __init__(self, worker_id: str, task_type: str = "agent") -> None:
+        self.id = worker_id
+        self.task_type = task_type
+        self.enabled = True
+
+    async def execute(self, task, emit_chunk=None):
+        return WorkerResult(ok=True, data={})
 
 
 class TestOpenAIxToolArgsParser(unittest.TestCase):
@@ -1295,6 +1316,119 @@ class TestOpenAIxModelOnlyQueueState(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["model"], "qwen3.5:9b")
         self.assertTrue(payload["can_run_now"])
 
+    async def test_model_only_queue_state_uses_after_unload_availability_when_queue_is_empty(self) -> None:
+        """Reports can_run_now=true when scheduler could run immediately after unloading soft consumers."""
+        endpoint = Endpoint_openaix({"id": "openaix", "worker": "openaix"})
+        endpoint._core = _FakeCore(
+            {
+                "workers": {
+                    "default": "openaix",
+                    "items": {
+                        "openaix": {
+                            "provider": "ollama_remote",
+                        }
+                    },
+                },
+                "models": {
+                    "providers": {
+                        "ollama_remote": {
+                            "api": "ollama",
+                            "models": [
+                                {"id": "smart_gemma-4-26B", "resources": {"remote": {"VRAM": 19500}}},
+                            ]
+                        },
+                    }
+                },
+            },
+            queue=_FakeQueue(
+                {
+                    "queued_count_total": 0,
+                    "queued_count_below_priority": 0,
+                    "priority_counts": [],
+                }
+            ),
+            resources=_FakeResources(False, after_unload=True),
+        )
+
+        response = await endpoint._model_only_queue_state_response(
+            protocol="openai",
+            model_id="smart_gemma-4-26B",
+            priority=8,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = json.loads(response.body)
+        self.assertEqual(payload["provider"], "ollama_remote")
+        self.assertTrue(payload["can_run_now"])
+
+    async def test_model_only_queue_state_resolves_smart_alias_when_only_after_unload_is_available(self) -> None:
+        """Treats a smart candidate as immediate when scheduler could run it after force-unload."""
+        endpoint = Endpoint_openaix({"id": "openaix", "worker": "openaix"})
+        endpoint._core = _FakeCore(
+            {
+                "workers": {
+                    "default": "openaix",
+                    "items": {
+                        "openaix": {
+                            "provider": "smart",
+                        }
+                    },
+                },
+                "models": {
+                    "providers": {
+                        "smart": {
+                            "api": "smart",
+                            "models": [
+                                {
+                                    "id": "smart_chat",
+                                    "alias": "smart_chat",
+                                    "type": "first_available",
+                                    "items": [
+                                        {"provider": "ollama_remote", "model": "fast-model", "fallback_prio": 1},
+                                    ],
+                                }
+                            ],
+                        },
+                        "ollama_remote": {
+                            "api": "ollama",
+                            "models": [
+                                {"id": "fast-model", "resources": {"remote": {"VRAM": 19500}}},
+                            ],
+                        },
+                    }
+                },
+            },
+            queue=_SmartFakeQueue(
+                {
+                    '{"remote":{"VRAM":19500}}': {
+                        "queued_count_total": 0,
+                        "queued_count_below_priority": 0,
+                        "priority_counts": [],
+                    },
+                }
+            ),
+            resources=_SmartFakeResources(
+                {'{"remote":{"VRAM":19500}}': False},
+                {'{"remote":{"VRAM":19500}}': True},
+            ),
+        )
+
+        async def fake_ollama_probe(provider_id, model_id, *, timeout_ms, incoming_bearer_token=""):
+            return True
+
+        endpoint._probe_ollama_model_availability = fake_ollama_probe
+
+        response = await endpoint._model_only_queue_state_response(
+            protocol="openai",
+            model_id="smart_chat",
+            priority=8,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = json.loads(response.body)
+        self.assertEqual(payload["provider"], "ollama_remote")
+        self.assertTrue(payload["can_run_now"])
+
     async def test_model_only_queue_state_resolves_smart_alias_to_concrete_provider_and_model(self) -> None:
         """Resolves smart aliases through the same candidate-selection logic as inference."""
         endpoint = Endpoint_openaix({"id": "openaix", "worker": "openaix"})
@@ -1381,6 +1515,53 @@ class TestOpenAIxModelOnlyQueueState(unittest.IsolatedAsyncioTestCase):
 class TestOpenAIxProviderQueueState(unittest.IsolatedAsyncioTestCase):
     """Regression checks for provider-aware queue-state compatibility behavior."""
 
+    async def test_provider_queue_state_uses_after_unload_availability_when_queue_is_empty(self) -> None:
+        """Reports can_run_now=true when scheduler could run immediately after unloading soft consumers."""
+        endpoint = Endpoint_openaix({"id": "openaix", "worker": "openaix"})
+        endpoint._core = _FakeCore(
+            {
+                "workers": {
+                    "default": "openaix",
+                    "items": {
+                        "openaix": {
+                            "provider": "ollama_remote",
+                        }
+                    },
+                },
+                "models": {
+                    "providers": {
+                        "ollama_remote": {
+                            "api": "ollama",
+                            "models": [
+                                {"id": "smart_gemma-4-26B", "resources": {"remote": {"VRAM": 19500}}},
+                            ]
+                        },
+                    }
+                },
+            },
+            queue=_FakeQueue(
+                {
+                    "queued_count_total": 0,
+                    "queued_count_below_priority": 0,
+                    "priority_counts": [],
+                }
+            ),
+            resources=_FakeResources(False, after_unload=True),
+        )
+
+        response = await endpoint._model_queue_state_response(
+            protocol="openai",
+            provider_id="ollama_remote",
+            model_id="smart_gemma-4-26B",
+            priority=8,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = json.loads(response.body)
+        self.assertEqual(payload["provider"], "ollama_remote")
+        self.assertEqual(payload["model"], "smart_gemma-4-26B")
+        self.assertTrue(payload["can_run_now"])
+
     async def test_provider_queue_state_default_resolves_smart_alias_to_concrete_provider_and_model(self) -> None:
         """Treats provider=default as inference-style model resolution before smart queue-state evaluation."""
         endpoint = Endpoint_openaix({"id": "openaix", "worker": "openaix"})
@@ -1464,6 +1645,104 @@ class TestOpenAIxProviderQueueState(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["provider"], "ollama_ready")
         self.assertEqual(payload["model"], "fast-model")
         self.assertTrue(payload["can_run_now"])
+
+
+class TestSchedulerSmartRouteRefresh(unittest.IsolatedAsyncioTestCase):
+    """Regression checks for scheduler-time refresh of queued smart-route selections."""
+
+    async def test_refreshes_busy_fallback_route_before_dispatch(self) -> None:
+        """Re-evaluates queued smart tasks so they can move to a newly available candidate."""
+        scheduler = Scheduler(
+            queue=_SmartFakeQueue(
+                {
+                    '{"local":{"VRAM":19500}}': {
+                        "queued_count_total": 0,
+                        "queued_count_below_priority": 0,
+                        "priority_counts": [],
+                    },
+                    '{"remote":{"VRAM":19500}}': {
+                        "queued_count_total": 1,
+                        "queued_count_below_priority": 0,
+                        "priority_counts": [{"priority": 5, "count": 1}],
+                    },
+                }
+            ),
+            workers={"openaix": _SchedulerFakeWorker("openaix")},
+            workers_cfg={"openaix": {"provider": "smart"}},
+            resources=_SmartFakeResources(
+                {'{"local":{"VRAM":19500}}': False, '{"remote":{"VRAM":19500}}': False},
+                {'{"local":{"VRAM":19500}}': True, '{"remote":{"VRAM":19500}}': False},
+            ),
+            full_config={
+                "models": {
+                    "providers": {
+                        "smart": {
+                            "api": "smart",
+                            "models": [
+                                {
+                                    "id": "smart_gemma-4-26B",
+                                    "alias": "smart_gemma-4-26B",
+                                    "type": "first_available",
+                                    "items": [
+                                        {"provider": "ollama_local", "model": "gemma-local", "fallback_prio": 10},
+                                        {"provider": "ollama_remote", "model": "gemma-remote", "fallback_prio": 1},
+                                    ],
+                                }
+                            ],
+                        },
+                        "ollama_local": {
+                            "api": "ollama",
+                            "baseUrl": "http://127.0.0.1:11434",
+                            "models": [{"id": "gemma-local", "resources": {"local": {"VRAM": 19500}}}],
+                        },
+                        "ollama_remote": {
+                            "api": "ollama",
+                            "baseUrl": "http://192.168.1.110:11434",
+                            "models": [{"id": "gemma-remote", "resources": {"remote": {"VRAM": 19500}}}],
+                        },
+                    }
+                }
+            },
+        )
+
+        async def fake_ollama_probe(provider_id, model_id, *, timeout_ms, incoming_bearer_token=""):
+            return True
+
+        scheduler._probe_ollama_model_availability = fake_ollama_probe
+
+        task = Task_agent(payload={"model": "gemma-remote"}, stream=False)
+        task.priority = 5
+        task.worker_id = "openaix"
+        task.resource_requirements = {"remote": {"VRAM": 19500}}
+        task.config = {
+            "incoming_bearer_token": "test-token",
+            "route": {
+                "requested_model": "smart_gemma-4-26B",
+                "requested_alias": "smart_gemma-4-26B",
+                "requested_provider": "smart",
+                "resolved_provider": "ollama_remote",
+                "resolved_model": "gemma-remote",
+                "selection": "smart_route",
+                "strategy": "first_available",
+                "selection_reason": "busy_fallback",
+                "candidate_index": 1,
+                "fallback_prio": 1,
+                "candidate_probes": [],
+                "resolved_worker": "openaix",
+            }
+        }
+
+        await scheduler._refresh_smart_route_for_dispatch(task, "openaix")
+
+        self.assertEqual(task.config["route"]["resolved_provider"], "ollama_local")
+        self.assertEqual(task.config["route"]["resolved_model"], "gemma-local")
+        self.assertEqual(task.config["route"]["selection_reason"], "immediate")
+        self.assertEqual(task.payload["model"], "gemma-local")
+        self.assertEqual(task.resource_requirements, {})
+        self.assertEqual(
+            scheduler._resolve_resource_requirements(task, "openaix"),
+            {"local": {"VRAM": 19500}},
+        )
 
 
 class TestOpenAIxSmartRouting(unittest.IsolatedAsyncioTestCase):

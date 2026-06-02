@@ -38,6 +38,7 @@ class SmartRouter:
         resolve_model_resource_requirements: Callable[[str, str], dict | None],
         get_local_queue_state: Callable[[dict, int], Awaitable[dict | None]] | None,
         check_resource_available: Callable[[dict], bool] | None,
+        check_resource_available_after_unload: Callable[[dict], bool] | None,
         probe_remote_model_queue_state: Callable[..., Awaitable[dict | None]],
         probe_ollama_model_availability: Callable[..., Awaitable[bool]] | None,
         resolve_probe_timeout_ms: Callable[[dict], int],
@@ -52,6 +53,7 @@ class SmartRouter:
         self._resolve_model_resource_requirements = resolve_model_resource_requirements
         self._get_local_queue_state = get_local_queue_state
         self._check_resource_available = check_resource_available
+        self._check_resource_available_after_unload = check_resource_available_after_unload
         self._probe_remote_model_queue_state = probe_remote_model_queue_state
         self._probe_ollama_model_availability = probe_ollama_model_availability
         self._resolve_probe_timeout_ms = resolve_probe_timeout_ms
@@ -180,6 +182,9 @@ class SmartRouter:
             queue_state = await self._get_local_queue_state(requirements, request_priority)
             if isinstance(queue_state, dict):
                 resource_ready = bool(self._check_resource_available(requirements))
+                resource_ready_after_unload = bool(
+                    self._check_resource_available_after_unload(requirements)
+                ) if self._check_resource_available_after_unload is not None else resource_ready
                 blocked_by_same_or_higher = int(queue_state.get("queued_count_total") or 0) - int(queue_state.get("queued_count_below_priority") or 0)
                 provider_api = self._provider_api(provider_id)
                 if provider_api == "ollama" and self._probe_ollama_model_availability is not None:
@@ -210,11 +215,13 @@ class SmartRouter:
                     "model": model_id,
                     "index": index,
                     "fallback_prio": fallback_prio,
-                    "can_run_now": resource_ready and blocked_by_same_or_higher == 0,
+                    "can_run_now": resource_ready_after_unload and blocked_by_same_or_higher == 0,
                     "queue_state": queue_state,
                     "probe_ok": True,
                     "probe_source": "local" if provider_api != "ollama" else "ollama_http",
                     "probe_latency_ms": int((time.perf_counter() - started_at) * 1000),
+                    "resource_ready": resource_ready,
+                    "resource_ready_after_unload": resource_ready_after_unload,
                     "routing_eligible": True,
                 }
 

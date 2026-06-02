@@ -8,11 +8,15 @@ from __future__ import annotations
 
 import asyncio
 import time
+from urllib.parse import quote
 from typing import TYPE_CHECKING
+
+import httpx
 
 from core.task import Task, STATUS_QUEUED
 from core.worker import WorkerResult
 from core import log
+from core.smart_router import SmartRouter, SmartRouteError
 
 if TYPE_CHECKING:
     from core.queue_manager import QueueManager
@@ -81,6 +85,8 @@ class Scheduler:
                     log("system", "warn",
                         f"No worker for task {task_id} (type={task_type}), re-queued")
                     continue
+
+                await self._refresh_smart_route_for_dispatch(task, worker.id)
 
                 reqs = self._resolve_resource_requirements(task, worker.id)
                 if reqs and self._resources and not self._resources.check_available(reqs):
@@ -313,6 +319,80 @@ class Scheduler:
             if self._resources and reserved_reqs:
                 await self._resources.release_for(reserved_reqs, consumer_id=consumer_id, model_id=model_id)
 
+    async def _refresh_smart_route_for_dispatch(self, task: Task, worker_id: str) -> None:
+        """Re-resolve queued smart routes so stale busy-fallback selections can move to a newly available candidate."""
+        route_cfg = (task.config or {}).get("route") if isinstance(task.config, dict) else None
+        if not isinstance(route_cfg, dict):
+            return
+        if str(route_cfg.get("selection") or "").strip() != "smart_route":
+            return
+
+        requested_provider = str(route_cfg.get("requested_provider") or "").strip()
+        requested_model = str(
+            route_cfg.get("requested_alias")
+            or route_cfg.get("requested_model")
+            or route_cfg.get("resolved_model")
+            or ""
+        ).strip()
+        if not requested_provider or not requested_model:
+            return
+        if self._provider_api(requested_provider) != "smart":
+            return
+
+        base_route = {
+            "requested_model": requested_model,
+            "requested_alias": str(route_cfg.get("requested_alias") or requested_model).strip(),
+            "resolved_provider": requested_provider,
+            "resolved_model": requested_model,
+        }
+        request_payload = dict(task.payload or {})
+        request_payload["model"] = requested_model
+        incoming_bearer_token = ""
+        if isinstance(task.config, dict):
+            incoming_bearer_token = str(task.config.get("incoming_bearer_token") or "").strip()
+
+        try:
+            resolution = await self._make_smart_router(worker_id).resolve_route(
+                base_route,
+                request_payload=request_payload,
+                request_priority=task.priority,
+                incoming_bearer_token=incoming_bearer_token,
+            )
+        except SmartRouteError:
+            return
+
+        next_route = dict(resolution.route or {})
+        if not next_route:
+            return
+
+        current_provider = str(route_cfg.get("resolved_provider") or "").strip()
+        current_model = str(route_cfg.get("resolved_model") or "").strip()
+        next_provider = str(next_route.get("resolved_provider") or "").strip()
+        next_model = str(next_route.get("resolved_model") or "").strip()
+        if current_provider == next_provider and current_model == next_model:
+            task.config = dict(task.config or {})
+            task.config["route"] = next_route
+            return
+
+        task.config = dict(task.config or {})
+        task.config["route"] = next_route
+        task.payload = dict(task.payload or {})
+        task.payload["model"] = next_model
+        task.resource_requirements = {}
+
+        resolved_worker = str(next_route.get("resolved_worker") or "").strip()
+        if resolved_worker:
+            task.worker_id = resolved_worker
+
+        log(
+            "system",
+            "info",
+            (
+                f"Task {task.id} smart route refreshed before dispatch: "
+                f"{current_provider}/{current_model} -> {next_provider}/{next_model}"
+            ),
+        )
+
     def _resolve_resource_requirements(self, task: Task, worker_id: str) -> dict[str, dict[str, int]]:
         """Resolve resource requirements from task or worker/model config."""
         if task.resource_requirements:
@@ -346,6 +426,237 @@ class Scheduler:
 
         task.resource_requirements = merged
         return merged
+
+    def _make_smart_router(self, worker_id: str) -> SmartRouter:
+        """Build a shared smart router for scheduler-time route refresh."""
+
+        async def get_local_queue_state(requirements: dict, priority: int) -> dict | None:
+            return await self._queue.get_resource_queue_state(requirements, priority=priority)
+
+        def check_resource_available(requirements: dict) -> bool:
+            if self._resources is None:
+                return False
+            return bool(self._resources.check_available(requirements))
+
+        def check_resource_available_after_unload(requirements: dict) -> bool:
+            if self._resources is None:
+                return False
+            return bool(self._resources.check_available_after_unload(requirements))
+
+        return SmartRouter(
+            endpoint_id="scheduler",
+            default_worker_id=worker_id,
+            find_provider_model_cfg=self._find_provider_model_cfg,
+            provider_api=self._provider_api,
+            resolve_model_resource_requirements=self._resolve_model_resource_requirements,
+            get_local_queue_state=get_local_queue_state,
+            check_resource_available=check_resource_available,
+            check_resource_available_after_unload=check_resource_available_after_unload,
+            probe_remote_model_queue_state=self._probe_remote_model_queue_state,
+            probe_ollama_model_availability=self._probe_ollama_model_availability,
+            resolve_probe_timeout_ms=self._resolve_probe_timeout_ms,
+            resolve_worker_id_for_route=self._resolve_worker_id_for_route,
+        )
+
+    def _provider_api(self, provider_id: str) -> str:
+        """Return provider api type from full config."""
+        providers = (((self._full_config or {}).get("models") or {}).get("providers") or {})
+        provider_cfg = providers.get(provider_id) if isinstance(providers, dict) else None
+        return str((provider_cfg or {}).get("api") or "").strip()
+
+    def _provider_cfg(self, provider_id: str) -> dict:
+        """Return provider config from full config."""
+        providers = (((self._full_config or {}).get("models") or {}).get("providers") or {})
+        provider_cfg = providers.get(provider_id) if isinstance(providers, dict) else None
+        return provider_cfg if isinstance(provider_cfg, dict) else {}
+
+    @staticmethod
+    def _model_id(model_cfg: dict) -> str:
+        """Return external model id from provider model config."""
+        return str(model_cfg.get("id") or "").strip()
+
+    @staticmethod
+    def _model_alias(model_cfg: dict) -> str:
+        """Return external model alias from provider model config."""
+        return str(model_cfg.get("alias") or "").strip()
+
+    def _find_provider_model_cfg(self, provider_id: str, model_id: str) -> dict | None:
+        """Return one provider model config matched by id, name, or alias."""
+        models = self._provider_cfg(provider_id).get("models") or []
+        if not isinstance(models, list):
+            return None
+
+        normalized = str(model_id or "").strip()
+        for model_cfg in models:
+            if not isinstance(model_cfg, dict):
+                continue
+            if normalized not in {
+                self._model_id(model_cfg),
+                self._model_alias(model_cfg),
+                str(model_cfg.get("name") or "").strip(),
+            }:
+                continue
+            return model_cfg
+        return None
+
+    def _resolve_model_resource_requirements(self, provider_id: str, model_id: str) -> dict | None:
+        """Return resource requirements for one concrete provider/model pair."""
+        model_cfg = self._find_provider_model_cfg(provider_id, model_id)
+        if not isinstance(model_cfg, dict):
+            return None
+        resources = model_cfg.get("resources")
+        return dict(resources) if isinstance(resources, dict) else None
+
+    @staticmethod
+    def _resolve_probe_timeout_ms(item: dict) -> int:
+        """Resolve smart-candidate probe timeout in milliseconds."""
+        try:
+            parsed = int((item or {}).get("request_timeout_ms", 1500))
+        except Exception:
+            parsed = 1500
+        return max(1, parsed)
+
+    def _resolve_worker_id_for_route(self, worker_id: str, route: dict | None) -> str:
+        """Adjust worker selection for providers that require a different execution path."""
+        if not isinstance(route, dict):
+            return worker_id
+
+        resolved_worker = str(route.get("resolved_worker") or "").strip()
+        if resolved_worker:
+            return resolved_worker
+
+        provider_id = str(route.get("resolved_provider") or "").strip()
+        if self._provider_api(provider_id) != "openaix":
+            return worker_id
+        if "openaix" in self._workers:
+            return "openaix"
+        return worker_id
+
+    async def _probe_remote_model_queue_state(
+        self,
+        provider_id: str,
+        model_id: str,
+        *,
+        priority: int,
+        timeout_ms: int,
+        incoming_bearer_token: str = "",
+    ) -> dict | None:
+        """Probe remote OpenAIx model-only queue-state using dual-route compatibility."""
+        provider_cfg = self._provider_cfg(provider_id)
+        base_url = str(provider_cfg.get("baseUrl") or "").rstrip("/")
+        if not base_url:
+            return None
+
+        encoded_model = quote(str(model_id), safe="")
+        candidate_urls = [
+            f"{base_url}/v1/models/{encoded_model}/queue-state",
+            f"{base_url}/api/models/{encoded_model}/queue-state",
+        ]
+        headers = self._resolve_probe_headers(provider_id, incoming_bearer_token)
+        timeout_seconds = max(0.001, timeout_ms / 1000.0)
+
+        try:
+            async with httpx.AsyncClient(timeout=timeout_seconds, headers=headers) as client:
+                for url in candidate_urls:
+                    try:
+                        response = await client.get(url, params={"priority": priority})
+                    except httpx.TimeoutException:
+                        return None
+                    except httpx.HTTPError:
+                        continue
+
+                    if response.status_code < 200 or response.status_code >= 300:
+                        continue
+
+                    try:
+                        payload = response.json()
+                    except Exception:
+                        continue
+                    if isinstance(payload, dict):
+                        return payload
+        except httpx.HTTPError:
+            return None
+
+        return None
+
+    async def _probe_ollama_model_availability(
+        self,
+        provider_id: str,
+        model_id: str,
+        *,
+        timeout_ms: int,
+        incoming_bearer_token: str = "",
+    ) -> bool:
+        """Confirm that an Ollama provider answers and reports the requested model in /api/tags."""
+        provider_cfg = self._provider_cfg(provider_id)
+        base_url = str(provider_cfg.get("baseUrl") or "").rstrip("/")
+        if not base_url:
+            return False
+
+        headers = self._resolve_probe_headers(provider_id, incoming_bearer_token)
+        timeout_seconds = max(0.001, timeout_ms / 1000.0)
+
+        try:
+            async with httpx.AsyncClient(timeout=timeout_seconds, headers=headers) as client:
+                response = await client.get(f"{base_url}/api/tags")
+        except httpx.HTTPError:
+            return False
+
+        if response.status_code < 200 or response.status_code >= 300:
+            return False
+
+        try:
+            payload = response.json()
+        except Exception:
+            return False
+
+        models = payload.get("models") if isinstance(payload, dict) else None
+        if not isinstance(models, list):
+            return False
+
+        normalized_model_id = str(model_id or "").strip()
+        for model in models:
+            if not isinstance(model, dict):
+                continue
+            candidate_names = {
+                str(model.get("name") or "").strip(),
+                str(model.get("model") or "").strip(),
+                str(model.get("id") or "").strip(),
+            }
+            if normalized_model_id in candidate_names:
+                return True
+        return False
+
+    def _resolve_probe_headers(self, provider_id: str, incoming_bearer_token: str = "") -> dict[str, str]:
+        """Resolve smart-probe auth headers with provider override or bearer fallback."""
+        provider_auth = self._provider_cfg(provider_id).get("auth")
+        headers = self._build_auth_headers(provider_auth if isinstance(provider_auth, dict) else {})
+        if not headers and incoming_bearer_token.strip():
+            headers["Authorization"] = f"Bearer {incoming_bearer_token.strip()}"
+        return headers
+
+    @staticmethod
+    def _build_auth_headers(auth_cfg: dict) -> dict[str, str]:
+        """Build HTTP headers from provider auth config."""
+        if not isinstance(auth_cfg, dict):
+            return {}
+
+        headers: dict[str, str] = {}
+        raw_headers = auth_cfg.get("headers")
+        if isinstance(raw_headers, dict):
+            for key, value in raw_headers.items():
+                if isinstance(key, str) and isinstance(value, str):
+                    headers[key] = value
+
+        raw_authorization = auth_cfg.get("authorization")
+        if isinstance(raw_authorization, str) and raw_authorization.strip():
+            headers["Authorization"] = raw_authorization.strip()
+
+        auth_type = str(auth_cfg.get("type", "bearer")).strip().lower()
+        token = auth_cfg.get("token")
+        if isinstance(token, str) and token.strip() and auth_type in {"bearer", "token", ""}:
+            headers["Authorization"] = f"Bearer {token.strip()}"
+        return headers
 
     @staticmethod
     def _reason_from_error(error: dict) -> str:

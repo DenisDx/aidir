@@ -356,6 +356,11 @@ class Endpoint_ollama(BaseEndpoint):
                 return False
             return bool(self._core.resources.check_available(requirements))
 
+        def check_resource_available_after_unload(requirements: dict) -> bool:
+            if self._core is None or self._core.resources is None:
+                return False
+            return bool(self._core.resources.check_available_after_unload(requirements))
+
         return SmartRouter(
             endpoint_id=self.id,
             default_worker_id=worker_id,
@@ -364,6 +369,7 @@ class Endpoint_ollama(BaseEndpoint):
             resolve_model_resource_requirements=self._resolve_model_resource_requirements,
             get_local_queue_state=get_local_queue_state,
             check_resource_available=check_resource_available,
+            check_resource_available_after_unload=check_resource_available_after_unload,
             probe_remote_model_queue_state=self._probe_remote_model_queue_state,
             probe_ollama_model_availability=self._probe_ollama_model_availability,
             resolve_probe_timeout_ms=self._resolve_probe_timeout_ms,
