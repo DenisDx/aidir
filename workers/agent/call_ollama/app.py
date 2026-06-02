@@ -21,6 +21,20 @@ class CallOllamaWorker(BaseWorker):
     """Proxy worker: forwards agent tasks to upstream Ollama API."""
 
     task_type = "agent"
+    _GENERATION_OPTION_FIELDS = {
+        "temperature": "temperature",
+        "top_p": "top_p",
+        "repeat_penalty": "repeat_penalty",
+        "repetition_penalty": "repeat_penalty",
+        "repeat_last_n": "repeat_last_n",
+        "num_predict": "num_predict",
+        "max_tokens": "num_predict",
+        "seed": "seed",
+        "presence_penalty": "presence_penalty",
+        "frequency_penalty": "frequency_penalty",
+        "top_k": "top_k",
+        "min_p": "min_p",
+    }
 
     def __init__(self) -> None:
         self._base_url: str = "http://127.0.0.1:11434"
@@ -65,6 +79,7 @@ class CallOllamaWorker(BaseWorker):
         payload: dict = dict(task.payload)    # shallow copy; we may mutate stream/options
         provider_id = self._resolve_task_provider_id(task)
         base_url = self._resolve_base_url(provider_id)
+        payload = self._apply_model_generation_defaults(payload, provider_id=provider_id)
         payload = self._apply_model_context_window(payload, provider_id=provider_id)
         stream: bool = task.stream
         url = f"{base_url}/api/chat"
@@ -82,13 +97,13 @@ class CallOllamaWorker(BaseWorker):
                     return await self._forward_sync(client, url, payload, task, save_call)
 
         except httpx.ConnectError as exc:
-            log("worker", "error", f"Upstream Ollama unreachable: {exc}", "call_ollama")
+            log("worker", "warning", f"Upstream Ollama unreachable: {exc}", "call_ollama")
             return WorkerResult(
                 ok=False,
                 error={"code": "UPSTREAM_UNREACHABLE", "message": str(exc)},
             )
         except httpx.TimeoutException as exc:
-            log("worker", "error", f"Upstream Ollama timed out: {exc}", "call_ollama")
+            log("worker", "warning", f"Upstream Ollama timed out: {exc}", "call_ollama")
             return WorkerResult(
                 ok=False,
                 error={"code": "UPSTREAM_TIMEOUT", "message": str(exc)},
@@ -125,8 +140,64 @@ class CallOllamaWorker(BaseWorker):
         payload["options"] = options
         return payload
 
+    def _apply_model_generation_defaults(self, payload: dict, provider_id: str | None = None) -> dict:
+        """Apply per-model generation defaults into Ollama options unless request overrides them."""
+        if not isinstance(payload, dict):
+            return payload
+
+        model_name = payload.get("model")
+        if not isinstance(model_name, str) or not model_name.strip():
+            return payload
+
+        model_cfg = self._resolve_model_cfg(model_name, provider_id=provider_id)
+        if not isinstance(model_cfg, dict):
+            return payload
+
+        out = dict(payload)
+        options = out.get("options") if isinstance(out.get("options"), dict) else {}
+        for field_name, option_name in self._GENERATION_OPTION_FIELDS.items():
+            if self._payload_has_generation_value(out, option_name) or options.get(option_name) is not None:
+                continue
+
+            default_value = model_cfg.get(field_name)
+            if default_value is None and option_name != field_name:
+                default_value = model_cfg.get(option_name)
+            if default_value is not None:
+                options[option_name] = default_value
+
+        if options:
+            out["options"] = options
+        return out
+
+    @classmethod
+    def _payload_has_generation_value(cls, payload: dict, option_name: str) -> bool:
+        """Return whether payload already defines any top-level alias for one Ollama option name."""
+        if not isinstance(payload, dict):
+            return False
+        for field_name, mapped_option in cls._GENERATION_OPTION_FIELDS.items():
+            if mapped_option != option_name:
+                continue
+            if payload.get(field_name) is not None:
+                return True
+        return False
+
     def _resolve_model_context_window(self, model_name: str, provider_id: str | None = None) -> int | None:
         """Return configured contextWindow for model from effective provider, if available."""
+        model_cfg = self._resolve_model_cfg(model_name, provider_id=provider_id)
+        if not isinstance(model_cfg, dict):
+            return None
+
+        raw_ctx = model_cfg.get("contextWindow")
+        if raw_ctx is None:
+            return None
+        try:
+            parsed = int(raw_ctx)
+        except (TypeError, ValueError):
+            return None
+        return parsed if parsed > 0 else None
+
+    def _resolve_model_cfg(self, model_name: str, provider_id: str | None = None) -> dict | None:
+        """Return configured model dictionary for the effective provider, if available."""
         if self._core is None:
             return None
 
@@ -143,14 +214,7 @@ class CallOllamaWorker(BaseWorker):
             if model_name not in {cfg_id, cfg_name}:
                 continue
 
-            raw_ctx = model_cfg.get("contextWindow")
-            if raw_ctx is None:
-                return None
-            try:
-                parsed = int(raw_ctx)
-            except (TypeError, ValueError):
-                return None
-            return parsed if parsed > 0 else None
+            return model_cfg
 
         return None
 
@@ -182,6 +246,12 @@ class CallOllamaWorker(BaseWorker):
         resp = await client.post(url, json=upstream_payload)
 
         if resp.status_code != 200:
+            log(
+                "worker",
+                "warning",
+                f"Task {task.id} upstream sync error: status={resp.status_code} body={resp.text[:512]!r}",
+                "call_ollama",
+            )
             return WorkerResult(
                 ok=False,
                 error={
@@ -212,6 +282,12 @@ class CallOllamaWorker(BaseWorker):
 
         async with client.stream("POST", url, json=upstream_payload) as resp:
             if resp.status_code != 200:
+                log(
+                    "worker",
+                    "warning",
+                    f"Task {task.id} upstream stream error: status={resp.status_code}",
+                    "call_ollama",
+                )
                 return WorkerResult(
                     ok=False,
                     error={

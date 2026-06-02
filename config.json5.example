@@ -157,10 +157,15 @@
         // "tools_max_turns": 50,
         // Optional default generation params for OpenAI / OpenAIx requests.
         // Request top-level fields or options.* override these values.
+        // Either OpenAI-style aliases (`repetition_penalty`, `max_tokens`) or
+        // direct Ollama names (`repeat_penalty`, `repeat_last_n`, `num_predict`) can be used.
         "generation_defaults": {
           // "temperature": ${OPENAIX_TEMPERATURE:-0.7},
           // "top_p": ${OPENAIX_TOP_P:-0.9},
+          // "repeat_penalty": ${OPENAIX_REPEAT_PENALTY:-1.1},
           // "repetition_penalty": ${OPENAIX_REPETITION_PENALTY:-1.1},
+          // "repeat_last_n": ${OPENAIX_REPEAT_LAST_N:-64},
+          // "num_predict": ${OPENAIX_NUM_PREDICT:-1024},
           // "max_tokens": ${OPENAIX_MAX_TOKENS:-1024},
           // "seed": ${OPENAIX_SEED:-42},
           // "presence_penalty": ${OPENAIX_PRESENCE_PENALTY:-0.0},
@@ -278,6 +283,21 @@
               id:"qwen3.5:9b",
               "name": "smart model",
               "contextWindow": 80000,
+              // Optional per-model Ollama generation defaults.
+              // Request values override these defaults.
+              // For overlapping aliases, prefer one form and do not set both.
+              // "temperature": 0.4,
+              // "top_p": 0.9,
+              // "repeat_penalty": 1.1,
+              // "repetition_penalty": 1.1,
+              // "repeat_last_n": 64,
+              // "num_predict": 1024,
+              // "max_tokens": 1024,
+              // "seed": 42,
+              // "presence_penalty": 0.0,
+              // "frequency_penalty": 0.0,
+              // "top_k": 40,
+              // "min_p": 0.0,
               resources:{
                   "local_machine":{
                       VRAM:9800, 

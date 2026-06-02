@@ -10,16 +10,22 @@ TODO: apply middleware chain before task creation.
 from __future__ import annotations
 
 import asyncio
+import base64
 import hmac
 import json
+import time
+import uuid
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, AsyncGenerator
+from urllib.parse import quote
 
+import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from core.endpoint import BaseEndpoint
 from core.error_logging import attach_request_id_middleware, get_or_create_request_id, log_exception
+from core.smart_router import SmartRouteError, SmartRouter
 from core.task_types.task_agent import Task_agent
 from core.task import STATUS_COMPLETED, STATUS_FAILED, STATUS_CANCELED
 from core import log
@@ -101,9 +107,26 @@ class Endpoint_ollama(BaseEndpoint):
             return auth_error
 
         stream: bool = bool(body.get("stream", False))
+        incoming_bearer_token = self._extract_bearer_token(request)
+        route_trace = self._build_incoming_route_trace(request.headers)
+        route_trace_error = self._validate_incoming_route_trace(route_trace)
+        if route_trace_error is not None:
+            code, status_code, message = route_trace_error
+            return JSONResponse({"error": {"code": code, "message": message}}, status_code=status_code)
 
         # Build task
-        task = self._build_task_for_payload(body, stream)
+        try:
+            task = await self._build_task_for_payload_async(
+                body,
+                stream,
+                incoming_bearer_token=incoming_bearer_token,
+                route_trace=route_trace,
+            )
+        except SmartRouteError as exc:
+            return JSONResponse(
+                {"error": {"code": exc.code, "message": str(exc)}},
+                status_code=exc.status_code,
+            )
 
         # Apply timeouts from config
         cfg_tasks = self._core.config.get("tasks", {}) or {}
@@ -215,21 +238,273 @@ class Endpoint_ollama(BaseEndpoint):
         """Create Task_agent and resolve model/provider route using alias-aware rules."""
         worker_id = self._resolve_worker_id(payload)
         route = self._resolve_model_route((payload or {}).get("model"), worker_id)
+        if route is not None and self._provider_api(route["resolved_provider"]) == "smart":
+            raise SmartRouteError(
+                code="SMART_ROUTE_ASYNC_REQUIRED",
+                status_code=500,
+                message="Smart routes require async task construction",
+            )
+
+        return self._create_task_for_payload(payload, stream, worker_id, route)
+
+    async def _build_task_for_payload_async(
+        self,
+        payload: dict,
+        stream: bool,
+        *,
+        incoming_bearer_token: str = "",
+        route_trace: dict | None = None,
+    ) -> Task_agent:
+        """Create Task_agent and resolve smart routes before queueing when needed."""
+        worker_id = self._resolve_worker_id(payload)
+        route = self._resolve_model_route((payload or {}).get("model"), worker_id)
+        if route is not None and self._provider_api(route["resolved_provider"]) == "smart":
+            route = await self._resolve_smart_route(
+                route,
+                worker_id=worker_id,
+                payload=payload,
+                incoming_bearer_token=incoming_bearer_token,
+            )
+
+        task = self._create_task_for_payload(payload, stream, worker_id, route)
+        if incoming_bearer_token:
+            task.config = dict(task.config or {})
+            task.config["incoming_bearer_token"] = incoming_bearer_token
+        if isinstance(route_trace, dict):
+            task.config = dict(task.config or {})
+            task.config["route_trace"] = dict(route_trace)
+        return task
+
+    def _create_task_for_payload(
+        self,
+        payload: dict,
+        stream: bool,
+        worker_id: str,
+        route: dict | None,
+    ) -> Task_agent:
+        """Finalize Task_agent creation once worker and route are resolved."""
         if route is not None:
             payload = dict(payload or {})
             payload["model"] = route["resolved_model"]
+
+        effective_worker_id = self._resolve_worker_id_for_route(worker_id, route)
 
         task = Task_agent(
             payload=payload,
             stream=stream,
             external=True,
         )
-        if worker_id:
-            task.worker_id = worker_id
+        if effective_worker_id:
+            task.worker_id = effective_worker_id
         if route is not None:
             task.config = dict(task.config or {})
             task.config["route"] = route
         return task
+
+    def _resolve_worker_id_for_route(self, worker_id: str, route: dict | None) -> str:
+        """Adjust worker selection when the resolved provider requires a different execution path."""
+        if not isinstance(route, dict):
+            return worker_id
+
+        resolved_worker = str(route.get("resolved_worker") or "").strip()
+        if resolved_worker:
+            return resolved_worker
+
+        provider_id = str(route.get("resolved_provider") or "").strip()
+        provider_api = self._provider_api(provider_id)
+        if provider_api != "openaix":
+            return worker_id
+
+        routed_worker_id = self._resolve_worker_id_by_name("openaix")
+        return routed_worker_id or worker_id
+
+    def _resolve_worker_id_by_name(self, worker_id: str) -> str:
+        """Return a configured worker id when it exists, otherwise an empty string."""
+        if not worker_id or self._core is None:
+            return ""
+        workers_cfg = self._core.config.get("workers.items") or {}
+        if isinstance(workers_cfg, dict) and worker_id in workers_cfg:
+            return worker_id
+        return ""
+
+    async def _resolve_smart_route(
+        self,
+        route: dict,
+        *,
+        worker_id: str,
+        payload: dict,
+        incoming_bearer_token: str = "",
+    ) -> dict:
+        """Resolve one smart alias route into a concrete provider/model pair."""
+        resolution = await self._smart_router(worker_id).resolve_route(
+            route,
+            request_payload=payload,
+            request_priority=SmartRouter.resolve_request_priority(payload),
+            incoming_bearer_token=incoming_bearer_token,
+        )
+        return resolution.route
+
+    def _smart_router(self, worker_id: str) -> SmartRouter:
+        """Build the shared smart-router helper bound to this endpoint environment."""
+        async def get_local_queue_state(requirements: dict, priority: int) -> dict | None:
+            if self._core is None or self._core.queue is None or self._core.resources is None:
+                return None
+            return await self._core.queue.get_resource_queue_state(requirements, priority=priority)
+
+        def check_resource_available(requirements: dict) -> bool:
+            if self._core is None or self._core.resources is None:
+                return False
+            return bool(self._core.resources.check_available(requirements))
+
+        return SmartRouter(
+            endpoint_id=self.id,
+            default_worker_id=worker_id,
+            find_provider_model_cfg=self._find_provider_model_cfg,
+            provider_api=self._provider_api,
+            resolve_model_resource_requirements=self._resolve_model_resource_requirements,
+            get_local_queue_state=get_local_queue_state,
+            check_resource_available=check_resource_available,
+            probe_remote_model_queue_state=self._probe_remote_model_queue_state,
+            probe_ollama_model_availability=self._probe_ollama_model_availability,
+            resolve_probe_timeout_ms=self._resolve_probe_timeout_ms,
+            resolve_worker_id_for_route=self._resolve_worker_id_for_route,
+            on_selection=self._log_smart_route_selection,
+            on_failure=self._log_smart_route_failure,
+        )
+
+    async def _evaluate_smart_candidate(
+        self,
+        item: object,
+        *,
+        request_priority: int,
+        index: int,
+        incoming_bearer_token: str = "",
+    ) -> dict | None:
+        """Evaluate one smart routing candidate using locally visible queue/resource state."""
+        return await self._smart_router("").evaluate_candidate(
+            item,
+            request_priority=request_priority,
+            index=index,
+            incoming_bearer_token=incoming_bearer_token,
+        )
+
+    @staticmethod
+    def _build_smart_route_result(
+        route: dict,
+        candidate: dict,
+        *,
+        strategy: str,
+        reason: str,
+        candidate_probes: list[dict],
+    ) -> dict:
+        """Build final concrete route metadata for a selected smart candidate."""
+        return SmartRouter.build_route_result(
+            route,
+            candidate,
+            strategy=strategy,
+            reason=reason,
+            candidate_probes=candidate_probes,
+        )
+
+    @staticmethod
+    def _candidate_probe_record(index: int, item: object, *, probe_ok: bool | None = None, reason: str = "", candidate: dict | None = None) -> dict:
+        """Build a compact probe record for route observability and task metadata."""
+        return SmartRouter.candidate_probe_record(
+            index,
+            item,
+            probe_ok=probe_ok,
+            reason=reason,
+            candidate=candidate,
+        )
+
+    def _log_smart_route_selection(self, route: dict) -> None:
+        """Log selected smart route with candidate probe summary."""
+        probes = route.get("candidate_probes") if isinstance(route, dict) else []
+        log(
+            "http",
+            "info",
+            (
+                f"Smart route selected requested={route.get('requested_model')} provider={route.get('resolved_provider')} "
+                f"model={route.get('resolved_model')} strategy={route.get('strategy')} "
+                f"reason={route.get('selection_reason')} probes={json.dumps(probes, ensure_ascii=False)}"
+            ),
+            self.id,
+        )
+
+    def _log_smart_route_failure(self, route: dict, *, strategy: str, candidate_probes: list[dict]) -> None:
+        """Log smart-route failure with candidate probe summary."""
+        log(
+            "http",
+            "warning",
+            (
+                f"Smart route failed requested={route.get('requested_model') or route.get('resolved_model')} "
+                f"strategy={strategy} probes={json.dumps(candidate_probes, ensure_ascii=False)}"
+            ),
+            self.id,
+        )
+
+    @staticmethod
+    def _resolve_request_priority(payload: dict | None) -> int:
+        """Resolve routing priority from payload, defaulting to the normal task priority."""
+        return SmartRouter.resolve_request_priority(payload)
+
+    def _current_instance_id(self) -> str:
+        """Return the configured instance id used for inter-aidir route tracing."""
+        if self._core is None:
+            return "aidir"
+        value = self._core.config.get("instance", "aidir")
+        return str(value or "aidir").strip() or "aidir"
+
+    def _route_trace_max_hops(self) -> int:
+        """Return the configured maximum number of inter-aidir hops."""
+        if self._core is None:
+            return 8
+        try:
+            parsed = int(self._core.config.get("routing.max_hops", 8))
+        except Exception:
+            parsed = 8
+        return max(1, parsed)
+
+    @staticmethod
+    def _split_visited_instances(raw_value: object) -> list[str]:
+        """Parse the visited-instance trace header into a normalized list."""
+        if not isinstance(raw_value, str):
+            return []
+        items: list[str] = []
+        seen: set[str] = set()
+        for part in raw_value.split(","):
+            value = part.strip()
+            if not value or value in seen:
+                continue
+            seen.add(value)
+            items.append(value)
+        return items
+
+    def _build_incoming_route_trace(self, headers) -> dict:
+        """Build internal route-trace metadata from incoming HTTP headers."""
+        route_id = str(headers.get("X-Aidir-Route-Id", "") or "").strip() or str(uuid.uuid4())
+        visited_instances = self._split_visited_instances(headers.get("X-Aidir-Visited-Instances", ""))
+        return {
+            "route_id": route_id,
+            "visited_instances": visited_instances,
+            "current_instance": self._current_instance_id(),
+            "max_hops": self._route_trace_max_hops(),
+        }
+
+    @staticmethod
+    def _validate_incoming_route_trace(route_trace: dict) -> tuple[str, int, str] | None:
+        """Reject loops and overlong visited-instance chains on incoming requests."""
+        if not isinstance(route_trace, dict):
+            return None
+        current_instance = str(route_trace.get("current_instance") or "").strip()
+        visited_instances = route_trace.get("visited_instances") if isinstance(route_trace.get("visited_instances"), list) else []
+        max_hops = int(route_trace.get("max_hops") or 8)
+
+        if current_instance and current_instance in visited_instances:
+            return ("ROUTING_LOOP", 409, f"Routing loop detected for instance '{current_instance}'")
+        if len(visited_instances) >= max_hops:
+            return ("ROUTING_HOPS_EXCEEDED", 409, f"Routing hop limit exceeded ({max_hops})")
+        return None
 
     def _resolve_worker_id(self, payload: dict) -> str:
         """Resolve worker id for a request using payload override, endpoint cfg, or global default."""
@@ -280,6 +555,177 @@ class Endpoint_ollama(BaseEndpoint):
             return ""
         provider_id = self._core.config.get(f"workers.items.{worker_id}.provider")
         return str(provider_id).strip() if provider_id is not None else ""
+
+    def _provider_cfg(self, provider_id: str) -> dict:
+        """Return provider config dictionary or an empty dict when missing."""
+        providers = self._core.config.get("models.providers") or {} if self._core is not None else {}
+        if not isinstance(providers, dict):
+            return {}
+        provider_cfg = providers.get(provider_id)
+        return provider_cfg if isinstance(provider_cfg, dict) else {}
+
+    def _provider_api(self, provider_id: str) -> str:
+        """Return provider api type string for a configured provider."""
+        return str(self._provider_cfg(provider_id).get("api") or "").strip()
+
+    def _resolve_probe_headers(self, provider_id: str, incoming_bearer_token: str = "") -> dict[str, str]:
+        """Resolve auth headers for remote smart probes using provider override or pass-through bearer."""
+        headers = self._build_auth_headers(self._provider_cfg(provider_id).get("auth") or {})
+        if headers:
+            return headers
+        if isinstance(incoming_bearer_token, str) and incoming_bearer_token.strip():
+            return {"Authorization": f"Bearer {incoming_bearer_token.strip()}"}
+        return {}
+
+    @staticmethod
+    def _build_auth_headers(auth_cfg: dict) -> dict[str, str]:
+        """Build HTTP headers from auth config."""
+        if not isinstance(auth_cfg, dict):
+            return {}
+
+        headers: dict[str, str] = {}
+        raw_headers = auth_cfg.get("headers")
+        if isinstance(raw_headers, dict):
+            for key, value in raw_headers.items():
+                if isinstance(key, str) and isinstance(value, str):
+                    headers[key] = value
+
+        raw_authorization = auth_cfg.get("authorization")
+        if isinstance(raw_authorization, str) and raw_authorization.strip():
+            headers["Authorization"] = raw_authorization.strip()
+
+        auth_type = str(auth_cfg.get("type", "bearer")).strip().lower()
+        token = auth_cfg.get("token")
+        if isinstance(token, str) and token.strip() and auth_type in {"bearer", "token", ""}:
+            headers["Authorization"] = f"Bearer {token.strip()}"
+
+        if auth_type == "basic":
+            username = auth_cfg.get("username")
+            password = auth_cfg.get("password")
+            if isinstance(username, str) and isinstance(password, str):
+                raw = f"{username}:{password}".encode("utf-8")
+                headers["Authorization"] = f"Basic {base64.b64encode(raw).decode('ascii')}"
+
+        return headers
+
+    def _resolve_probe_timeout_ms(self, item: dict) -> int:
+        """Resolve per-candidate remote probe timeout in milliseconds."""
+        try:
+            parsed = int(item.get("request_timeout_ms", 1500))
+        except Exception:
+            parsed = 1500
+        return max(1, parsed)
+
+    async def _probe_remote_model_queue_state(
+        self,
+        provider_id: str,
+        model_id: str,
+        *,
+        priority: int,
+        timeout_ms: int,
+        incoming_bearer_token: str = "",
+    ) -> dict | None:
+        """Probe remote OpenAIx model-only queue-state using dual-route compatibility."""
+        provider_cfg = self._provider_cfg(provider_id)
+        base_url = str(provider_cfg.get("baseUrl") or "").rstrip("/")
+        if not base_url:
+            return None
+
+        encoded_model = quote(str(model_id), safe="")
+        candidate_urls = [
+            f"{base_url}/v1/models/{encoded_model}/queue-state",
+            f"{base_url}/api/models/{encoded_model}/queue-state",
+        ]
+        headers = self._resolve_probe_headers(provider_id, incoming_bearer_token)
+        timeout_seconds = max(0.001, timeout_ms / 1000.0)
+
+        try:
+            async with httpx.AsyncClient(timeout=timeout_seconds, headers=headers) as client:
+                for url in candidate_urls:
+                    try:
+                        response = await client.get(url, params={"priority": priority})
+                    except httpx.TimeoutException:
+                        return None
+                    except httpx.HTTPError:
+                        continue
+
+                    if response.status_code < 200 or response.status_code >= 300:
+                        continue
+
+                    try:
+                        payload = response.json()
+                    except Exception:
+                        continue
+                    if isinstance(payload, dict):
+                        return payload
+        except httpx.HTTPError:
+            return None
+
+        return None
+
+    async def _probe_ollama_model_availability(
+        self,
+        provider_id: str,
+        model_id: str,
+        *,
+        timeout_ms: int,
+        incoming_bearer_token: str = "",
+    ) -> bool:
+        """Confirm that an Ollama provider responds and reports the requested model in /api/tags."""
+        provider_cfg = self._provider_cfg(provider_id)
+        base_url = str(provider_cfg.get("baseUrl") or "").rstrip("/")
+        if not base_url:
+            return False
+
+        headers = self._resolve_probe_headers(provider_id, incoming_bearer_token)
+        timeout_seconds = max(0.001, timeout_ms / 1000.0)
+
+        try:
+            async with httpx.AsyncClient(timeout=timeout_seconds, headers=headers) as client:
+                response = await client.get(f"{base_url}/api/tags")
+        except httpx.HTTPError:
+            return False
+
+        if response.status_code < 200 or response.status_code >= 300:
+            return False
+
+        try:
+            payload = response.json()
+        except Exception:
+            return False
+
+        models = payload.get("models") if isinstance(payload, dict) else None
+        if not isinstance(models, list):
+            return False
+
+        normalized_model_id = str(model_id or "").strip()
+        for model in models:
+            if not isinstance(model, dict):
+                continue
+            candidate_names = {
+                str(model.get("name") or "").strip(),
+                str(model.get("model") or "").strip(),
+                str(model.get("id") or "").strip(),
+            }
+            if normalized_model_id in candidate_names:
+                return True
+        return False
+
+    def _find_provider_model_cfg(self, provider_id: str, model_id: str) -> dict | None:
+        """Return provider model config matched by id, name, or alias."""
+        provider_cfg = self._provider_cfg(provider_id)
+        models = provider_cfg.get("models") or []
+        if not isinstance(models, list):
+            return None
+
+        normalized_model_id = str(model_id).strip()
+        for model in models:
+            if not isinstance(model, dict):
+                continue
+            if normalized_model_id not in {self._model_id(model), str(model.get("name") or "").strip(), self._model_alias(model)}:
+                continue
+            return model
+        return None
 
     def _warn_model_resolution(self, warning_key: str, message: str) -> None:
         """Emit a model-resolution warning once per endpoint instance."""
@@ -359,6 +805,49 @@ class Endpoint_ollama(BaseEndpoint):
             "selection": "alias" if selected["rank"] == 0 else "model_id",
             "worker_preferred_provider": preferred_provider,
         }
+
+    def _resolve_model_resource_requirements(self, provider_id: str, model_id: str) -> dict | None:
+        """Resolve configured resource requirements for a provider/model pair."""
+        provider_cfg = self._provider_cfg(provider_id)
+        models = provider_cfg.get("models") or []
+        if not isinstance(models, list):
+            return None
+
+        normalized_model_id = str(model_id).strip()
+        for model in models:
+            if not isinstance(model, dict):
+                continue
+            candidate_id = str(model.get("id") or "").strip()
+            candidate_name = str(model.get("name") or "").strip()
+            candidate_alias = self._model_alias(model)
+            if normalized_model_id not in {candidate_id, candidate_name, candidate_alias}:
+                continue
+            resources = model.get("resources") or {}
+            if not isinstance(resources, dict):
+                return {}
+            return self._normalize_resource_requirements(resources)
+
+        return None
+
+    @staticmethod
+    def _normalize_resource_requirements(resources: dict | None) -> dict[str, dict[str, int]]:
+        """Normalize configured resource requirements into integer dictionaries."""
+        if not isinstance(resources, dict):
+            return {}
+
+        out: dict[str, dict[str, int]] = {}
+        for resource_id, metrics in resources.items():
+            if not isinstance(metrics, dict):
+                continue
+            normalized_metrics: dict[str, int] = {}
+            for metric_name, amount in metrics.items():
+                try:
+                    normalized_metrics[str(metric_name)] = int(amount)
+                except Exception:
+                    continue
+            if normalized_metrics:
+                out[str(resource_id)] = normalized_metrics
+        return out
 
     async def _sync_response(self, task: Task_agent) -> JSONResponse:
         """Wait for task completion and return a single JSON response."""

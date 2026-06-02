@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import base64
 import json
 from typing import Awaitable, Callable
 
@@ -27,7 +28,10 @@ class OpenAIxWorker(BaseWorker):
     _GENERATION_OPTION_FIELDS = {
         "temperature": "temperature",
         "top_p": "top_p",
+        "repeat_penalty": "repeat_penalty",
         "repetition_penalty": "repeat_penalty",
+        "repeat_last_n": "repeat_last_n",
+        "num_predict": "num_predict",
         "max_tokens": "num_predict",
         "seed": "seed",
         "presence_penalty": "presence_penalty",
@@ -114,6 +118,7 @@ class OpenAIxWorker(BaseWorker):
 
         url = f"{base_url}/api/chat"
         save_call = self._resolve_save_llm_request(task.payload or {})
+        request_headers = self._resolve_request_headers(task, provider_id)
 
         # Limit message history to prevent context overload
         # Keep system + last N user/assistant messages
@@ -135,7 +140,8 @@ class OpenAIxWorker(BaseWorker):
         if not context_result.ok:
             return context_result
 
-        payload_with_ctx = self._apply_model_context_window(dict(task.payload or {}), provider_id=provider_id)
+        payload_with_model_defaults = self._apply_model_generation_defaults(dict(task.payload or {}), provider_id=provider_id)
+        payload_with_ctx = self._apply_model_context_window(payload_with_model_defaults, provider_id=provider_id)
         payload = self._normalize_payload(payload_with_ctx, task.stream)
         upstream_timeout = self._resolve_upstream_timeout(task)
 
@@ -147,18 +153,18 @@ class OpenAIxWorker(BaseWorker):
         )
 
         try:
-            async with httpx.AsyncClient(timeout=upstream_timeout) as client:
+            async with httpx.AsyncClient(timeout=upstream_timeout, headers=request_headers) as client:
                 # Check if tools are present in payload (injected by context builder)
                 has_tools = bool(payload.get("tools"))
                 if task.stream and not has_tools:
                     return await self._forward_stream(client, url, payload, emit_chunk, save_call=save_call, task_id=task.id)
                 return await self._run_with_internal_tools(client, url, payload, task, emit_chunk, save_call=save_call)
         except httpx.ConnectError as exc:
-            log("worker", "error", f"Upstream unreachable: {exc}", "openaix")
+            log("worker", "warning", f"Upstream unreachable: {exc}", "openaix")
             return WorkerResult(ok=False, error={"code": "UPSTREAM_UNREACHABLE", "message": str(exc)})
         except httpx.TimeoutException as exc:
             timeout_message = self._build_timeout_message(exc)
-            log("worker", "error", f"Upstream timeout: {timeout_message}", "openaix")
+            log("worker", "warning", f"Upstream timeout: {timeout_message}", "openaix")
             return WorkerResult(ok=False, error={"code": "UPSTREAM_TIMEOUT", "message": timeout_message})
         except Exception as exc:
             log("worker", "error", f"Unexpected error: {exc}", "openaix")
@@ -260,6 +266,51 @@ class OpenAIxWorker(BaseWorker):
 
         return out
 
+    def _apply_model_generation_defaults(self, payload: dict, provider_id: str | None = None) -> dict:
+        """Apply per-model generation defaults unless request already overrides them."""
+        if not isinstance(payload, dict):
+            return payload
+
+        model_name = payload.get("model")
+        if not isinstance(model_name, str) or not model_name.strip():
+            return payload
+
+        model_cfg = self._resolve_model_cfg(model_name, provider_id=provider_id)
+        if not isinstance(model_cfg, dict):
+            return payload
+
+        out = dict(payload)
+        options = out.get("options") if isinstance(out.get("options"), dict) else {}
+        applied_options: set[str] = set()
+        for field_name, option_name in self._GENERATION_OPTION_FIELDS.items():
+            if option_name in applied_options:
+                continue
+            if self._payload_has_generation_value(out, option_name) or options.get(option_name) is not None:
+                applied_options.add(option_name)
+                continue
+
+            default_value = model_cfg.get(field_name)
+            target_field = field_name
+            if default_value is None and option_name != field_name:
+                default_value = model_cfg.get(option_name)
+                target_field = option_name
+            if default_value is not None:
+                out[target_field] = default_value
+                applied_options.add(option_name)
+        return out
+
+    @classmethod
+    def _payload_has_generation_value(cls, payload: dict, option_name: str) -> bool:
+        """Return whether payload already defines any top-level alias for one Ollama option name."""
+        if not isinstance(payload, dict):
+            return False
+        for field_name, mapped_option in cls._GENERATION_OPTION_FIELDS.items():
+            if mapped_option != option_name:
+                continue
+            if payload.get(field_name) is not None:
+                return True
+        return False
+
     def _apply_model_context_window(self, payload: dict, provider_id: str | None = None) -> dict:
         """Set options.num_ctx from model config contextWindow when not explicitly provided."""
         if not isinstance(payload, dict):
@@ -287,6 +338,21 @@ class OpenAIxWorker(BaseWorker):
 
     def _resolve_model_context_window(self, model_name: str, provider_id: str | None = None) -> int | None:
         """Return configured contextWindow for model from effective provider, if available."""
+        model_cfg = self._resolve_model_cfg(model_name, provider_id=provider_id)
+        if not isinstance(model_cfg, dict):
+            return None
+
+        raw_ctx = model_cfg.get("contextWindow")
+        if raw_ctx is None:
+            return None
+        try:
+            parsed = int(raw_ctx)
+        except (TypeError, ValueError):
+            return None
+        return parsed if parsed > 0 else None
+
+    def _resolve_model_cfg(self, model_name: str, provider_id: str | None = None) -> dict | None:
+        """Return configured model dictionary for the effective provider, if available."""
         if self._core is None:
             return None
 
@@ -303,14 +369,7 @@ class OpenAIxWorker(BaseWorker):
             if model_name not in {cfg_id, cfg_name}:
                 continue
 
-            raw_ctx = model_cfg.get("contextWindow")
-            if raw_ctx is None:
-                return None
-            try:
-                parsed = int(raw_ctx)
-            except (TypeError, ValueError):
-                return None
-            return parsed if parsed > 0 else None
+            return model_cfg
 
         return None
 
@@ -331,6 +390,81 @@ class OpenAIxWorker(BaseWorker):
         if not base_url:
             return self._base_url
         return str(base_url).rstrip("/")
+
+    def _resolve_request_headers(self, task: Task, provider_id: str) -> dict[str, str]:
+        """Resolve auth headers with provider override, incoming bearer fallback, or no auth."""
+        provider_auth = None
+        if self._core is not None:
+            provider_auth = self._core.config.get(f"models.providers.{provider_id}.auth")
+        headers = self._build_auth_headers(provider_auth if isinstance(provider_auth, dict) else {})
+        if not headers:
+            task_cfg = task.config if isinstance(task.config, dict) else {}
+            incoming_bearer_token = task_cfg.get("incoming_bearer_token")
+            if isinstance(incoming_bearer_token, str) and incoming_bearer_token.strip():
+                headers["Authorization"] = f"Bearer {incoming_bearer_token.strip()}"
+
+        if self._provider_api(provider_id) == "openaix":
+            headers.update(self._build_route_trace_headers(task))
+        return headers
+
+    def _provider_api(self, provider_id: str) -> str:
+        """Return provider api type for the effective upstream provider."""
+        if self._core is None:
+            return ""
+        value = self._core.config.get(f"models.providers.{provider_id}.api")
+        return str(value or "").strip()
+
+    def _build_route_trace_headers(self, task: Task) -> dict[str, str]:
+        """Build outgoing inter-aidir route-trace headers for remote OpenAIx hops."""
+        task_cfg = task.config if isinstance(task.config, dict) else {}
+        route_trace = task_cfg.get("route_trace") if isinstance(task_cfg.get("route_trace"), dict) else {}
+        route_id = str(route_trace.get("route_id") or "").strip()
+        visited_instances = route_trace.get("visited_instances") if isinstance(route_trace.get("visited_instances"), list) else []
+        outgoing_visited = [str(item).strip() for item in visited_instances if isinstance(item, str) and item.strip()]
+
+        current_instance = ""
+        if self._core is not None:
+            current_instance = str(self._core.config.get("instance", "aidir") or "aidir").strip() or "aidir"
+        if current_instance and current_instance not in outgoing_visited:
+            outgoing_visited.append(current_instance)
+
+        headers: dict[str, str] = {}
+        if route_id:
+            headers["X-Aidir-Route-Id"] = route_id
+        if outgoing_visited:
+            headers["X-Aidir-Visited-Instances"] = ", ".join(outgoing_visited)
+        return headers
+
+    @staticmethod
+    def _build_auth_headers(auth_cfg: dict) -> dict[str, str]:
+        """Build HTTP headers from provider auth config."""
+        if not isinstance(auth_cfg, dict):
+            return {}
+
+        headers: dict[str, str] = {}
+        raw_headers = auth_cfg.get("headers")
+        if isinstance(raw_headers, dict):
+            for key, value in raw_headers.items():
+                if isinstance(key, str) and isinstance(value, str):
+                    headers[key] = value
+
+        raw_authorization = auth_cfg.get("authorization")
+        if isinstance(raw_authorization, str) and raw_authorization.strip():
+            headers["Authorization"] = raw_authorization.strip()
+
+        auth_type = str(auth_cfg.get("type", "bearer")).strip().lower()
+        token = auth_cfg.get("token")
+        if isinstance(token, str) and token.strip() and auth_type in {"bearer", "token", ""}:
+            headers["Authorization"] = f"Bearer {token.strip()}"
+
+        if auth_type == "basic":
+            username = auth_cfg.get("username")
+            password = auth_cfg.get("password")
+            if isinstance(username, str) and isinstance(password, str):
+                raw = f"{username}:{password}".encode("utf-8")
+                headers["Authorization"] = f"Basic {base64.b64encode(raw).decode('ascii')}"
+
+        return headers
 
     async def _apply_context_chain(self, task: Task_agent) -> WorkerResult:
         """Run context workers synchronously before model execution."""
@@ -935,6 +1069,12 @@ class OpenAIxWorker(BaseWorker):
         chunks: list[dict] = [] if save_call else []
         async with client.stream("POST", url, json=upstream_payload) as resp:
             if resp.status_code != 200:
+                log(
+                    "worker",
+                    "warning",
+                    f"Task {task_id or '-'} upstream stream error: status={resp.status_code}",
+                    "openaix",
+                )
                 return WorkerResult(
                     ok=False,
                     error={

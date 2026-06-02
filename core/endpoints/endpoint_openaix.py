@@ -21,6 +21,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from core import log
 from core.error_logging import attach_request_id_middleware, get_or_create_request_id, log_exception
 from core.endpoints.endpoint_ollama import Endpoint_ollama
+from core.smart_router import SmartRouteError
 from core.task import STATUS_CANCELED, STATUS_COMPLETED, STATUS_FAILED
 
 
@@ -31,7 +32,10 @@ class Endpoint_openaix(Endpoint_ollama):
     _GENERATION_OPTION_FIELDS = {
         "temperature": "temperature",
         "top_p": "top_p",
+        "repeat_penalty": "repeat_penalty",
         "repetition_penalty": "repeat_penalty",
+        "repeat_last_n": "repeat_last_n",
+        "num_predict": "num_predict",
         "max_tokens": "num_predict",
         "seed": "seed",
         "presence_penalty": "presence_penalty",
@@ -100,11 +104,27 @@ class Endpoint_openaix(Endpoint_ollama):
                 priority=priority,
             )
 
+        @app.get("/v1/models/{model_id:path}/queue-state")
+        async def openai_model_only_queue_state(model_id: str, priority: int = 5):
+            return await self._model_only_queue_state_response(
+                protocol="openai",
+                model_id=model_id,
+                priority=priority,
+            )
+
         @app.get("/api/providers/{provider_id}/models/{model_id:path}/queue-state")
         async def ollama_model_queue_state(provider_id: str, model_id: str, priority: int = 5):
             return await self._model_queue_state_response(
                 protocol="ollama",
                 provider_id=provider_id,
+                model_id=model_id,
+                priority=priority,
+            )
+
+        @app.get("/api/models/{model_id:path}/queue-state")
+        async def ollama_model_only_queue_state(model_id: str, priority: int = 5):
+            return await self._model_only_queue_state_response(
+                protocol="ollama",
                 model_id=model_id,
                 priority=priority,
             )
@@ -132,7 +152,31 @@ class Endpoint_openaix(Endpoint_ollama):
             return auth_error
 
         stream = bool(body.get("stream", False))
-        task = self._build_task_for_payload(body, stream)
+        incoming_bearer_token = self._extract_bearer_token(request)
+        route_trace = self._build_incoming_route_trace(request.headers)
+        route_trace_error = self._validate_incoming_route_trace(route_trace)
+        if route_trace_error is not None:
+            code, status_code, message = route_trace_error
+            return self._error_response(
+                protocol="ollama",
+                status_code=status_code,
+                code=code,
+                message=message,
+            )
+        try:
+            task = await self._build_task_for_payload_async(
+                body,
+                stream,
+                incoming_bearer_token=incoming_bearer_token,
+                route_trace=route_trace,
+            )
+        except SmartRouteError as exc:
+            return self._error_response(
+                protocol="ollama",
+                status_code=exc.status_code,
+                code=exc.code,
+                message=str(exc),
+            )
 
         try:
             await self._core.on_task_added(task)
@@ -179,8 +223,32 @@ class Endpoint_openaix(Endpoint_ollama):
             return auth_error
 
         stream = bool(body.get("stream", False))
+        incoming_bearer_token = self._extract_bearer_token(request)
+        route_trace = self._build_incoming_route_trace(request.headers)
+        route_trace_error = self._validate_incoming_route_trace(route_trace)
+        if route_trace_error is not None:
+            code, status_code, message = route_trace_error
+            return self._error_response(
+                protocol="openai",
+                status_code=status_code,
+                code=code,
+                message=message,
+            )
         ollama_payload = self._openai_request_to_ollama(body)
-        task = self._build_task_for_payload(ollama_payload, stream)
+        try:
+            task = await self._build_task_for_payload_async(
+                ollama_payload,
+                stream,
+                incoming_bearer_token=incoming_bearer_token,
+                route_trace=route_trace,
+            )
+        except SmartRouteError as exc:
+            return self._error_response(
+                protocol="openai",
+                status_code=exc.status_code,
+                code=exc.code,
+                message=str(exc),
+            )
 
         try:
             await self._core.on_task_added(task)
@@ -203,18 +271,60 @@ class Endpoint_openaix(Endpoint_ollama):
 
     def _build_task_for_payload(self, payload: dict, stream: bool):
         """Create Task_agent with standard timeout and worker selection rules."""
-        from core.task_types.task_agent import Task_agent
-
         payload = self._apply_generation_defaults(payload)
         worker_id = self._resolve_worker_id(payload)
         route = self._resolve_model_route((payload or {}).get("model"), worker_id)
+        if route is not None and self._provider_api(route["resolved_provider"]) == "smart":
+            raise SmartRouteError(
+                code="SMART_ROUTE_ASYNC_REQUIRED",
+                status_code=500,
+                message="Smart routes require async task construction",
+            )
+
+        return self._create_task_for_payload(payload, stream, worker_id, route)
+
+    async def _build_task_for_payload_async(
+        self,
+        payload: dict,
+        stream: bool,
+        *,
+        incoming_bearer_token: str = "",
+        route_trace: dict | None = None,
+    ):
+        """Create Task_agent and resolve smart routes before queueing when needed."""
+        payload = self._apply_generation_defaults(payload)
+        worker_id = self._resolve_worker_id(payload)
+        route = self._resolve_model_route((payload or {}).get("model"), worker_id)
+        if route is not None and self._provider_api(route["resolved_provider"]) == "smart":
+            route = await self._resolve_smart_route(
+                route,
+                worker_id=worker_id,
+                payload=payload,
+                incoming_bearer_token=incoming_bearer_token,
+            )
+
+        task = self._create_task_for_payload(payload, stream, worker_id, route)
+        if incoming_bearer_token:
+            task.config = dict(task.config or {})
+            task.config["incoming_bearer_token"] = incoming_bearer_token
+        if isinstance(route_trace, dict):
+            task.config = dict(task.config or {})
+            task.config["route_trace"] = dict(route_trace)
+        return task
+
+    def _create_task_for_payload(self, payload: dict, stream: bool, worker_id: str, route: dict | None):
+        """Finalize Task_agent creation once worker and route are resolved."""
+        from core.task_types.task_agent import Task_agent
+
         if route is not None:
             payload = dict(payload or {})
             payload["model"] = route["resolved_model"]
 
+        effective_worker_id = self._resolve_worker_id_for_route(worker_id, route)
+
         task = Task_agent(payload=payload, stream=stream, external=True)
-        if worker_id:
-            task.worker_id = worker_id
+        if effective_worker_id:
+            task.worker_id = effective_worker_id
         if route is not None:
             task.config = dict(task.config or {})
             task.config["route"] = route
@@ -229,6 +339,64 @@ class Endpoint_openaix(Endpoint_ollama):
             task.queue_timeout = int(cfg_tasks.get("queue_timeout", 300))
             task.run_timeout = int(cfg_tasks.get("run_timeout", 300))
         return task
+
+    async def _resolve_smart_route(
+        self,
+        route: dict,
+        *,
+        worker_id: str,
+        payload: dict,
+        incoming_bearer_token: str = "",
+    ) -> dict:
+        """Resolve one smart alias route into a concrete provider/model pair."""
+        return await super()._resolve_smart_route(
+            route,
+            worker_id=worker_id,
+            payload=payload,
+            incoming_bearer_token=incoming_bearer_token,
+        )
+
+    async def _evaluate_smart_candidate(
+        self,
+        item: object,
+        *,
+        request_priority: int,
+        index: int,
+        incoming_bearer_token: str = "",
+    ) -> dict | None:
+        """Evaluate one smart routing candidate using locally visible queue/resource state."""
+        return await super()._evaluate_smart_candidate(
+            item,
+            request_priority=request_priority,
+            index=index,
+            incoming_bearer_token=incoming_bearer_token,
+        )
+
+    @staticmethod
+    def _build_smart_route_result(
+        route: dict,
+        candidate: dict,
+        *,
+        strategy: str,
+        reason: str,
+        candidate_probes: list[dict],
+    ) -> dict:
+        """Build final concrete route metadata for a selected smart candidate."""
+        return Endpoint_ollama._build_smart_route_result(
+            route,
+            candidate,
+            strategy=strategy,
+            reason=reason,
+            candidate_probes=candidate_probes,
+        )
+
+    @staticmethod
+    def _resolve_request_priority(payload: dict | None) -> int:
+        """Resolve routing priority from payload, defaulting to the normal task priority."""
+        try:
+            return max(0, int((payload or {}).get("priority", 5)))
+        except Exception:
+            return 5
 
     def _resolve_worker_id(self, payload: dict) -> str:
         """Resolve worker id for a request using payload override, endpoint cfg, or global default."""
@@ -257,18 +425,35 @@ class Endpoint_openaix(Endpoint_ollama):
 
         out = dict(payload)
         options = out.get("options") if isinstance(out.get("options"), dict) else {}
+        applied_options: set[str] = set()
         for field_name, option_name in self._GENERATION_OPTION_FIELDS.items():
-            if out.get(field_name) is not None:
+            if option_name in applied_options:
                 continue
-            if options.get(option_name) is not None:
+            if self._payload_has_generation_value(out, option_name) or options.get(option_name) is not None:
+                applied_options.add(option_name)
                 continue
 
             default_value = defaults.get(field_name)
+            target_field = field_name
             if default_value is None and option_name != field_name:
                 default_value = defaults.get(option_name)
+                target_field = option_name
             if default_value is not None:
-                out[field_name] = default_value
+                out[target_field] = default_value
+                applied_options.add(option_name)
         return out
+
+    @classmethod
+    def _payload_has_generation_value(cls, payload: dict, option_name: str) -> bool:
+        """Return whether the payload already defines any top-level alias for one Ollama option name."""
+        if not isinstance(payload, dict):
+            return False
+        for field_name, mapped_option in cls._GENERATION_OPTION_FIELDS.items():
+            if mapped_option != option_name:
+                continue
+            if payload.get(field_name) is not None:
+                return True
+        return False
 
     @staticmethod
     def _openai_request_to_ollama(body: dict) -> dict:
@@ -293,7 +478,10 @@ class Endpoint_openaix(Endpoint_ollama):
             "tool_choice",
             "temperature",
             "top_p",
+            "repeat_penalty",
             "repetition_penalty",
+            "repeat_last_n",
+            "num_predict",
             "max_tokens",
             "seed",
             "presence_penalty",
@@ -478,6 +666,34 @@ class Endpoint_openaix(Endpoint_ollama):
         provider_id = self._core.config.get(f"workers.items.{worker_id}.provider")
         return str(provider_id).strip() if provider_id is not None else ""
 
+    def _provider_cfg(self, provider_id: str) -> dict:
+        """Return provider config dictionary or an empty dict when missing."""
+        providers = self._core.config.get("models.providers") or {} if self._core is not None else {}
+        if not isinstance(providers, dict):
+            return {}
+        provider_cfg = providers.get(provider_id)
+        return provider_cfg if isinstance(provider_cfg, dict) else {}
+
+    def _provider_api(self, provider_id: str) -> str:
+        """Return provider api type string for a configured provider."""
+        return str(self._provider_cfg(provider_id).get("api") or "").strip()
+
+    def _find_provider_model_cfg(self, provider_id: str, model_id: str) -> dict | None:
+        """Return provider model config matched by id, name, or alias."""
+        provider_cfg = self._provider_cfg(provider_id)
+        models = provider_cfg.get("models") or []
+        if not isinstance(models, list):
+            return None
+
+        normalized_model_id = str(model_id).strip()
+        for model in models:
+            if not isinstance(model, dict):
+                continue
+            if normalized_model_id not in {self._model_id(model), str(model.get("name") or "").strip(), self._model_alias(model)}:
+                continue
+            return model
+        return None
+
     def _warn_model_resolution(self, warning_key: str, message: str) -> None:
         """Emit a model-resolution warning once per endpoint instance."""
         if warning_key in self._model_resolution_warnings_emitted:
@@ -640,6 +856,38 @@ class Endpoint_openaix(Endpoint_ollama):
             "priority_counts": queue_state["priority_counts"],
         }
         return JSONResponse(payload)
+
+    async def _model_only_queue_state_response(
+        self,
+        *,
+        protocol: str,
+        model_id: str,
+        priority: int,
+    ) -> JSONResponse:
+        """Resolve external model id using inference routing rules and return queue state."""
+        worker_id = self._resolve_worker_id({})
+        route = self._resolve_model_route(model_id, worker_id)
+        if route is None:
+            return self._error_response(
+                protocol=protocol,
+                status_code=404,
+                code="INVALID_MODEL",
+                message=f"Unknown model: {model_id}",
+            )
+
+        response = await self._model_queue_state_response(
+            protocol=protocol,
+            provider_id=route["resolved_provider"],
+            model_id=route["resolved_model"],
+            priority=priority,
+        )
+        try:
+            payload = json.loads(response.body)
+        except Exception:
+            return response
+
+        payload["requested_model"] = str(model_id)
+        return JSONResponse(payload, status_code=response.status_code)
 
     def _resolve_model_resource_requirements(self, provider_id: str, model_id: str) -> dict | None:
         """Resolve configured resource requirements for a provider/model pair."""
