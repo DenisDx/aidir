@@ -840,6 +840,7 @@ class TestOpenAIxGenerationParameters(unittest.TestCase):
             {
                 "model": "qwen3",
                 "messages": [{"role": "user", "content": "Hi"}],
+                "think": False,
                 "temperature": 0.33,
                 "top_p": 0.88,
                 "repeat_penalty": 1.19,
@@ -872,6 +873,7 @@ class TestOpenAIxGenerationParameters(unittest.TestCase):
                 "min_p": 0.04,
             },
         )
+        self.assertIs(normalized.get("think"), False)
 
     def test_openaix_worker_applies_model_generation_defaults(self) -> None:
         """Uses model-level generation config when request does not override it."""

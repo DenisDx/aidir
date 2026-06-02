@@ -248,6 +248,7 @@ class OpenAIxWorker(BaseWorker):
             "tools",
             "tool_choice",
             "stop",
+            "think",
             "response_format",
         ]
         for key in passthrough:
