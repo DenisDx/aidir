@@ -337,14 +337,14 @@ class TestOpenAIxToolInjection(unittest.IsolatedAsyncioTestCase):
 class TestOpenAIxTimeoutBehavior(unittest.TestCase):
     """Regression checks for timeout behavior in OpenAIx worker."""
 
-    def test_resolve_upstream_timeout_prefers_task_run_timeout(self) -> None:
-        """Uses task.run_timeout so upstream timeout matches task execution budget."""
+    def test_resolve_upstream_timeout_uses_worker_timeout_for_one_llm_call(self) -> None:
+        """Single upstream LLM call timeout should come from worker request_timeout."""
         worker = OpenAIxWorker()
         worker._timeout = 100
         task = Task_agent(payload={}, stream=False)
         task.run_timeout = 300
 
-        self.assertEqual(worker._resolve_upstream_timeout(task), 300)
+        self.assertEqual(worker._resolve_upstream_timeout(task), 100)
 
     def test_resolve_upstream_timeout_falls_back_to_worker_timeout(self) -> None:
         """Uses worker timeout when task timeout is not set."""

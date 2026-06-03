@@ -127,6 +127,8 @@ class Task:
             "retry_period": str(self.retry_period),
             "retry_attempt": str(self.retry_attempt),
             "fallback_index": str(self.fallback_index),
+            "queue_timeout": str(self.queue_timeout),
+            "run_timeout": str(self.run_timeout),
             "resource_requirements": json.dumps(self.resource_requirements),
             "config":      json.dumps(self.config),
             "context":     context_json,

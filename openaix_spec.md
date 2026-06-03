@@ -417,7 +417,6 @@ curl -s "$BASE/api/chat" \
   -d '{
     "worker": "openaix",
     "envid": "dev",
-    "timeout": 120,
     "context_builder": {
       "context_add_internal_tools": {
         "tools": {

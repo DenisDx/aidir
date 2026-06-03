@@ -50,8 +50,7 @@ class Endpoint_ollama(BaseEndpoint):
         self.id = endpoint_cfg.get("id", "ollama")
         self._cfg = endpoint_cfg
         self._core: "Core | None" = None
-        # Timeout for entire endpoint request (queue + execution)
-        self._request_timeout = int(endpoint_cfg.get("request_timeout", 100))
+        self._warn_deprecated_request_timeout(endpoint_cfg)
         self._model_resolution_warnings_emitted: set[str] = set()
 
     async def initialize(self, core: "Core") -> None:
@@ -857,13 +856,9 @@ class Endpoint_ollama(BaseEndpoint):
 
     async def _sync_response(self, task: Task_agent) -> JSONResponse:
         """Wait for task completion and return a single JSON response."""
-        # Use timeout from task if set by request, otherwise use endpoint default
-        timeout = task.run_timeout if task.run_timeout > 0 else self._request_timeout
-        try:
-            await asyncio.wait_for(task._done_event.wait(), timeout=timeout)
-        except asyncio.TimeoutError:
-            await self._core.queue.mark_canceled(task)
-            asyncio.create_task(self._core.delete_task(task.id))
+        timeout_phase = await self._wait_for_task_terminal(task)
+        if timeout_phase is not None:
+            await self._terminate_task_on_timeout(task)
             return JSONResponse(
                 {"error": {"code": "TIMEOUT", "message": "Request timed out"}},
                 status_code=_HTTP_TIMEOUT,
@@ -874,8 +869,14 @@ class Endpoint_ollama(BaseEndpoint):
         if task.status == STATUS_COMPLETED:
             return JSONResponse(task.result or {})
         if task.status == STATUS_FAILED:
+            error = task.error or {"message": "Worker error"}
+            if error.get("code") in {"TIMEOUT", "QUEUE_TIMEOUT"}:
+                return JSONResponse(
+                    {"error": {"code": error.get("code"), "message": error.get("message", "Request timed out")}},
+                    status_code=_HTTP_TIMEOUT,
+                )
             return JSONResponse(
-                {"error": task.error or {"message": "Worker error"}},
+                {"error": error},
                 status_code=_HTTP_UPSTREAM,
             )
         # canceled
@@ -887,15 +888,10 @@ class Endpoint_ollama(BaseEndpoint):
     async def _stream_response(self, task: Task_agent) -> AsyncGenerator[bytes, None]:
         """Read chunks from task queue and yield as NDJSON lines."""
         try:
-            # Use timeout from task if set by request, otherwise use endpoint default
-            timeout = task.run_timeout if task.run_timeout > 0 else self._request_timeout
-            deadline = asyncio.get_event_loop().time() + timeout
-
             while True:
-                remaining = deadline - asyncio.get_event_loop().time()
-                if remaining <= 0:
-                    # Timeout: cancel task and yield error chunk
-                    await self._core.queue.mark_canceled(task)
+                timeout_phase, remaining = self._task_timeout_phase(task)
+                if remaining is not None and remaining <= 0:
+                    await self._terminate_task_on_timeout(task)
                     yield (json.dumps({
                         "error": {"code": "TIMEOUT", "message": "Request timed out"},
                         "done": True,
@@ -903,9 +899,8 @@ class Endpoint_ollama(BaseEndpoint):
                     break
 
                 try:
-                    chunk = await asyncio.wait_for(
-                        task._chunk_queue.get(), timeout=min(remaining, 5.0)
-                    )
+                    wait_timeout = 1.0 if remaining is None else max(0.01, min(remaining, 1.0))
+                    chunk = await asyncio.wait_for(task._chunk_queue.get(), timeout=wait_timeout)
                 except asyncio.TimeoutError:
                     continue
 

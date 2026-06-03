@@ -33,8 +33,7 @@ class Endpoint_mcp(BaseEndpoint):
         self._server_name = endpoint_cfg.get("serverName", "aidir-mcp")
         self._server_version = endpoint_cfg.get("serverVersion", "0.1.0")
         self._protocol_version = endpoint_cfg.get("protocolVersion", "2024-11-05")
-        # Timeout for entire endpoint request (queue + execution)
-        self._request_timeout = int(endpoint_cfg.get("request_timeout", 100))
+        self._warn_deprecated_request_timeout(endpoint_cfg)
 
     async def initialize(self, core: "Core") -> None:
         """Bind endpoint to core instance and write startup log."""
@@ -220,12 +219,9 @@ class Endpoint_mcp(BaseEndpoint):
                 status_code=503,
             )
 
-        timeout = self._request_timeout
-        try:
-            await asyncio.wait_for(task._done_event.wait(), timeout=timeout)
-        except asyncio.TimeoutError:
-            await self._core.queue.mark_canceled(task)
-            asyncio.create_task(self._core.delete_task(task.id))
+        timeout_phase = await self._wait_for_task_terminal(task)
+        if timeout_phase is not None:
+            await self._terminate_task_on_timeout(task)
             return JSONResponse(
                 {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32001, "message": "Tool call timed out"}},
                 status_code=504,
@@ -238,6 +234,11 @@ class Endpoint_mcp(BaseEndpoint):
 
         if task.status == STATUS_FAILED:
             err = task.error or {"code": "TOOL_ERROR", "message": "Tool failed"}
+            if err.get("code") in {"TIMEOUT", "QUEUE_TIMEOUT"}:
+                return JSONResponse(
+                    {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32001, "message": err.get("message", "Tool call timed out")}},
+                    status_code=504,
+                )
             return JSONResponse(
                 {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32002, "message": err.get("message", "Tool failed"), "data": err}},
                 status_code=502,

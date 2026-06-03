@@ -80,8 +80,6 @@
       "worker": "openaix",
       // worker used for pre-agent context building
       "context_builder_worker": "context_builder",
-      // Timeout for entire request (queue + execution)
-      "request_timeout": ${REQUEST_TIMEOUT:-100},
       "middlewares": [] // TODO: add middleware ids here when needed
     },
     {
@@ -94,8 +92,6 @@
         "level": "debug",
         "alllevel": "info"
       },
-      // Timeout for entire request (queue + execution)
-      "request_timeout": ${REQUEST_TIMEOUT:-100},
       "tools": {
         "search": {
           "worker": "web_search",
@@ -173,7 +169,7 @@
           // "top_k": ${OPENAIX_TOP_K:-40},
           // "min_p": ${OPENAIX_MIN_P:-0.0}
         },
-        // Timeout for single HTTP request to upstream LLM
+        // Timeout for one upstream HTTP request to the LLM.
         "request_timeout": ${REQUEST_TIMEOUT:-100},
         "logging": {
           "level": "debug",
@@ -218,14 +214,14 @@
         "enabled": true,
         "provider": "brave",
         "apiKey": "${BRAVE_APIKEY}",
-        // Timeout for Brave API request
+        // Timeout for one upstream Brave API request.
         "request_timeout": ${REQUEST_TIMEOUT:-100}
       },
       "web_fetch": {
         "enabled": true,
         "provider": "brave",
         "apiKey": "${BRAVE_APIKEY}",
-        // Timeout for Brave LLM Context API request
+        // Timeout for one upstream Brave LLM Context API request.
         "request_timeout": ${REQUEST_TIMEOUT:-100}
       },
       "selftest": {
@@ -418,8 +414,11 @@
     ]
   },
   "tasks": {
+    // Graceful restart wait for already running tasks before forced cancellation.
     "restart_wait_timeout": ${TASK_RESTART_WAIT_TIMEOUT_SECONDS:-120},
+    // Max time a task may remain queued before its first transition to running.
     "queue_timeout": ${TASK_QUEUE_TIMEOUT_SECONDS:-300},
+    // Max execution time after the task actually starts running.
     "run_timeout": ${TASK_RUN_TIMEOUT_SECONDS:-300},
     "external_task_live": ${EXTERNAL_TASK_LIVE_SECONDS:-2500000}
   },

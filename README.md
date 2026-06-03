@@ -102,11 +102,27 @@ Copy from `.env.example`. **Never commit this file** (it is in `.gitignore`).
 | `ROOT_PASSWORD` | `changeme` | WebUI password — **change this** |
 | `LOG_WIPE_PERIOD` | `0` | Log cleanup interval in seconds (0 = disabled) |
 | `CRON_PERIOD` | `1` | Cron run interval in minutes (any integer >= 1) |
+| `REQUEST_TIMEOUT` | `100` | Max duration of one outbound HTTP call to an upstream LLM/API |
 | `TASK_RESTART_WAIT_TIMEOUT_SECONDS` | `120` | Max graceful restart wait for active tasks before shutdown continues |
-| `TASK_QUEUE_TIMEOUT_SECONDS` | `300` | Max time a task waits in queue before cancellation |
-| `TASK_RUN_TIMEOUT_SECONDS` | `300` | Max execution time per task |
+| `TASK_QUEUE_TIMEOUT_SECONDS` | `300` | Max time a task may wait before its first transition to `running` |
+| `TASK_RUN_TIMEOUT_SECONDS` | `300` | Max total execution time after a task has started running |
 | `TLS_CERT_PATH` | *(optional)* | Path to TLS certificate (handled by nginx) |
 | `TLS_KEY_PATH` | *(optional)* | Path to TLS private key |
+
+### Timeout semantics
+
+The timeout model is split into three separate responsibilities:
+
+- `REQUEST_TIMEOUT` limits one outbound HTTP request to an upstream LLM or API.
+- `TASK_QUEUE_TIMEOUT_SECONDS` limits only the waiting period before the task starts running for the first time.
+- `TASK_RUN_TIMEOUT_SECONDS` limits the task after it has started running, including tool loops and multiple LLM calls.
+
+Important rule:
+
+- if a task reaches `running` just before queue timeout expires, queue timeout no longer applies to that task
+- from that point on, only `TASK_RUN_TIMEOUT_SECONDS` can stop it
+
+`TASK_RESTART_WAIT_TIMEOUT_SECONDS` is separate from task lifecycle timing. It is used only during graceful restart/shutdown to decide how long the service should wait for already running tasks before forced cancellation.
 
 ### `config.json5` — active system configuration
 
@@ -124,10 +140,10 @@ JSON5 format (comments and trailing commas allowed). Uses `${VAR}` and `${VAR:-d
 Key sections:
 
 - **`endpoints`** — which APIs to expose and on which ports
-- **`workers.items`** — per-worker config (logging overrides, upstream provider)
+- **`workers.items`** — per-worker config (logging overrides, upstream provider, per-call `request_timeout`)
 - **`models.providers`** — upstream AI providers (Ollama local/remote, OpenAI-compatible)
 - **`webui`** — WebUI port, auth mode, users
-- **`tasks`** — queue and run timeouts
+- **`tasks`** — restart drain timeout plus queue/run lifecycle timeouts
 - **`logging`** — log levels per subsystem (0=EMERG … 7=DEBUG)
 - **`resources`** — hardware resources to track (VRAM etc.; enforced in future releases)
 

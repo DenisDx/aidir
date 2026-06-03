@@ -51,8 +51,6 @@ class Endpoint_openaix(Endpoint_ollama):
         self._errors_compatibility_mode = bool(
             endpoint_cfg.get("errors_compatibility_mode", True)
         )
-        # Timeout for entire endpoint request (queue + execution)
-        self._request_timeout = int(endpoint_cfg.get("request_timeout", 100))
         self._model_resolution_warnings_emitted: set[str] = set()
 
     def create_app(self, core) -> FastAPI:
@@ -330,14 +328,8 @@ class Endpoint_openaix(Endpoint_ollama):
             task.config["route"] = route
 
         cfg_tasks = self._core.config.get("tasks", {}) or {}
-        # Use timeout from request if specified, otherwise use defaults
-        if "timeout" in payload and payload["timeout"] is not None:
-            timeout_val = int(payload["timeout"])
-            task.queue_timeout = timeout_val
-            task.run_timeout = timeout_val
-        else:
-            task.queue_timeout = int(cfg_tasks.get("queue_timeout", 300))
-            task.run_timeout = int(cfg_tasks.get("run_timeout", 300))
+        task.queue_timeout = int(cfg_tasks.get("queue_timeout", 300))
+        task.run_timeout = int(cfg_tasks.get("run_timeout", 300))
         return task
 
     async def _resolve_smart_route(
@@ -498,13 +490,9 @@ class Endpoint_openaix(Endpoint_ollama):
 
     async def _openai_sync_response(self, task, request_body: dict) -> JSONResponse:
         """Wait for task completion and return OpenAI chat.completion JSON."""
-        # Use timeout from task if set by request, otherwise use endpoint default
-        timeout = task.run_timeout if task.run_timeout > 0 else self._request_timeout
-        try:
-            await asyncio.wait_for(task._done_event.wait(), timeout=timeout)
-        except asyncio.TimeoutError:
-            await self._core.queue.mark_canceled(task)
-            asyncio.create_task(self._core.delete_task(task.id))
+        timeout_phase = await self._wait_for_task_terminal(task)
+        if timeout_phase is not None:
+            await self._terminate_task_on_timeout(task)
             log("http", "warning", f"{self.id} /v1/chat/completions timeout: task={task.id}", self.id)
             return self._error_response(
                 protocol="openai",
@@ -532,6 +520,23 @@ class Endpoint_openaix(Endpoint_ollama):
             return JSONResponse(self._ollama_sync_to_openai(task.result or {}, task.id, request_body))
         if task.status == STATUS_FAILED:
             err = task.error or {}
+            if err.get("code") in {"TIMEOUT", "QUEUE_TIMEOUT"}:
+                log(
+                    "http",
+                    "warning",
+                    (
+                        f"{self.id} /v1/chat/completions timeout_failed: task={task.id} "
+                        f"code={err.get('code')} message={err.get('message', 'Request timed out')}"
+                    ),
+                    self.id,
+                )
+                return self._error_response(
+                    protocol="openai",
+                    status_code=504,
+                    code="timeout_error",
+                    message=err.get("message", "Request timed out"),
+                    task_id=task.id,
+                )
             log(
                 "http",
                 "warning",
@@ -569,15 +574,11 @@ class Endpoint_openaix(Endpoint_ollama):
 
     async def _openai_stream_response(self, task, request_body: dict) -> AsyncGenerator[bytes, None]:
         """Stream OpenAI-compatible SSE chunks converted from Ollama chunks."""
-        # Use timeout from task if set by request, otherwise use endpoint default
-        timeout = task.run_timeout if task.run_timeout > 0 else self._request_timeout
-        deadline = asyncio.get_event_loop().time() + timeout
-
         try:
             while True:
-                remaining = deadline - asyncio.get_event_loop().time()
-                if remaining <= 0:
-                    await self._core.queue.mark_canceled(task)
+                timeout_phase, remaining = self._task_timeout_phase(task)
+                if remaining is not None and remaining <= 0:
+                    await self._terminate_task_on_timeout(task)
                     err = self._openai_error_payload(
                         code="timeout_error",
                         message="Request timed out",
@@ -587,7 +588,8 @@ class Endpoint_openaix(Endpoint_ollama):
                     break
 
                 try:
-                    chunk = await asyncio.wait_for(task._chunk_queue.get(), timeout=min(remaining, 5.0))
+                    wait_timeout = 1.0 if remaining is None else max(0.01, min(remaining, 1.0))
+                    chunk = await asyncio.wait_for(task._chunk_queue.get(), timeout=wait_timeout)
                 except asyncio.TimeoutError:
                     continue
 

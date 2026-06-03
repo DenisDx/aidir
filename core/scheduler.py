@@ -13,6 +13,8 @@ from typing import TYPE_CHECKING
 
 import httpx
 
+from datetime import datetime, timezone
+
 from core.task import Task, STATUS_QUEUED
 from core.worker import WorkerResult
 from core import log
@@ -71,6 +73,9 @@ class Scheduler:
                 task = self._queue.get_task(task_id)
                 if task is None:
                     log("system", "warn", f"Task {task_id} popped but not in memory")
+                    continue
+
+                if await self._expire_queued_task_if_needed(task):
                     continue
 
                 # Task is scheduled for later retry.
@@ -241,10 +246,56 @@ class Scheduler:
     @staticmethod
     def _run_timeout_source(task: Task) -> str:
         """Describe where the effective task run timeout came from."""
-        payload = task.payload if isinstance(task.payload, dict) else {}
-        if payload.get("timeout") is not None:
-            return "payload.timeout"
         return "tasks.run_timeout / TASK_RUN_TIMEOUT_SECONDS"
+
+    @staticmethod
+    def _queue_timeout_source(task: Task) -> str:
+        """Describe where the effective task queue timeout came from."""
+        return "tasks.queue_timeout / TASK_QUEUE_TIMEOUT_SECONDS"
+
+    @staticmethod
+    def _normalize_utc(value: datetime | None) -> datetime | None:
+        """Return a timezone-aware UTC datetime or None when unavailable."""
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+    @classmethod
+    def _queue_elapsed_seconds(cls, task: Task) -> float:
+        """Return how long the task has waited before its first execution."""
+        created_at = cls._normalize_utc(getattr(task, "created_at", None))
+        if created_at is None:
+            return 0.0
+        return max(0.0, (datetime.now(timezone.utc) - created_at).total_seconds())
+
+    @classmethod
+    def _queue_timeout_expired(cls, task: Task) -> bool:
+        """Return whether a queued task exceeded its pre-execution queue timeout."""
+        if getattr(task, "started_at", None) is not None:
+            return False
+        try:
+            timeout_limit = int(getattr(task, "queue_timeout", 0) or 0)
+        except (TypeError, ValueError):
+            timeout_limit = 0
+        if timeout_limit <= 0:
+            return False
+        return cls._queue_elapsed_seconds(task) >= timeout_limit
+
+    @classmethod
+    def _build_queue_timeout_message(cls, task: Task, elapsed_seconds: float) -> str:
+        """Build an informative queue-timeout message for logs and API errors."""
+        try:
+            timeout_limit = int(task.queue_timeout)
+        except (TypeError, ValueError):
+            timeout_limit = 0
+
+        timeout_source = cls._queue_timeout_source(task)
+        return (
+            f"Task queue timeout exceeded after {elapsed_seconds:.2f}s "
+            f"(limit={timeout_limit}s, parameter=task.queue_timeout, source={timeout_source})"
+        )
 
     @classmethod
     def _build_run_timeout_message(cls, task: Task, elapsed_seconds: float) -> str:
@@ -318,6 +369,17 @@ class Scheduler:
         finally:
             if self._resources and reserved_reqs:
                 await self._resources.release_for(reserved_reqs, consumer_id=consumer_id, model_id=model_id)
+
+    async def _expire_queued_task_if_needed(self, task: Task) -> bool:
+        """Fail queued tasks that exceeded queue timeout before their first run."""
+        if not self._queue_timeout_expired(task):
+            return False
+
+        elapsed = self._queue_elapsed_seconds(task)
+        timeout_message = self._build_queue_timeout_message(task, elapsed)
+        log("worker", "warning", f"Task {task.id} queue timeout: {timeout_message}", "scheduler")
+        await self._queue.mark_failed(task, {"code": "QUEUE_TIMEOUT", "message": timeout_message})
+        return True
 
     async def _refresh_smart_route_for_dispatch(self, task: Task, worker_id: str) -> None:
         """Re-resolve queued smart routes so stale busy-fallback selections can move to a newly available candidate."""

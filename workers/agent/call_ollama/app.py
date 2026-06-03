@@ -52,6 +52,10 @@ class CallOllamaWorker(BaseWorker):
         self._core = core
         provider_id: str = config.get("provider", "ollama_local")
         self._provider_id = provider_id
+        try:
+            self._timeout = max(1, int(config.get("request_timeout", 100) or 100))
+        except (TypeError, ValueError):
+            self._timeout = 100
 
         if core is not None:
             base_url = core.config.get(f"models.providers.{provider_id}.baseUrl")

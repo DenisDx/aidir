@@ -172,22 +172,12 @@ class OpenAIxWorker(BaseWorker):
             return WorkerResult(ok=False, error={"code": "EXCEPTION", "message": str(exc)})
 
     def _resolve_upstream_timeout(self, task: Task) -> int:
-        """Use task timeout for upstream request when available to avoid premature failures."""
+        """Return per-request upstream timeout for one HTTP call to the LLM."""
         try:
             configured_timeout = int(self._timeout)
         except (TypeError, ValueError):
             configured_timeout = 100
-        configured_timeout = max(1, configured_timeout)
-
-        task_timeout = getattr(task, "run_timeout", 0)
-        try:
-            task_timeout_int = int(task_timeout)
-        except (TypeError, ValueError):
-            task_timeout_int = 0
-
-        if task_timeout_int > 0:
-            return task_timeout_int
-        return configured_timeout
+        return max(1, configured_timeout)
 
     @staticmethod
     def _build_timeout_message(exc: httpx.TimeoutException) -> str:
