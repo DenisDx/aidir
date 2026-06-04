@@ -18,6 +18,14 @@ class WebSearchWorker(BaseToolWorker):
     """Tool worker that queries Brave Web Search API."""
 
     task_type = "tool"
+    _MAX_QUERY_CHARS = 400
+    _MAX_QUERY_WORDS = 50
+    _ALLOWED_SEARCH_LANGS = {
+        "ar", "eu", "bn", "bg", "ca", "zh-hans", "zh-hant", "hr", "cs", "da", "nl", "en", "en-gb",
+        "et", "fi", "fr", "gl", "de", "el", "gu", "he", "hi", "hu", "is", "it", "jp", "kn", "ko",
+        "lv", "lt", "ms", "ml", "mr", "nb", "pl", "pt-br", "pt-pt", "pa", "ro", "ru", "sr", "sk",
+        "sl", "es", "sv", "ta", "te", "th", "tr", "uk", "ur", "vi",
+    }
 
     def get_tool_description(self) -> list[dict]:
         """Return MCP-compatible tool description as a list."""
@@ -29,7 +37,7 @@ class WebSearchWorker(BaseToolWorker):
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "Search query (max 400 chars, 50 words).",
+                        "description": "Query Length: Maximum 400 characters and 50 words.",
                     },
                     "count": {
                         "type": "integer",
@@ -99,6 +107,39 @@ class WebSearchWorker(BaseToolWorker):
             parsed = int(default)
         return min(maximum, max(minimum, parsed))
 
+    @classmethod
+    def _normalize_query(cls, value: str) -> str:
+        """Collapse whitespace and trim Brave queries to supported size."""
+        query = " ".join(str(value).split())
+        if not query:
+            return ""
+
+        words = query.split(" ")
+        if len(words) > cls._MAX_QUERY_WORDS:
+            query = " ".join(words[: cls._MAX_QUERY_WORDS])
+
+        if len(query) <= cls._MAX_QUERY_CHARS:
+            return query
+
+        trimmed = query[: cls._MAX_QUERY_CHARS].rstrip()
+        split_at = trimmed.rfind(" ")
+        if split_at >= cls._MAX_QUERY_CHARS * 3 // 4:
+            trimmed = trimmed[:split_at]
+        return trimmed.rstrip() or query[: cls._MAX_QUERY_CHARS].rstrip()
+
+    @classmethod
+    def _normalize_search_lang(cls, value: object, default: str = "en") -> str:
+        """Map unsupported search_lang values to a safe Brave default."""
+        normalized = str(value or default).strip().lower()
+        if normalized in cls._ALLOWED_SEARCH_LANGS:
+            return normalized
+
+        base = normalized.split("-", 1)[0]
+        if base in cls._ALLOWED_SEARCH_LANGS:
+            return base
+
+        return default
+
     async def execute(
         self,
         task: Task,
@@ -120,7 +161,7 @@ class WebSearchWorker(BaseToolWorker):
         payload = task.payload or {}
         args = payload.get("arguments") or {}
 
-        query = str(args.get("query", "")).strip()
+        query = self._normalize_query(args.get("query", ""))
         if not query:
             return WorkerResult(ok=False, error={"code": "INVALID_ARGUMENT", "message": "query is required"})
 
@@ -132,7 +173,7 @@ class WebSearchWorker(BaseToolWorker):
             "count": count,
             "offset": offset,
             "country": str(args.get("country", "us") or "us"),
-            "search_lang": str(args.get("search_lang", "en") or "en"),
+            "search_lang": self._normalize_search_lang(args.get("search_lang", "en")),
             "ui_lang": str(args.get("ui_lang", "en-US") or "en-US"),
             "safesearch": str(args.get("safesearch", "moderate") or "moderate"),
         }

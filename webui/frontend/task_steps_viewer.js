@@ -335,6 +335,77 @@
     return createElement('div', 'task-steps-empty', 'No matching log entries found.');
   }
 
+  function renderCallHistory(task) {
+    const history = Array.isArray(task?.llm_call_history) ? task.llm_call_history : [];
+    if (!history.length) {
+      return renderEmptyState();
+    }
+
+    const wrap = createElement('div', 'task-steps-table-wrap');
+    const table = createElement('table', 'task-steps-table');
+    const thead = document.createElement('thead');
+    thead.innerHTML = '<tr><th>#</th><th>Started</th><th>Time</th><th>Path</th><th>Model</th><th>Status</th><th>Details</th></tr>';
+    table.appendChild(thead);
+
+    const tbody = document.createElement('tbody');
+    history.forEach(entry => {
+      const tr = document.createElement('tr');
+      const details = [
+        entry.request_kind ? `kind=${entry.request_kind}` : '',
+        entry.provider_id ? `provider=${entry.provider_id}` : '',
+        Number.isFinite(Number(entry.message_count)) && Number(entry.message_count) > 0 ? `messages=${entry.message_count}` : '',
+        Number.isFinite(Number(entry.input_count)) && Number(entry.input_count) > 0 ? `inputs=${entry.input_count}` : '',
+        entry.has_tools ? 'tools=yes' : '',
+        entry.save_llm_request ? 'full-log=yes' : '',
+        entry.error_code ? `error=${entry.error_code}` : '',
+      ].filter(Boolean).join(' · ') || '—';
+
+      [
+        String(entry.call_index || '—'),
+        formatDateTime(entry.started_at),
+        formatDurationMs(Number(entry.duration_ms)),
+        entry.url_path || '—',
+        entry.model || '—',
+        entry.status || '—',
+        details,
+      ].forEach(value => {
+        tr.appendChild(createElement('td', '', value));
+      });
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    wrap.appendChild(table);
+    return wrap;
+  }
+
+  function renderTaskDetailsView(task) {
+    const bodyNode = createElement('div', 'task-steps-view');
+    const history = Array.isArray(task?.llm_call_history) ? task.llm_call_history : [];
+
+    const summaryGrid = createElement('div', 'task-steps-summary-grid');
+    summaryGrid.appendChild(renderSummaryCard('Task duration', formatTaskDuration(task?.started_at, task?.finished_at)));
+    summaryGrid.appendChild(renderSummaryCard('LLM calls', formatInteger(Number(task?.llm_call_count || 0)), history.length ? `${history.length} stored summary entr${history.length === 1 ? 'y' : 'ies'}` : 'No persisted call history'));
+    summaryGrid.appendChild(renderSummaryCard('Worker', task?.worker_id || '—', task?.status || 'created'));
+    summaryGrid.appendChild(renderSummaryCard('Task type', task?.type || '—', task?.envid ? `envid ${task.envid}` : ''));
+    bodyNode.appendChild(summaryGrid);
+
+    const historyTitle = createElement('div', 'task-steps-summary-label', 'LLM call history');
+    bodyNode.appendChild(historyTitle);
+    bodyNode.appendChild(renderCallHistory(task || {}));
+
+    const jsonTitle = createElement('div', 'task-steps-summary-label', 'Task JSON');
+    bodyNode.appendChild(jsonTitle);
+    bodyNode.appendChild(renderJsonTree(task || {}));
+
+    return bodyNode;
+  }
+
+  function renderTaskJsonView(task) {
+    const bodyNode = createElement('div', 'task-json-view');
+    bodyNode.appendChild(renderJsonTree(task || {}));
+    return bodyNode;
+  }
+
   function renderStepsView(task, searchResult) {
     const lines = Array.isArray(searchResult?.lines) ? searchResult.lines : [];
     const steps = deriveStepDurations(task || {}, lines.map(parseStep));
@@ -372,6 +443,8 @@
 
   global.TaskStepsViewer = {
     renderJsonTree,
+    renderTaskJsonView,
+    renderTaskDetailsView,
     renderStepsView,
   };
 })(window);

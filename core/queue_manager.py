@@ -156,6 +156,33 @@ class QueueManager:
     def list_tasks(self) -> list[Task]:
         return list(self._tasks.values())
 
+    async def increment_llm_call_count(self, task: Task) -> int:
+        """Increment persisted LLM call count for a task and mirror it in memory."""
+        next_value = int(getattr(task, "llm_call_count", 0) or 0) + 1
+        task.llm_call_count = next_value
+
+        hincrby = getattr(self._redis, "hincrby", None)
+        if callable(hincrby):
+            persisted = await hincrby(self._tk(task.id), "llm_call_count", 1)
+            try:
+                task.llm_call_count = int(persisted)
+            except Exception:
+                task.llm_call_count = next_value
+            return task.llm_call_count
+
+        await self._redis.hset(self._tk(task.id), mapping={"llm_call_count": str(task.llm_call_count)})
+        return task.llm_call_count
+
+    async def persist_llm_call_diagnostics(self, task: Task) -> None:
+        """Persist task-level LLM call diagnostics without rewriting unrelated task state."""
+        await self._redis.hset(
+            self._tk(task.id),
+            mapping={
+                "llm_call_count": str(int(getattr(task, "llm_call_count", 0) or 0)),
+                "llm_call_history": json.dumps(getattr(task, "llm_call_history", []) or []),
+            },
+        )
+
     async def get_resource_queue_state(
         self,
         requirements: dict[str, dict[str, int]] | None = None,

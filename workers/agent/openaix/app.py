@@ -26,6 +26,12 @@ class OpenAIxWorker(BaseWorker):
     """Proxy worker for the extended OpenAIx syntax."""
 
     task_type = "agent"
+    _UPSTREAM_RETRY_ERROR_CODES = {
+        "UPSTREAM_UNREACHABLE",
+        "UPSTREAM_TIMEOUT",
+        "UPSTREAM_ERROR",
+        "UPSTREAM_INVALID_JSON",
+    }
     _GENERATION_OPTION_FIELDS = {
         "temperature": "temperature",
         "top_p": "top_p",
@@ -158,16 +164,19 @@ class OpenAIxWorker(BaseWorker):
                 # Check if tools are present in payload (injected by context builder)
                 has_tools = bool(payload.get("tools"))
                 if task.stream and not has_tools:
-                    return await self._forward_stream(client, url, payload, emit_chunk, save_call=save_call, task_id=task.id)
+                    return await self._forward_stream(client, url, payload, emit_chunk, task=task, save_call=save_call, task_id=task.id)
                 return await self._run_with_internal_tools(client, url, payload, task, emit_chunk, save_call=save_call)
         except httpx.ConnectError as exc:
+            await self._finalize_latest_started_llm_call(task, status="connect_error", error_code="UPSTREAM_UNREACHABLE")
             log("worker", "warning", f"Upstream unreachable: {exc}", "openaix")
             return WorkerResult(ok=False, error={"code": "UPSTREAM_UNREACHABLE", "message": str(exc)})
         except httpx.TimeoutException as exc:
+            await self._finalize_latest_started_llm_call(task, status="timeout", error_code="UPSTREAM_TIMEOUT")
             timeout_message = self._build_timeout_message(exc)
             log("worker", "warning", f"Upstream timeout: {timeout_message}", "openaix")
             return WorkerResult(ok=False, error={"code": "UPSTREAM_TIMEOUT", "message": timeout_message})
         except Exception as exc:
+            await self._finalize_latest_started_llm_call(task, status="exception", error_code="EXCEPTION")
             log("worker", "error", f"Unexpected error: {exc}", "openaix")
             return WorkerResult(ok=False, error={"code": "EXCEPTION", "message": str(exc)})
 
@@ -194,6 +203,83 @@ class OpenAIxWorker(BaseWorker):
                 return f"{exc.__class__.__name__}: {method} {url}"
 
         return exc.__class__.__name__
+
+    def _resolve_retry_counts(self, task: Task | None, payload: dict, provider_id: str | None = None) -> tuple[int, int]:
+        """Return configured retry counts for upstream and non-upstream LLM errors."""
+        model_cfg = self._resolve_retry_model_cfg(task, payload, provider_id=provider_id)
+        if not isinstance(model_cfg, dict):
+            return 0, 0
+
+        return (
+            self._parse_retry_count(model_cfg.get("upstream_retry_count")),
+            self._parse_retry_count(model_cfg.get("error_retry_count")),
+        )
+
+    def _resolve_retry_model_cfg(self, task: Task | None, payload: dict, provider_id: str | None = None) -> dict | None:
+        """Return the model config that owns retry policy for the current upstream call."""
+        route_cfg = (task.config or {}).get("route") if isinstance(getattr(task, "config", None), dict) else None
+        if isinstance(route_cfg, dict):
+            requested_provider = str(route_cfg.get("requested_provider") or "").strip()
+            requested_model = str(route_cfg.get("requested_model") or "").strip()
+            if requested_provider and requested_model:
+                route_model_cfg = self._resolve_model_cfg(requested_model, provider_id=requested_provider)
+                if isinstance(route_model_cfg, dict):
+                    return route_model_cfg
+
+        model_name = payload.get("model") if isinstance(payload, dict) else None
+        if not isinstance(model_name, str) or not model_name.strip():
+            return None
+
+        effective_provider_id = (
+            str(provider_id or self._resolve_task_provider_id(task) or "").strip()
+            if task is not None
+            else str(provider_id or self._provider_id or "").strip()
+        )
+        if not effective_provider_id:
+            return None
+        return self._resolve_model_cfg(model_name, provider_id=effective_provider_id)
+
+    @staticmethod
+    def _parse_retry_count(raw_value: object) -> int:
+        """Parse retry count from config and clamp invalid values to zero."""
+        try:
+            parsed = int(raw_value)
+        except (TypeError, ValueError):
+            return 0
+        return max(0, parsed)
+
+    @classmethod
+    def _should_retry_result(
+        cls,
+        result: WorkerResult,
+        *,
+        attempt: int,
+        upstream_retry_count: int,
+        error_retry_count: int,
+    ) -> bool:
+        """Return whether the failed upstream call should be retried."""
+        if result.ok:
+            return False
+
+        error = result.error if isinstance(result.error, dict) else {}
+        error_code = str(error.get("code") or "").strip()
+        if not error_code:
+            return False
+
+        retry_limit = upstream_retry_count if error_code in cls._UPSTREAM_RETRY_ERROR_CODES else error_retry_count
+        return attempt <= retry_limit
+
+    def _log_retry_attempt(self, task_id: str, error_code: str, attempt: int, retry_limit: int) -> None:
+        """Log one retry decision for the current LLM call."""
+        log(
+            "worker",
+            "info",
+            (
+                f"Task {task_id or '-'} retrying upstream LLM call after {error_code}: "
+                f"attempt {attempt + 1}/{retry_limit + 1}"
+            ),
+            "openaix",
+        )
 
     def _resolve_save_llm_request(self, request_payload: dict) -> bool:
         """Resolve save_llm_request flag with per-request value overriding worker default."""
@@ -358,7 +444,8 @@ class OpenAIxWorker(BaseWorker):
                 continue
             cfg_id = model_cfg.get("id")
             cfg_name = model_cfg.get("name")
-            if model_name not in {cfg_id, cfg_name}:
+            cfg_alias = model_cfg.get("alias")
+            if model_name not in {cfg_id, cfg_name, cfg_alias}:
                 continue
 
             return model_cfg
@@ -658,7 +745,7 @@ class OpenAIxWorker(BaseWorker):
                 "openaix",
             )
             current_payload["messages"] = messages
-            step = await self._forward_sync(client, url, current_payload, save_call=save_call, task_id=parent_task.id)
+            step = await self._forward_sync(client, url, current_payload, task=parent_task, save_call=save_call, task_id=parent_task.id)
             if not step.ok:
                 return step
 
@@ -762,6 +849,7 @@ class OpenAIxWorker(BaseWorker):
             client,
             url,
             fallback_payload,
+            task=parent_task,
             save_call=save_call,
             task_id=parent_task.id,
         )
@@ -976,8 +1064,20 @@ class OpenAIxWorker(BaseWorker):
 
         return WorkerResult(ok=False, error={"code": "TOOL_UNKNOWN_STATE", "message": f"Internal tool unknown state: {task.status}"})
 
-    async def _forward_sync(self, client: httpx.AsyncClient, url: str, payload: dict, *, save_call: bool = False, task_id: str = "") -> WorkerResult:
+    async def _forward_sync(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        payload: dict,
+        *,
+        task: Task_agent | None = None,
+        save_call: bool = False,
+        task_id: str = "",
+    ) -> WorkerResult:
         """Send a non-streaming request and return the full JSON body."""
+        effective_task_id = task_id or (task.id if task is not None else "")
+        provider_id = self._resolve_task_provider_id(task) if task is not None else self._provider_id
+        upstream_retry_count, error_retry_count = self._resolve_retry_counts(task, payload, provider_id=provider_id)
         upstream_payload = {**payload, "stream": False}
         messages = upstream_payload.get("messages")
         msg_count = len(messages) if isinstance(messages, list) else 0
@@ -991,67 +1091,115 @@ class OpenAIxWorker(BaseWorker):
             "worker",
             "debug",
             (
-                f"Task {task_id or '-'} upstream sync request: "
+                f"Task {effective_task_id or '-'} upstream sync request: "
                 f"messages={msg_count} last_role={last_role!r} "
                 f"tools={bool(upstream_payload.get('tools'))}"
             ),
             "openaix",
         )
+        result = WorkerResult(ok=False, error={"code": "EXCEPTION", "message": "retry loop not entered"})
 
-        request = self._build_json_request(client, url, upstream_payload)
-        if save_call:
-            save_llm_raw_call(self.id, request.content)
+        for attempt in range(1, max(upstream_retry_count, error_retry_count) + 2):
+            history_entry = None
+            if task is not None:
+                history_entry = await self._begin_llm_call(
+                    task,
+                    url=url,
+                    payload=payload,
+                    provider_id=provider_id,
+                    save_call=save_call,
+                )
+            try:
+                request = self._build_json_request(client, url, upstream_payload)
+                if save_call:
+                    save_llm_raw_call(self.id, request.content)
 
-        resp = await self._send_json_request(client, request, upstream_payload)
-        raw_response = await self._read_response_body(resp)
-        if save_call:
-            save_llm_raw_call(self.id, raw_response)
+                resp = await self._send_json_request(client, request, upstream_payload)
+                raw_response = await self._read_response_body(resp)
+                if save_call:
+                    save_llm_raw_call(self.id, raw_response)
 
-        if resp.status_code != 200:
-            body_preview = resp.text[:512]
-            log(
-                "worker",
-                "warning",
-                (
-                    f"Task {task_id or '-'} upstream sync error: status={resp.status_code} "
-                    f"messages={msg_count} last_role={last_role!r} body={body_preview!r}"
-                ),
-                "openaix",
-            )
-            return WorkerResult(
-                ok=False,
-                error={
-                    "code": "UPSTREAM_ERROR",
-                    "message": f"Upstream returned HTTP {resp.status_code}",
-                    "body": body_preview,
-                },
-            )
+                if resp.status_code != 200:
+                    body_preview = resp.text[:512]
+                    log(
+                        "worker",
+                        "warning",
+                        (
+                            f"Task {effective_task_id or '-'} upstream sync error: status={resp.status_code} "
+                            f"messages={msg_count} last_role={last_role!r} body={body_preview!r}"
+                        ),
+                        "openaix",
+                    )
+                    if task is not None:
+                        await self._finalize_llm_call(task, history_entry, status="http_error", http_status=resp.status_code, error_code="UPSTREAM_ERROR")
+                    result = WorkerResult(
+                        ok=False,
+                        error={
+                            "code": "UPSTREAM_ERROR",
+                            "message": f"Upstream returned HTTP {resp.status_code}",
+                            "body": body_preview,
+                        },
+                    )
+                else:
+                    try:
+                        data = json.loads(raw_response)
+                    except json.JSONDecodeError:
+                        body_preview = resp.text[:512]
+                        log(
+                            "worker",
+                            "warning",
+                            (
+                                f"Task {effective_task_id or '-'} upstream sync invalid json: "
+                                f"messages={msg_count} last_role={last_role!r} body={body_preview!r}"
+                            ),
+                            "openaix",
+                        )
+                        if task is not None:
+                            await self._finalize_llm_call(task, history_entry, status="invalid_json", http_status=resp.status_code, error_code="UPSTREAM_INVALID_JSON")
+                        result = WorkerResult(
+                            ok=False,
+                            error={
+                                "code": "UPSTREAM_INVALID_JSON",
+                                "message": "Upstream returned invalid JSON",
+                                "body": body_preview,
+                            },
+                        )
+                    else:
+                        if task is not None:
+                            await self._finalize_llm_call(task, history_entry, status="ok", http_status=resp.status_code, response=data)
 
-        try:
-            data = json.loads(raw_response)
-        except json.JSONDecodeError:
-            body_preview = resp.text[:512]
-            log(
-                "worker",
-                "warning",
-                (
-                    f"Task {task_id or '-'} upstream sync invalid json: "
-                    f"messages={msg_count} last_role={last_role!r} body={body_preview!r}"
-                ),
-                "openaix",
-            )
-            return WorkerResult(
-                ok=False,
-                error={
-                    "code": "UPSTREAM_INVALID_JSON",
-                    "message": "Upstream returned invalid JSON",
-                    "body": body_preview,
-                },
-            )
+                        if save_call:
+                            save_llm_call(self.id, effective_task_id, upstream_payload, data)
+                        return WorkerResult(ok=True, data=data, usage=data.get("usage"))
+            except httpx.ConnectError as exc:
+                if task is not None:
+                    await self._finalize_llm_call(task, history_entry, status="connect_error", error_code="UPSTREAM_UNREACHABLE")
+                log("worker", "warning", f"Upstream unreachable: {exc}", "openaix")
+                result = WorkerResult(ok=False, error={"code": "UPSTREAM_UNREACHABLE", "message": str(exc)})
+            except httpx.TimeoutException as exc:
+                if task is not None:
+                    await self._finalize_llm_call(task, history_entry, status="timeout", error_code="UPSTREAM_TIMEOUT")
+                timeout_message = self._build_timeout_message(exc)
+                log("worker", "warning", f"Upstream timeout: {timeout_message}", "openaix")
+                result = WorkerResult(ok=False, error={"code": "UPSTREAM_TIMEOUT", "message": timeout_message})
+            except Exception as exc:
+                if task is not None:
+                    await self._finalize_llm_call(task, history_entry, status="exception", error_code="EXCEPTION")
+                log("worker", "error", f"Unexpected error: {exc}", "openaix")
+                result = WorkerResult(ok=False, error={"code": "EXCEPTION", "message": str(exc)})
 
-        if save_call:
-            save_llm_call(self.id, task_id, upstream_payload, data)
-        return WorkerResult(ok=True, data=data, usage=data.get("usage"))
+            if not self._should_retry_result(
+                result,
+                attempt=attempt,
+                upstream_retry_count=upstream_retry_count,
+                error_retry_count=error_retry_count,
+            ):
+                return result
+
+            retry_limit = upstream_retry_count if result.error["code"] in self._UPSTREAM_RETRY_ERROR_CODES else error_retry_count
+            self._log_retry_attempt(effective_task_id, result.error["code"], attempt, retry_limit)
+
+        return result
 
     async def _forward_stream(
         self,
@@ -1059,47 +1207,108 @@ class OpenAIxWorker(BaseWorker):
         url: str,
         payload: dict,
         emit_chunk: Callable[[dict], Awaitable[None]] | None,
+        task: Task_agent | None = None,
         *,
         save_call: bool = False,
         task_id: str = "",
     ) -> WorkerResult:
         """Forward streaming chunks to the endpoint emitter."""
-        upstream_payload = {**payload, "stream": True}
-        final_data: dict | None = None
-        chunks: list[dict] = [] if save_call else []
-        request = self._build_json_request(client, url, upstream_payload)
-        if save_call:
-            save_llm_raw_call(self.id, request.content)
+        effective_task_id = task_id or (task.id if task is not None else "")
+        provider_id = self._resolve_task_provider_id(task) if task is not None else self._provider_id
+        upstream_retry_count, error_retry_count = self._resolve_retry_counts(task, payload, provider_id=provider_id)
+        result = WorkerResult(ok=False, error={"code": "EXCEPTION", "message": "retry loop not entered"})
 
-        stream_context = await self._open_stream_request(client, request, upstream_payload)
-        raw_parts: list[bytes] = [] if save_call else []
-        async with stream_context as resp:
-            if resp.status_code != 200:
-                raw_error = await self._read_response_body(resp)
+        for attempt in range(1, max(upstream_retry_count, error_retry_count) + 2):
+            history_entry = None
+            if task is not None:
+                history_entry = await self._begin_llm_call(
+                    task,
+                    url=url,
+                    payload=payload,
+                    provider_id=provider_id,
+                    save_call=save_call,
+                )
+            upstream_payload = {**payload, "stream": True}
+            final_data: dict | None = None
+            chunks: list[dict] = [] if save_call else []
+            emitted_any_chunk = False
+
+            async def tracked_emit_chunk(chunk: dict) -> None:
+                nonlocal emitted_any_chunk
+                emitted_any_chunk = True
+                if emit_chunk is not None:
+                    await emit_chunk(chunk)
+
+            try:
+                request = self._build_json_request(client, url, upstream_payload)
                 if save_call:
-                    save_llm_raw_call(self.id, raw_error)
-                log(
-                    "worker",
-                    "warning",
-                    f"Task {task_id or '-'} upstream stream error: status={resp.status_code}",
-                    "openaix",
-                )
-                return WorkerResult(
-                    ok=False,
-                    error={
-                        "code": "UPSTREAM_ERROR",
-                        "message": f"Upstream returned HTTP {resp.status_code}",
-                    },
-                )
+                    save_llm_raw_call(self.id, request.content)
 
-            final_data = await self._consume_stream_response(resp, emit_chunk, chunks, raw_parts, save_call)
+                stream_context = await self._open_stream_request(client, request, upstream_payload)
+                raw_parts: list[bytes] = [] if save_call else []
+                async with stream_context as resp:
+                    if resp.status_code != 200:
+                        raw_error = await self._read_response_body(resp)
+                        if save_call:
+                            save_llm_raw_call(self.id, raw_error)
+                        log(
+                            "worker",
+                            "warning",
+                            f"Task {effective_task_id or '-'} upstream stream error: status={resp.status_code}",
+                            "openaix",
+                        )
+                        if task is not None:
+                            await self._finalize_llm_call(task, history_entry, status="http_error", http_status=resp.status_code, error_code="UPSTREAM_ERROR")
+                        result = WorkerResult(
+                            ok=False,
+                            error={
+                                "code": "UPSTREAM_ERROR",
+                                "message": f"Upstream returned HTTP {resp.status_code}",
+                            },
+                        )
+                    else:
+                        final_data = await self._consume_stream_response(resp, tracked_emit_chunk, chunks, raw_parts, save_call)
 
-        if save_call:
-            save_llm_raw_call(self.id, b"".join(raw_parts))
+                        if save_call:
+                            save_llm_raw_call(self.id, b"".join(raw_parts))
 
-        if save_call:
-            save_llm_call(self.id, task_id, upstream_payload, {"stream_chunks": chunks})
-        return WorkerResult(ok=True, data=final_data, usage=(final_data or {}).get("usage"))
+                        if save_call:
+                            save_llm_call(self.id, effective_task_id, upstream_payload, {"stream_chunks": chunks})
+                        if task is not None:
+                            await self._finalize_llm_call(task, history_entry, status="ok", http_status=200, response={"stream_chunks": chunks, **(final_data or {})})
+                        return WorkerResult(ok=True, data=final_data, usage=(final_data or {}).get("usage"))
+            except httpx.ConnectError as exc:
+                if task is not None:
+                    await self._finalize_llm_call(task, history_entry, status="connect_error", error_code="UPSTREAM_UNREACHABLE")
+                log("worker", "warning", f"Upstream unreachable: {exc}", "openaix")
+                result = WorkerResult(ok=False, error={"code": "UPSTREAM_UNREACHABLE", "message": str(exc)})
+            except httpx.TimeoutException as exc:
+                if task is not None:
+                    await self._finalize_llm_call(task, history_entry, status="timeout", error_code="UPSTREAM_TIMEOUT")
+                timeout_message = self._build_timeout_message(exc)
+                log("worker", "warning", f"Upstream timeout: {timeout_message}", "openaix")
+                result = WorkerResult(ok=False, error={"code": "UPSTREAM_TIMEOUT", "message": timeout_message})
+            except Exception as exc:
+                if task is not None:
+                    await self._finalize_llm_call(task, history_entry, status="exception", error_code="EXCEPTION")
+                log("worker", "error", f"Unexpected error: {exc}", "openaix")
+                result = WorkerResult(ok=False, error={"code": "EXCEPTION", "message": str(exc)})
+
+            if emitted_any_chunk:
+                return result
+
+            if not self._should_retry_result(
+                result,
+                attempt=attempt,
+                upstream_retry_count=upstream_retry_count,
+                error_retry_count=error_retry_count,
+            ):
+                return result
+
+            retry_limit = upstream_retry_count if result.error["code"] in self._UPSTREAM_RETRY_ERROR_CODES else error_retry_count
+            self._log_retry_attempt(effective_task_id, result.error["code"], attempt, retry_limit)
+
+        return result
 
     @staticmethod
     def _build_json_request(client: httpx.AsyncClient, url: str, payload: dict) -> httpx.Request:

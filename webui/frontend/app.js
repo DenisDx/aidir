@@ -316,7 +316,13 @@ async function loadTasks() {
       <td>${t.worker_id || '—'}</td>
       <td style="color:var(--muted);font-size:12px">${fmtTime(t.created_at)}</td>
       <td style="color:var(--muted);font-size:12px">${fmtTaskDuration(t.started_at)}</td>
-      <td><button class="btn-sm" data-dashboard-json="${escapeHtml(t.id || '')}">Show JSON</button></td>
+      <td>${Number(t.llm_call_count || 0)}</td>
+      <td>
+        <div class="task-viewer-actions">
+          <button class="btn-sm" data-dashboard-json="${escapeHtml(t.id || '')}">Show JSON</button>
+          <button class="btn-sm" data-dashboard-steps="${escapeHtml(t.id || '')}">Show steps</button>
+        </div>
+      </td>
       <td>
         <div class="task-viewer-actions">
           <button class="btn-sm" data-dashboard-terminate="${escapeHtml(t.id || '')}" ${canTerminate ? '' : 'disabled'}>Terminate</button>
@@ -324,6 +330,7 @@ async function loadTasks() {
       </td>
     `;
     tr.querySelector('[data-dashboard-json]').addEventListener('click', () => openTaskViewerJson(t.id));
+    tr.querySelector('[data-dashboard-steps]').addEventListener('click', () => openTaskViewerSteps(t));
     const terminateBtn = tr.querySelector('[data-dashboard-terminate]');
     if (terminateBtn) {
       terminateBtn.addEventListener('click', () => terminateDashboardTask(t.id, terminateBtn));
@@ -571,7 +578,7 @@ function renderTaskViewerRows(tasks) {
   body.innerHTML = '';
   if (!tasks.length) {
     const tr = document.createElement('tr');
-    tr.innerHTML = '<td colspan="10" style="color:var(--muted)">No tasks match the current filters.</td>';
+    tr.innerHTML = '<td colspan="11" style="color:var(--muted)">No tasks match the current filters.</td>';
     body.appendChild(tr);
     return;
   }
@@ -586,6 +593,7 @@ function renderTaskViewerRows(tasks) {
       <td>${escapeHtml(task.type || '—')}</td>
       <td style="color:var(--muted);font-size:12px">${escapeHtml(fmtDateTime(task.created_at))}</td>
       <td style="color:var(--muted);font-size:12px">${escapeHtml(fmtTaskDuration(task.started_at, task.finished_at))}</td>
+      <td>${escapeHtml(String(Number(task.llm_call_count || 0)))}</td>
       <td style="color:var(--muted);font-size:12px">${escapeHtml(fmtDateTime(task.last_operation_at))}</td>
       <td><button class="btn-sm" data-task-json-id="${escapeHtml(task.id || '')}">Show JSON</button></td>
       <td><button class="btn-sm" data-task-steps-id="${escapeHtml(task.id || '')}">Show steps</button></td>
@@ -649,11 +657,13 @@ function openTaskViewerNodeModal(title, subtitle, bodyNode) {
 }
 
 function openTaskViewerModal(task) {
-  openTaskViewerTextModal(
-    `Task ${task.id || ''}`,
-    `${task.status || 'created'} · ${task.worker_id || 'no worker'}${task.envid ? ` · envid ${task.envid}` : ''}`,
-    JSON.stringify(task, null, 2),
-  );
+  const subtitle = `${task.status || 'created'} · ${task.worker_id || 'no worker'}${task.envid ? ` · envid ${task.envid}` : ''} · ${Number(task.llm_call_count || 0)} LLM calls`;
+  const viewer = window.TaskStepsViewer;
+  if (viewer && typeof viewer.renderTaskJsonView === 'function') {
+    openTaskViewerNodeModal(`Task ${task.id || ''} JSON`, subtitle, viewer.renderTaskJsonView(task));
+    return;
+  }
+  openTaskViewerTextModal(`Task ${task.id || ''} JSON`, subtitle, JSON.stringify(task, null, 2));
 }
 
 function closeTaskViewerModal() {

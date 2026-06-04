@@ -138,6 +138,7 @@ def _task_to_view_item(task: dict[str, Any]) -> dict[str, Any]:
         "worker_id": task.get("worker_id") or "",
         "envid": _task_envid(task),
         "priority": task.get("priority"),
+        "llm_call_count": int(task.get("llm_call_count") or 0),
         "created_at": created_at.isoformat() if created_at else None,
         "updated_at": updated_at.isoformat() if updated_at else None,
         "started_at": started_at.isoformat() if started_at else None,
@@ -152,6 +153,9 @@ def _task_from_hash(task_hash: dict[str, str]) -> dict[str, Any]:
     """Decode Redis task hash into JSON-friendly dict for API responses."""
     task: dict[str, Any] = dict(task_hash)
     task["priority"] = int(task.get("priority") or 0)
+    task["llm_call_count"] = int(task.get("llm_call_count") or 0)
+    raw_history = _parse_json_field(task.get("llm_call_history"))
+    task["llm_call_history"] = raw_history if isinstance(raw_history, list) else []
     task["external"] = str(task.get("external") or "0") in {"1", "true", "True"}
     for key in ("payload", "result", "error", "parent_context", "config", "context", "resource_requirements"):
         task[key] = _parse_json_field(task.get(key))
@@ -315,6 +319,7 @@ def create_app(
                     "type":       t.type,
                     "status":     t.status,
                     "priority":   t.priority,
+                    "llm_call_count": int(getattr(t, "llm_call_count", 0) or 0),
                     "worker_id":  t.worker_id,
                     "created_at": t.created_at.isoformat(),
                     "started_at": t.started_at.isoformat() if t.started_at else None,

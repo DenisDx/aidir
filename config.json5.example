@@ -294,6 +294,12 @@
               // "frequency_penalty": 0.0,
               // "top_k": 40,
               // "min_p": 0.0,
+                // Optional per-call retry policy for this model.
+                // upstream_retry_count retries transport/upstream response errors
+                // such as timeouts, connect failures, non-200 HTTP, or invalid JSON.
+                // error_retry_count retries other worker-side exceptions for this one LLM call.
+                // "upstream_retry_count": 1,
+                // "error_retry_count": 0,
               resources:{
                   "local_machine":{
                       VRAM:9800, 

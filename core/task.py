@@ -56,6 +56,8 @@ class Task:
     finished_at: datetime | None = None
     result: Any = None
     error: dict | None = None
+    llm_call_count: int = 0
+    llm_call_history: list[dict[str, Any]] = field(default_factory=list)
 
     # ── Timeouts (seconds; 0 = no limit) ─────────────────────────────────
     queue_timeout: int = 300
@@ -120,6 +122,8 @@ class Task:
             "payload":     json.dumps(self.payload),
             "result":      json.dumps(self.result) if self.result is not None else "",
             "error":       json.dumps(self.error) if self.error else "",
+            "llm_call_count": str(int(self.llm_call_count or 0)),
+            "llm_call_history": json.dumps(self.llm_call_history or []),
             "external":    "1" if self.external else "0",
             "parent_worker": self.parent_worker or "",
             "parent_context": json.dumps(self.parent_context) if self.parent_context else "",

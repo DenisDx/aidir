@@ -90,6 +90,9 @@ Generation parameter handling:
 3. If the caller already supplied the corresponding `options.*` value, `options.*` wins.
 4. Worker config may define overrideable defaults under `workers.items.<worker_id>.generation_defaults` using either the OpenAI/OpenAIx aliases or the direct Ollama option names.
 5. Provider model config may also define the same generation fields under `models.providers.<provider>.models[]`; these act as per-model defaults and are overridden by request values.
+6. Provider model config may define `upstream_retry_count` and `error_retry_count` under `models.providers.<provider>.models[]`.
+7. `upstream_retry_count` retries one outbound LLM HTTP call when the upstream fails with timeout/connect/HTTP/non-JSON errors; `error_retry_count` retries other worker-side exceptions for that same call.
+8. For smart-routed models, retry policy is taken from the requested smart model config first, then falls back to the resolved concrete provider/model config.
 
 ### 4.5 Processing notes
 

@@ -102,18 +102,21 @@ class CallOllamaWorker(BaseWorker):
                     return await self._forward_sync(client, url, payload, task, save_call)
 
         except httpx.ConnectError as exc:
+            await self._finalize_latest_started_llm_call(task, status="connect_error", error_code="UPSTREAM_UNREACHABLE")
             log("worker", "warning", f"Upstream Ollama unreachable: {exc}", "call_ollama")
             return WorkerResult(
                 ok=False,
                 error={"code": "UPSTREAM_UNREACHABLE", "message": str(exc)},
             )
         except httpx.TimeoutException as exc:
+            await self._finalize_latest_started_llm_call(task, status="timeout", error_code="UPSTREAM_TIMEOUT")
             log("worker", "warning", f"Upstream Ollama timed out: {exc}", "call_ollama")
             return WorkerResult(
                 ok=False,
                 error={"code": "UPSTREAM_TIMEOUT", "message": str(exc)},
             )
         except Exception as exc:
+            await self._finalize_latest_started_llm_call(task, status="exception", error_code="EXCEPTION")
             log("worker", "error", f"Unexpected error: {exc}", "call_ollama")
             return WorkerResult(
                 ok=False,
@@ -247,6 +250,13 @@ class CallOllamaWorker(BaseWorker):
         self, client: httpx.AsyncClient, url: str, payload: dict, task: Task_agent, save_call: bool = False
     ) -> WorkerResult:
         """Non-streaming: send request, wait for full response, return it."""
+        history_entry = await self._begin_llm_call(
+            task,
+            url=url,
+            payload=payload,
+            provider_id=self._resolve_task_provider_id(task),
+            save_call=save_call,
+        )
         upstream_payload = {**payload, "stream": False}
         request = self._build_json_request(client, url, upstream_payload)
         if save_call:
@@ -264,6 +274,7 @@ class CallOllamaWorker(BaseWorker):
                 f"Task {task.id} upstream sync error: status={resp.status_code} body={resp.text[:512]!r}",
                 "call_ollama",
             )
+            await self._finalize_llm_call(task, history_entry, status="http_error", http_status=resp.status_code, error_code="UPSTREAM_ERROR")
             return WorkerResult(
                 ok=False,
                 error={
@@ -274,6 +285,7 @@ class CallOllamaWorker(BaseWorker):
             )
 
         data = json.loads(raw_response)
+        await self._finalize_llm_call(task, history_entry, status="ok", http_status=resp.status_code, response=data)
         if save_call:
             save_llm_call(self.id, task.id, upstream_payload, data)
         return WorkerResult(ok=True, data=data, usage=data.get("usage"))
@@ -288,6 +300,13 @@ class CallOllamaWorker(BaseWorker):
         save_call: bool = False,
     ) -> WorkerResult:
         """Streaming: forward chunks from upstream to emit_chunk; return final state."""
+        history_entry = await self._begin_llm_call(
+            task,
+            url=url,
+            payload=payload,
+            provider_id=self._resolve_task_provider_id(task),
+            save_call=save_call,
+        )
         upstream_payload = {**payload, "stream": True}
         final_data: dict | None = None
         chunks: list[dict] = [] if save_call else []
@@ -308,6 +327,7 @@ class CallOllamaWorker(BaseWorker):
                     f"Task {task.id} upstream stream error: status={resp.status_code}",
                     "call_ollama",
                 )
+                await self._finalize_llm_call(task, history_entry, status="http_error", http_status=resp.status_code, error_code="UPSTREAM_ERROR")
                 return WorkerResult(
                     ok=False,
                     error={
@@ -323,6 +343,7 @@ class CallOllamaWorker(BaseWorker):
 
         if save_call:
             save_llm_call(self.id, task.id, upstream_payload, {"stream_chunks": chunks})
+        await self._finalize_llm_call(task, history_entry, status="ok", http_status=200, response={"stream_chunks": chunks, **(final_data or {})})
         return WorkerResult(ok=True, data=final_data, usage=(final_data or {}).get("usage"))
 
     @staticmethod

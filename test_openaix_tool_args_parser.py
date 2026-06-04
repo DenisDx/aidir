@@ -18,6 +18,8 @@ from core.endpoints.endpoint_ollama import Endpoint_ollama
 from core.endpoints.endpoint_openaix import Endpoint_openaix
 from workers.agent.call_ollama.app import CallOllamaWorker
 from workers.agent.openaix.app import OpenAIxWorker
+from workers.tool.web_search.app import WebSearchWorker
+from workers.tool.web_fetch.app import WebFetchWorker
 
 
 class _FakeConfig:
@@ -334,6 +336,97 @@ class TestOpenAIxToolInjection(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.data["message"]["tool_calls"][0]["function"]["name"], "caller_tool")
 
 
+class _FakeAsyncResponse:
+    """Small async HTTP response stub for tool worker tests."""
+
+    def __init__(self, *, status_code: int = 200, body: dict | None = None, text: str = "") -> None:
+        self.status_code = status_code
+        self._body = body or {}
+        self.text = text
+
+    def json(self) -> dict:
+        return dict(self._body)
+
+
+class _FakeAsyncClient:
+    """Capture outgoing Brave request arguments without real network IO."""
+
+    def __init__(self, *, get_response=None, post_response=None, capture=None, **kwargs) -> None:
+        self._get_response = get_response or _FakeAsyncResponse(body={"web": {"results": []}, "query": {"more_results_available": False}})
+        self._post_response = post_response or _FakeAsyncResponse(body={"grounding": {"generic": []}, "sources": {}})
+        self._capture = capture if capture is not None else {}
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def get(self, url, *, params=None, headers=None):
+        self._capture["get"] = {"url": url, "params": dict(params or {}), "headers": dict(headers or {})}
+        return self._get_response
+
+    async def post(self, url, *, json=None, headers=None):
+        self._capture["post"] = {"url": url, "json": dict(json or {}), "headers": dict(headers or {})}
+        return self._post_response
+
+
+class TestBraveToolSanitization(unittest.IsolatedAsyncioTestCase):
+    """Regression checks for Brave tool argument sanitization."""
+
+    async def test_web_search_trims_query_and_normalizes_search_lang(self) -> None:
+        """Prevents invalid Brave search params from reaching the upstream API."""
+        worker = WebSearchWorker()
+        worker._provider = "brave"
+        worker._api_key = "test-key"
+        worker._timeout = 1
+        worker._base_url = "https://api.search.brave.com"
+        capture: dict = {}
+        task = SimpleNamespace(payload={"arguments": {"query": "word " * 200, "search_lang": "en-US"}})
+
+        with patch("workers.tool.web_search.app.httpx.AsyncClient", side_effect=lambda *args, **kwargs: _FakeAsyncClient(capture=capture, *args, **kwargs)):
+            result = await worker.execute(task)
+
+        self.assertTrue(result.ok)
+        sent = capture["get"]["params"]
+        self.assertLessEqual(len(sent["q"]), 400)
+        self.assertLessEqual(len(sent["q"].split()), 50)
+        self.assertEqual(sent["search_lang"], "en")
+
+    async def test_web_fetch_trims_query_preserves_site_suffix_and_normalizes_search_lang(self) -> None:
+        """Keeps Brave fetch queries within limits while preserving the host restriction."""
+        worker = WebFetchWorker()
+        worker._provider = "brave"
+        worker._api_key = "test-key"
+        worker._timeout = 1
+        worker._base_url = "https://api.search.brave.com"
+        capture: dict = {}
+        task = SimpleNamespace(
+            payload={
+                "arguments": {
+                    "url": "https://example.com/path",
+                    "query": "quoted text " * 200,
+                    "search_lang": "english",
+                }
+            }
+        )
+
+        with patch("workers.tool.web_fetch.app.httpx.AsyncClient", side_effect=lambda *args, **kwargs: _FakeAsyncClient(capture=capture, *args, **kwargs)):
+            result = await worker.execute(task)
+
+        self.assertTrue(result.ok)
+        sent = capture["post"]["json"]
+        self.assertLessEqual(len(sent["q"]), 400)
+        self.assertIn("site:example.com", sent["q"])
+        self.assertEqual(sent["search_lang"], "en")
+
+    def test_web_fetch_tool_description_is_mcp_list(self) -> None:
+        """Returns the fetch tool schema in the same list form as other internal tools."""
+        description = WebFetchWorker().get_tool_description()
+        self.assertIsInstance(description, list)
+        self.assertEqual(description[0]["name"], "fetch")
+
+
 class TestOpenAIxTimeoutBehavior(unittest.TestCase):
     """Regression checks for timeout behavior in OpenAIx worker."""
 
@@ -363,6 +456,55 @@ class TestOpenAIxTimeoutBehavior(unittest.TestCase):
         self.assertEqual(
             OpenAIxWorker._build_timeout_message(exc),
             "ReadTimeout: POST http://127.0.0.1:11434/api/chat",
+        )
+
+    def test_resolve_retry_counts_prefers_requested_smart_model_alias(self) -> None:
+        """Uses retry policy from the requested smart model config, including alias matches."""
+        worker = OpenAIxWorker()
+        worker._core = _FakeCore(
+            {
+                "models": {
+                    "providers": {
+                        "smart": {
+                            "models": [
+                                {
+                                    "id": "smart_glm_internal",
+                                    "alias": "smart_glm-4.7",
+                                    "upstream_retry_count": 2,
+                                    "error_retry_count": 1,
+                                }
+                            ]
+                        },
+                        "ollama_local": {
+                            "models": [
+                                {
+                                    "id": "huihui_ai/glm-4.7-flash-abliterated:q4_K_S",
+                                    "upstream_retry_count": 0,
+                                    "error_retry_count": 0,
+                                }
+                            ]
+                        },
+                    }
+                }
+            }
+        )
+        task = Task_agent(payload={}, stream=False)
+        task.config = {
+            "route": {
+                "requested_provider": "smart",
+                "requested_model": "smart_glm-4.7",
+                "resolved_provider": "ollama_local",
+                "resolved_model": "huihui_ai/glm-4.7-flash-abliterated:q4_K_S",
+            }
+        }
+
+        self.assertEqual(
+            worker._resolve_retry_counts(
+                task,
+                {"model": "huihui_ai/glm-4.7-flash-abliterated:q4_K_S"},
+                provider_id="ollama_local",
+            ),
+            (2, 1),
         )
 
 
@@ -434,6 +576,129 @@ class TestWorkerWarningLogs(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.error["code"], "UPSTREAM_TIMEOUT")
         self.assertTrue(any(level == "warning" and "timeout" in message.lower() for _, level, message, _ in records))
 
+    async def test_openaix_forward_sync_retries_upstream_timeout_from_smart_model_policy(self) -> None:
+        """Retries one failed upstream call when the requested smart model enables upstream retries."""
+        worker = OpenAIxWorker()
+        worker._core = _FakeCore(
+            {
+                "models": {
+                    "providers": {
+                        "smart": {
+                            "models": [
+                                {
+                                    "id": "smart_glm_internal",
+                                    "alias": "smart_glm-4.7",
+                                    "upstream_retry_count": 1,
+                                }
+                            ]
+                        },
+                        "ollama_local": {
+                            "models": [
+                                {"id": "huihui_ai/glm-4.7-flash-abliterated:q4_K_S"}
+                            ]
+                        },
+                    }
+                }
+            }
+        )
+        task = Task_agent(
+            payload={"model": "huihui_ai/glm-4.7-flash-abliterated:q4_K_S", "messages": [{"role": "user", "content": "Hi"}]},
+            stream=False,
+        )
+        task.config = {
+            "route": {
+                "requested_provider": "smart",
+                "requested_model": "smart_glm-4.7",
+                "resolved_provider": "ollama_local",
+                "resolved_model": "huihui_ai/glm-4.7-flash-abliterated:q4_K_S",
+            }
+        }
+        request = httpx.Request("POST", "http://127.0.0.1:11434/api/chat")
+        response_text = '{"message":{"role":"assistant","content":"ok"},"done":true}'
+        send_attempts = 0
+
+        class FakeResponse:
+            status_code = 200
+            text = response_text
+
+            async def aread(self):
+                return response_text.encode("utf-8")
+
+        class FakeClient:
+            def build_request(self, method, url, json):
+                return httpx.Request(method, url, json=json)
+
+            async def send(self, request_obj):
+                nonlocal send_attempts
+                send_attempts += 1
+                if send_attempts == 1:
+                    raise httpx.ReadTimeout("", request=request)
+                return FakeResponse()
+
+        result = await worker._forward_sync(
+            FakeClient(),
+            "http://127.0.0.1:11434/api/chat",
+            {"model": "huihui_ai/glm-4.7-flash-abliterated:q4_K_S", "messages": [{"role": "user", "content": "Hi"}]},
+            task=task,
+            task_id=task.id,
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(send_attempts, 2)
+        self.assertEqual(task.llm_call_count, 2)
+
+    async def test_openaix_forward_sync_retries_non_upstream_exception_when_enabled(self) -> None:
+        """Uses error_retry_count for non-upstream exceptions raised during one LLM call."""
+        worker = OpenAIxWorker()
+        worker._core = _FakeCore(
+            {
+                "models": {
+                    "providers": {
+                        "ollama_local": {
+                            "models": [
+                                {
+                                    "id": "qwen3.5:9b",
+                                    "error_retry_count": 1,
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        )
+        task = Task_agent(payload={"model": "qwen3.5:9b", "messages": []}, stream=False)
+        response_text = '{"message":{"role":"assistant","content":"ok"},"done":true}'
+        send_attempts = 0
+
+        class FakeResponse:
+            status_code = 200
+            text = response_text
+
+            async def aread(self):
+                return response_text.encode("utf-8")
+
+        class FakeClient:
+            def build_request(self, method, url, json):
+                return httpx.Request(method, url, json=json)
+
+            async def send(self, request_obj):
+                nonlocal send_attempts
+                send_attempts += 1
+                if send_attempts == 1:
+                    raise RuntimeError("boom")
+                return FakeResponse()
+
+        result = await worker._forward_sync(
+            FakeClient(),
+            "http://127.0.0.1:11434/api/chat",
+            {"model": "qwen3.5:9b", "messages": []},
+            task=task,
+            task_id=task.id,
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(send_attempts, 2)
+
     async def test_openaix_forward_stream_logs_upstream_http_error_as_warning(self) -> None:
         """Logs streaming model HTTP refusal as warning on the OpenAIx worker."""
         worker = OpenAIxWorker()
@@ -462,6 +727,33 @@ class TestWorkerWarningLogs(unittest.IsolatedAsyncioTestCase):
 
 class TestRawCallLogs(unittest.IsolatedAsyncioTestCase):
     """Regression checks for raw request/response call logging."""
+
+    async def test_call_ollama_forward_sync_increments_task_llm_call_count(self) -> None:
+        """Each non-streaming Ollama upstream call increments task llm_call_count once."""
+        worker = CallOllamaWorker()
+        task = Task_agent(payload={"model": "qwen3.5:9b", "messages": []}, stream=False)
+        response_text = '{"message":{"role":"assistant","content":"ok"},"done":true}'
+
+        class FakeResponse:
+            status_code = 200
+
+            async def aread(self):
+                return response_text.encode("utf-8")
+
+        class FakeClient:
+            def build_request(self, method, url, json):
+                return httpx.Request(method, url, json=json)
+
+            async def send(self, request):
+                return FakeResponse()
+
+        result = await worker._forward_sync(FakeClient(), "http://127.0.0.1:11434/api/chat", {"model": "qwen3.5:9b"}, task)
+
+        self.assertTrue(result.ok)
+        self.assertEqual(task.llm_call_count, 1)
+        self.assertEqual(len(task.llm_call_history), 1)
+        self.assertEqual(task.llm_call_history[0]["status"], "ok")
+        self.assertEqual(task.llm_call_history[0]["url_path"], "/api/chat")
 
     async def test_call_ollama_forward_sync_writes_raw_request_and_response(self) -> None:
         """Writes one raw request line and one raw response line for sync Ollama calls."""
@@ -539,6 +831,40 @@ class TestRawCallLogs(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b'"stream":true', raw_log.call_args_list[0].args[1])
         self.assertEqual(raw_log.call_args_list[1].args[1], (raw_line_1 + raw_line_2).encode("utf-8"))
         parsed_log.assert_called_once()
+
+    async def test_openaix_forward_sync_increments_task_llm_call_count(self) -> None:
+        """Each OpenAIx upstream call increments task llm_call_count once."""
+        worker = OpenAIxWorker()
+        task = Task_agent(payload={"model": "qwen3.5:9b", "messages": []}, stream=False)
+        response_text = '{"message":{"role":"assistant","content":"ok"},"done":true}'
+
+        class FakeResponse:
+            status_code = 200
+            text = response_text
+
+            async def aread(self):
+                return response_text.encode("utf-8")
+
+        class FakeClient:
+            def build_request(self, method, url, json):
+                return httpx.Request(method, url, json=json)
+
+            async def send(self, request):
+                return FakeResponse()
+
+        result = await worker._forward_sync(
+            FakeClient(),
+            "http://127.0.0.1:11434/api/chat",
+            {"model": "qwen3.5:9b", "messages": []},
+            task=task,
+            task_id=task.id,
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(task.llm_call_count, 1)
+        self.assertEqual(len(task.llm_call_history), 1)
+        self.assertEqual(task.llm_call_history[0]["status"], "ok")
+        self.assertEqual(task.llm_call_history[0]["url_path"], "/api/chat")
 
 
 class TestOpenAIxAuthHeaders(unittest.IsolatedAsyncioTestCase):
