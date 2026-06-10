@@ -309,6 +309,7 @@ async function loadTasks() {
   data.tasks.forEach(t => {
     const tr = document.createElement('tr');
     const canTerminate = ['created', 'queued', 'running'].includes(String(t.status || '').toLowerCase());
+    const requestPreview = escapeHtml(firstMessagePreview(t));
     tr.innerHTML = `
       <td style="font-family:monospace;font-size:11px">${t.id.slice(0, 8)}…</td>
       <td>${t.type}</td>
@@ -316,6 +317,7 @@ async function loadTasks() {
       <td>${t.worker_id || '—'}</td>
       <td style="color:var(--muted);font-size:12px">${fmtTime(t.created_at)}</td>
       <td style="color:var(--muted);font-size:12px">${fmtTaskDuration(t.started_at)}</td>
+      <td style="color:var(--muted);font-size:12px">${requestPreview}</td>
       <td>${Number(t.llm_call_count || 0)}</td>
       <td>
         <div class="task-viewer-actions">
@@ -441,6 +443,20 @@ function fmtTaskDuration(startedAt, finishedAt = null) {
   }
 
   return `${minutes}:${String(seconds).padStart(2, '0')}`;
+}
+
+function firstMessagePreview(task, maxLength = 40) {
+  const payload = task && typeof task.payload === 'object' ? task.payload : null;
+  const messages = Array.isArray(payload && payload.messages) ? payload.messages : [];
+  const firstMessage = messages.length > 0 && messages[0] && typeof messages[0] === 'object' ? messages[0] : null;
+  const rawContent = firstMessage ? firstMessage.content : '';
+  const content = Array.isArray(rawContent)
+    ? rawContent.filter(part => part != null).map(part => String(part)).join(' ')
+    : (rawContent == null ? '' : String(rawContent));
+  const normalized = content.replace(/\s+/g, ' ').trim();
+  if (!normalized) return '—';
+  if (normalized.length <= maxLength) return normalized;
+  return `${normalized.slice(0, Math.max(0, maxLength - 1))}…`;
 }
 
 function normalizeTaskViewerDate(value) {
@@ -578,13 +594,14 @@ function renderTaskViewerRows(tasks) {
   body.innerHTML = '';
   if (!tasks.length) {
     const tr = document.createElement('tr');
-    tr.innerHTML = '<td colspan="11" style="color:var(--muted)">No tasks match the current filters.</td>';
+    tr.innerHTML = '<td colspan="12" style="color:var(--muted)">No tasks match the current filters.</td>';
     body.appendChild(tr);
     return;
   }
 
   tasks.forEach(task => {
     const tr = document.createElement('tr');
+    const requestPreview = escapeHtml(firstMessagePreview(task));
     tr.innerHTML = `
       <td style="font-family:monospace;font-size:11px">${escapeHtml((task.id || '').slice(0, 8))}…</td>
       <td><span class="badge badge-${escapeHtml(task.status || 'created')}">${escapeHtml(task.status || 'created')}</span></td>
@@ -593,6 +610,7 @@ function renderTaskViewerRows(tasks) {
       <td>${escapeHtml(task.type || '—')}</td>
       <td style="color:var(--muted);font-size:12px">${escapeHtml(fmtDateTime(task.created_at))}</td>
       <td style="color:var(--muted);font-size:12px">${escapeHtml(fmtTaskDuration(task.started_at, task.finished_at))}</td>
+      <td style="color:var(--muted);font-size:12px">${requestPreview}</td>
       <td>${escapeHtml(String(Number(task.llm_call_count || 0)))}</td>
       <td style="color:var(--muted);font-size:12px">${escapeHtml(fmtDateTime(task.last_operation_at))}</td>
       <td><button class="btn-sm" data-task-json-id="${escapeHtml(task.id || '')}">Show JSON</button></td>
@@ -659,8 +677,8 @@ function openTaskViewerNodeModal(title, subtitle, bodyNode) {
 function openTaskViewerModal(task) {
   const subtitle = `${task.status || 'created'} · ${task.worker_id || 'no worker'}${task.envid ? ` · envid ${task.envid}` : ''} · ${Number(task.llm_call_count || 0)} LLM calls`;
   const viewer = window.TaskStepsViewer;
-  if (viewer && typeof viewer.renderTaskJsonView === 'function') {
-    openTaskViewerNodeModal(`Task ${task.id || ''} JSON`, subtitle, viewer.renderTaskJsonView(task));
+  if (viewer && typeof viewer.renderTaskDetailsView === 'function') {
+    openTaskViewerNodeModal(`Task ${task.id || ''} details`, subtitle, viewer.renderTaskDetailsView(task));
     return;
   }
   openTaskViewerTextModal(`Task ${task.id || ''} JSON`, subtitle, JSON.stringify(task, null, 2));
@@ -708,7 +726,13 @@ async function openTaskViewerSteps(task) {
   const taskId = task?.id;
   if (!taskId) return;
 
-  const logFile = taskViewerLogFile(task);
+  let currentTask = task;
+  const taskData = await apiGet(`/api/tasks/viewer/${encodeURIComponent(taskId)}`);
+  if (taskData?.task) {
+    currentTask = taskData.task;
+  }
+
+  const logFile = taskViewerLogFile(currentTask);
   const contains = `"task_id": "${taskId}"`;
   const params = new URLSearchParams({
     file: logFile,
@@ -726,7 +750,7 @@ async function openTaskViewerSteps(task) {
 
   const viewer = window.TaskStepsViewer;
   if (viewer && typeof viewer.renderStepsView === 'function') {
-    const rendered = viewer.renderStepsView(task, data);
+    const rendered = viewer.renderStepsView(currentTask, data);
     openTaskViewerNodeModal(rendered.title, rendered.subtitle, rendered.bodyNode);
     return;
   }

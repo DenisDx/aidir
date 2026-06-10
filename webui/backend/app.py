@@ -123,30 +123,15 @@ def _task_last_operation_at(task: dict[str, Any]) -> datetime | None:
     return None
 
 
-def _task_to_view_item(task: dict[str, Any]) -> dict[str, Any]:
-    """Project a raw task record to a compact viewer row and keep full JSON-ready data."""
-    created_at = _parse_dt(task.get("created_at"))
-    updated_at = _parse_dt(task.get("updated_at"))
-    started_at = _parse_dt(task.get("started_at"))
-    finished_at = _parse_dt(task.get("finished_at"))
+def _task_to_api_item(task: dict[str, Any]) -> dict[str, Any]:
+    """Return a single normalized task shape for WebUI list and detail APIs."""
     last_op = _task_last_operation_at(task)
-
-    return {
-        "id": task.get("id", ""),
-        "type": task.get("type", ""),
-        "status": task.get("status", ""),
-        "worker_id": task.get("worker_id") or "",
-        "envid": _task_envid(task),
-        "priority": task.get("priority"),
-        "llm_call_count": int(task.get("llm_call_count") or 0),
-        "created_at": created_at.isoformat() if created_at else None,
-        "updated_at": updated_at.isoformat() if updated_at else None,
-        "started_at": started_at.isoformat() if started_at else None,
-        "finished_at": finished_at.isoformat() if finished_at else None,
-        "last_operation_at": last_op.isoformat() if last_op else None,
-        "parent_worker": task.get("parent_worker") or "",
-        "task": task,
-    }
+    item = dict(task)
+    item["worker_id"] = item.get("worker_id") or ""
+    item["parent_worker"] = item.get("parent_worker") or ""
+    item["envid"] = _task_envid(item)
+    item["last_operation_at"] = last_op.isoformat() if last_op else None
+    return item
 
 
 def _task_from_hash(task_hash: dict[str, str]) -> dict[str, Any]:
@@ -313,19 +298,7 @@ def create_app(
     async def get_tasks(session: dict = Depends(_require_session)):
         tasks = core.queue.list_tasks()
         return {
-            "tasks": [
-                {
-                    "id":         t.id,
-                    "type":       t.type,
-                    "status":     t.status,
-                    "priority":   t.priority,
-                    "llm_call_count": int(getattr(t, "llm_call_count", 0) or 0),
-                    "worker_id":  t.worker_id,
-                    "created_at": t.created_at.isoformat(),
-                    "started_at": t.started_at.isoformat() if t.started_at else None,
-                }
-                for t in tasks
-            ]
+            "tasks": [_task_to_api_item(_task_from_hash(t.to_redis_hash())) for t in tasks]
         }
 
     @app.get("/api/tasks/viewer/meta")
@@ -390,7 +363,7 @@ def create_app(
             if op_to and last_op and last_op > op_to:
                 continue
 
-            items.append(_task_to_view_item(task))
+            items.append(_task_to_api_item(task))
 
         items.sort(key=lambda item: item.get("last_operation_at") or item.get("created_at") or "", reverse=True)
         return {
@@ -403,13 +376,13 @@ def create_app(
         """Return full JSON for one task, from live memory or Redis."""
         live_task = core.queue.get_task(task_id) if core.queue else None
         if live_task is not None:
-            return {"task": _task_from_hash(live_task.to_redis_hash())}
+            return {"task": _task_to_api_item(_task_from_hash(live_task.to_redis_hash()))}
 
         ns = core.config.get("instance", "aidir")
         raw = await core.redis.hgetall(f"{ns}:task:{task_id}")
         if not raw:
             raise HTTPException(status_code=404, detail="Task not found")
-        return {"task": _task_from_hash(raw)}
+        return {"task": _task_to_api_item(_task_from_hash(raw))}
 
     @app.post("/api/tasks/{task_id}/terminate")
     async def terminate_task(task_id: str, session: dict = Depends(_require_session)):
@@ -419,7 +392,7 @@ def create_app(
             raise HTTPException(status_code=404, detail="Task not found")
 
         log("webui", "warn", f"Task termination requested by user {session['login']}: {task_id}", "control")
-        return {"ok": True, "task": _task_from_hash(task_hash)}
+        return {"ok": True, "task": _task_to_api_item(_task_from_hash(task_hash))}
 
     # ── Status ────────────────────────────────────────────────────────────────
 

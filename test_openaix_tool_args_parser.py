@@ -731,7 +731,13 @@ class TestRawCallLogs(unittest.IsolatedAsyncioTestCase):
     async def test_call_ollama_forward_sync_increments_task_llm_call_count(self) -> None:
         """Each non-streaming Ollama upstream call increments task llm_call_count once."""
         worker = CallOllamaWorker()
-        task = Task_agent(payload={"model": "qwen3.5:9b", "messages": []}, stream=False)
+        task = Task_agent(
+            payload={
+                "model": "qwen3.5:9b",
+                "messages": [{"role": "user", "content": "Why did the task hang on inference?"}],
+            },
+            stream=False,
+        )
         response_text = '{"message":{"role":"assistant","content":"ok"},"done":true}'
 
         class FakeResponse:
@@ -754,6 +760,8 @@ class TestRawCallLogs(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(task.llm_call_history), 1)
         self.assertEqual(task.llm_call_history[0]["status"], "ok")
         self.assertEqual(task.llm_call_history[0]["url_path"], "/api/chat")
+        self.assertEqual(task.llm_call_history[0]["request_text"], "user: Why did the task hang on inference?")
+        self.assertEqual(task.llm_call_history[0]["request_preview"], "user: Why did the task hang on inference?")
 
     async def test_call_ollama_forward_sync_writes_raw_request_and_response(self) -> None:
         """Writes one raw request line and one raw response line for sync Ollama calls."""
@@ -835,7 +843,13 @@ class TestRawCallLogs(unittest.IsolatedAsyncioTestCase):
     async def test_openaix_forward_sync_increments_task_llm_call_count(self) -> None:
         """Each OpenAIx upstream call increments task llm_call_count once."""
         worker = OpenAIxWorker()
-        task = Task_agent(payload={"model": "qwen3.5:9b", "messages": []}, stream=False)
+        task = Task_agent(
+            payload={
+                "model": "qwen3.5:9b",
+                "messages": [{"role": "user", "content": "Show the pending LLM request"}],
+            },
+            stream=False,
+        )
         response_text = '{"message":{"role":"assistant","content":"ok"},"done":true}'
 
         class FakeResponse:
@@ -865,6 +879,8 @@ class TestRawCallLogs(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(task.llm_call_history), 1)
         self.assertEqual(task.llm_call_history[0]["status"], "ok")
         self.assertEqual(task.llm_call_history[0]["url_path"], "/api/chat")
+        self.assertEqual(task.llm_call_history[0]["request_text"], "user: Show the pending LLM request")
+        self.assertEqual(task.llm_call_history[0]["request_preview"], "user: Show the pending LLM request")
 
 
 class TestOpenAIxAuthHeaders(unittest.IsolatedAsyncioTestCase):

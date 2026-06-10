@@ -12,6 +12,7 @@ from typing import Any, Awaitable, Callable
 import httpx
 
 from core.call_log import save_llm_call, save_llm_raw_call
+from core.error_logging import log_exception
 from core.worker import BaseWorker, WorkerResult
 from core.task import Task
 from core.task_types.task_agent import Task_agent
@@ -117,11 +118,43 @@ class CallOllamaWorker(BaseWorker):
             )
         except Exception as exc:
             await self._finalize_latest_started_llm_call(task, status="exception", error_code="EXCEPTION")
-            log("worker", "error", f"Unexpected error: {exc}", "call_ollama")
+            error_message = self._describe_exception(exc)
+            log_exception(
+                "worker",
+                "call_ollama",
+                f"Unexpected error task={task.id} provider={provider_id} url={url} stream={stream}",
+                exc,
+            )
             return WorkerResult(
                 ok=False,
-                error={"code": "EXCEPTION", "message": str(exc)},
+                error={"code": "EXCEPTION", "message": error_message},
             )
+
+    @staticmethod
+    def _describe_exception(exc: BaseException) -> str:
+        """Build a non-empty generic exception message for API responses and logs."""
+        detail = str(exc).strip()
+        if detail:
+            return f"{exc.__class__.__name__}: {detail}"
+
+        request = getattr(exc, "request", None)
+        if request is not None:
+            method = getattr(request, "method", "") or ""
+            url = getattr(request, "url", None)
+            if method and url is not None:
+                return f"{exc.__class__.__name__}: {method} {url}"
+
+        cause = getattr(exc, "__cause__", None) or getattr(exc, "__context__", None)
+        if cause is not None:
+            cause_detail = str(cause).strip()
+            if cause_detail:
+                return f"{exc.__class__.__name__}: caused by {cause.__class__.__name__}: {cause_detail}"
+
+        repr_text = repr(exc).strip()
+        if repr_text:
+            return repr_text
+
+        return exc.__class__.__name__
 
     def _apply_model_context_window(self, payload: dict, provider_id: str | None = None) -> dict:
         """Set options.num_ctx from model config contextWindow when not explicitly provided."""

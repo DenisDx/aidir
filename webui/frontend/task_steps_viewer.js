@@ -45,6 +45,17 @@
     return formatDurationMs(endTime - started.getTime());
   }
 
+  function formatCallDuration(entry) {
+    const durationMs = Number(entry?.duration_ms);
+    if (Number.isFinite(durationMs) && durationMs > 0) {
+      return formatDurationMs(durationMs);
+    }
+    if (String(entry?.status || '').toLowerCase() === 'started') {
+      return formatTaskDuration(entry?.started_at, null);
+    }
+    return '—';
+  }
+
   function formatNs(nsValue) {
     if (!Number.isFinite(nsValue) || nsValue < 0) return '—';
     return formatDurationMs(nsValue / 1000000);
@@ -310,9 +321,12 @@
       summary.appendChild(title);
 
       const meta = createElement('div', 'task-step-entry-meta');
-      meta.appendChild(createElement('span', '', `Finished ${step.tsLabel}`));
+      meta.appendChild(createElement('span', '', step.isPending ? `Started ${step.tsLabel}` : `Finished ${step.tsLabel}`));
       meta.appendChild(createElement('span', '', `Tokens ${formatInteger(step.totalTokens)}`));
       meta.appendChild(createElement('span', '', `Tools ${formatInteger(step.toolCallCount)}`));
+      if (step.isPending) {
+        meta.appendChild(createElement('span', '', 'Waiting for response'));
+      }
       summary.appendChild(meta);
       summary.appendChild(createElement('div', 'task-step-entry-preview', step.preview));
       details.appendChild(summary);
@@ -322,6 +336,10 @@
         body.appendChild(createElement('div', 'task-steps-note', `JSON parse error: ${step.parseError}`));
         body.appendChild(createElement('pre', 'json-raw-fallback', step.rawLine));
       } else {
+        if (step.isPending && step.requestText) {
+          body.appendChild(createElement('div', 'task-steps-summary-label', 'Request text'));
+          body.appendChild(createElement('pre', 'json-raw-fallback', step.requestText));
+        }
         body.appendChild(renderJsonTree(step.entry));
       }
       details.appendChild(body);
@@ -335,6 +353,42 @@
     return createElement('div', 'task-steps-empty', 'No matching log entries found.');
   }
 
+  function buildPendingStep(task, steps) {
+    const history = Array.isArray(task?.llm_call_history) ? task.llm_call_history : [];
+    if (!history.length) return null;
+
+    const entry = history[history.length - 1];
+    if (!entry || String(entry.status || '').toLowerCase() !== 'started') return null;
+
+    return {
+      index: steps.length + 1,
+      rawLine: '',
+      entry: {
+        task_id: task?.id || '',
+        ts: entry.started_at,
+        pending: true,
+        request: {
+          model: entry.model || '',
+          text: entry.request_text || entry.request_preview || '',
+        },
+        llm_call_history_entry: entry,
+      },
+      parseError: '',
+      ts: parseDate(entry.started_at),
+      tsLabel: formatDateTime(entry.started_at),
+      modelDurationNs: 0,
+      promptTokens: 0,
+      completionTokens: 0,
+      totalTokens: 0,
+      toolCallCount: 0,
+      toolCallNames: [],
+      stepDurationMs: NaN,
+      preview: clipText(entry.request_text || entry.request_preview || 'Waiting for response', 180),
+      requestText: entry.request_text || entry.request_preview || '',
+      isPending: true,
+    };
+  }
+
   function renderCallHistory(task) {
     const history = Array.isArray(task?.llm_call_history) ? task.llm_call_history : [];
     if (!history.length) {
@@ -344,7 +398,7 @@
     const wrap = createElement('div', 'task-steps-table-wrap');
     const table = createElement('table', 'task-steps-table');
     const thead = document.createElement('thead');
-    thead.innerHTML = '<tr><th>#</th><th>Started</th><th>Time</th><th>Path</th><th>Model</th><th>Status</th><th>Details</th></tr>';
+    thead.innerHTML = '<tr><th>#</th><th>Started</th><th>Time</th><th>Path</th><th>Model</th><th>Status</th><th>Request</th><th>Details</th></tr>';
     table.appendChild(thead);
 
     const tbody = document.createElement('tbody');
@@ -360,13 +414,18 @@
         entry.error_code ? `error=${entry.error_code}` : '',
       ].filter(Boolean).join(' · ') || '—';
 
+      const statusLabel = String(entry.status || '').toLowerCase() === 'started'
+        ? 'started (waiting for response)'
+        : (entry.status || '—');
+
       [
         String(entry.call_index || '—'),
         formatDateTime(entry.started_at),
-        formatDurationMs(Number(entry.duration_ms)),
+        formatCallDuration(entry),
         entry.url_path || '—',
         entry.model || '—',
-        entry.status || '—',
+        statusLabel,
+        clipText(entry.request_preview || '', 180),
         details,
       ].forEach(value => {
         tr.appendChild(createElement('td', '', value));
@@ -409,6 +468,10 @@
   function renderStepsView(task, searchResult) {
     const lines = Array.isArray(searchResult?.lines) ? searchResult.lines : [];
     const steps = deriveStepDurations(task || {}, lines.map(parseStep));
+    const pendingStep = buildPendingStep(task || {}, steps);
+    if (pendingStep) {
+      steps.push(pendingStep);
+    }
 
     const bodyNode = createElement('div', 'task-steps-view');
     bodyNode.appendChild(renderSummaryGrid(task || {}, searchResult || {}, steps));
@@ -429,9 +492,13 @@
       bodyNode.appendChild(renderEmptyState());
     }
 
-    const subtitleParts = [searchResult?.file || '—', `${searchResult?.count ?? steps.length} entr${(searchResult?.count ?? steps.length) === 1 ? 'y' : 'ies'}`];
+    const realCount = Number(searchResult?.count ?? lines.length);
+    const subtitleParts = [searchResult?.file || '—', `${realCount} log entr${realCount === 1 ? 'y' : 'ies'}`];
+    if (pendingStep) {
+      subtitleParts.push('1 pending request');
+    }
     if (searchResult?.truncated) {
-      subtitleParts.push(`showing first ${steps.length}`);
+      subtitleParts.push(`showing first ${lines.length}`);
     }
 
     return {

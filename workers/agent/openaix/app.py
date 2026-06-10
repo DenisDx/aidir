@@ -16,6 +16,7 @@ import httpx
 from core import log
 from core.call_log import save_llm_call, save_llm_raw_call
 from core.context import Context
+from core.error_logging import log_exception
 from core.task import Task, STATUS_COMPLETED, STATUS_FAILED, STATUS_CANCELED
 from core.task_types.task_agent import Task_agent
 from core.task_types.task_tool import Task_tool
@@ -177,8 +178,14 @@ class OpenAIxWorker(BaseWorker):
             return WorkerResult(ok=False, error={"code": "UPSTREAM_TIMEOUT", "message": timeout_message})
         except Exception as exc:
             await self._finalize_latest_started_llm_call(task, status="exception", error_code="EXCEPTION")
-            log("worker", "error", f"Unexpected error: {exc}", "openaix")
-            return WorkerResult(ok=False, error={"code": "EXCEPTION", "message": str(exc)})
+            error_message = self._describe_exception(exc)
+            log_exception(
+                "worker",
+                "openaix",
+                f"Unexpected error task={task.id} provider={provider_id} url={url} stream={task.stream}",
+                exc,
+            )
+            return WorkerResult(ok=False, error={"code": "EXCEPTION", "message": error_message})
 
     def _resolve_upstream_timeout(self, task: Task) -> int:
         """Return per-request upstream timeout for one HTTP call to the LLM."""
@@ -201,6 +208,32 @@ class OpenAIxWorker(BaseWorker):
             url = getattr(request, "url", None)
             if method and url is not None:
                 return f"{exc.__class__.__name__}: {method} {url}"
+
+        return exc.__class__.__name__
+
+    @staticmethod
+    def _describe_exception(exc: BaseException) -> str:
+        """Build a non-empty generic exception message for API responses and logs."""
+        detail = str(exc).strip()
+        if detail:
+            return f"{exc.__class__.__name__}: {detail}"
+
+        request = getattr(exc, "request", None)
+        if request is not None:
+            method = getattr(request, "method", "") or ""
+            url = getattr(request, "url", None)
+            if method and url is not None:
+                return f"{exc.__class__.__name__}: {method} {url}"
+
+        cause = getattr(exc, "__cause__", None) or getattr(exc, "__context__", None)
+        if cause is not None:
+            cause_detail = str(cause).strip()
+            if cause_detail:
+                return f"{exc.__class__.__name__}: caused by {cause.__class__.__name__}: {cause_detail}"
+
+        repr_text = repr(exc).strip()
+        if repr_text:
+            return repr_text
 
         return exc.__class__.__name__
 
@@ -608,7 +641,14 @@ class OpenAIxWorker(BaseWorker):
                 result = await worker.execute(task)
             except Exception as exc:
                 task.worker_id = original_worker_id
-                return WorkerResult(ok=False, error={"code": "WORKER_EXCEPTION", "message": f"{worker_name}: {exc}"})
+                error_message = self._describe_exception(exc)
+                log_exception(
+                    "worker",
+                    "openaix",
+                    f"Internal worker execute failed parent_task={task.id} worker={worker_name}",
+                    exc,
+                )
+                return WorkerResult(ok=False, error={"code": "WORKER_EXCEPTION", "message": f"{worker_name}: {error_message}"})
 
             if not result.ok:
                 task.worker_id = original_worker_id
@@ -1185,8 +1225,14 @@ class OpenAIxWorker(BaseWorker):
             except Exception as exc:
                 if task is not None:
                     await self._finalize_llm_call(task, history_entry, status="exception", error_code="EXCEPTION")
-                log("worker", "error", f"Unexpected error: {exc}", "openaix")
-                result = WorkerResult(ok=False, error={"code": "EXCEPTION", "message": str(exc)})
+                error_message = self._describe_exception(exc)
+                log_exception(
+                    "worker",
+                    "openaix",
+                    f"Unexpected sync upstream error task={effective_task_id or '-'} provider={provider_id} url={url} attempt={attempt}",
+                    exc,
+                )
+                result = WorkerResult(ok=False, error={"code": "EXCEPTION", "message": error_message})
 
             if not self._should_retry_result(
                 result,
@@ -1291,8 +1337,14 @@ class OpenAIxWorker(BaseWorker):
             except Exception as exc:
                 if task is not None:
                     await self._finalize_llm_call(task, history_entry, status="exception", error_code="EXCEPTION")
-                log("worker", "error", f"Unexpected error: {exc}", "openaix")
-                result = WorkerResult(ok=False, error={"code": "EXCEPTION", "message": str(exc)})
+                error_message = self._describe_exception(exc)
+                log_exception(
+                    "worker",
+                    "openaix",
+                    f"Unexpected stream upstream error task={effective_task_id or '-'} provider={provider_id} url={url} attempt={attempt}",
+                    exc,
+                )
+                result = WorkerResult(ok=False, error={"code": "EXCEPTION", "message": error_message})
 
             if emitted_any_chunk:
                 return result

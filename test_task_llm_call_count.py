@@ -94,7 +94,13 @@ class TestTaskLlmCallCount(unittest.IsolatedAsyncioTestCase):
         task.status = "running"
         task.worker_id = "openaix"
         task.llm_call_count = 4
-        task.llm_call_history = [{"call_index": 4, "status": "timeout", "url_path": "/api/chat"}]
+        task.llm_call_history = [{
+            "call_index": 4,
+            "status": "started",
+            "url_path": "/api/chat",
+            "request_text": "user: Diagnose the last hanging step in full detail",
+            "request_preview": "user: Diagnose the last hanging step",
+        }]
         core = _FakeCore(task)
 
         with patch("webui.backend.app._get_session", return_value={"permissions": ["all"], "login": "tester"}):
@@ -107,7 +113,9 @@ class TestTaskLlmCallCount(unittest.IsolatedAsyncioTestCase):
             task_response = client.get(f"/api/tasks/viewer/{task.id}")
             self.assertEqual(task_response.status_code, 200)
             self.assertEqual(task_response.json()["task"]["llm_call_count"], 4)
-            self.assertEqual(task_response.json()["task"]["llm_call_history"][0]["status"], "timeout")
+            self.assertEqual(task_response.json()["task"]["llm_call_history"][0]["status"], "started")
+            self.assertEqual(task_response.json()["task"]["llm_call_history"][0]["request_text"], "user: Diagnose the last hanging step in full detail")
+            self.assertEqual(task_response.json()["task"]["llm_call_history"][0]["request_preview"], "user: Diagnose the last hanging step")
 
 
 if __name__ == "__main__":

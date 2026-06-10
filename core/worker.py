@@ -168,6 +168,8 @@ class BaseWorker:
             "last_role": str(messages[-1].get("role") or "") if messages and isinstance(messages[-1], dict) else "",
             "has_tools": bool(request_payload.get("tools")),
             "input_count": input_count,
+            "request_text": self._extract_llm_request_text(request_payload),
+            "request_preview": self._summarize_llm_request(request_payload),
             "save_llm_request": bool(save_call),
             "status": "started",
         }
@@ -266,6 +268,80 @@ class BaseWorker:
             summary["stream_chunk_count"] = len(stream_chunks)
 
         return summary
+
+    @classmethod
+    def _summarize_llm_request(cls, payload: dict[str, Any] | None) -> str:
+        """Build a compact preview of the outbound LLM request."""
+        return cls._extract_llm_request_text(payload, limit=240)
+
+    @classmethod
+    def _extract_llm_request_text(cls, payload: dict[str, Any] | None, limit: int = 4000) -> str:
+        """Extract a readable text form of the outbound LLM request."""
+        if not isinstance(payload, dict):
+            return ""
+
+        messages = payload.get("messages") if isinstance(payload.get("messages"), list) else []
+        if messages:
+            last_message = messages[-1] if isinstance(messages[-1], dict) else {}
+            role = str(last_message.get("role") or "").strip()
+            content_preview = cls._summarize_content(last_message.get("content"), limit=limit)
+            if content_preview and role:
+                return cls._clip_text(f"{role}: {content_preview}", limit)
+            if content_preview:
+                return cls._clip_text(content_preview, limit)
+
+        input_preview = cls._summarize_content(payload.get("input"), limit=limit)
+        if input_preview:
+            return cls._clip_text(input_preview, limit)
+
+        model = str(payload.get("model") or "").strip()
+        if model:
+            return cls._clip_text(f"model={model}", limit)
+        return ""
+
+    @classmethod
+    def _summarize_content(cls, content: Any, limit: int = 240) -> str:
+        """Flatten common message/input structures into a short plain-text preview."""
+        if isinstance(content, str):
+            return cls._clip_text(content, limit)
+
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                part = cls._summarize_content(item, limit=limit)
+                if part:
+                    parts.append(part)
+                if len(" ".join(parts)) >= limit:
+                    break
+            return cls._clip_text(" ".join(parts), limit)
+
+        if isinstance(content, dict):
+            item_type = str(content.get("type") or "").strip()
+            if item_type in {"text", "input_text"}:
+                return cls._summarize_content(content.get("text"), limit=limit)
+            if item_type in {"image", "input_image", "image_url"}:
+                return "[image]"
+            if item_type in {"tool_result", "tool_response"}:
+                tool_name = str(content.get("tool_name") or content.get("name") or "tool").strip()
+                return f"[{tool_name} result]"
+            if "content" in content:
+                return cls._summarize_content(content.get("content"), limit=limit)
+            if "text" in content:
+                return cls._summarize_content(content.get("text"), limit=limit)
+            if item_type:
+                return f"[{item_type}]"
+
+        return ""
+
+    @staticmethod
+    def _clip_text(value: Any, limit: int) -> str:
+        """Normalize whitespace and clip text to a bounded length."""
+        text = " ".join(str(value or "").split())
+        if not text:
+            return ""
+        if len(text) <= limit:
+            return text
+        return text[: max(0, limit - 1)] + "…"
 
 
 class BaseToolWorker(BaseWorker):
