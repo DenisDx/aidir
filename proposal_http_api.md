@@ -6,6 +6,8 @@ This proposal defines a lightweight built-in HTTP API tool for aidir.
 
 The goal is to add one injectable tool worker that can call token-authenticated HTTP APIs and return normalized structured results to agents.
 
+The same worker also covers the simpler case of fetching a plain URL with no credentials at all — an agent can request any URL and receive the raw page content without configuring an auth scheme.
+
 The tool must:
 
 1. be implemented as a normal `tool` worker, not as a separate agent or subsystem;
@@ -60,6 +62,7 @@ This keeps the implementation small and aligned with current aidir architecture.
 4. Make the tool injectable into agents exactly like existing `search`, `fetch`, and `selftest` tools.
 5. Return a normalized result envelope that is easy for models to consume.
 6. Keep the implementation autonomous and isolated from unrelated modules.
+7. Support unauthenticated URL fetches through connectors with `auth.type: none`, enabling agents to retrieve a plain URL without any credential setup.
 
 ## Non-Goals for v1
 
@@ -182,15 +185,15 @@ Recommended shape:
         "user_agent": "aidir-http-api/1.0",
         "max_response_chars": 50000,
         "connectors": {
-          "groupsio_cryonet3": {
+          "example_connector": {
             "enabled": true,
-            "base_url": "https://groups.io/api/v1",
+            "base_url": "https://api.example.com/v1",
             "auth": {
-              "type": "bearer_env",
-              "env": "GROUPS_IO_API_KEY"
+              "type": "bearer",
+              "key": "${EXAMPLE_API_KEY}"
             },
             "defaults": {
-              "group_name": "cryonet3"
+              "group_name": "example_group"
             },
             "operations": {
               "list_topics": {
@@ -199,6 +202,7 @@ Recommended shape:
                 "query": {
                   "group_name": "{group_name}"
                 },
+                "response_hook_file": "./workers/tool/http_api/hooks/groupsio_topics_hook.py",
                 "pagination": {
                   "type": "cursor",
                   "request_param": "page_token",
@@ -241,15 +245,16 @@ v1 should support only token-like credential forms that fit simple autonomous co
 
 Required auth types:
 
-1. `bearer_env`
-2. `header_env`
-3. `query_env`
-4. `bearer_file`
-5. `header_file`
+1. `none` — no authentication; the worker sends the request as-is, returning raw response body (HTML, plain text, or JSON); useful for agents that need to fetch a public URL directly
+2. `bearer`
+3. `header`
+4. `query`
+5. `bearer_file`
+6. `header_file`
 
 Behavior:
 
-1. env-based auth loads a secret from an environment variable;
+1. key-based auth reads secret values from config placeholders such as `${EXAMPLE_API_KEY}`;
 2. file-based auth loads a secret from a local file path;
 3. the tool injects the secret into headers or query params;
 4. the secret is never added to returned data, task payload, or tool descriptions.
@@ -258,13 +263,12 @@ Example:
 
 ```json5
 "auth": {
-  "type": "header_env",
-  "header": "X-API-Key",
-  "env": "GROUPS_IO_API_KEY"
+  "type": "bearer",
+  "key": "${EXAMPLE_API_KEY}"
 }
 ```
 
-`TBD`: should file-based secrets be allowed to come from arbitrary absolute paths, or should v1 restrict them to a known secrets directory for safer deployments?
+Decision for v1: file-based secrets are allowed to come from arbitrary external files via absolute paths.
 
 ## Operation Model
 
@@ -282,6 +286,7 @@ Each operation may define:
 8. `mode`
 9. `allowed_params`
 10. `timeout_seconds` override
+11. `response_hook_file`
 
 Template substitution should be simple and local.
 
@@ -293,7 +298,17 @@ Recommended source order for template values:
 
 If a required template variable is missing, the tool must fail with a structured validation error.
 
-`TBD`: should v1 support nested template expansion inside JSON bodies, or should it initially support only flat string substitution to keep implementation small?
+Decision for v1: start with flat string substitution only to keep implementation simple, while keeping operation/config structure forward-compatible for adding nested JSON-body templating later.
+
+Decision for v1: support optional per-operation response normalization hooks via local Python file paths configured in `response_hook_file`.
+
+Standardized hook invocation contract for v1:
+
+1. worker loads the module from `response_hook_file`;
+2. worker calls `transform_response(response: dict, context: dict) -> dict` when present;
+3. `response` contains the parsed upstream response body;
+4. `context` contains connector/operation identifiers and request metadata;
+5. return value replaces the response payload used by envelope normalization.
 
 ## Pagination Model
 
@@ -326,7 +341,7 @@ Suggested normalized paging output:
 }
 ```
 
-`TBD`: should v1 expose auto-pagination at all, or should it always return one page and require the model to call the tool again with `page_token`?
+Decision for v1: use bounded auto-pagination where possible, while still returning continuation metadata (`next_page_token` / equivalent) so callers can continue manually when needed.
 
 ## Response Envelope
 
@@ -337,7 +352,7 @@ Recommended success shape:
 ```json
 {
   "ok": true,
-  "connector": "groupsio_cryonet3",
+  "connector": "example_connector",
   "operation": "list_topics",
   "status_code": 200,
   "item": null,
@@ -356,7 +371,7 @@ Recommended failure shape:
 ```json
 {
   "ok": false,
-  "connector": "groupsio_cryonet3",
+  "connector": "example_connector",
   "operation": "list_topics",
   "error": {
     "code": "HTTP_API_HTTP_ERROR",
@@ -388,31 +403,21 @@ Optional extension inside the same architecture:
 1. allow `POST` for read-like search/query APIs that require request bodies;
 2. continue to reject mutating operations by default.
 
-`TBD`: should v1 allow `POST` at all when the remote API uses POST for safe query endpoints, or should the first implementation hard-limit itself to GET for maximum safety?
+Decision for v1: support both `GET` and safe query-style `POST` operations, while continuing to reject mutating operations by default.
 
 ## Retry and Timeout Behavior
 
-The worker should own its own HTTP retry behavior.
+The worker should own its own HTTP timeout behavior.
 
-Recommended worker-level settings:
+Recommended worker-level settings for v1:
 
 1. `request_timeout`
-2. `max_retries`
-3. `retry_backoff_seconds`
 
-Retry should apply only to transport-like cases:
+Retry-related settings are deferred for later versions.
 
-1. connect failures;
-2. read timeouts;
-3. optional 429 and 5xx when enabled.
+Decision for v1: no automatic retries; every request is a single attempt.
 
-Do not retry by default:
-
-1. 4xx auth failures;
-2. connector validation errors;
-3. malformed local configuration.
-
-`TBD`: should 429 handling be generic in v1, including optional parsing of `Retry-After`, or should that be deferred to keep the implementation minimal?
+Decision for v1: do not implement generic 429 retry handling and do not parse `Retry-After`; both are deferred.
 
 ## Injection Model
 
@@ -440,7 +445,7 @@ This means:
 2. the tool can also be exposed through the existing MCP endpoint if desired, because it is still a normal tool worker;
 3. tool discovery remains consistent with the rest of aidir.
 
-`TBD`: should v1 expose this worker through MCP by default, or should it remain internal-only unless explicitly enabled in endpoint config?
+Decision for v1: expose this worker through MCP by default, matching the `web_search` (Brave Search) policy, while still allowing explicit disablement via endpoint tool configuration.
 
 ## Required Code Changes
 
@@ -508,6 +513,7 @@ The implementation must follow these rules:
 4. logs must redact auth values;
 5. connector config must whitelist what operations are callable;
 6. the model must not be allowed to supply an arbitrary URL directly in v1.
+7. `response_hook_file` must be a local filesystem path from configuration; runtime must not accept hook paths from model/tool arguments.
 
 That last point is important.
 
@@ -527,6 +533,8 @@ Minimum test scope:
 8. pagination metadata extraction;
 9. secret redaction in logs/errors;
 10. tool description shape.
+11. response hook loading/call behavior for a configured operation.
+12. safe failure behavior when hook file is missing or hook raises.
 
 Recommended test style:
 
@@ -548,13 +556,7 @@ If a site cannot be represented by this model, it should be called out explicitl
 
 ## Open Questions / TBD
 
-1. `TBD`: should v1 support only `GET`, or also safe `POST` query endpoints?
-2. `TBD`: should auto-pagination be included in v1, or should the first version always return one page and a continuation token?
-3. `TBD`: should file-based secret loading be restricted to a known secrets directory?
-4. `TBD`: should v1 parse `Retry-After` for 429 responses, or keep retry logic transport-only?
-5. `TBD`: should MCP exposure be enabled by default or remain opt-in?
-6. `TBD`: should v1 support nested JSON-body templating, or only flat string substitution?
-7. `TBD`: should per-connector response normalization allow tiny optional Python hooks, or should v1 stay config-only even if that excludes some APIs?
+1. No open TBD items remain for v1 scope.
 
 ## Acceptance Criteria
 
@@ -566,3 +568,74 @@ This proposal is satisfied when:
 4. the worker never exposes secrets to the model;
 5. the implementation does not require new scheduler, endpoint, or task abstractions;
 6. tests cover the core config/auth/request/normalization behavior.
+
+## Phased Implementation Plan
+
+### Stage 1 - Scaffold and Validation (completed)
+
+Goal: establish a safe runtime skeleton with deterministic config parsing and hook contract checks, without external HTTP side effects.
+
+Deliverables:
+
+1. create `workers/tool/http_api/app.py` with a stable `http_api` tool schema;
+2. implement connector/operation/method validation and flat template rendering;
+3. implement standardized hook loading contract for `response_hook_file` using `transform_response(response, context)` discovery;
+4. add default local worker config `workers/tool/http_api/config.json5` (disabled by default);
+5. add one sample hook module under `workers/tool/http_api/hooks/`.
+
+Completion notes:
+
+1. Stage 1 is implemented in this repository revision;
+2. stage-1 scaffolding remains the foundation for request validation, templating, and hook contract discovery.
+
+### Stage 2 - Outbound HTTP Execution and Envelope Assembly (completed)
+
+Goal: perform real HTTP calls for configured operations and produce the normalized success/failure envelope.
+
+Deliverables:
+
+1. implement auth application for `none`, env-based, and file-based token modes;
+2. execute configured `GET` and safe query-style `POST` requests via `httpx`;
+3. enforce response-size bounds and produce normalized `item`/`items`/`paging`/`meta` fields;
+4. apply `response_hook_file` transformation result before final envelope shaping;
+5. add deterministic error mapping and redaction for failures.
+
+Completion notes:
+
+1. Stage 2 is implemented in this repository revision;
+2. `workers/tool/http_api/app.py` now performs real `GET`/safe `POST` calls, applies configured auth, executes optional response hook transformation, and returns normalized envelope output.
+
+### Stage 3 - Pagination Runtime and Guardrails (completed)
+
+Goal: implement bounded auto-pagination and continuation metadata behavior.
+
+Deliverables:
+
+1. support `none`, `cursor`, `page`, and `offset_limit` execution paths;
+2. enforce hard upper bounds (`limit`, `max_pages`) to prevent runaway loops;
+3. keep continuation fields (`next_page_token` or equivalent) in all applicable responses;
+4. ensure pagination remains compatible with response hooks.
+
+Completion notes:
+
+1. Stage 3 is implemented in this repository revision;
+2. `workers/tool/http_api/app.py` now supports bounded pagination execution paths for `none`, `cursor`, `page`, and `offset_limit` with hard page limits;
+3. continuation metadata (`next_page_token`, `next_page`, `next_offset`, `has_more`) is returned consistently in the normalized paging block.
+
+### Stage 4 - Integration, Tests, and Documentation (completed)
+
+Goal: wire the worker into standard config paths and finalize validation/documentation coverage.
+
+Deliverables:
+
+1. add example root config snippets for `workers.items.http_api` and `workers.items.openaix.tools.http_api`;
+2. add focused unit tests for config/auth/templating/hook/pagination/envelope/error behavior;
+3. add README notes with minimal setup and security caveats;
+4. confirm MCP exposure behavior and explicit disablement path in endpoint configuration.
+
+Completion notes:
+
+1. Stage 4 is implemented in this repository revision;
+2. root config snippets for `workers.items.http_api` and `workers.items.openaix.tools.http_api` are added in `config.json5` and `config.json5.example`;
+3. focused worker tests are added in `test_http_api_worker.py`;
+4. README now documents `http_api` MCP exposure, a sample MCP call, and explicit endpoint-level opt-out by removing `http_api` from `endpoints[mcp].tools`.

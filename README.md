@@ -262,8 +262,13 @@ Default config exposes an MCP endpoint with two test tools:
 
 - `search` -> worker `web_search` (Brave Web Search API)
 - `fetch` -> worker `web_fetch` (Brave LLM Context API)
+- `selftest` -> worker `selftest` (runtime health checks)
+- `http_api` -> worker `http_api` (configured connector calls)
 
 These tools require `BRAVE_APIKEY` (via `.env` and `config.json5` mapping).
+
+`http_api` is wired by default in endpoint config, but the worker itself is disabled until configured.
+To disable MCP exposure explicitly, remove `http_api` from `endpoints[].tools` where `id: "mcp"`.
 
 Quick checks:
 
@@ -287,6 +292,10 @@ curl http://127.0.0.1:20001/mcp \
 curl http://127.0.0.1:20001/mcp \
   -H 'content-type: application/json' \
   -d '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"selftest","arguments":{}}}'
+
+curl http://127.0.0.1:20001/mcp \
+  -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"http_api","arguments":{"connector":"example_connector","operation":"list_topics","params":{"group_name":"example_group"}}}}'
 ```
 
 ---

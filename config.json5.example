@@ -129,6 +129,10 @@
             "properties": {}
           }
           */
+        },
+        "http_api": {
+          "worker": "http_api"
+          // Explicit MCP opt-out path: remove this entry from endpoints[mcp].tools.
         }
       }
     }
@@ -186,6 +190,9 @@
           "selftest":{
               worker:"selftest",
           },
+          "http_api":{
+              worker:"http_api",
+          },
         }
       },
       "reject_agent": {
@@ -212,22 +219,93 @@
       },
       "web_search": {
         "enabled": true,
-        "provider": "brave",
-        "apiKey": "${BRAVE_APIKEY}",
-        // Timeout for one upstream Brave API request.
-        "request_timeout": ${REQUEST_TIMEOUT:-100}
+        "provider_cooldown_seconds": 60,
+        "request_timeout": ${REQUEST_TIMEOUT:-100},
+        "providers": [
+          {
+            "id": "brave",
+            "type": "brave",
+            "enabled": true,
+            "apiKey": "${BRAVE_APIKEY}"
+          },
+          {
+            "id": "local_searxng",
+            "type": "searxng",
+            "enabled": false,
+            "empty_is_error": true,
+            "host": "${SEARXNG_HOST:-127.0.0.1}",
+            "port": ${SEARXNG_PORT:-18080},
+            "engines": [],
+            "categories": ["general"],
+            "language": "all",
+            "safesearch": 0
+          }
+        ]
       },
       "web_fetch": {
         "enabled": true,
-        "provider": "brave",
-        "apiKey": "${BRAVE_APIKEY}",
-        // Timeout for one upstream Brave LLM Context API request.
-        "request_timeout": ${REQUEST_TIMEOUT:-100}
+        "provider_cooldown_seconds": 60,
+        "request_timeout": ${REQUEST_TIMEOUT:-100},
+        "providers": [
+          {
+            "id": "brave",
+            "type": "brave",
+            "enabled": true,
+            "apiKey": "${BRAVE_APIKEY}"
+          },
+          {
+            "id": "local_searxng",
+            "type": "searxng",
+            "enabled": false,
+            "empty_is_error": true,
+            "host": "${SEARXNG_HOST:-127.0.0.1}",
+            "port": ${SEARXNG_PORT:-18080},
+            "engines": [],
+            "categories": ["general"],
+            "language": "all",
+            "safesearch": 0
+          }
+        ]
       },
       "selftest": {
         "enabled": true,
         "includeWorkers": true,
         "includeResources": true
+      },
+      "http_api": {
+        "enabled": false,
+        // Timeout for one outbound API request in http_api worker.
+        "request_timeout": ${REQUEST_TIMEOUT:-100},
+        "user_agent": "aidir-http-api/1.0",
+        "max_response_chars": 50000,
+        "connectors": {
+          "example_connector": {
+            "enabled": true,
+            "base_url": "${EXAMPLE_API_BASE_URL:-https://api.example.com/v1}",
+            "auth": {
+              "type": "bearer",
+              "key": "${EXAMPLE_API_KEY}"
+            },
+            "defaults": {
+              "group_name": "example_group"
+            },
+            "operations": {
+              "list_topics": {
+                "method": "GET",
+                "path": "/gettopics",
+                "query": {
+                  "group_name": "{group_name}"
+                },
+                "pagination": {
+                  "type": "cursor",
+                  "request_param": "page_token",
+                  "response_field": "next_page_token"
+                },
+                "result_path": "topics"
+              }
+            }
+          }
+        }
       },
       "context_builder": {
         "enabled": true
