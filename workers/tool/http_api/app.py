@@ -37,14 +37,33 @@ class HttpApiWorker(BaseToolWorker):
 
     def get_tool_description(self) -> list[dict[str, Any]]:
         """Return MCP-style tool schema for http_api."""
+        connector_ops = self._get_enabled_connector_operations()
+        connector_names = sorted(connector_ops.keys())
+        operation_names = sorted({name for ops in connector_ops.values() for name in ops})
+
+        connector_prop: dict[str, Any] = {"type": "string"}
+        if connector_names:
+            connector_prop["enum"] = connector_names
+
+        operation_prop: dict[str, Any] = {"type": "string"}
+        if operation_names:
+            operation_prop["enum"] = operation_names
+
+        description = "Call a configured token-authenticated HTTP API connector and return normalized structured data."
+        if connector_ops:
+            details = "; ".join(
+                f"{connector}: {', '.join(ops)}" for connector, ops in sorted(connector_ops.items())
+            )
+            description = f"{description} Available operations by connector: {details}."
+
         return [{
             "name": "http_api",
-            "description": "Call a configured token-authenticated HTTP API connector and return normalized structured data.",
+            "description": description,
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "connector": {"type": "string"},
-                    "operation": {"type": "string"},
+                    "connector": connector_prop,
+                    "operation": operation_prop,
                     "params": {"type": "object"},
                     "page_token": {"type": "string"},
                     "limit": {"type": "integer"},
@@ -89,7 +108,9 @@ class HttpApiWorker(BaseToolWorker):
         operations = connector_cfg.get("operations") if isinstance(connector_cfg.get("operations"), dict) else {}
         operation_cfg = operations.get(operation_name)
         if not isinstance(operation_cfg, dict):
-            return self._error("HTTP_API_UNKNOWN_OPERATION", f"Unknown operation: {operation_name}")
+            available = sorted(str(name) for name in operations.keys())
+            details = f" Available operations for connector {connector_name}: {', '.join(available)}." if available else ""
+            return self._error("HTTP_API_UNKNOWN_OPERATION", f"Unknown operation: {operation_name}.{details}")
 
         allowed_params = operation_cfg.get("allowed_params")
         if isinstance(allowed_params, list):
@@ -360,6 +381,20 @@ class HttpApiWorker(BaseToolWorker):
         except (TypeError, ValueError):
             parsed = default
         return max(min_value, parsed)
+
+    def _get_enabled_connector_operations(self) -> dict[str, list[str]]:
+        """Return enabled connector ids mapped to their operation ids."""
+        result: dict[str, list[str]] = {}
+        for connector_name, connector_cfg in self._connectors.items():
+            if not isinstance(connector_cfg, dict):
+                continue
+            if connector_cfg.get("enabled") is False:
+                continue
+            operations = connector_cfg.get("operations") if isinstance(connector_cfg.get("operations"), dict) else {}
+            op_names = sorted(str(name) for name, cfg in operations.items() if isinstance(cfg, dict))
+            if op_names:
+                result[str(connector_name)] = op_names
+        return result
 
     @staticmethod
     def _safe_optional_int(value: Any, min_value: int = 0) -> int | None:

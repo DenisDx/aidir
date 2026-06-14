@@ -296,12 +296,38 @@
                 "query": {
                   "group_name": "{group_name}"
                 },
+                "allowed_params": ["group_name"],
                 "pagination": {
                   "type": "cursor",
                   "request_param": "page_token",
                   "response_field": "next_page_token"
                 },
-                "result_path": "topics"
+                "result_path": "data"
+              },
+              "get_message": {
+                "method": "GET",
+                "path": "/getmessage",
+                "query": {
+                  "group_name": "{group_name}",
+                  "msg_num": "{msg_num}"
+                },
+                "allowed_params": ["group_name", "msg_num"],
+                "mode": "item"
+              },
+              "get_messages": {
+                "method": "GET",
+                "path": "/getmessages",
+                "query": {
+                  "group_name": "{group_name}",
+                  "topic_id": "{topic_id}"
+                },
+                "allowed_params": ["group_name", "topic_id"],
+                "pagination": {
+                  "type": "cursor",
+                  "request_param": "page_token",
+                  "response_field": "next_page_token"
+                },
+                "result_path": "data"
               }
             }
           }

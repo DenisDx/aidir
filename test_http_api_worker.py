@@ -96,6 +96,18 @@ class TestHttpApiWorker(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.ok)
         self.assertEqual(result.error.get("code"), "HTTP_API_UNKNOWN_CONNECTOR")
 
+    async def test_unknown_operation_includes_allowed_list(self):
+        task = Task(type="tool", payload={"arguments": {"connector": "demo", "operation": "missing", "params": {}}})
+        result = await self.worker.execute(task)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error.get("code"), "HTTP_API_UNKNOWN_OPERATION")
+        self.assertIn("Available operations for connector demo", str(result.error.get("message") or ""))
+
+    async def test_tool_description_includes_enums_from_config(self):
+        schema = self.worker.get_tool_description()[0]["inputSchema"]["properties"]
+        self.assertIn("demo", schema["connector"].get("enum") or [])
+        self.assertIn("list", schema["operation"].get("enum") or [])
+
     async def test_key_auth_missing_secret(self):
         await self.worker.initialize(
             {
