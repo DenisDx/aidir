@@ -125,6 +125,95 @@ class _SchedulerFakeWorker:
 class TestOpenAIxToolArgsParser(unittest.TestCase):
     """Validate robust parsing of tool arguments with quotes and encoded payloads."""
 
+    def test_openai_worker_streaming_request_supports_send_based_client(self) -> None:
+        """Wraps a send()-based client response in an async context manager for streaming."""
+
+        class _FakeResponse:
+            def __init__(self) -> None:
+                self.status_code = 200
+                self.text = ""
+                self.content = b""
+
+        class _FakeClient:
+            def __init__(self, response: _FakeResponse) -> None:
+                self._response = response
+
+            async def send(self, request, stream=False):
+                return self._response
+
+        worker = OpenAIxWorker()
+        client = _FakeClient(_FakeResponse())
+        request = httpx.Request("POST", "http://example.com")
+
+        async def _run() -> None:
+            stream_context = await worker._open_stream_request(client, request, {"stream": True})
+            async with stream_context as resp:
+                self.assertIs(resp, client._response)
+
+        import asyncio
+        asyncio.run(_run())
+
+    def test_openai_worker_fills_empty_content_from_thinking(self) -> None:
+        """Uses non-empty thinking as content when the upstream reply leaves content blank."""
+
+        class _FakeStreamResponse:
+            def __init__(self, payloads: list[str]) -> None:
+                self._payloads = payloads
+                self.status_code = 200
+
+            async def aiter_raw(self):
+                for payload in self._payloads:
+                    yield payload.encode("utf-8")
+
+        worker = OpenAIxWorker()
+        emitted: list[dict] = []
+
+        async def _emit(chunk: dict) -> None:
+            emitted.append(chunk)
+
+        async def _run() -> None:
+            data = await worker._consume_stream_response(_FakeStreamResponse(['{"message": {"content": "", "thinking": "hello"}}\n']), _emit, [], [], False)
+            self.assertEqual(data["message"]["content"], "hello")
+            self.assertEqual(emitted[0]["message"]["content"], "hello")
+
+        import asyncio
+        asyncio.run(_run())
+
+    def test_openai_worker_sync_path_normalizes_tool_call_reply(self) -> None:
+        """Normalizes sync responses that contain tool calls and empty content."""
+
+        class _FakeResponse:
+            def __init__(self, body: str) -> None:
+                self._body = body
+                self.status_code = 200
+                self.text = body
+                self.content = body.encode("utf-8")
+
+        class _FakeClient:
+            def __init__(self) -> None:
+                self.sent = []
+
+        worker = OpenAIxWorker()
+        client = _FakeClient()
+        request = httpx.Request("POST", "http://example.com")
+        body = '{"message": {"content": "", "thinking": "hello", "tool_calls": [{"id": "call-1", "function": {"name": "gateway", "arguments": {"action": "restart"}}}]}}'
+
+        async def _run() -> None:
+            with patch.object(worker, "_build_json_request", return_value=request), \
+                 patch.object(worker, "_send_json_request", new=AsyncMock(return_value=_FakeResponse(body))), \
+                 patch.object(worker, "_read_response_body", new=AsyncMock(return_value=body)), \
+                 patch.object(worker, "_begin_llm_call", new=AsyncMock(return_value=None)), \
+                 patch.object(worker, "_finalize_llm_call", new=AsyncMock(return_value=None)):
+                result = await worker._forward_sync(client, "http://example.com", {"messages": []}, task=None, save_call=False, task_id="")
+
+            self.assertTrue(result.ok)
+            self.assertEqual(result.data["message"]["content"], "hello")
+            self.assertEqual(result.data["message"]["tool_calls"][0]["function"]["name"], "gateway")
+
+        import asyncio
+        from unittest.mock import AsyncMock
+        asyncio.run(_run())
+
     def test_parse_tool_arguments_dict_passthrough(self) -> None:
         """Returns dict unchanged when arguments are already structured."""
         raw = {"message": 'He said "hello"', "count": 2}

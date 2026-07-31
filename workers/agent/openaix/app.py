@@ -11,6 +11,19 @@ import codecs
 import json
 from typing import Awaitable, Callable
 
+
+class _AsyncContextWrapper:
+    """Wrap a response-like object so it can be used with async with in both tests and runtime."""
+
+    def __init__(self, response) -> None:
+        self._response = response
+
+    async def __aenter__(self):
+        return self._response
+
+    async def __aexit__(self, exc_type, exc, tb) -> bool:
+        return False
+
 import httpx
 
 from core import log
@@ -1291,7 +1304,7 @@ class OpenAIxWorker(BaseWorker):
 
                         if compat_resp.status_code == 200:
                             try:
-                                data = json.loads(compat_raw_response)
+                                data = self._normalize_upstream_response_data(json.loads(compat_raw_response))
                             except json.JSONDecodeError:
                                 body_preview = compat_resp.text[:512]
                                 continue
@@ -1346,6 +1359,7 @@ class OpenAIxWorker(BaseWorker):
                             },
                         )
                     else:
+                        data = self._normalize_upstream_response_data(data)
                         if task is not None:
                             await self._finalize_llm_call(task, history_entry, status="ok", http_status=resp.status_code, response=data)
 
@@ -1616,7 +1630,8 @@ class OpenAIxWorker(BaseWorker):
         """Open one streaming request using either real httpx or a test double."""
         send = getattr(client, "send", None)
         if callable(send):
-            return await send(request, stream=True)
+            resp = await send(request, stream=True)
+            return _AsyncContextWrapper(resp)
         return client.stream(request.method, str(request.url), json=payload)
 
     @staticmethod
@@ -1634,6 +1649,31 @@ class OpenAIxWorker(BaseWorker):
         if isinstance(content, (bytes, str)):
             return content
         return str(content)
+
+    @staticmethod
+    def _normalize_upstream_response_data(data: object) -> object:
+        """Fill empty content from thinking/reasoning fields when the upstream response omits content."""
+        if not isinstance(data, dict):
+            return data
+
+        message = data.get("message")
+        if not isinstance(message, dict):
+            return data
+
+        content = message.get("content")
+        if isinstance(content, str) and content.strip():
+            return data
+
+        for field_name in ("thinking", "reasoning_content", "reasoning"):
+            field_value = message.get(field_name)
+            if isinstance(field_value, str) and field_value.strip():
+                patched = dict(data)
+                patched_message = dict(message)
+                patched_message["content"] = field_value
+                patched["message"] = patched_message
+                return patched
+
+        return data
 
     @staticmethod
     async def _consume_stream_response(resp, emit_chunk, chunks: list[dict], raw_parts: list[bytes], save_call: bool) -> dict | None:
@@ -1657,12 +1697,15 @@ class OpenAIxWorker(BaseWorker):
                         chunk = json.loads(line)
                     except json.JSONDecodeError:
                         continue
+                    chunk = OpenAIxWorker._normalize_upstream_response_data(chunk)
                     if emit_chunk:
                         await emit_chunk(chunk)
                     if save_call:
                         chunks.append(chunk)
-                    if chunk.get("done"):
+                    if isinstance(chunk, dict):
                         final_data = chunk
+                        if chunk.get("done"):
+                            break
 
             tail = decoder.decode(b"", final=True)
             if tail:
@@ -1673,11 +1716,12 @@ class OpenAIxWorker(BaseWorker):
                 except json.JSONDecodeError:
                     chunk = None
                 if isinstance(chunk, dict):
+                    chunk = OpenAIxWorker._normalize_upstream_response_data(chunk)
                     if emit_chunk:
                         await emit_chunk(chunk)
                     if save_call:
                         chunks.append(chunk)
-                    if chunk.get("done"):
+                    if isinstance(chunk, dict):
                         final_data = chunk
             return final_data
 
@@ -1692,11 +1736,12 @@ class OpenAIxWorker(BaseWorker):
                     chunk = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                chunk = OpenAIxWorker._normalize_upstream_response_data(chunk)
                 if emit_chunk:
                     await emit_chunk(chunk)
                 if save_call:
                     chunks.append(chunk)
-                if chunk.get("done"):
+                if isinstance(chunk, dict):
                     final_data = chunk
 
         return final_data

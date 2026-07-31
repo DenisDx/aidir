@@ -9,6 +9,19 @@ import codecs
 import json
 from typing import Any, Awaitable, Callable
 
+
+class _AsyncContextWrapper:
+    """Wrap a response-like object so it can be used with async with in both tests and runtime."""
+
+    def __init__(self, response) -> None:
+        self._response = response
+
+    async def __aenter__(self):
+        return self._response
+
+    async def __aexit__(self, exc_type, exc, tb) -> bool:
+        return False
+
 import httpx
 
 from core.call_log import save_llm_call, save_llm_raw_call
@@ -317,7 +330,7 @@ class CallOllamaWorker(BaseWorker):
                 },
             )
 
-        data = json.loads(raw_response)
+        data = self._normalize_upstream_response_data(json.loads(raw_response))
         await self._finalize_llm_call(task, history_entry, status="ok", http_status=resp.status_code, response=data)
         if save_call:
             save_llm_call(self.id, task.id, upstream_payload, data)
@@ -400,7 +413,8 @@ class CallOllamaWorker(BaseWorker):
         """Open one streaming request using either real httpx or a test double."""
         send = getattr(client, "send", None)
         if callable(send):
-            return await send(request, stream=True)
+            resp = await send(request, stream=True)
+            return _AsyncContextWrapper(resp)
         return client.stream(request.method, str(request.url), json=payload)
 
     @staticmethod
@@ -418,6 +432,31 @@ class CallOllamaWorker(BaseWorker):
         if isinstance(content, (bytes, str)):
             return content
         return str(content)
+
+    @staticmethod
+    def _normalize_upstream_response_data(data: object) -> object:
+        """Fill empty content from thinking/reasoning fields when the upstream response omits content."""
+        if not isinstance(data, dict):
+            return data
+
+        message = data.get("message")
+        if not isinstance(message, dict):
+            return data
+
+        content = message.get("content")
+        if isinstance(content, str) and content.strip():
+            return data
+
+        for field_name in ("thinking", "reasoning_content", "reasoning"):
+            field_value = message.get(field_name)
+            if isinstance(field_value, str) and field_value.strip():
+                patched = dict(data)
+                patched_message = dict(message)
+                patched_message["content"] = field_value
+                patched["message"] = patched_message
+                return patched
+
+        return data
 
     @staticmethod
     async def _consume_stream_response(resp, emit_chunk, chunks: list[dict], raw_parts: list[bytes], save_call: bool) -> dict | None:
@@ -442,13 +481,16 @@ class CallOllamaWorker(BaseWorker):
                     except json.JSONDecodeError:
                         continue
 
+                    chunk = CallOllamaWorker._normalize_upstream_response_data(chunk)
                     if emit_chunk:
                         await emit_chunk(chunk)
                     if save_call:
                         chunks.append(chunk)
 
-                    if chunk.get("done"):
+                    if isinstance(chunk, dict):
                         final_data = chunk
+                        if chunk.get("done"):
+                            break
 
             tail = decoder.decode(b"", final=True)
             if tail:
@@ -459,11 +501,12 @@ class CallOllamaWorker(BaseWorker):
                 except json.JSONDecodeError:
                     chunk = None
                 if isinstance(chunk, dict):
+                    chunk = CallOllamaWorker._normalize_upstream_response_data(chunk)
                     if emit_chunk:
                         await emit_chunk(chunk)
                     if save_call:
                         chunks.append(chunk)
-                    if chunk.get("done"):
+                    if isinstance(chunk, dict):
                         final_data = chunk
             return final_data
 
@@ -479,12 +522,13 @@ class CallOllamaWorker(BaseWorker):
                 except json.JSONDecodeError:
                     continue
 
+                chunk = CallOllamaWorker._normalize_upstream_response_data(chunk)
                 if emit_chunk:
                     await emit_chunk(chunk)
                 if save_call:
                     chunks.append(chunk)
 
-                if chunk.get("done"):
+                if isinstance(chunk, dict):
                     final_data = chunk
 
         return final_data
