@@ -348,7 +348,7 @@ class OpenAIxWorker(BaseWorker):
         """Convert extended OpenAIx payload into upstream Ollama-compatible chat payload."""
         out = {
             "model": payload.get("model", ""),
-            "messages": payload.get("messages", []),
+            "messages": cls._normalize_messages_content(payload.get("messages", [])),
             "stream": bool(stream),
         }
 
@@ -376,6 +376,71 @@ class OpenAIxWorker(BaseWorker):
             out["options"] = out_options
 
         return out
+
+    @classmethod
+    def _normalize_messages_content(cls, messages: object) -> list:
+        """Normalize OpenAI content parts into plain string content for Ollama chat."""
+        if not isinstance(messages, list):
+            return []
+
+        normalized: list = []
+        for message in messages:
+            if not isinstance(message, dict):
+                normalized.append(message)
+                continue
+
+            normalized_message = dict(message)
+            normalized_message["content"] = cls._coerce_message_content_to_text(message.get("content"))
+            normalized.append(normalized_message)
+        return normalized
+
+    @classmethod
+    def _coerce_message_content_to_text(cls, content: object) -> str:
+        """Convert one message content value to plain text accepted by Ollama chat."""
+        if isinstance(content, str):
+            return content
+        if content is None:
+            return ""
+
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, str):
+                    if item:
+                        parts.append(item)
+                    continue
+
+                if isinstance(item, dict):
+                    item_type = str(item.get("type") or "").strip().lower()
+                    if item_type == "text":
+                        text_value = item.get("text")
+                        if text_value is not None:
+                            parts.append(str(text_value))
+                            continue
+
+                    text_value = item.get("text")
+                    if isinstance(text_value, str) and text_value:
+                        parts.append(text_value)
+                        continue
+
+                    if "content" in item and item.get("content") is not None:
+                        parts.append(cls._coerce_message_content_to_text(item.get("content")))
+                        continue
+
+                    parts.append(json.dumps(item, ensure_ascii=False, sort_keys=True))
+                    continue
+
+                parts.append(str(item))
+
+            return "\n".join(part for part in parts if part)
+
+        if isinstance(content, dict):
+            text_value = content.get("text")
+            if text_value is not None:
+                return str(text_value)
+            return json.dumps(content, ensure_ascii=False, sort_keys=True)
+
+        return str(content)
 
     def _apply_model_generation_defaults(self, payload: dict, provider_id: str | None = None) -> dict:
         """Apply per-model generation defaults unless request already overrides them."""
@@ -1201,6 +1266,42 @@ class OpenAIxWorker(BaseWorker):
 
                 if resp.status_code != 200:
                     body_preview = resp.text[:512]
+                    compat_payloads = self._build_parser_compat_payloads(upstream_payload, body_preview)
+                    for compat_index, compat_payload in enumerate(compat_payloads, start=1):
+                        compat_messages = compat_payload.get("messages")
+                        compat_count = len(compat_messages) if isinstance(compat_messages, list) else 0
+                        log(
+                            "worker",
+                            "warning",
+                            (
+                                f"Task {effective_task_id or '-'} upstream parser compatibility retry "
+                                f"#{compat_index}: messages {msg_count}->{compat_count} "
+                                f"tools={bool(compat_payload.get('tools'))}"
+                            ),
+                            "openaix",
+                        )
+                        compat_request = self._build_json_request(client, url, compat_payload)
+                        if save_call:
+                            save_llm_raw_call(self.id, compat_request.content)
+
+                        compat_resp = await self._send_json_request(client, compat_request, compat_payload)
+                        compat_raw_response = await self._read_response_body(compat_resp)
+                        if save_call:
+                            save_llm_raw_call(self.id, compat_raw_response)
+
+                        if compat_resp.status_code == 200:
+                            try:
+                                data = json.loads(compat_raw_response)
+                            except json.JSONDecodeError:
+                                body_preview = compat_resp.text[:512]
+                                continue
+                            if task is not None:
+                                await self._finalize_llm_call(task, history_entry, status="ok", http_status=compat_resp.status_code, response=data)
+                            if save_call:
+                                save_llm_call(self.id, effective_task_id, compat_payload, data)
+                            return WorkerResult(ok=True, data=data, usage=data.get("usage"))
+
+                        body_preview = compat_resp.text[:512]
                     log(
                         "worker",
                         "warning",
@@ -1286,6 +1387,98 @@ class OpenAIxWorker(BaseWorker):
             self._log_retry_attempt(effective_task_id, result.error["code"], attempt, retry_limit)
 
         return result
+
+    @staticmethod
+    def _is_upstream_parser_compat_error(body_preview: str) -> bool:
+        """Return True for known Ollama parser errors that can be mitigated by history trimming."""
+        text = str(body_preview or "").lower()
+        return (
+            "value looks like object" in text and "closing '}'" in text
+        )
+
+    @staticmethod
+    def _sanitize_messages_for_parser_compat(messages: list) -> list:
+        """Drop known-bad placeholder turns and trim history for parser-compat retries."""
+        sanitized: list = []
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+
+            role = str(message.get("role") or "").strip().lower()
+            content = message.get("content")
+            content_text = content if isinstance(content, str) else str(content or "")
+            has_tool_calls = isinstance(message.get("tool_calls"), list) and bool(message.get("tool_calls"))
+
+            if role == "assistant":
+                if not content_text.strip() and not has_tool_calls:
+                    continue
+                if content_text.strip().startswith("[assistant turn failed before producing content]"):
+                    continue
+
+            sanitized.append(message)
+
+        if len(sanitized) > 14:
+            sanitized = sanitized[-14:]
+        return sanitized
+
+    @classmethod
+    def _build_parser_compat_payloads(cls, payload: dict, body_preview: str) -> list[dict]:
+        """Build ordered compatibility payload variants for known parser errors."""
+        if not cls._is_upstream_parser_compat_error(body_preview):
+            return []
+
+        messages = payload.get("messages") if isinstance(payload, dict) else None
+        if not isinstance(messages, list) or not messages:
+            return []
+
+        candidates: list[dict] = []
+
+        sanitized = cls._sanitize_messages_for_parser_compat(messages)
+        if sanitized and sanitized != messages:
+            compat_payload = dict(payload)
+            compat_payload["messages"] = sanitized
+            candidates.append(compat_payload)
+
+        trimmed = messages[-14:] if len(messages) > 14 else []
+        if trimmed and trimmed != messages:
+            compat_payload = dict(payload)
+            compat_payload["messages"] = trimmed
+            candidates.append(compat_payload)
+
+            compat_no_tools = dict(compat_payload)
+            compat_no_tools.pop("tools", None)
+            compat_no_tools.pop("tool_choice", None)
+            candidates.append(compat_no_tools)
+
+        first_system = next(
+            (item for item in messages if isinstance(item, dict) and str(item.get("role") or "").strip().lower() == "system"),
+            None,
+        )
+        last_user = next(
+            (item for item in reversed(messages) if isinstance(item, dict) and str(item.get("role") or "").strip().lower() == "user"),
+            None,
+        )
+        if first_system is not None and last_user is not None:
+            minimal = [first_system, last_user]
+            compat_minimal = dict(payload)
+            compat_minimal["messages"] = minimal
+            compat_minimal.pop("tools", None)
+            compat_minimal.pop("tool_choice", None)
+            candidates.append(compat_minimal)
+
+        deduped: list[dict] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            try:
+                key = json.dumps(candidate, ensure_ascii=False, sort_keys=True, default=str)
+            except Exception:
+                key = str(id(candidate))
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(candidate)
+
+        return deduped
 
     async def _forward_stream(
         self,

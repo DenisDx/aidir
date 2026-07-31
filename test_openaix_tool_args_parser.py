@@ -717,6 +717,59 @@ class TestWorkerWarningLogs(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.ok)
         self.assertEqual(send_attempts, 2)
 
+    async def test_openaix_forward_sync_parser_compat_retry_with_trimmed_history(self) -> None:
+        """Retries parser-specific 400 once with sanitized/trimmed messages and succeeds."""
+        worker = OpenAIxWorker()
+
+        response_text = '{"message":{"role":"assistant","content":"ok"},"done":true}'
+        send_payload_sizes: list[int] = []
+
+        class FakeResponse:
+            def __init__(self, status_code: int, text: str) -> None:
+                self.status_code = status_code
+                self.text = text
+
+            async def aread(self):
+                return self.text.encode("utf-8")
+
+        class FakeClient:
+            def build_request(self, method, url, json):
+                return httpx.Request(method, url, json=json)
+
+            async def send(self, request_obj):
+                payload = json.loads(request_obj.content.decode("utf-8"))
+                messages = payload.get("messages") if isinstance(payload, dict) else []
+                send_payload_sizes.append(len(messages) if isinstance(messages, list) else 0)
+
+                if len(send_payload_sizes) == 1:
+                    return FakeResponse(
+                        400,
+                        "{\"error\":\"Value looks like object, but can't find closing '}' symbol\"}",
+                    )
+                return FakeResponse(200, response_text)
+
+        messages = [
+            {"role": "system", "content": "system prompt"},
+            {"role": "tool", "content": "{}"},
+            {"role": "assistant", "content": "[assistant turn failed before producing content]"},
+            {"role": "assistant", "content": ""},
+        ] + [
+            {"role": "user", "content": f"u{i}"}
+            for i in range(16)
+        ]
+
+        result = await worker._forward_sync(
+            FakeClient(),
+            "http://127.0.0.1:11434/api/chat",
+            {"model": "qwen3.5:9b", "messages": messages},
+            task_id="task-compat",
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(len(send_payload_sizes), 2)
+        self.assertEqual(send_payload_sizes[0], 20)
+        self.assertLessEqual(send_payload_sizes[1], 14)
+
     async def test_openaix_forward_stream_logs_upstream_http_error_as_warning(self) -> None:
         """Logs streaming model HTTP refusal as warning on the OpenAIx worker."""
         worker = OpenAIxWorker()
@@ -1234,6 +1287,47 @@ class TestOpenAIxGenerationParameters(unittest.TestCase):
             },
         )
         self.assertIs(normalized.get("think"), False)
+
+    def test_normalize_payload_converts_content_parts_array_to_plain_text(self) -> None:
+        """Normalizes OpenAI content-parts arrays into string content for Ollama chat."""
+        normalized = OpenAIxWorker._normalize_payload(
+            {
+                "model": "qwen3",
+                "messages": [
+                    {"role": "system", "content": "rules"},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "line 1"},
+                            {"type": "text", "text": "line 2"},
+                        ],
+                    },
+                ],
+            },
+            stream=False,
+        )
+
+        self.assertEqual(normalized["messages"][1]["content"], "line 1\nline 2")
+
+    def test_normalize_payload_converts_object_content_to_json_string(self) -> None:
+        """Normalizes object content into a JSON string to avoid upstream type errors."""
+        normalized = OpenAIxWorker._normalize_payload(
+            {
+                "model": "qwen3",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": {
+                            "foo": "bar",
+                            "n": 3,
+                        },
+                    }
+                ],
+            },
+            stream=False,
+        )
+
+        self.assertEqual(normalized["messages"][0]["content"], '{"foo": "bar", "n": 3}')
 
     def test_openaix_worker_applies_model_generation_defaults(self) -> None:
         """Uses model-level generation config when request does not override it."""
