@@ -56,6 +56,26 @@ class Resource:
                     total[k] = total.get(k, 0) + v
         return total
 
+    def _matching_soft_consumer(
+        self,
+        model_id: str,
+        required: dict[str, int] | None = None,
+    ) -> dict | None:
+        """Return active soft consumer for the same model when it satisfies required usage."""
+        mid = str(model_id or "").strip()
+        if not self.alive_time or not mid:
+            return None
+
+        req = required or {}
+        for entry in self.get_active_soft_consumers():
+            if str(entry.get("model_id") or "").strip() != mid:
+                continue
+            resources = entry.get("resources") or {}
+            if any(int(resources.get(key, 0)) < int(amount) for key, amount in req.items() if int(amount) > 0):
+                continue
+            return entry
+        return None
+
     def is_available(self, required: dict[str, int] | None = None) -> bool:
         """Return True if requested amounts fit (accounting for alive-time soft usage)."""
         req = required or {}
@@ -68,6 +88,30 @@ class Resource:
             used = int(self.used.get(key, 0))
             soft_amount = int(soft.get(key, 0))
             if used + soft_amount + need > limit:
+                return False
+        return True
+
+    def is_available_for_reuse(
+        self,
+        required: dict[str, int] | None = None,
+        model_id: str = "",
+    ) -> bool:
+        """Return True when the same warm model can be reused without unloading it."""
+        req = required or {}
+        match = self._matching_soft_consumer(model_id, req)
+        if match is None:
+            return False
+
+        soft = self._compute_soft_used()
+        matched_resources = match.get("resources") or {}
+        for key, amount in req.items():
+            need = int(amount)
+            if need <= 0:
+                continue
+            limit = int(self.limits.get(key, 0))
+            used = int(self.used.get(key, 0))
+            soft_amount = int(soft.get(key, 0)) - int(matched_resources.get(key, 0))
+            if used + max(0, soft_amount) + need > limit:
                 return False
         return True
 
@@ -91,6 +135,14 @@ class Resource:
         now = time.time()
         return [e for e in self._soft_used if now - e["released_at"] < self.alive_time]
 
+    def has_reusable_soft_consumer(
+        self,
+        model_id: str,
+        required: dict[str, int] | None = None,
+    ) -> bool:
+        """Return True when the same model is still present as a compatible soft consumer."""
+        return self._matching_soft_consumer(model_id, required) is not None
+
     def clear_soft_consumer(self, model_id: str) -> None:
         """Remove soft consumer entry for a model (after force-unload)."""
         self._soft_used = [e for e in self._soft_used if e.get("model_id") != model_id]
@@ -100,11 +152,15 @@ class Resource:
         self,
         required: dict[str, int] | None = None,
         consumer_id: str = "",
+        model_id: str | None = None,
     ) -> None:
         """Blindly reserve amounts without availability checks."""
         req = required or {}
         cid = consumer_id.strip()
+        mid = str(model_id or "").strip()
         async with self._lock:
+            if mid and self._matching_soft_consumer(mid, req) is not None:
+                self.clear_soft_consumer(mid)
             for key, amount in req.items():
                 inc = int(amount)
                 if inc <= 0:

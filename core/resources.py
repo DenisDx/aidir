@@ -60,6 +60,24 @@ class Resources:
                 return False
         return True
 
+    def check_available_for_reuse(
+        self,
+        requirements: dict[str, dict[str, int]] | None = None,
+        model_id: str | None = None,
+    ) -> bool:
+        """Return True when all resources can reuse the same warm model without unload."""
+        reqs = requirements or {}
+        mid = str(model_id or "").strip()
+        if not mid:
+            return False
+        for rid, need in reqs.items():
+            res = self._items.get(rid)
+            if res is None:
+                return False
+            if not res.is_available_for_reuse(need, mid):
+                return False
+        return True
+
     def check_available_after_unload(self, requirements: dict[str, dict[str, int]] | None = None) -> bool:
         """Return True if resources would be available after force-unloading all soft consumers."""
         reqs = requirements or {}
@@ -75,15 +93,19 @@ class Resources:
         self,
         requirements: dict[str, dict[str, int]] | None = None,
         full_config: dict | None = None,
+        keep_model_id: str | None = None,
     ) -> None:
         """Force-unload soft consumers that block needed resources, calling provider API."""
         reqs = requirements or {}
+        keep_mid = str(keep_model_id or "").strip()
         for rid in reqs:
             res = self._items.get(rid)
             if res is None or not res.alive_time:
                 continue
             for entry in res.get_active_soft_consumers():
                 model_id = entry.get("model_id") or ""
+                if keep_mid and model_id == keep_mid:
+                    continue
                 if model_id:
                     await self._call_provider_unload(res, model_id, full_config)
                 res.clear_soft_consumer(model_id)
@@ -125,6 +147,7 @@ class Resources:
         self,
         requirements: dict[str, dict[str, int]] | None = None,
         consumer_id: str = "",
+        model_id: str | None = None,
     ) -> None:
         """Blindly reserve all requested resources for a specific consumer."""
         reqs = requirements or {}
@@ -132,7 +155,7 @@ class Resources:
             res = self._items.get(rid)
             if res is None:
                 continue
-            await res.reserve_blind(need, consumer_id=consumer_id)
+            await res.reserve_blind(need, consumer_id=consumer_id, model_id=model_id)
 
     async def release(self, requirements: dict[str, dict[str, int]] | None = None) -> None:
         """Release previously reserved resources."""

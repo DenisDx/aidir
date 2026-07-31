@@ -94,12 +94,19 @@ class Scheduler:
                 await self._refresh_smart_route_for_dispatch(task, worker.id)
 
                 reqs = self._resolve_resource_requirements(task, worker.id)
+                requested_model_id = str(((task.payload or {}).get("model") or "")).strip()
                 if reqs and self._resources and not self._resources.check_available(reqs):
-                    if self._resources.check_available_after_unload(reqs):
+                    if requested_model_id and self._resources.check_available_for_reuse(reqs, requested_model_id):
+                        log("system", "info", f"Task {task.id} reusing warm model {requested_model_id}")
+                    elif self._resources.check_available_after_unload(reqs):
                         # Soft consumers (alive-time models) block the resource; force-unload them.
                         log("system", "info",
                             f"Task {task.id} needs force-unload of idle models to free resources")
-                        await self._resources.force_unload_for(reqs, self._full_config)
+                        await self._resources.force_unload_for(
+                            reqs,
+                            self._full_config,
+                            keep_model_id=requested_model_id or None,
+                        )
                         # After unload, verify (hard check — soft consumers cleared)
                         if not self._resources.check_available_after_unload(reqs):
                             task.next_retry_at = time.time() + 5
@@ -325,7 +332,11 @@ class Scheduler:
         model_id: str | None = (task.payload or {}).get("model") or None
 
         if self._resources and reserved_reqs:
-            await self._resources.reserve_blind_for(reserved_reqs, consumer_id=consumer_id)
+            await self._resources.reserve_blind_for(
+                reserved_reqs,
+                consumer_id=consumer_id,
+                model_id=model_id,
+            )
 
         started = time.monotonic()
 
