@@ -1,18 +1,6 @@
-import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import json
-
-# Mocking core.config before importing core.logger and core.cron
-import types
-mock_config = types.ModuleType('core.config')
-mock_config.config = types.SimpleNamespace(
-    logging=types.SimpleNamespace(
-        level='info',
-        timezone='UTC'
-    )
-)
-sys.modules['core.config'] = mock_config
 
 from core.logger import logger
 from core.cron import _trim_log_file
