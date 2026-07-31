@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from datetime import datetime, timezone
 from typing import AsyncGenerator
@@ -537,6 +538,7 @@ class Endpoint_openaix(Endpoint_ollama):
                     message=err.get("message", "Request timed out"),
                     task_id=task.id,
                 )
+            mapped_error = self._map_openai_failed_task_error(err)
             log(
                 "http",
                 "warning",
@@ -548,10 +550,12 @@ class Endpoint_openaix(Endpoint_ollama):
             )
             return self._error_response(
                 protocol="openai",
-                status_code=502,
-                code=(task.error or {}).get("code", "server_error"),
-                message=(task.error or {}).get("message", "Worker error"),
+                status_code=mapped_error["status_code"],
+                code=mapped_error["code"],
+                message=mapped_error["message"],
                 task_id=task.id,
+                error_type=mapped_error.get("error_type"),
+                error_param=mapped_error.get("error_param"),
             )
         if task.status == STATUS_CANCELED:
             log("http", "warning", f"{self.id} /v1/chat/completions canceled: task={task.id}", self.id)
@@ -1024,16 +1028,79 @@ class Endpoint_openaix(Endpoint_ollama):
 
     def _openai_error_payload(self, code: str, message: str, task_id: str | None = None) -> dict:
         """OpenAI-style error payload."""
+        return self._openai_error_payload_with_type(code, message, task_id=task_id)
+
+    @staticmethod
+    def _openai_error_payload_with_type(
+        code: str,
+        message: str,
+        task_id: str | None = None,
+        *,
+        error_type: str | None = None,
+        error_param: str | None = None,
+    ) -> dict:
+        """OpenAI-style error payload with optional type/param overrides."""
+        normalized_code = str(code or "server_error")
+        normalized_type = str(error_type or normalized_code)
         payload = {
             "error": {
                 "message": message,
-                "type": code,
-                "code": code,
+                "type": normalized_type,
+                "code": normalized_code,
             }
         }
+        if error_param is not None:
+            payload["error"]["param"] = error_param
         if task_id:
             payload["error"]["task_id"] = task_id
         return payload
+
+    @staticmethod
+    def _extract_model_not_found_name(raw_text: str) -> str:
+        """Extract missing model id from upstream text when present."""
+        match = re.search(r"model\s+['\"]([^'\"]+)['\"]\s+not\s+found", raw_text, flags=re.IGNORECASE)
+        if not match:
+            return ""
+        return str(match.group(1)).strip()
+
+    def _map_openai_failed_task_error(self, error: dict | None) -> dict[str, str | int | None]:
+        """Map worker failure payload to OpenAI-compatible HTTP status and error envelope."""
+        err = error if isinstance(error, dict) else {}
+        err_code = str(err.get("code") or "server_error")
+        err_message = str(err.get("message") or "Worker error")
+        err_body = str(err.get("body") or "")
+        combined = f"{err_message}\n{err_body}".lower()
+
+        if err_code == "INVALID_MODEL":
+            return {
+                "status_code": 404,
+                "code": "model_not_found",
+                "message": err_message,
+                "error_type": "invalid_request_error",
+                "error_param": "model",
+            }
+
+        if err_code == "UPSTREAM_ERROR" and "404" in combined and "model" in combined and "not found" in combined:
+            missing_model = self._extract_model_not_found_name(f"{err_message}\n{err_body}")
+            if missing_model:
+                mapped_message = f"The model '{missing_model}' does not exist."
+            else:
+                mapped_message = "The requested model does not exist."
+            return {
+                "status_code": 404,
+                "code": "model_not_found",
+                "message": mapped_message,
+                "error_type": "invalid_request_error",
+                "error_param": "model",
+            }
+
+        return {
+            "status_code": 502,
+            "code": err_code,
+            "message": err_message,
+            "error_type": None,
+            "error_param": None,
+        }
 
     def _ollama_error_payload(self, code: str, message: str, task_id: str | None = None) -> dict:
         """Ollama-style error payload used in this project."""
@@ -1050,11 +1117,19 @@ class Endpoint_openaix(Endpoint_ollama):
         code: str,
         message: str,
         task_id: str | None = None,
+        error_type: str | None = None,
+        error_param: str | None = None,
     ) -> JSONResponse:
         """Protocol-aware error response. Supports compatibility mode toggle."""
         if self._errors_compatibility_mode:
             payload = (
-                self._openai_error_payload(code, message, task_id)
+                self._openai_error_payload_with_type(
+                    code,
+                    message,
+                    task_id=task_id,
+                    error_type=error_type,
+                    error_param=error_param,
+                )
                 if protocol == "openai"
                 else self._ollama_error_payload(code, message, task_id)
             )

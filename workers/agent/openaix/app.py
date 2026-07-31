@@ -601,10 +601,27 @@ class OpenAIxWorker(BaseWorker):
         request_has_tools_field = "tools" in request_payload
         request_tools_value = request_payload.get("tools") if request_has_tools_field else None
         requested_internal_tool_names = self._extract_requested_internal_tool_names(request_tools_value)
+        smart_default_injection_enabled = self._resolve_smart_default_tool_injection(task, request_payload)
+        skip_default_tools_injection = (smart_default_injection_enabled is False) and (not request_has_tools_field)
         disable_internal_tools_injection = request_has_tools_field and (
             request_tools_value is None
             or (isinstance(request_tools_value, list) and len(request_tools_value) == 0)
         )
+
+        if skip_default_tools_injection:
+            disable_internal_tools_injection = True
+            task.config["disable_default_tool_injection"] = True
+            log(
+                "worker",
+                "info",
+                (
+                    f"Task {task.id}: smart model default_tool_injection=false and request has no tools field; "
+                    "internal tools injection disabled"
+                ),
+                "openaix",
+            )
+        else:
+            task.config["disable_default_tool_injection"] = False
 
         if disable_internal_tools_injection:
             log(
@@ -621,11 +638,11 @@ class OpenAIxWorker(BaseWorker):
             if worker_name == "context_add_internal_tools" and disable_internal_tools_injection:
                 continue
 
-            if worker_name == "context_render_openclaw_style" and task.context is not None and request_has_tools_field:
-                # When caller controls the tools list, advertise only explicitly requested internal tools.
+            if worker_name == "context_render_openclaw_style" and task.context is not None:
                 if disable_internal_tools_injection:
                     task.context.tools = {}
-                else:
+                elif request_has_tools_field:
+                    # When caller controls the tools list, advertise only explicitly requested internal tools.
                     task.context.tools = {
                         name: spec
                         for name, spec in task.context.tools.items()
@@ -668,6 +685,7 @@ class OpenAIxWorker(BaseWorker):
         task.config = dict(task.config or {})
         messages = list(payload.get("messages") or [])
         request_has_tools_field = "tools" in payload
+        disable_default_tool_injection = bool(task.config.get("disable_default_tool_injection", False))
         injected_tool_names: list[str] = []
 
         if task.context.system_rendered:
@@ -713,7 +731,7 @@ class OpenAIxWorker(BaseWorker):
                     injected_tool_names.append(tool_name)
 
                 payload["tools"] = out_tools
-        elif task.context.tools:
+        elif task.context.tools and not disable_default_tool_injection:
             out_tools = []
             for tool_name, tool_spec in task.context.tools.items():
                 if not isinstance(tool_spec, dict):
@@ -726,6 +744,28 @@ class OpenAIxWorker(BaseWorker):
         task.config["injected_tool_names"] = injected_tool_names
         payload["messages"] = messages
         task.payload = payload
+
+    def _resolve_smart_default_tool_injection(self, task: Task | None, payload: dict | None) -> bool | None:
+        """Return smart model default tool-injection policy for the request, when available."""
+        route_cfg = (task.config or {}).get("route") if isinstance(getattr(task, "config", None), dict) else None
+        if not isinstance(route_cfg, dict):
+            return None
+
+        requested_provider = str(route_cfg.get("requested_provider") or "").strip()
+        requested_model = str(route_cfg.get("requested_model") or "").strip()
+        if not requested_provider or not requested_model:
+            return None
+        if self._provider_api(requested_provider) != "smart":
+            return None
+
+        smart_model_cfg = self._resolve_model_cfg(requested_model, provider_id=requested_provider)
+        if not isinstance(smart_model_cfg, dict):
+            return None
+
+        raw_flag = smart_model_cfg.get("default_tool_injection")
+        if raw_flag is None:
+            return True
+        return bool(raw_flag)
 
     @staticmethod
     def _tool_payload_entry(tool_name: str, tool_spec: dict) -> dict:

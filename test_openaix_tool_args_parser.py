@@ -270,6 +270,24 @@ class TestOpenAIxToolInjection(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(task.payload["tools"][1]["function"]["name"], "internal_echo")
         self.assertEqual(len(task.payload["tools"]), 2)
 
+    def test_apply_context_to_payload_skips_default_injection_when_flag_is_set(self) -> None:
+        """Does not inject default internal tools when disable_default_tool_injection is set."""
+        task = Task_agent(payload={"messages": []}, stream=False)
+        task.config = {"disable_default_tool_injection": True}
+        task.context = Context.empty()
+        task.context.tools = {
+            "internal_echo": {
+                "worker": "echo_tool",
+                "description": "Echo input",
+                "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}},
+            }
+        }
+
+        OpenAIxWorker._apply_context_to_payload(task)
+
+        self.assertEqual(task.config["injected_tool_names"], [])
+        self.assertNotIn("tools", task.payload)
+
     async def test_run_with_internal_tools_does_not_execute_non_injected_tool(self) -> None:
         """Passes through tool calls when the tool was caller-provided rather than injected by aidir."""
         worker = OpenAIxWorker()
@@ -1298,6 +1316,120 @@ class TestOpenAIxGenerationParameters(unittest.TestCase):
                 "repeat_last_n": 32,
             },
         )
+
+
+class TestOpenAIxSmartDefaultToolInjection(unittest.TestCase):
+    """Regression checks for smart-model default tool injection policy."""
+
+    def test_resolve_smart_default_tool_injection_false(self) -> None:
+        """Returns False when smart model explicitly disables default tool injection."""
+        worker = OpenAIxWorker()
+        worker._provider_id = "ollama_local"
+        worker._core = _FakeCore(
+            {
+                "models": {
+                    "providers": {
+                        "smart": {
+                            "api": "smart",
+                            "models": [
+                                {
+                                    "id": "smart_chat",
+                                    "default_tool_injection": False,
+                                }
+                            ],
+                        }
+                    }
+                }
+            }
+        )
+        task = Task_agent(payload={"model": "resolved-model", "messages": []}, stream=False)
+        task.config = {
+            "route": {
+                "requested_provider": "smart",
+                "requested_model": "smart_chat",
+                "resolved_provider": "ollama_local",
+                "resolved_model": "resolved-model",
+            }
+        }
+
+        policy = worker._resolve_smart_default_tool_injection(task, task.payload)
+
+        self.assertIs(policy, False)
+
+    def test_resolve_smart_default_tool_injection_defaults_true_when_omitted(self) -> None:
+        """Defaults to True when smart model does not define default_tool_injection."""
+        worker = OpenAIxWorker()
+        worker._provider_id = "ollama_local"
+        worker._core = _FakeCore(
+            {
+                "models": {
+                    "providers": {
+                        "smart": {
+                            "api": "smart",
+                            "models": [
+                                {
+                                    "id": "smart_chat",
+                                }
+                            ],
+                        }
+                    }
+                }
+            }
+        )
+        task = Task_agent(payload={"model": "resolved-model", "messages": []}, stream=False)
+        task.config = {
+            "route": {
+                "requested_provider": "smart",
+                "requested_model": "smart_chat",
+                "resolved_provider": "ollama_local",
+                "resolved_model": "resolved-model",
+            }
+        }
+
+        policy = worker._resolve_smart_default_tool_injection(task, task.payload)
+
+        self.assertIs(policy, True)
+
+
+class TestOpenAIxErrorMapping(unittest.TestCase):
+    """Regression checks for OpenAI-compatible error envelopes."""
+
+    def test_map_failed_task_upstream_model_not_found_to_openai_error(self) -> None:
+        """Converts upstream 404 model-miss into OpenAI model_not_found payload fields."""
+        endpoint = Endpoint_openaix({"id": "openaix", "worker": "openaix"})
+
+        mapped = endpoint._map_openai_failed_task_error(
+            {
+                "code": "UPSTREAM_ERROR",
+                "message": "Upstream returned HTTP 404",
+                "body": "{\"error\":\"model 'MODEL_NAME' not found\"}",
+            }
+        )
+
+        self.assertEqual(mapped["status_code"], 404)
+        self.assertEqual(mapped["code"], "model_not_found")
+        self.assertEqual(mapped["error_type"], "invalid_request_error")
+        self.assertEqual(mapped["error_param"], "model")
+        self.assertEqual(mapped["message"], "The model 'MODEL_NAME' does not exist.")
+
+    def test_openai_error_response_supports_openai_type_and_param(self) -> None:
+        """Renders OpenAI error envelope with explicit type and param fields."""
+        endpoint = Endpoint_openaix({"id": "openaix", "worker": "openaix"})
+
+        response = endpoint._error_response(
+            protocol="openai",
+            status_code=404,
+            code="model_not_found",
+            message="The model 'MODEL_NAME' does not exist.",
+            error_type="invalid_request_error",
+            error_param="model",
+        )
+
+        payload = json.loads(response.body)
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(payload["error"]["code"], "model_not_found")
+        self.assertEqual(payload["error"]["type"], "invalid_request_error")
+        self.assertEqual(payload["error"]["param"], "model")
 
 
 class TestOpenAIxModelRouting(unittest.TestCase):
