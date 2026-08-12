@@ -1154,11 +1154,50 @@ class Endpoint_openaix(Endpoint_ollama):
             "total_tokens": prompt_tokens + completion_tokens,
         }
 
+    @staticmethod
+    def _ollama_tool_calls_to_openai(raw_calls: object, *, streaming: bool = False) -> list[dict]:
+        """Convert Ollama tool calls into OpenAI-compatible function-call objects."""
+        if not isinstance(raw_calls, list):
+            return []
+
+        tool_calls: list[dict] = []
+        for fallback_index, raw_call in enumerate(raw_calls):
+            if not isinstance(raw_call, dict):
+                continue
+
+            function = raw_call.get("function")
+            function = function if isinstance(function, dict) else {}
+            name = function.get("name") or raw_call.get("name")
+            if not isinstance(name, str) or not name:
+                continue
+
+            arguments = function.get("arguments", raw_call.get("arguments", {}))
+            if not isinstance(arguments, str):
+                arguments = json.dumps(arguments if arguments is not None else {})
+
+            tool_call = {
+                "id": str(raw_call.get("id") or ""),
+                "type": str(raw_call.get("type") or "function"),
+                "function": {
+                    "name": name,
+                    "arguments": arguments,
+                },
+            }
+            if streaming:
+                index = raw_call.get("index")
+                tool_call["index"] = index if isinstance(index, int) else fallback_index
+            tool_calls.append(tool_call)
+        return tool_calls
+
     def _ollama_sync_to_openai(self, data: dict, task_id: str, request_body: dict) -> dict:
         """Convert non-stream ollama chat response to OpenAI chat.completion shape."""
         msg = data.get("message") or {}
         content = msg.get("content", "")
         model = data.get("model") or request_body.get("model") or ""
+        tool_calls = self._ollama_tool_calls_to_openai(msg.get("tool_calls"))
+        message = {"role": "assistant", "content": content}
+        if tool_calls:
+            message["tool_calls"] = tool_calls
 
         resp = {
             "id": f"chatcmpl-{task_id}",
@@ -1168,8 +1207,8 @@ class Endpoint_openaix(Endpoint_ollama):
             "choices": [
                 {
                     "index": 0,
-                    "message": {"role": "assistant", "content": content},
-                    "finish_reason": "stop",
+                    "message": message,
+                    "finish_reason": "tool_calls" if tool_calls else "stop",
                 }
             ],
         }
@@ -1184,12 +1223,15 @@ class Endpoint_openaix(Endpoint_ollama):
         msg = chunk.get("message") or {}
         content = msg.get("content", "")
         done = bool(chunk.get("done", False))
+        tool_calls = self._ollama_tool_calls_to_openai(msg.get("tool_calls"), streaming=True)
 
         delta = {"content": content}
         if not content:
             delta = {}
+        if tool_calls:
+            delta["tool_calls"] = tool_calls
 
-        finish_reason = "stop" if done else None
+        finish_reason = "tool_calls" if done and tool_calls else "stop" if done else None
 
         return {
             "id": f"chatcmpl-{task_id}",

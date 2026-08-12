@@ -885,7 +885,7 @@ class OpenAIxWorker(BaseWorker):
         """
         current_payload = dict(payload)
         current_payload["stream"] = False
-        messages = list(current_payload.get("messages") or [])
+        messages = self._normalize_tool_history_messages(current_payload.get("messages"))
         max_turns = self._tools_max_turns
         turn = 0
         last_step_data: dict | None = None
@@ -1159,6 +1159,22 @@ class OpenAIxWorker(BaseWorker):
 
         if normalized_calls:
             normalized["tool_calls"] = normalized_calls
+        return normalized
+
+    @classmethod
+    def _normalize_tool_history_messages(cls, messages: object) -> list[dict]:
+        """Normalize assistant tool-call history before replaying it to Ollama."""
+        if not isinstance(messages, list):
+            return []
+
+        normalized: list[dict] = []
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            if str(message.get("role") or "").strip().lower() == "assistant" and isinstance(message.get("tool_calls"), list):
+                normalized.append(cls._normalize_assistant_message_for_history(message))
+            else:
+                normalized.append(dict(message))
         return normalized
 
     @staticmethod

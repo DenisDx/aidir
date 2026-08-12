@@ -381,7 +381,7 @@ class TestOpenAIxToolInjection(unittest.IsolatedAsyncioTestCase):
         """Passes through tool calls when the tool was caller-provided rather than injected by aidir."""
         worker = OpenAIxWorker()
 
-        async def fake_forward_sync(client, url, payload, *, save_call=False, task_id=""):
+        async def fake_forward_sync(client, url, payload, *, task=None, save_call=False, task_id=""):
             return WorkerResult(
                 ok=True,
                 data={
@@ -441,6 +441,55 @@ class TestOpenAIxToolInjection(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(result.ok)
         self.assertEqual(result.data["message"]["tool_calls"][0]["function"]["name"], "caller_tool")
+
+    async def test_run_with_internal_tools_normalizes_openai_tool_history(self) -> None:
+        """Replays caller history with Ollama-compatible tool-call argument objects."""
+        worker = OpenAIxWorker()
+        forwarded_payloads: list[dict] = []
+
+        async def fake_forward_sync(client, url, payload, *, task=None, save_call=False, task_id=""):
+            forwarded_payloads.append(payload)
+            return WorkerResult(ok=True, data={"message": {"role": "assistant", "content": "done"}})
+
+        worker._forward_sync = fake_forward_sync
+        parent_task = Task_agent(
+            payload={
+                "messages": [
+                    {"role": "system", "content": "system"},
+                    {"role": "user", "content": "search"},
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call-1",
+                                "type": "function",
+                                "function": {"name": "web_search", "arguments": '{"query":"test"}'},
+                            }
+                        ],
+                    },
+                    {"role": "tool", "tool_call_id": "call-1", "name": "web_search", "content": "{}"},
+                ],
+                "tools": [{"type": "function", "function": {"name": "web_search", "parameters": {"type": "object"}}}],
+            },
+            stream=False,
+        )
+        parent_task.context = Context.empty()
+        parent_task.config = {"injected_tool_names": ["web_search"]}
+
+        result = await worker._run_with_internal_tools(
+            client=None,
+            url="http://example.test/api/chat",
+            payload=parent_task.payload,
+            parent_task=parent_task,
+            emit_chunk=None,
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(len(forwarded_payloads), 1)
+        messages = forwarded_payloads[0]["messages"]
+        self.assertEqual(messages[2]["tool_calls"][0]["function"]["arguments"], {"query": "test"})
+        self.assertEqual(messages[3], parent_task.payload["messages"][3])
 
 
 class _FakeAsyncResponse:
@@ -1613,6 +1662,93 @@ class TestOpenAIxErrorMapping(unittest.TestCase):
         self.assertEqual(payload["error"]["code"], "model_not_found")
         self.assertEqual(payload["error"]["type"], "invalid_request_error")
         self.assertEqual(payload["error"]["param"], "model")
+
+
+class TestOpenAIxToolCallSerialization(unittest.TestCase):
+    """Regression checks for OpenAI tool-call response serialization."""
+
+    def test_sync_response_preserves_tool_calls(self) -> None:
+        """Returns a caller-owned function call in the OpenAI completion response."""
+        endpoint = Endpoint_openaix({"id": "openaix", "worker": "openaix"})
+
+        response = endpoint._ollama_sync_to_openai(
+            {
+                "model": "test-model",
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "function": {"name": "caller_tool", "arguments": {"query": "test"}},
+                        }
+                    ],
+                },
+            },
+            "task-1",
+            {"model": "test-model"},
+        )
+
+        choice = response["choices"][0]
+        self.assertEqual(choice["finish_reason"], "tool_calls")
+        self.assertEqual(choice["message"]["tool_calls"], [
+            {
+                "id": "call-1",
+                "type": "function",
+                "function": {"name": "caller_tool", "arguments": '{"query": "test"}'},
+            }
+        ])
+
+    def test_stream_response_preserves_tool_call_delta(self) -> None:
+        """Returns a caller-owned function call in an OpenAI streaming delta."""
+        endpoint = Endpoint_openaix({"id": "openaix", "worker": "openaix"})
+
+        response = endpoint._ollama_chunk_to_openai(
+            {
+                "model": "test-model",
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "function": {"name": "caller_tool", "arguments": {"query": "test"}},
+                        }
+                    ],
+                },
+            },
+            "task-1",
+            {"model": "test-model"},
+        )
+
+        choice = response["choices"][0]
+        self.assertIsNone(choice["finish_reason"])
+        self.assertEqual(choice["delta"]["tool_calls"], [
+            {
+                "id": "call-1",
+                "type": "function",
+                "index": 0,
+                "function": {"name": "caller_tool", "arguments": '{"query": "test"}'},
+            }
+        ])
+
+    def test_stream_terminal_tool_call_sets_tool_calls_finish_reason(self) -> None:
+        """Marks a completed streaming function call with OpenAI's tool_calls finish reason."""
+        endpoint = Endpoint_openaix({"id": "openaix", "worker": "openaix"})
+
+        response = endpoint._ollama_chunk_to_openai(
+            {
+                "done": True,
+                "message": {
+                    "tool_calls": [
+                        {"function": {"name": "caller_tool", "arguments": {}}},
+                    ],
+                },
+            },
+            "task-1",
+            {"model": "test-model"},
+        )
+
+        self.assertEqual(response["choices"][0]["finish_reason"], "tool_calls")
 
 
 class TestOpenAIxModelRouting(unittest.TestCase):
