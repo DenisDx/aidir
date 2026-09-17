@@ -95,8 +95,11 @@ class Scheduler:
 
                 reqs = self._resolve_resource_requirements(task, worker.id)
                 requested_model_id = str(((task.payload or {}).get("model") or "")).strip()
+                requested_provider_id = self._resolve_task_provider_id(task, worker.id)
                 if reqs and self._resources and not self._resources.check_available(reqs):
-                    if requested_model_id and self._resources.check_available_for_reuse(reqs, requested_model_id):
+                    if requested_model_id and self._resources.check_available_for_reuse(
+                        reqs, requested_model_id, requested_provider_id
+                    ):
                         log("system", "info", f"Task {task.id} reusing warm model {requested_model_id}")
                     elif self._resources.check_available_after_unload(reqs):
                         # Soft consumers (alive-time models) block the resource; force-unload them.
@@ -106,9 +109,10 @@ class Scheduler:
                             reqs,
                             self._full_config,
                             keep_model_id=requested_model_id or None,
+                            keep_provider_id=requested_provider_id or None,
                         )
-                        # After unload, verify (hard check — soft consumers cleared)
-                        if not self._resources.check_available_after_unload(reqs):
+                        # Re-check actual soft reservations; a failed unload must keep its VRAM occupied.
+                        if not self._resources.check_available(reqs):
                             task.next_retry_at = time.time() + 5
                             await self._queue.add_task(task)
                             log("system", "warn",
@@ -330,12 +334,14 @@ class Scheduler:
         consumer_id = f"{task.id}:{worker.id}"
         # Model id is used to track soft consumers (alive_time) after release
         model_id: str | None = (task.payload or {}).get("model") or None
+        provider_id = self._resolve_task_provider_id(task, worker.id)
 
         if self._resources and reserved_reqs:
             await self._resources.reserve_blind_for(
                 reserved_reqs,
                 consumer_id=consumer_id,
                 model_id=model_id,
+                provider_id=provider_id,
             )
 
         started = time.monotonic()
@@ -379,7 +385,12 @@ class Scheduler:
 
         finally:
             if self._resources and reserved_reqs:
-                await self._resources.release_for(reserved_reqs, consumer_id=consumer_id, model_id=model_id)
+                await self._resources.release_for(
+                    reserved_reqs,
+                    consumer_id=consumer_id,
+                    model_id=model_id,
+                    provider_id=provider_id,
+                )
 
     async def _expire_queued_task_if_needed(self, task: Task) -> bool:
         """Fail queued tasks that exceeded queue timeout before their first run."""
@@ -500,6 +511,16 @@ class Scheduler:
         task.resource_requirements = merged
         return merged
 
+    def _resolve_task_provider_id(self, task: Task, worker_id: str) -> str:
+        """Return the resolved route provider, falling back to the selected worker provider."""
+        route_cfg = (task.config or {}).get("route") if isinstance(task.config, dict) else None
+        if isinstance(route_cfg, dict):
+            provider_id = str(route_cfg.get("resolved_provider") or "").strip()
+            if provider_id:
+                return provider_id
+        worker_cfg = self._workers_cfg.get(worker_id, {}) or {}
+        return str(worker_cfg.get("provider") or "").strip()
+
     def _make_smart_router(self, worker_id: str) -> SmartRouter:
         """Build a shared smart router for scheduler-time route refresh."""
 
@@ -599,6 +620,10 @@ class Scheduler:
             return resolved_worker
 
         provider_id = str(route.get("resolved_provider") or "").strip()
+        if self._provider_api(provider_id) == "llama-cpp":
+            if "call_llama_cpp" in self._workers:
+                return "call_llama_cpp"
+            return worker_id
         if self._provider_api(provider_id) != "openaix":
             return worker_id
         if "openaix" in self._workers:
@@ -660,19 +685,23 @@ class Scheduler:
         timeout_ms: int,
         incoming_bearer_token: str = "",
     ) -> bool:
-        """Confirm that an Ollama provider answers and reports the requested model in /api/tags."""
+        """Confirm that an Ollama or llama.cpp provider reports the requested model."""
         provider_cfg = self._provider_cfg(provider_id)
         base_url = str(provider_cfg.get("baseUrl") or "").rstrip("/")
         if not base_url:
             return False
+
+        api_type = self._provider_api(provider_id)
 
         headers = self._resolve_probe_headers(provider_id, incoming_bearer_token)
         timeout_seconds = max(0.001, timeout_ms / 1000.0)
 
         try:
             async with httpx.AsyncClient(timeout=timeout_seconds, headers=headers) as client:
-                response = await client.get(f"{base_url}/api/tags")
+                response = await client.get(f"{base_url}/v1/models" if api_type == "llama-cpp" else f"{base_url}/api/tags")
         except httpx.HTTPError:
+            if api_type == "llama-cpp" and str(provider_cfg.get("exec_cmd") or "").strip():
+                return True
             return False
 
         if response.status_code < 200 or response.status_code >= 300:
@@ -683,7 +712,7 @@ class Scheduler:
         except Exception:
             return False
 
-        models = payload.get("models") if isinstance(payload, dict) else None
+        models = payload.get("data") if api_type == "llama-cpp" and isinstance(payload, dict) else payload.get("models") if isinstance(payload, dict) else None
         if not isinstance(models, list):
             return False
 

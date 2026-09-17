@@ -40,7 +40,7 @@ class Resource:
         self.keep_alive_period: int = int(keep_alive_period)
         self.provider: str | None = provider
         # Soft consumers: models still in memory after task release (within alive_time window).
-        # Each entry: {consumer_id, resources, released_at, model_id}
+        # Each entry: {consumer_id, resources, released_at, model_id, provider_id}
         self._soft_used: list[dict] = []
         self._lock = asyncio.Lock()
 
@@ -60,6 +60,7 @@ class Resource:
         self,
         model_id: str,
         required: dict[str, int] | None = None,
+        provider_id: str | None = None,
     ) -> dict | None:
         """Return active soft consumer for the same model when it satisfies required usage."""
         mid = str(model_id or "").strip()
@@ -67,8 +68,11 @@ class Resource:
             return None
 
         req = required or {}
+        pid = str(provider_id or "").strip()
         for entry in self.get_active_soft_consumers():
             if str(entry.get("model_id") or "").strip() != mid:
+                continue
+            if pid and str(entry.get("provider_id") or "").strip() != pid:
                 continue
             resources = entry.get("resources") or {}
             if any(int(resources.get(key, 0)) < int(amount) for key, amount in req.items() if int(amount) > 0):
@@ -95,10 +99,11 @@ class Resource:
         self,
         required: dict[str, int] | None = None,
         model_id: str = "",
+        provider_id: str | None = None,
     ) -> bool:
         """Return True when the same warm model can be reused without unloading it."""
         req = required or {}
-        match = self._matching_soft_consumer(model_id, req)
+        match = self._matching_soft_consumer(model_id, req, provider_id)
         if match is None:
             return False
 
@@ -139,13 +144,19 @@ class Resource:
         self,
         model_id: str,
         required: dict[str, int] | None = None,
+        provider_id: str | None = None,
     ) -> bool:
         """Return True when the same model is still present as a compatible soft consumer."""
-        return self._matching_soft_consumer(model_id, required) is not None
+        return self._matching_soft_consumer(model_id, required, provider_id) is not None
 
-    def clear_soft_consumer(self, model_id: str) -> None:
+    def clear_soft_consumer(self, model_id: str, provider_id: str | None = None) -> None:
         """Remove soft consumer entry for a model (after force-unload)."""
-        self._soft_used = [e for e in self._soft_used if e.get("model_id") != model_id]
+        pid = str(provider_id or "").strip()
+        self._soft_used = [
+            entry for entry in self._soft_used
+            if entry.get("model_id") != model_id
+            or (pid and str(entry.get("provider_id") or "").strip() != pid)
+        ]
 
 
     async def reserve_blind(
@@ -153,14 +164,15 @@ class Resource:
         required: dict[str, int] | None = None,
         consumer_id: str = "",
         model_id: str | None = None,
+        provider_id: str | None = None,
     ) -> None:
         """Blindly reserve amounts without availability checks."""
         req = required or {}
         cid = consumer_id.strip()
         mid = str(model_id or "").strip()
         async with self._lock:
-            if mid and self._matching_soft_consumer(mid, req) is not None:
-                self.clear_soft_consumer(mid)
+            if mid and self._matching_soft_consumer(mid, req, provider_id) is not None:
+                self.clear_soft_consumer(mid, provider_id)
             for key, amount in req.items():
                 inc = int(amount)
                 if inc <= 0:
@@ -175,6 +187,7 @@ class Resource:
         reserved: dict[str, int] | None = None,
         consumer_id: str = "",
         model_id: str | None = None,
+        provider_id: str | None = None,
     ) -> None:
         """Release previously reserved amounts. Adds to soft-used tracking if alive_time > 0."""
         req = reserved or {}
@@ -194,14 +207,20 @@ class Resource:
                 self.consumers.pop(cid, None)
             # Track soft consumer - model may remain in VRAM for alive_time seconds after release
             mid = (model_id or "").strip()
+            pid = str(provider_id or "").strip()
             if self.alive_time > 0 and req and mid:
                 # Refresh existing entry so timestamp reflects the latest release
-                self._soft_used = [e for e in self._soft_used if e.get("model_id") != mid]
+                self._soft_used = [
+                    entry for entry in self._soft_used
+                    if entry.get("model_id") != mid
+                    or (pid and str(entry.get("provider_id") or "").strip() != pid)
+                ]
                 self._soft_used.append({
                     "consumer_id": cid,
                     "resources": {k: int(v) for k, v in req.items() if int(v) > 0},
                     "released_at": time.time(),
                     "model_id": mid,
+                    "provider_id": pid,
                 })
 
     def snapshot(self) -> dict:
@@ -214,6 +233,7 @@ class Resource:
         soft_consumers = [
             {
                 "model_id": e["model_id"],
+                "provider_id": e.get("provider_id", ""),
                 "resources": e["resources"],
                 "expires_in": max(0, round(self.alive_time - (time.time() - e["released_at"]))),
             }

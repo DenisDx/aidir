@@ -56,8 +56,9 @@ class TestResourceReuse(unittest.IsolatedAsyncioTestCase):
 
         unloaded: list[str] = []
 
-        async def _fake_unload(_res, model_id, _full_config):
+        async def _fake_unload(_res, model_id, _provider_id, _full_config):
             unloaded.append(model_id)
+            return True
 
         resources._call_provider_unload = _fake_unload  # type: ignore[method-assign]
 
@@ -66,6 +67,29 @@ class TestResourceReuse(unittest.IsolatedAsyncioTestCase):
         remaining = resources.get("gpu").get_active_soft_consumers()
         self.assertEqual(unloaded, ["model-b"])
         self.assertEqual([entry["model_id"] for entry in remaining], ["model-a"])
+
+    async def test_force_unload_uses_soft_consumer_provider(self) -> None:
+        """Uses the provider that owns an idle model instead of the legacy resource default."""
+        resources = Resources(
+            [{"id": "gpu", "type": "cuda", "limits": {"VRAM": 20}, "alive_time": 300, "provider": "ollama_local"}]
+        )
+        await resources.release_for(
+            {"gpu": {"VRAM": 8}},
+            consumer_id="prev",
+            model_id="shared-model",
+            provider_id="llama_local",
+        )
+
+        unloaded: list[tuple[str, str]] = []
+
+        async def _fake_unload(_res, model_id, provider_id, _full_config):
+            unloaded.append((model_id, provider_id))
+            return True
+
+        resources._call_provider_unload = _fake_unload  # type: ignore[method-assign]
+        await resources.force_unload_for({"gpu": {"VRAM": 8}}, full_config={})
+
+        self.assertEqual(unloaded, [("shared-model", "llama_local")])
 
 
 if __name__ == "__main__":

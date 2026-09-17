@@ -346,6 +346,21 @@ async def keep_alive_ping(redis: aioredis.Redis) -> None:
                 provider = providers.get(provider_id) or {}
                 base_url = (provider.get("baseUrl") or "").rstrip("/")
                 api_type = provider.get("api") or ""
+                if api_type == "llama-cpp":
+                    if not provider.get("exec_cmd"):
+                        continue
+                    from core.local_server_manager import LocalServerError, LocalServerManager
+                    try:
+                        await LocalServerManager(config.raw(), _ROOT).ensure_running(provider_id)
+                    except LocalServerError as exc:
+                        log("system", "warn", f"llama.cpp keep-alive restart failed for {provider_id}: {exc}")
+                        continue
+                    data["released_at"] = now
+                    ttl = max(keep_alive, 3600)
+                    await redis.set(key, json.dumps(data), ex=ttl)
+                    pinged += 1
+                    log("system", "info", f"llama.cpp keep-alive verified {model_id} via {provider_id}")
+                    continue
                 if not base_url or api_type != "ollama":
                     continue
                 import httpx

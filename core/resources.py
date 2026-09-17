@@ -41,6 +41,10 @@ class Resources:
         self._redis = redis
         self._ns = ns
 
+    def set_local_server_manager(self, manager) -> None:
+        """Inject the manager used to stop locally owned llama.cpp servers."""
+        self._local_server_manager = manager
+
     def all(self) -> list[Resource]:
         """Return all resources."""
         return list(self._items.values())
@@ -64,6 +68,7 @@ class Resources:
         self,
         requirements: dict[str, dict[str, int]] | None = None,
         model_id: str | None = None,
+        provider_id: str | None = None,
     ) -> bool:
         """Return True when all resources can reuse the same warm model without unload."""
         reqs = requirements or {}
@@ -74,7 +79,7 @@ class Resources:
             res = self._items.get(rid)
             if res is None:
                 return False
-            if not res.is_available_for_reuse(need, mid):
+            if not res.is_available_for_reuse(need, mid, provider_id):
                 return False
         return True
 
@@ -94,50 +99,78 @@ class Resources:
         requirements: dict[str, dict[str, int]] | None = None,
         full_config: dict | None = None,
         keep_model_id: str | None = None,
-    ) -> None:
+        keep_provider_id: str | None = None,
+    ) -> bool:
         """Force-unload soft consumers that block needed resources, calling provider API."""
         reqs = requirements or {}
         keep_mid = str(keep_model_id or "").strip()
+        all_unloaded = True
         for rid in reqs:
             res = self._items.get(rid)
             if res is None or not res.alive_time:
                 continue
             for entry in res.get_active_soft_consumers():
                 model_id = entry.get("model_id") or ""
-                if keep_mid and model_id == keep_mid:
+                entry_provider_id = str(entry.get("provider_id") or "").strip()
+                provider_id = entry_provider_id or str(res.provider or "").strip()
+                if keep_mid and model_id == keep_mid and (
+                    not keep_provider_id or provider_id == keep_provider_id
+                ):
                     continue
                 if model_id:
-                    await self._call_provider_unload(res, model_id, full_config)
-                res.clear_soft_consumer(model_id)
+                    unloaded = await self._call_provider_unload(res, model_id, provider_id, full_config)
+                    if not unloaded:
+                        all_unloaded = False
+                        continue
+                res.clear_soft_consumer(model_id, entry_provider_id or None)
+        return all_unloaded
 
     async def _call_provider_unload(
         self,
         res: Resource,
         model_id: str,
+        provider_id: str,
         full_config: dict | None,
-    ) -> None:
+    ) -> bool:
         """Call provider API to force-unload a model (Ollama: POST /api/generate keep_alive=0)."""
-        provider_id = res.provider
         if not provider_id or not full_config:
             log("system", "info",
                 f"Soft-releasing {model_id} from {res.id} (no provider configured, memory freed in tracking only)")
-            return
+            return False
         providers = ((full_config.get("models") or {}).get("providers") or {})
         provider = providers.get(provider_id) or {}
         base_url = (provider.get("baseUrl") or "").rstrip("/")
         api_type = provider.get("api") or ""
+        if api_type == "llama-cpp":
+            manager = getattr(self, "_local_server_manager", None)
+            if manager is None:
+                log("system", "warn", f"Cannot stop llama.cpp provider {provider_id}: server manager unavailable")
+                return False
+            try:
+                stopped = await manager.stop(provider_id)
+                if stopped:
+                    log("system", "info", f"Force-unloaded {model_id} from {res.id} via {provider_id}")
+                return stopped
+            except Exception as exc:
+                log("system", "warn", f"Force-unload {model_id} on {res.id} failed: {exc}")
+                return False
         if not base_url or api_type != "ollama":
             log("system", "info",
                 f"Soft-releasing {model_id} from {res.id} (provider {provider_id} not ollama)")
-            return
+            return False
         try:
             import httpx
             url = f"{base_url}/api/generate"
             async with httpx.AsyncClient(timeout=10.0) as client:
-                await client.post(url, json={"model": model_id, "keep_alive": 0})
+                response = await client.post(url, json={"model": model_id, "keep_alive": 0})
+                if response.status_code < 200 or response.status_code >= 300:
+                    log("system", "warn", f"Force-unload {model_id} on {res.id} returned HTTP {response.status_code}")
+                    return False
             log("system", "info", f"Force-unloaded {model_id} from {res.id} via {provider_id}")
+            return True
         except Exception as exc:
             log("system", "warn", f"Force-unload {model_id} on {res.id} failed: {exc}")
+            return False
 
     async def reserve_blind(self, requirements: dict[str, dict[str, int]] | None = None) -> None:
         """Blindly reserve all requested resources."""
@@ -148,6 +181,7 @@ class Resources:
         requirements: dict[str, dict[str, int]] | None = None,
         consumer_id: str = "",
         model_id: str | None = None,
+        provider_id: str | None = None,
     ) -> None:
         """Blindly reserve all requested resources for a specific consumer."""
         reqs = requirements or {}
@@ -155,7 +189,7 @@ class Resources:
             res = self._items.get(rid)
             if res is None:
                 continue
-            await res.reserve_blind(need, consumer_id=consumer_id, model_id=model_id)
+            await res.reserve_blind(need, consumer_id=consumer_id, model_id=model_id, provider_id=provider_id)
 
     async def release(self, requirements: dict[str, dict[str, int]] | None = None) -> None:
         """Release previously reserved resources."""
@@ -166,6 +200,7 @@ class Resources:
         requirements: dict[str, dict[str, int]] | None = None,
         consumer_id: str = "",
         model_id: str | None = None,
+        provider_id: str | None = None,
     ) -> None:
         """Release previously reserved resources for a specific consumer."""
         reqs = requirements or {}
@@ -173,15 +208,16 @@ class Resources:
             res = self._items.get(rid)
             if res is None:
                 continue
-            await res.release(need, consumer_id=consumer_id, model_id=model_id)
+            await res.release(need, consumer_id=consumer_id, model_id=model_id, provider_id=provider_id)
         # Persist model activity to Redis so cron can track keep_alive pings
         if model_id and self._redis:
-            await self._persist_model_activity(model_id, reqs)
+            await self._persist_model_activity(model_id, reqs, provider_id)
 
     async def _persist_model_activity(
         self,
         model_id: str,
         requirements: dict[str, dict[str, int]],
+        provider_id: str | None = None,
     ) -> None:
         """Write model last-activity timestamp to Redis for cron keep_alive tracking."""
         now = time.time()
@@ -189,7 +225,8 @@ class Resources:
             res = self._items.get(rid)
             if res is None or (not res.keep_alive and not res.alive_time):
                 continue
-            key = f"{self._ns}:resource:{rid}:activity:{model_id}"
+            effective_provider_id = str(provider_id or res.provider or "").strip()
+            key = f"{self._ns}:resource:{rid}:activity:{effective_provider_id}:{model_id}"
             ttl = max(res.keep_alive, res.alive_time, 3600)
             try:
                 import json
@@ -199,7 +236,7 @@ class Resources:
                     "released_at": now,
                     "keep_alive": res.keep_alive,
                     "keep_alive_period": res.keep_alive_period,
-                    "provider": res.provider or "",
+                    "provider": effective_provider_id,
                 }
                 await self._redis.set(key, json.dumps(data), ex=ttl)
             except Exception as exc:

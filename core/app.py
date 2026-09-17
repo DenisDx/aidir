@@ -28,6 +28,7 @@ from core.config import Config, config as _global_config
 from core.error_logging import log_exception
 from core.envid import EnvidRegistry
 from core.logger import logger
+from core.local_server_manager import LocalServerManager
 from core.queue_manager import QueueManager
 from core.resources import Resources
 from core.scheduler import Scheduler
@@ -75,6 +76,7 @@ class Core:
         self.workers_cfg: dict[str, dict] = {}
         self.loop_workers: list[tuple[str, object]] = []
         self.resources = Resources([])
+        self.llama_cpp_server_manager = LocalServerManager({}, _ROOT)
         self.envid_registry: EnvidRegistry | None = None
         self._background_tasks: set[asyncio.Task] = set()
         self._restart_requested = False
@@ -136,6 +138,8 @@ class Core:
         self.workers = load_workers(self.config.raw(), workers_cfg=workers_cfg)
         self.resources = Resources(self.config.get("resources") or [])
         self.resources.set_redis(self.redis, instance)
+        self.llama_cpp_server_manager = LocalServerManager(self.config.raw(), _ROOT)
+        self.resources.set_local_server_manager(self.llama_cpp_server_manager)
         # Initialize each worker with its config section
         for wid, w in self.workers.items():
             setattr(w, "_core", self)

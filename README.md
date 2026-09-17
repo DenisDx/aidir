@@ -147,6 +147,14 @@ Key sections:
 - **`logging`** — log levels per subsystem (0=EMERG … 7=DEBUG)
 - **`resources`** — hardware resources to track (VRAM etc.; enforced in future releases)
 
+### llama.cpp providers
+
+Set a provider's `api` to `llama-cpp` to use `llama-server` through its OpenAI-compatible API. `call_llama_cpp` automatically converts incoming Ollama requests to `/v1/chat/completions`; OpenAI requests follow the same internal route.
+
+Use `exec_cmd` for a local server command. aidir starts it on demand, waits for `/health`, and records its PID in `logs/llama_cpp_servers.json`. Only such recorded processes are stopped when shared resources need VRAM. An already healthy server is treated as external and is never stopped. Leave `exec_cmd` empty for an externally managed or remote server.
+
+For a `llama-cpp` provider, resource `keep_alive` means restart-on-failure during its active window; it does not send API pings. Smart routes probe a running provider via `/v1/models`; an unavailable provider with `exec_cmd` remains eligible for lazy startup after the scheduler has freed resources.
+
 ### Network ports and routing map
 
 Runtime topology:

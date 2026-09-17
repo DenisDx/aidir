@@ -187,7 +187,7 @@ class SmartRouter:
                 ) if self._check_resource_available_after_unload is not None else resource_ready
                 blocked_by_same_or_higher = int(queue_state.get("queued_count_total") or 0) - int(queue_state.get("queued_count_below_priority") or 0)
                 provider_api = self._provider_api(provider_id)
-                if provider_api == "ollama" and self._probe_ollama_model_availability is not None:
+                if provider_api in {"ollama", "llama-cpp"} and self._probe_ollama_model_availability is not None:
                     probe_ok = bool(
                         await self._probe_ollama_model_availability(
                             provider_id,
@@ -205,7 +205,7 @@ class SmartRouter:
                             "can_run_now": False,
                             "queue_state": queue_state,
                             "probe_ok": False,
-                            "probe_source": "ollama_http",
+                            "probe_source": f"{provider_api}_http",
                             "probe_latency_ms": int((time.perf_counter() - started_at) * 1000),
                             "probe_error": "probe_failed",
                             "routing_eligible": False,
@@ -218,7 +218,7 @@ class SmartRouter:
                     "can_run_now": resource_ready_after_unload and blocked_by_same_or_higher == 0,
                     "queue_state": queue_state,
                     "probe_ok": True,
-                    "probe_source": "local" if provider_api != "ollama" else "ollama_http",
+                    "probe_source": "local" if provider_api not in {"ollama", "llama-cpp"} else f"{provider_api}_http",
                     "probe_latency_ms": int((time.perf_counter() - started_at) * 1000),
                     "resource_ready": resource_ready,
                     "resource_ready_after_unload": resource_ready_after_unload,

@@ -311,6 +311,9 @@ class Endpoint_ollama(BaseEndpoint):
 
         provider_id = str(route.get("resolved_provider") or "").strip()
         provider_api = self._provider_api(provider_id)
+        if provider_api == "llama-cpp":
+            routed_worker_id = self._resolve_worker_id_by_name("call_llama_cpp")
+            return routed_worker_id or worker_id
         if provider_api != "openaix":
             return worker_id
 
@@ -676,19 +679,23 @@ class Endpoint_ollama(BaseEndpoint):
         timeout_ms: int,
         incoming_bearer_token: str = "",
     ) -> bool:
-        """Confirm that an Ollama provider responds and reports the requested model in /api/tags."""
+        """Confirm that an Ollama or llama.cpp provider reports the requested model."""
         provider_cfg = self._provider_cfg(provider_id)
         base_url = str(provider_cfg.get("baseUrl") or "").rstrip("/")
         if not base_url:
             return False
+
+        api_type = self._provider_api(provider_id)
 
         headers = self._resolve_probe_headers(provider_id, incoming_bearer_token)
         timeout_seconds = max(0.001, timeout_ms / 1000.0)
 
         try:
             async with httpx.AsyncClient(timeout=timeout_seconds, headers=headers) as client:
-                response = await client.get(f"{base_url}/api/tags")
+                response = await client.get(f"{base_url}/v1/models" if api_type == "llama-cpp" else f"{base_url}/api/tags")
         except httpx.HTTPError:
+            if api_type == "llama-cpp" and str(provider_cfg.get("exec_cmd") or "").strip():
+                return True
             return False
 
         if response.status_code < 200 or response.status_code >= 300:
@@ -699,7 +706,7 @@ class Endpoint_ollama(BaseEndpoint):
         except Exception:
             return False
 
-        models = payload.get("models") if isinstance(payload, dict) else None
+        models = payload.get("data") if api_type == "llama-cpp" and isinstance(payload, dict) else payload.get("models") if isinstance(payload, dict) else None
         if not isinstance(models, list):
             return False
 

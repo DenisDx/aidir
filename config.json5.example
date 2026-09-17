@@ -150,6 +150,17 @@
           "alllevel": "warning"
         }
       },
+      "call_llama_cpp": {
+        "enabled": true,
+        "provider": "llama_local",
+        "request_timeout": ${REQUEST_TIMEOUT:-100},
+        "tools": {
+          "search": {"worker": "web_search"},
+          "fetch": {"worker": "web_fetch"},
+          "selftest": {"worker": "selftest"},
+          "http_api": {"worker": "http_api"}
+        }
+      },
       "openaix": {
         "enabled": true,
         "provider": "ollama_local",
@@ -484,6 +495,22 @@
               },
           },
         ] 
+      },
+      "llama_local": {
+        "api": "llama-cpp",
+        "host": "127.0.0.1",
+        "port": 8888,
+        "baseUrl": "http://127.0.0.1:8888",
+        // Leave empty for an externally managed or remote llama-server.
+        "exec_cmd": "",
+        "startup_timeout": 120,
+        "models": [
+          {
+            "id": "example-llama-model",
+            "contextWindow": 32768,
+            "resources": {"local_machine": {"VRAM": 8000}}
+          }
+        ]
       },
 
     }
