@@ -1172,6 +1172,7 @@ class Endpoint_openaix(Endpoint_ollama):
                 "aidir.model": model_id,
                 "aidir.requested_name": requested_name,
                 "aidir.context_window": model_cfg.get("contextWindow"),
+                "aidir.context_length": model_cfg.get("contextWindow"),
             },
             "capabilities": [str(item) for item in capabilities],
         }

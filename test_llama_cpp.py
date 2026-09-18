@@ -127,6 +127,8 @@ class TestOllamaShowEndpoint(unittest.TestCase):
         self.assertEqual(payload["details"]["format"], "gguf")
         self.assertEqual(payload["model_info"]["aidir.provider"], "llama_local")
         self.assertEqual(payload["model_info"]["aidir.model"], "qwen3.8-27b")
+        self.assertEqual(payload["model_info"]["aidir.context_window"], 180000)
+        self.assertEqual(payload["model_info"]["aidir.context_length"], 180000)
 
     def test_show_rejects_missing_name(self) -> None:
         """Requires the standard Ollama name field."""
