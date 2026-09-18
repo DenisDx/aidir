@@ -379,8 +379,9 @@ function renderResources(resources) {
   resources.forEach(r => {
     const usageParts = Object.keys(r.limits || {}).map(key => {
       const used = Number((r.used || {})[key] || 0);
+      const softUsed = Number((r.soft_used || {})[key] || 0);
       const limit = Number((r.limits || {})[key] || 0);
-      return `${key}: ${used}/${limit}`;
+      return `${key}: ${used + softUsed}/${limit}${softUsed ? ` (${softUsed} idle)` : ''}`;
     });
 
     const consumers = (r.consumers || []).map(c => {
@@ -390,12 +391,20 @@ function renderResources(resources) {
       return `<div style="margin-bottom:2px"><span style="font-family:monospace">${escapeHtml(c.id)}</span> <span style="color:var(--muted)">${escapeHtml(details)}</span></div>`;
     }).join('') || '<span style="color:var(--muted)">—</span>';
 
+    const softConsumers = (r.soft_consumers || []).map(c => {
+      const details = Object.entries(c.resources || {})
+        .map(([k, v]) => `${k}:${v}`)
+        .join(', ');
+      const state = c.persistent ? 'loaded' : `idle ${c.expires_in}s`;
+      return `<div style="margin-bottom:2px"><span style="font-family:monospace">${escapeHtml(c.provider_id || 'provider')}/${escapeHtml(c.model_id)}</span> <span style="color:var(--muted)">${escapeHtml(details)} (${escapeHtml(state)})</span></div>`;
+    }).join('');
+
     const tr = document.createElement('tr');
     tr.innerHTML = `
       <td>${escapeHtml(r.id || '—')}</td>
       <td>${escapeHtml(r.type || '—')}</td>
       <td>${escapeHtml(usageParts.join(' | ') || '—')}</td>
-      <td>${consumers}</td>
+      <td>${consumers}${softConsumers}</td>
     `;
     body.appendChild(tr);
   });

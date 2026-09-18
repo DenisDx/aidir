@@ -138,8 +138,13 @@ class Core:
         self.workers = load_workers(self.config.raw(), workers_cfg=workers_cfg)
         self.resources = Resources(self.config.get("resources") or [])
         self.resources.set_redis(self.redis, instance)
+        self.resources.set_full_config(self.config.raw())
         self.llama_cpp_server_manager = LocalServerManager(self.config.raw(), _ROOT)
         self.resources.set_local_server_manager(self.llama_cpp_server_manager)
+        stopped_providers = await self.llama_cpp_server_manager.stop_all()
+        if stopped_providers:
+            log("core", "info", f"Stopped inherited llama.cpp providers during startup: {stopped_providers}")
+        self.resources.restore_owned_llama_cpp_consumers(self.config.raw(), self.llama_cpp_server_manager)
         # Initialize each worker with its config section
         for wid, w in self.workers.items():
             setattr(w, "_core", self)
@@ -192,6 +197,14 @@ class Core:
             self.scheduler.stop()
             sched_elapsed = time.monotonic() - sched_started
             log("core", "info", f"Scheduler stopped in {sched_elapsed:.2f}s")
+
+        try:
+            await self.resources.force_unload_all(self.config.raw())
+            stopped_providers = await self.llama_cpp_server_manager.stop_all()
+            self.resources.clear_soft_consumers_for_providers(stopped_providers)
+            log("core", "info", f"Inference resources released; stopped llama.cpp providers={stopped_providers}")
+        except Exception as exc:
+            log("system", "warn", f"Inference resource release during shutdown failed: {exc}")
         
         if self.redis:
             log("core", "info", "Closing Redis connection")

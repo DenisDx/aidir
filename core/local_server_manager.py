@@ -31,7 +31,7 @@ class LocalServerManager:
         self._state_path = self._root / "logs" / "llama_cpp_servers.json"
         self._locks: dict[str, asyncio.Lock] = {}
 
-    async def ensure_running(self, provider_id: str) -> None:
+    async def ensure_running(self, provider_id: str, model_id: str = "") -> None:
         """Ensure a llama.cpp provider is healthy, starting it only when configured locally."""
         provider = self._provider(provider_id)
         base_url = str(provider.get("baseUrl") or "").rstrip("/")
@@ -76,7 +76,11 @@ class LocalServerManager:
             except OSError as exc:
                 raise LocalServerError("LLAMA_CPP_START_FAILED", f"Cannot start '{provider_id}': {exc}") from exc
 
-            record = {"pid": process.pid, "start_ticks": self._process_start_ticks(process.pid)}
+            record = {
+                "pid": process.pid,
+                "start_ticks": self._process_start_ticks(process.pid),
+                "model_id": str(model_id or "").strip(),
+            }
             self._store_state(provider_id, record)
             try:
                 await self._wait_ready(provider_id, base_url, record, process)
@@ -116,6 +120,22 @@ class LocalServerManager:
                 pass
         self._remove_state(provider_id)
         return True
+
+    async def stop_all(self) -> list[str]:
+        """Stop every persisted process that is still verifiably owned by aidir."""
+        stopped: list[str] = []
+        for provider_id in list(self._load_state()):
+            if await self.stop(provider_id):
+                stopped.append(provider_id)
+        return stopped
+
+    def owned_records(self) -> dict[str, dict]:
+        """Return valid persisted records for aidir-owned running processes only."""
+        return {
+            provider_id: record
+            for provider_id, record in self._load_state().items()
+            if isinstance(record, dict) and self._is_owned_process(record)
+        }
 
     def _provider(self, provider_id: str) -> dict:
         """Return one configured provider dictionary."""

@@ -86,6 +86,10 @@ class Endpoint_openaix(Endpoint_ollama):
         async def api_tags():
             return self._ollama_tags_response()
 
+        @app.post("/api/show")
+        async def api_show(request: Request):
+            return await self._handle_ollama_show(request)
+
         @app.post("/v1/chat/completions")
         async def openai_chat_completions(request: Request):
             return await self._handle_openai_chat(request)
@@ -951,6 +955,31 @@ class Endpoint_openaix(Endpoint_ollama):
         payload["requested_model"] = str(model_id)
         return JSONResponse(payload, status_code=response.status_code)
 
+    async def _handle_ollama_show(self, request: Request) -> JSONResponse:
+        """Return configured Ollama-compatible model metadata without contacting the upstream."""
+        try:
+            body = await request.json()
+        except Exception:
+            return self._error_response(protocol="ollama", status_code=400, code="INVALID_REQUEST", message="Invalid JSON body")
+        if not isinstance(body, dict):
+            return self._error_response(protocol="ollama", status_code=400, code="INVALID_REQUEST", message="Request body must be an object")
+
+        model_name = str(body.get("name") or "").strip()
+        if not model_name:
+            return self._error_response(protocol="ollama", status_code=400, code="INVALID_REQUEST", message="Field 'name' is required")
+
+        route = self._resolve_model_route(model_name, self._resolve_worker_id({}))
+        if not isinstance(route, dict):
+            return self._error_response(protocol="ollama", status_code=404, code="INVALID_MODEL", message=f"Unknown model: {model_name}")
+
+        provider_id = str(route.get("resolved_provider") or "").strip()
+        model_id = str(route.get("resolved_model") or "").strip()
+        model_cfg = self._find_provider_model_cfg(provider_id, model_id)
+        if not isinstance(model_cfg, dict):
+            return self._error_response(protocol="ollama", status_code=404, code="INVALID_MODEL", message=f"Unknown model: {model_name}")
+
+        return JSONResponse(self._ollama_show_response(model_name, provider_id, model_id, model_cfg))
+
     def _resolve_model_resource_requirements(self, provider_id: str, model_id: str) -> dict | None:
         """Resolve configured resource requirements for a provider/model pair."""
         providers = self._config_get("models.providers") or {}
@@ -1100,6 +1129,51 @@ class Endpoint_openaix(Endpoint_ollama):
             "message": err_message,
             "error_type": None,
             "error_param": None,
+        }
+
+    def _ollama_show_response(
+        self,
+        requested_name: str,
+        provider_id: str,
+        model_id: str,
+        model_cfg: dict,
+    ) -> dict:
+        """Build stable Ollama show metadata from a configured provider/model pair."""
+        provider_api = self._provider_api(provider_id)
+        generation_fields = (
+            "temperature", "top_p", "repeat_penalty", "repetition_penalty",
+            "repeat_last_n", "num_predict", "max_tokens", "seed",
+            "presence_penalty", "frequency_penalty", "top_k", "min_p",
+        )
+        parameters = "\n".join(
+            f"{field} {model_cfg[field]}"
+            for field in generation_fields
+            if model_cfg.get(field) is not None
+        )
+        capabilities = model_cfg.get("capabilities")
+        if not isinstance(capabilities, list):
+            capabilities = ["completion", "chat"]
+
+        return {
+            "modelfile": "",
+            "parameters": parameters,
+            "template": str(model_cfg.get("template") or ""),
+            "details": {
+                "parent_model": str(model_cfg.get("parent_model") or ""),
+                "format": str(model_cfg.get("format") or ("gguf" if provider_api == "llama-cpp" else "")),
+                "family": str(model_cfg.get("family") or model_cfg.get("name") or model_id),
+                "families": list(model_cfg.get("families") or []),
+                "parameter_size": str(model_cfg.get("parameter_size") or ""),
+                "quantization_level": str(model_cfg.get("quantization_level") or ""),
+            },
+            "model_info": {
+                "aidir.provider": provider_id,
+                "aidir.provider_api": provider_api,
+                "aidir.model": model_id,
+                "aidir.requested_name": requested_name,
+                "aidir.context_window": model_cfg.get("contextWindow"),
+            },
+            "capabilities": [str(item) for item in capabilities],
         }
 
     def _ollama_error_payload(self, code: str, message: str, task_id: str | None = None) -> dict:

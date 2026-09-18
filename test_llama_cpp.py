@@ -5,7 +5,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from fastapi.testclient import TestClient
 from core.local_server_manager import LocalServerManager
+from core.endpoints.endpoint_openaix import Endpoint_openaix
+from core.resources import Resources
 from workers.agent.call_llama_cpp.app import CallLlamaCppWorker
 
 
@@ -43,6 +46,99 @@ class TestLocalServerManager(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             manager = LocalServerManager({}, Path(directory))
             self.assertFalse(await manager.stop("llama_local"))
+
+
+class TestLlamaCppResourceRestore(unittest.TestCase):
+    """Validate startup restoration of llama.cpp resource occupancy."""
+
+    def test_restores_owned_server_as_persistent_vram_consumer(self) -> None:
+        """Shows surviving owned llama.cpp memory as occupied after an aidir restart."""
+        resources = Resources([{"id": "gpu", "type": "cuda", "limits": {"VRAM": 22}, "alive_time": 300}])
+        config = {"models": {"providers": {"llama_local": {
+            "api": "llama-cpp",
+            "models": [{"id": "model", "resources": {"gpu": {"VRAM": 22}}}],
+        }}}}
+
+        class _Manager:
+            """Test double returning one verified owned server record."""
+
+            @staticmethod
+            def owned_records() -> dict:
+                """Return one provider/model record retained across a restart."""
+                return {"llama_local": {"model_id": "model"}}
+
+        resources.restore_owned_llama_cpp_consumers(config, _Manager())
+
+        snapshot = resources.get("gpu").snapshot()
+        self.assertEqual(snapshot["soft_used"]["VRAM"], 22)
+        self.assertTrue(snapshot["soft_consumers"][0]["persistent"])
+        self.assertIsNone(snapshot["soft_consumers"][0]["expires_in"])
+
+
+class _Config:
+    """Minimal dotted configuration accessor for endpoint tests."""
+
+    def __init__(self, data: dict) -> None:
+        self._data = data
+
+    def get(self, key: str, default=None):
+        """Return a dotted configuration value or its default."""
+        value = self._data
+        for part in key.split("."):
+            if not isinstance(value, dict):
+                return default
+            value = value.get(part)
+            if value is None:
+                return default
+        return value
+
+
+class _Core:
+    """Minimal endpoint core that exposes only configuration."""
+
+    def __init__(self, config: dict) -> None:
+        self.config = _Config(config)
+
+
+class TestOllamaShowEndpoint(unittest.TestCase):
+    """Validate configuration-backed Ollama /api/show behavior."""
+
+    def setUp(self) -> None:
+        """Create an OpenAIx endpoint backed by a llama.cpp model configuration."""
+        config = {
+            "workers": {"items": {"openaix": {"provider": "ollama_local"}}},
+            "models": {"providers": {
+                "llama_local": {
+                    "api": "llama-cpp",
+                    "models": [{"id": "qwen3.8-27b", "alias": "qwen3.8-27", "contextWindow": 200000}],
+                },
+                "ollama_local": {"api": "ollama", "models": []},
+            }},
+        }
+        endpoint = Endpoint_openaix({"id": "test", "worker": "openaix"})
+        self.client = TestClient(endpoint.create_app(_Core(config)))
+
+    def test_show_resolves_alias_and_returns_llama_metadata(self) -> None:
+        """Returns stable metadata for a configured llama.cpp model alias."""
+        response = self.client.post("/api/show", json={"name": "qwen3.8-27", "verbose": True})
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["details"]["format"], "gguf")
+        self.assertEqual(payload["model_info"]["aidir.provider"], "llama_local")
+        self.assertEqual(payload["model_info"]["aidir.model"], "qwen3.8-27b")
+
+    def test_show_rejects_missing_name(self) -> None:
+        """Requires the standard Ollama name field."""
+        response = self.client.post("/api/show", json={})
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["error"]["code"], "INVALID_REQUEST")
+
+    def test_show_rejects_unknown_model(self) -> None:
+        """Returns a model-not-found response for unconfigured names."""
+        response = self.client.post("/api/show", json={"name": "missing"})
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.json()["error"]["code"], "INVALID_MODEL")
 
 
 if __name__ == "__main__":

@@ -51,7 +51,7 @@ class Resource:
         now = time.time()
         total: dict[str, int] = {}
         for entry in self._soft_used:
-            if now - entry["released_at"] < self.alive_time:
+            if entry.get("persistent") or now - entry["released_at"] < self.alive_time:
                 for k, v in entry["resources"].items():
                     total[k] = total.get(k, 0) + v
         return total
@@ -138,7 +138,10 @@ class Resource:
         if not self.alive_time:
             return []
         now = time.time()
-        return [e for e in self._soft_used if now - e["released_at"] < self.alive_time]
+        return [
+            entry for entry in self._soft_used
+            if entry.get("persistent") or now - entry["released_at"] < self.alive_time
+        ]
 
     def has_reusable_soft_consumer(
         self,
@@ -157,6 +160,25 @@ class Resource:
             if entry.get("model_id") != model_id
             or (pid and str(entry.get("provider_id") or "").strip() != pid)
         ]
+
+    def add_soft_consumer(
+        self,
+        resources: dict[str, int],
+        model_id: str,
+        provider_id: str,
+        *,
+        persistent: bool = False,
+    ) -> None:
+        """Record a model that occupies resources outside an active task reservation."""
+        self.clear_soft_consumer(model_id, provider_id)
+        self._soft_used.append({
+            "consumer_id": f"{provider_id}:{model_id}",
+            "resources": {key: int(value) for key, value in resources.items() if int(value) > 0},
+            "released_at": time.time(),
+            "model_id": model_id,
+            "provider_id": provider_id,
+            "persistent": persistent,
+        })
 
 
     async def reserve_blind(
@@ -188,6 +210,7 @@ class Resource:
         consumer_id: str = "",
         model_id: str | None = None,
         provider_id: str | None = None,
+        persistent: bool = False,
     ) -> None:
         """Release previously reserved amounts. Adds to soft-used tracking if alive_time > 0."""
         req = reserved or {}
@@ -221,6 +244,7 @@ class Resource:
                     "released_at": time.time(),
                     "model_id": mid,
                     "provider_id": pid,
+                    "persistent": persistent,
                 })
 
     def snapshot(self) -> dict:
@@ -235,7 +259,8 @@ class Resource:
                 "model_id": e["model_id"],
                 "provider_id": e.get("provider_id", ""),
                 "resources": e["resources"],
-                "expires_in": max(0, round(self.alive_time - (time.time() - e["released_at"]))),
+                "expires_in": None if e.get("persistent") else max(0, round(self.alive_time - (time.time() - e["released_at"]))),
+                "persistent": bool(e.get("persistent")),
             }
             for e in self.get_active_soft_consumers()
         ]

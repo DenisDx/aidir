@@ -35,6 +35,7 @@ class Resources:
             )
         self._redis: "aioredis.Redis | None" = None
         self._ns: str = "aidir"
+        self._full_config: dict = {}
 
     def set_redis(self, redis: "aioredis.Redis", ns: str = "aidir") -> None:
         """Inject Redis client for model activity persistence (needed by cron keep_alive)."""
@@ -44,6 +45,10 @@ class Resources:
     def set_local_server_manager(self, manager) -> None:
         """Inject the manager used to stop locally owned llama.cpp servers."""
         self._local_server_manager = manager
+
+    def set_full_config(self, full_config: dict) -> None:
+        """Store the current configuration for provider-specific resource behavior."""
+        self._full_config = full_config if isinstance(full_config, dict) else {}
 
     def all(self) -> list[Resource]:
         """Return all resources."""
@@ -125,6 +130,39 @@ class Resources:
                 res.clear_soft_consumer(model_id, entry_provider_id or None)
         return all_unloaded
 
+    async def force_unload_all(self, full_config: dict | None = None) -> bool:
+        """Unload every currently tracked idle model before service shutdown."""
+        all_unloaded = True
+        for resource in self.all():
+            for entry in list(resource.get_active_soft_consumers()):
+                model_id = str(entry.get("model_id") or "").strip()
+                entry_provider_id = str(entry.get("provider_id") or "").strip()
+                provider_id = entry_provider_id or str(resource.provider or "").strip()
+                if not model_id:
+                    continue
+                unloaded = await self._call_provider_unload(
+                    resource,
+                    model_id,
+                    provider_id,
+                    full_config or self._full_config,
+                )
+                if unloaded:
+                    resource.clear_soft_consumer(model_id, entry_provider_id or None)
+                else:
+                    all_unloaded = False
+        return all_unloaded
+
+    def clear_soft_consumers_for_providers(self, provider_ids: list[str]) -> None:
+        """Clear tracked model occupancy after their managed server processes stopped."""
+        providers = {str(provider_id).strip() for provider_id in provider_ids if str(provider_id).strip()}
+        if not providers:
+            return
+        for resource in self.all():
+            resource._soft_used = [
+                entry for entry in resource._soft_used
+                if str(entry.get("provider_id") or "").strip() not in providers
+            ]
+
     async def _call_provider_unload(
         self,
         res: Resource,
@@ -204,11 +242,18 @@ class Resources:
     ) -> None:
         """Release previously reserved resources for a specific consumer."""
         reqs = requirements or {}
+        persistent = self._provider_api_type(provider_id, self._full_config) == "llama-cpp"
         for rid, need in reqs.items():
             res = self._items.get(rid)
             if res is None:
                 continue
-            await res.release(need, consumer_id=consumer_id, model_id=model_id, provider_id=provider_id)
+            await res.release(
+                need,
+                consumer_id=consumer_id,
+                model_id=model_id,
+                provider_id=provider_id,
+                persistent=persistent,
+            )
         # Persist model activity to Redis so cron can track keep_alive pings
         if model_id and self._redis:
             await self._persist_model_activity(model_id, reqs, provider_id)
@@ -245,3 +290,29 @@ class Resources:
     def snapshot(self) -> list[dict]:
         """Return list of all runtime resource snapshots."""
         return [res.snapshot() for res in self.all()]
+
+    def restore_owned_llama_cpp_consumers(self, full_config: dict, manager) -> None:
+        """Restore persistent VRAM reservations for surviving aidir-owned llama.cpp servers."""
+        records = manager.owned_records()
+        providers = ((full_config.get("models") or {}).get("providers") or {})
+        for provider_id, record in records.items():
+            provider = providers.get(provider_id) if isinstance(providers, dict) else None
+            if not isinstance(provider, dict) or provider.get("api") != "llama-cpp":
+                continue
+            model_id = str(record.get("model_id") or "").strip()
+            for model in provider.get("models") or []:
+                if not isinstance(model, dict) or str(model.get("id") or "").strip() != model_id:
+                    continue
+                for resource_id, requirements in (model.get("resources") or {}).items():
+                    resource = self._items.get(str(resource_id))
+                    if resource is not None and isinstance(requirements, dict):
+                        resource.add_soft_consumer(requirements, model_id, provider_id, persistent=True)
+
+    @staticmethod
+    def _provider_api_type(provider_id: str | None, full_config: dict | None) -> str:
+        """Return provider API type when the registry has a current full configuration."""
+        if full_config is None:
+            return ""
+        providers = ((full_config.get("models") or {}).get("providers") or {})
+        provider = providers.get(provider_id) if isinstance(providers, dict) else None
+        return str((provider or {}).get("api") or "")

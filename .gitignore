@@ -15,6 +15,7 @@ logs/*.jsonl
 *.swo
 docker/volumes/
 .runtime/
+logs/
 
 memory/
 AGENTS.md

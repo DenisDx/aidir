@@ -32,7 +32,10 @@ class CallLlamaCppWorker(OpenAIxWorker):
 
         provider_id = self._resolve_task_provider_id(task)
         try:
-            await self._core.llama_cpp_server_manager.ensure_running(provider_id)
+            await self._core.llama_cpp_server_manager.ensure_running(
+                provider_id,
+                str((task.payload or {}).get("model") or ""),
+            )
         except LocalServerError as exc:
             return WorkerResult(ok=False, error={"code": exc.code, "message": str(exc)})
 
