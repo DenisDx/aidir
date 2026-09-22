@@ -732,8 +732,8 @@ class TestWorkerWarningLogs(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.error["code"], "UPSTREAM_TIMEOUT")
         self.assertTrue(any(level == "warning" and "timeout" in message.lower() for _, level, message, _ in records))
 
-    async def test_openaix_forward_sync_retries_upstream_timeout_from_smart_model_policy(self) -> None:
-        """Retries one failed upstream call when the requested smart model enables upstream retries."""
+    async def test_openaix_forward_sync_retries_upstream_timeout(self) -> None:
+        """Retries an upstream timeout when a smart model enables retries."""
         worker = OpenAIxWorker()
         worker._core = _FakeCore(
             {
@@ -770,15 +770,7 @@ class TestWorkerWarningLogs(unittest.IsolatedAsyncioTestCase):
             }
         }
         request = httpx.Request("POST", "http://127.0.0.1:11434/api/chat")
-        response_text = '{"message":{"role":"assistant","content":"ok"},"done":true}'
         send_attempts = 0
-
-        class FakeResponse:
-            status_code = 200
-            text = response_text
-
-            async def aread(self):
-                return response_text.encode("utf-8")
 
         class FakeClient:
             def build_request(self, method, url, json):
@@ -787,9 +779,7 @@ class TestWorkerWarningLogs(unittest.IsolatedAsyncioTestCase):
             async def send(self, request_obj):
                 nonlocal send_attempts
                 send_attempts += 1
-                if send_attempts == 1:
-                    raise httpx.ReadTimeout("", request=request)
-                return FakeResponse()
+                raise httpx.ReadTimeout("", request=request)
 
         result = await worker._forward_sync(
             FakeClient(),
@@ -799,7 +789,8 @@ class TestWorkerWarningLogs(unittest.IsolatedAsyncioTestCase):
             task_id=task.id,
         )
 
-        self.assertTrue(result.ok)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error["code"], "UPSTREAM_TIMEOUT")
         self.assertEqual(send_attempts, 2)
         self.assertEqual(task.llm_call_count, 2)
 
@@ -1625,6 +1616,33 @@ class TestOpenAIxSmartDefaultToolInjection(unittest.TestCase):
 
 class TestOpenAIxErrorMapping(unittest.TestCase):
     """Regression checks for OpenAI-compatible error envelopes."""
+
+    def test_map_upstream_timeout_to_openai_gateway_timeout(self) -> None:
+        """Converts an upstream timeout to the required OpenAI-compatible 504 error."""
+        endpoint = Endpoint_openaix({"id": "openaix", "worker": "openaix"})
+
+        mapped = endpoint._map_openai_failed_task_error(
+            {"code": "UPSTREAM_TIMEOUT", "message": "ReadTimeout"}
+        )
+        response = endpoint._error_response(
+            protocol="openai",
+            status_code=mapped["status_code"],
+            code=mapped["code"],
+            message=mapped["message"],
+            error_type=mapped["error_type"],
+        )
+
+        self.assertEqual(response.status_code, 504)
+        self.assertEqual(
+            json.loads(response.body),
+            {
+                "error": {
+                    "message": "upstream timeout",
+                    "type": "upstream_timeout_error",
+                    "code": "upstream_timeout",
+                }
+            },
+        )
 
     def test_map_failed_task_upstream_model_not_found_to_openai_error(self) -> None:
         """Converts upstream 404 model-miss into OpenAI model_not_found payload fields."""

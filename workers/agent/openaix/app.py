@@ -41,8 +41,8 @@ class OpenAIxWorker(BaseWorker):
 
     task_type = "agent"
     _UPSTREAM_RETRY_ERROR_CODES = {
-        "UPSTREAM_UNREACHABLE",
         "UPSTREAM_TIMEOUT",
+        "UPSTREAM_UNREACHABLE",
         "UPSTREAM_ERROR",
         "UPSTREAM_INVALID_JSON",
     }

@@ -311,7 +311,7 @@ async function loadTasks() {
     const canTerminate = ['created', 'queued', 'running'].includes(String(t.status || '').toLowerCase());
     const requestPreview = escapeHtml(firstMessagePreview(t));
     tr.innerHTML = `
-      <td style="font-family:monospace;font-size:11px">${t.id.slice(0, 8)}…</td>
+      <td style="font-family:monospace;font-size:11px">${escapeHtml(t.id || '')}</td>
       <td>${t.type}</td>
       <td><span class="badge badge-${t.status}">${t.status}</span></td>
       <td>${t.worker_id || '—'}</td>
@@ -612,7 +612,7 @@ function renderTaskViewerRows(tasks) {
     const tr = document.createElement('tr');
     const requestPreview = escapeHtml(firstMessagePreview(task));
     tr.innerHTML = `
-      <td style="font-family:monospace;font-size:11px">${escapeHtml((task.id || '').slice(0, 8))}…</td>
+      <td style="font-family:monospace;font-size:11px">${escapeHtml(task.id || '')}</td>
       <td><span class="badge badge-${escapeHtml(task.status || 'created')}">${escapeHtml(task.status || 'created')}</span></td>
       <td>${escapeHtml(task.worker_id || '—')}</td>
       <td>${escapeHtml(task.envid || '—')}</td>

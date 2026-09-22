@@ -1100,6 +1100,15 @@ class Endpoint_openaix(Endpoint_ollama):
         err_body = str(err.get("body") or "")
         combined = f"{err_message}\n{err_body}".lower()
 
+        if err_code == "UPSTREAM_TIMEOUT":
+            return {
+                "status_code": 504,
+                "code": "upstream_timeout",
+                "message": "upstream timeout",
+                "error_type": "upstream_timeout_error",
+                "error_param": None,
+            }
+
         if err_code == "INVALID_MODEL":
             return {
                 "status_code": 404,
