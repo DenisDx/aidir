@@ -827,6 +827,7 @@
           <option value="worker">worker.log</option>
           <option value="http">http.log</option>
           <option value="webui">webui.log</option>
+          <option value="local_llama_cpp">local_llama_cpp.log</option>
         </select>
         <label><input type="checkbox" id="log-live" checked> Live update</label>
         <label><input type="checkbox" id="log-scroll" checked> Auto-scroll</label>
@@ -878,6 +879,16 @@
         <div class="task-viewer-group">
           <div class="task-viewer-group-title">Worker</div>
           <div id="task-viewer-worker-list" class="task-checklist"></div>
+        </div>
+        <div class="task-viewer-group">
+          <div class="task-viewer-group-title">Max tasks</div>
+          <select id="task-viewer-limit">
+            <option value="500">500</option>
+            <option value="300" selected>300</option>
+            <option value="100">100</option>
+            <option value="50">50</option>
+            <option value="25">25</option>
+          </select>
         </div>
         <div class="task-viewer-toolbar">
           <button class="btn-primary" id="task-viewer-show-btn">Show</button>

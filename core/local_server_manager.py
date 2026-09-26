@@ -30,9 +30,28 @@ class LocalServerManager:
         self._root = Path(root)
         self._state_path = self._root / "logs" / "llama_cpp_servers.json"
         self._locks: dict[str, asyncio.Lock] = {}
+        self._startup_errors: dict[str, dict[str, str]] = {}
 
     async def ensure_running(self, provider_id: str, model_id: str = "") -> None:
         """Ensure a llama.cpp provider is healthy, starting it only when configured locally."""
+        try:
+            await self._ensure_running(provider_id, model_id)
+        except LocalServerError as exc:
+            self._startup_errors[provider_id] = {
+                "code": exc.code,
+                "message": str(exc),
+            }
+            raise
+        else:
+            self._startup_errors.pop(provider_id, None)
+
+    def startup_error(self, provider_id: str) -> dict[str, str] | None:
+        """Return the latest failed startup result for a local provider."""
+        error = self._startup_errors.get(provider_id)
+        return dict(error) if error else None
+
+    async def _ensure_running(self, provider_id: str, model_id: str = "") -> None:
+        """Start and await a local llama.cpp provider without recording status."""
         provider = self._provider(provider_id)
         base_url = str(provider.get("baseUrl") or "").rstrip("/")
         if not base_url:
@@ -63,7 +82,7 @@ class LocalServerManager:
             if not command:
                 raise LocalServerError("INVALID_EXEC_CMD", f"llama.cpp provider '{provider_id}' has an empty exec_cmd")
 
-            log_path = self._root / "logs" / f"llama_cpp_{self._safe_id(provider_id)}.log"
+            log_path = self._log_path(provider_id)
             log_path.parent.mkdir(parents=True, exist_ok=True)
             try:
                 with log_path.open("ab", buffering=0) as output:
@@ -199,6 +218,12 @@ class LocalServerManager:
         state.pop(provider_id, None)
         self._state_path.parent.mkdir(parents=True, exist_ok=True)
         self._state_path.write_text(json.dumps(state, sort_keys=True), encoding="utf-8")
+
+    def _log_path(self, provider_id: str) -> Path:
+        """Return the log path for output from one aidir-managed llama.cpp provider."""
+        if provider_id == "llama_local":
+            return self._root / "logs" / "local_llama_cpp.log"
+        return self._root / "logs" / f"llama_cpp_{self._safe_id(provider_id)}.log"
 
     @staticmethod
     def _process_start_ticks(pid: int) -> str:

@@ -279,10 +279,12 @@ class Resources:
         consumer_id: str = "",
         model_id: str | None = None,
         provider_id: str | None = None,
+        retain_model: bool = True,
     ) -> None:
-        """Release previously reserved resources for a specific consumer."""
+        """Release one reservation and optionally retain its model as loaded."""
         reqs = requirements or {}
-        persistent = self._provider_api_type(provider_id, self._full_config) == "llama-cpp"
+        tracked_model_id = model_id if retain_model else None
+        persistent = retain_model and self._provider_api_type(provider_id, self._full_config) == "llama-cpp"
         for rid, need in reqs.items():
             res = self._items.get(rid)
             if res is None:
@@ -290,13 +292,13 @@ class Resources:
             await res.release(
                 need,
                 consumer_id=consumer_id,
-                model_id=model_id,
+                model_id=tracked_model_id,
                 provider_id=provider_id,
                 persistent=persistent,
             )
         # Persist model activity to Redis so cron can track keep_alive pings
-        if model_id and self._redis:
-            await self._persist_model_activity(model_id, reqs, provider_id)
+        if tracked_model_id and self._redis:
+            await self._persist_model_activity(tracked_model_id, reqs, provider_id)
 
     async def _persist_model_activity(
         self,
@@ -339,7 +341,33 @@ class Resources:
 
     def snapshot(self) -> list[dict]:
         """Return list of all runtime resource snapshots."""
-        return [res.snapshot() for res in self.all()]
+        return [self._snapshot_resource(resource) for resource in self.all()]
+
+    def _snapshot_resource(self, resource: Resource) -> dict:
+        """Return a resource snapshot enriched with relevant llama.cpp startup errors."""
+        snapshot = resource.snapshot()
+        manager = getattr(self, "_local_server_manager", None)
+        providers = ((self._full_config.get("models") or {}).get("providers") or {})
+        errors: list[dict[str, str]] = []
+        if manager is not None and isinstance(providers, dict):
+            for provider_id, provider in providers.items():
+                if not isinstance(provider, dict) or provider.get("api") != "llama-cpp":
+                    continue
+                error = manager.startup_error(str(provider_id))
+                if not error:
+                    continue
+                for model in provider.get("models") or []:
+                    if not isinstance(model, dict) or resource.id not in (model.get("resources") or {}):
+                        continue
+                    errors.append({
+                        "provider_id": str(provider_id),
+                        "model_id": str(model.get("id") or ""),
+                        "code": str(error.get("code") or "LLAMA_CPP_START_FAILED"),
+                        "message": str(error.get("message") or "llama.cpp startup failed"),
+                    })
+        if errors:
+            snapshot["startup_errors"] = errors
+        return snapshot
 
     def restore_owned_llama_cpp_consumers(self, full_config: dict, manager) -> None:
         """Restore persistent VRAM reservations for surviving aidir-owned llama.cpp servers."""

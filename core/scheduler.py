@@ -345,6 +345,7 @@ class Scheduler:
             )
 
         started = time.monotonic()
+        failed_local_server_start = False
 
         try:
             result: WorkerResult = await asyncio.wait_for(
@@ -360,6 +361,14 @@ class Scheduler:
                 log("worker", "info", f"Task {task.id} completed", worker.id)
             else:
                 err = result.error or {"code": "WORKER_ERROR", "message": "Worker returned error"}
+                failed_local_server_start = (
+                    self._provider_api(provider_id) == "llama-cpp"
+                    and str(err.get("code") or "") in {
+                        "INVALID_EXEC_CMD",
+                        "LLAMA_CPP_START_FAILED",
+                        "UPSTREAM_UNREACHABLE",
+                    }
+                )
                 if not await self._handle_reject(task, worker.id, err):
                     await self._queue.mark_failed(task, err)
                     log("worker", "warn", f"Task {task.id} failed: {err}", worker.id)
@@ -390,6 +399,7 @@ class Scheduler:
                     consumer_id=consumer_id,
                     model_id=model_id,
                     provider_id=provider_id,
+                    retain_model=not failed_local_server_start,
                 )
 
     async def _expire_queued_task_if_needed(self, task: Task) -> bool:

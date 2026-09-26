@@ -7,6 +7,7 @@ Handles SIGHUP for config reload.
 from __future__ import annotations
 
 import asyncio
+import faulthandler
 import signal
 import sys
 import time
@@ -56,6 +57,14 @@ class ShutdownReport:
 
     timed_out: bool
     active_tasks: int
+
+
+def _enable_signal_stack_dump() -> None:
+    """Write all Python thread stacks to stderr when SIGUSR1 is received."""
+    try:
+        faulthandler.register(signal.SIGUSR1, all_threads=True)
+    except (AttributeError, OSError, RuntimeError, ValueError):
+        pass
 
 
 class Core:
@@ -558,6 +567,7 @@ def _build_webui_server(core: Core, restart_callback=None) -> uvicorn.Server:
 
 async def main() -> None:
     log("core", "info", "=== APPLICATION STARTUP BEGIN ===")
+    _enable_signal_stack_dump()
     core = Core()
     await core.start()
     log("core", "info", "Core initialization completed")

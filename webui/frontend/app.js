@@ -399,13 +399,19 @@ function renderResources(resources) {
       return `<div style="margin-bottom:2px"><span style="font-family:monospace">${escapeHtml(c.provider_id || 'provider')}/${escapeHtml(c.model_id)}</span> <span style="color:var(--muted)">${escapeHtml(details)} (${escapeHtml(state)})</span></div>`;
     }).join('');
 
+    const startupErrors = (r.startup_errors || []).map(error => {
+      const providerModel = `${error.provider_id || 'provider'}/${error.model_id || 'model'}`;
+      const detail = `${error.code || 'LLAMA_CPP_START_FAILED'}: ${error.message || 'llama.cpp startup failed'}`;
+      return `<div style="margin-bottom:2px;color:var(--red)"><span style="font-family:monospace">${escapeHtml(providerModel)}</span> ${escapeHtml(detail)}</div>`;
+    }).join('');
+
     const tr = document.createElement('tr');
     tr.innerHTML = `
       <td>${escapeHtml(r.id || '—')}</td>
       <td>${escapeHtml(r.type || '—')}</td>
       <td><input type="checkbox" data-resource-use ${r.use !== false ? 'checked' : ''} aria-label="Use resource ${escapeHtml(r.id || '')}"></td>
       <td>${escapeHtml(usageParts.join(' | ') || '—')}</td>
-      <td>${consumers}${softConsumers}</td>
+      <td>${consumers}${softConsumers}${startupErrors}</td>
       <td><button class="btn-sm" data-resource-force-release>Force release</button></td>
     `;
     const useCheckbox = tr.querySelector('[data-resource-use]');
@@ -627,7 +633,7 @@ function buildTaskViewerQuery() {
   if (opFrom) params.set('last_operation_from', opFrom);
   if (opTo) params.set('last_operation_to', opTo);
 
-  params.set('limit', '300');
+  params.set('limit', $('task-viewer-limit').value);
   return params;
 }
 

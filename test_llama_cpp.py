@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 
 from fastapi.testclient import TestClient
-from core.local_server_manager import LocalServerManager
+from core.local_server_manager import LocalServerError, LocalServerManager
 from core.endpoints.endpoint_openaix import Endpoint_openaix
 from core.resources import Resources
 from workers.agent.call_llama_cpp.app import CallLlamaCppWorker
@@ -41,11 +41,33 @@ class TestLlamaCppWorker(unittest.TestCase):
 class TestLocalServerManager(unittest.IsolatedAsyncioTestCase):
     """Validate persisted-PID ownership behavior."""
 
+    def test_llama_local_uses_dedicated_log_file(self) -> None:
+        """Sends managed llama_local stdout and stderr to the WebUI-visible log file."""
+        with tempfile.TemporaryDirectory() as directory:
+            manager = LocalServerManager({}, Path(directory))
+            self.assertEqual(manager._log_path("llama_local"), Path(directory) / "logs" / "local_llama_cpp.log")
+
     async def test_stop_does_not_touch_unknown_process(self) -> None:
         """Returns false when no aidir-owned PID record exists for a provider."""
         with tempfile.TemporaryDirectory() as directory:
             manager = LocalServerManager({}, Path(directory))
             self.assertFalse(await manager.stop("llama_local"))
+
+    async def test_failed_startup_is_retained_for_status(self) -> None:
+        """Exposes a local process early exit as a provider startup error."""
+        config = {"models": {"providers": {"llama_local": {
+            "baseUrl": "http://127.0.0.1:9",
+            "exec_cmd": "/bin/false",
+            "startup_timeout": 1,
+        }}}}
+        with tempfile.TemporaryDirectory() as directory:
+            manager = LocalServerManager(config, Path(directory))
+            with self.assertRaises(LocalServerError):
+                await manager.ensure_running("llama_local", "model")
+
+            error = manager.startup_error("llama_local")
+            self.assertEqual(error["code"], "LLAMA_CPP_START_FAILED")
+            self.assertIn("exited with code", error["message"])
 
 
 class TestLlamaCppResourceRestore(unittest.TestCase):
@@ -73,6 +95,53 @@ class TestLlamaCppResourceRestore(unittest.TestCase):
         self.assertEqual(snapshot["soft_used"]["VRAM"], 22)
         self.assertTrue(snapshot["soft_consumers"][0]["persistent"])
         self.assertIsNone(snapshot["soft_consumers"][0]["expires_in"])
+
+    def test_snapshot_includes_relevant_local_startup_error(self) -> None:
+        """Shows a failed local llama.cpp startup on the model's resource."""
+        resources = Resources([{"id": "gpu", "type": "cuda", "limits": {"VRAM": 22}}])
+        resources.set_full_config({"models": {"providers": {"llama_local": {
+            "api": "llama-cpp",
+            "models": [{"id": "model", "resources": {"gpu": {"VRAM": 22}}}],
+        }}}})
+
+        class _Manager:
+            """Test double exposing a local server startup error."""
+
+            @staticmethod
+            def startup_error(provider_id: str) -> dict | None:
+                """Return the failure associated with the expected provider."""
+                if provider_id == "llama_local":
+                    return {"code": "LLAMA_CPP_START_FAILED", "message": "exited with code 1"}
+                return None
+
+        resources.set_local_server_manager(_Manager())
+        snapshot = resources.snapshot()[0]
+
+        self.assertEqual(snapshot["startup_errors"][0]["model_id"], "model")
+        self.assertEqual(snapshot["startup_errors"][0]["code"], "LLAMA_CPP_START_FAILED")
+
+
+class TestLlamaCppFailedStartupRelease(unittest.IsolatedAsyncioTestCase):
+    """Validate resource cleanup after llama.cpp cannot start."""
+
+    async def test_failed_startup_does_not_create_soft_consumer(self) -> None:
+        """Releases failed startup reservations without reporting a loaded model."""
+        resources = Resources([{"id": "gpu", "type": "cuda", "limits": {"VRAM": 22}, "alive_time": 300}])
+        resources.set_full_config({"models": {"providers": {"llama_local": {"api": "llama-cpp"}}}})
+        requirements = {"gpu": {"VRAM": 22}}
+
+        await resources.reserve_blind_for(requirements, consumer_id="task", model_id="model", provider_id="llama_local")
+        await resources.release_for(
+            requirements,
+            consumer_id="task",
+            model_id="model",
+            provider_id="llama_local",
+            retain_model=False,
+        )
+
+        snapshot = resources.snapshot()[0]
+        self.assertEqual(snapshot["used"]["VRAM"], 0)
+        self.assertEqual(snapshot["soft_consumers"], [])
 
 
 class _Config:
@@ -127,8 +196,8 @@ class TestOllamaShowEndpoint(unittest.TestCase):
         self.assertEqual(payload["details"]["format"], "gguf")
         self.assertEqual(payload["model_info"]["aidir.provider"], "llama_local")
         self.assertEqual(payload["model_info"]["aidir.model"], "qwen3.8-27b")
-            self.assertEqual(payload["model_info"]["aidir.context_window"], 200000)
-            self.assertEqual(payload["model_info"]["aidir.context_length"], 200000)
+        self.assertEqual(payload["model_info"]["aidir.context_window"], 200000)
+        self.assertEqual(payload["model_info"]["aidir.context_length"], 200000)
 
     def test_show_rejects_missing_name(self) -> None:
         """Requires the standard Ollama name field."""
