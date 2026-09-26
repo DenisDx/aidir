@@ -371,7 +371,7 @@ function renderResources(resources) {
 
   if (!resources.length) {
     const tr = document.createElement('tr');
-    tr.innerHTML = '<td colspan="4" style="color:var(--muted)">No resources configured</td>';
+    tr.innerHTML = '<td colspan="6" style="color:var(--muted)">No resources configured</td>';
     body.appendChild(tr);
     return;
   }
@@ -403,11 +403,46 @@ function renderResources(resources) {
     tr.innerHTML = `
       <td>${escapeHtml(r.id || '—')}</td>
       <td>${escapeHtml(r.type || '—')}</td>
+      <td><input type="checkbox" data-resource-use ${r.use !== false ? 'checked' : ''} aria-label="Use resource ${escapeHtml(r.id || '')}"></td>
       <td>${escapeHtml(usageParts.join(' | ') || '—')}</td>
       <td>${consumers}${softConsumers}</td>
+      <td><button class="btn-sm" data-resource-force-release>Force release</button></td>
     `;
+    const useCheckbox = tr.querySelector('[data-resource-use]');
+    useCheckbox.addEventListener('change', () => setResourceUse(r.id, useCheckbox));
+    tr.querySelector('[data-resource-force-release]').addEventListener('click', () => forceReleaseResource(r.id));
     body.appendChild(tr);
   });
+}
+
+async function setResourceUse(resourceId, checkbox) {
+  if (!resourceId || !checkbox) return;
+
+  const use = checkbox.checked;
+  checkbox.disabled = true;
+  const res = await apiPost(`/api/resources/${encodeURIComponent(resourceId)}/use`, { use });
+  if (!res.ok) {
+    checkbox.checked = !use;
+    window.alert(res.data.detail || 'Failed to update resource use');
+  }
+  await loadTasks();
+}
+
+async function forceReleaseResource(resourceId) {
+  if (!resourceId) return;
+
+  const confirmed = window.confirm(`Force release idle models from resource ${resourceId}? Active tasks will not be interrupted.`);
+  if (!confirmed) return;
+
+  const res = await apiPost(`/api/resources/${encodeURIComponent(resourceId)}/force-release`, {});
+  if (!res.ok) {
+    window.alert(res.data.detail || 'Failed to force release resource');
+    return;
+  }
+
+  const models = res.data.unloaded_models || [];
+  window.alert(models.length ? `Released: ${models.join(', ')}` : 'Resource is already free');
+  await loadTasks();
 }
 
 function escapeHtml(s) {

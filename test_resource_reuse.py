@@ -36,6 +36,17 @@ class TestResourceReuse(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(resource.is_available_for_reuse({"VRAM": 8}, "model-a"))
 
+    async def test_disabled_resource_is_unavailable_for_new_work(self) -> None:
+        """Prevents both normal allocation and warm-model reuse while use is disabled."""
+        resource = Resource("gpu", "cuda", {"VRAM": 10}, alive_time=300)
+        await resource.release({"VRAM": 8}, consumer_id="prev", model_id="model-a")
+        resource.use = False
+
+        self.assertFalse(resource.is_available({"VRAM": 1}))
+        self.assertFalse(resource.is_available_for_reuse({"VRAM": 8}, "model-a"))
+        self.assertFalse(resource.is_available_after_unload({"VRAM": 1}))
+        self.assertFalse(resource.snapshot()["use"])
+
     async def test_force_unload_keeps_requested_warm_model(self) -> None:
         """Selective force-unload preserves the warm model that is about to be reused."""
         resources = Resources(
@@ -90,6 +101,30 @@ class TestResourceReuse(unittest.IsolatedAsyncioTestCase):
         await resources.force_unload_for({"gpu": {"VRAM": 8}}, full_config={})
 
         self.assertEqual(unloaded, [("shared-model", "llama_local")])
+
+    async def test_force_release_unloads_idle_models_without_touching_active_tasks(self) -> None:
+        """Releases every idle model on a resource but refuses while a task holds it."""
+        resources = Resources(
+            [{"id": "gpu", "type": "cuda", "limits": {"VRAM": 20}, "alive_time": 300}]
+        )
+        await resources.release_for({"gpu": {"VRAM": 8}}, consumer_id="prev", model_id="model-a")
+        unloaded: list[str] = []
+
+        async def _fake_unload(_res, model_id, _provider_id, _full_config):
+            unloaded.append(model_id)
+            return True
+
+        resources._call_provider_unload = _fake_unload  # type: ignore[method-assign]
+        result = await resources.force_release("gpu")
+
+        self.assertEqual(result, {"released": True, "active_consumers": [], "unloaded_models": ["model-a"]})
+        self.assertEqual(unloaded, ["model-a"])
+        self.assertEqual(resources.get("gpu").get_active_soft_consumers(), [])
+
+        await resources.reserve_blind_for({"gpu": {"VRAM": 8}}, consumer_id="active")
+        blocked = await resources.force_release("gpu")
+
+        self.assertEqual(blocked, {"released": False, "active_consumers": ["active"], "unloaded_models": []})
 
 
 if __name__ == "__main__":

@@ -58,6 +58,13 @@ class Resources:
         """Return resource by id."""
         return self._items.get(rid)
 
+    def set_use(self, rid: str, use: bool) -> Resource | None:
+        """Enable or disable a resource for new task reservations during this runtime."""
+        resource = self._items.get(rid)
+        if resource is not None:
+            resource.use = bool(use)
+        return resource
+
     def check_available(self, requirements: dict[str, dict[str, int]] | None = None) -> bool:
         """Return True if all resources have enough capacity including alive-time soft usage."""
         reqs = requirements or {}
@@ -151,6 +158,39 @@ class Resources:
                 else:
                     all_unloaded = False
         return all_unloaded
+
+    async def force_release(self, rid: str) -> dict | None:
+        """Unload idle models from one resource without interrupting active task reservations."""
+        resource = self._items.get(rid)
+        if resource is None:
+            return None
+
+        active_consumers = sorted(resource.consumers)
+        if active_consumers:
+            return {
+                "released": False,
+                "active_consumers": active_consumers,
+                "unloaded_models": [],
+            }
+
+        before = [
+            (str(entry.get("model_id") or ""), str(entry.get("provider_id") or ""))
+            for entry in resource.get_active_soft_consumers()
+        ]
+        released = await self.force_unload_for({rid: {}}, full_config=self._full_config)
+        remaining = {
+            (str(entry.get("model_id") or ""), str(entry.get("provider_id") or ""))
+            for entry in resource.get_active_soft_consumers()
+        }
+        unloaded_models = [model_id for model_id, provider_id in before if (model_id, provider_id) not in remaining]
+        for model_id, provider_id in before:
+            if (model_id, provider_id) not in remaining:
+                await self._clear_model_activity(rid, model_id, provider_id)
+        return {
+            "released": released and not remaining,
+            "active_consumers": [],
+            "unloaded_models": unloaded_models,
+        }
 
     def clear_soft_consumers_for_providers(self, provider_ids: list[str]) -> None:
         """Clear tracked model occupancy after their managed server processes stopped."""
@@ -286,6 +326,16 @@ class Resources:
                 await self._redis.set(key, json.dumps(data), ex=ttl)
             except Exception as exc:
                 log("system", "warn", f"Failed to persist model activity for {model_id}: {exc}")
+
+    async def _clear_model_activity(self, rid: str, model_id: str, provider_id: str) -> None:
+        """Remove a keep-alive activity record after explicitly unloading a model."""
+        if not self._redis:
+            return
+        key = f"{self._ns}:resource:{rid}:activity:{provider_id}:{model_id}"
+        try:
+            await self._redis.delete(key)
+        except Exception as exc:
+            log("system", "warn", f"Failed to clear model activity for {model_id}: {exc}")
 
     def snapshot(self) -> list[dict]:
         """Return list of all runtime resource snapshots."""

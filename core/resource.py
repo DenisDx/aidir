@@ -39,6 +39,7 @@ class Resource:
         self.keep_alive: int = int(keep_alive)
         self.keep_alive_period: int = int(keep_alive_period)
         self.provider: str | None = provider
+        self.use: bool = True
         # Soft consumers: models still in memory after task release (within alive_time window).
         # Each entry: {consumer_id, resources, released_at, model_id, provider_id}
         self._soft_used: list[dict] = []
@@ -82,6 +83,8 @@ class Resource:
 
     def is_available(self, required: dict[str, int] | None = None) -> bool:
         """Return True if requested amounts fit (accounting for alive-time soft usage)."""
+        if not self.use:
+            return False
         req = required or {}
         soft = self._compute_soft_used()
         for key, amount in req.items():
@@ -102,6 +105,8 @@ class Resource:
         provider_id: str | None = None,
     ) -> bool:
         """Return True when the same warm model can be reused without unloading it."""
+        if not self.use:
+            return False
         req = required or {}
         match = self._matching_soft_consumer(model_id, req, provider_id)
         if match is None:
@@ -122,6 +127,8 @@ class Resource:
 
     def is_available_after_unload(self, required: dict[str, int] | None = None) -> bool:
         """Return True if amounts fit assuming all soft consumers are force-unloaded."""
+        if not self.use:
+            return False
         req = required or {}
         for key, amount in req.items():
             need = int(amount)
@@ -267,6 +274,7 @@ class Resource:
         return {
             "id": self.id,
             "type": self.type,
+            "use": self.use,
             "limits": dict(self.limits),
             "used": dict(self.used),
             "soft_used": soft,

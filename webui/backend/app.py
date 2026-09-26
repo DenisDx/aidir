@@ -410,6 +410,46 @@ def create_app(
             "runtime": core.get_runtime_status(),
         }
 
+    @app.post("/api/resources/{resource_id}/use")
+    async def set_resource_use(
+        resource_id: str,
+        request: Request,
+        session: dict = Depends(_require_session),
+    ):
+        """Enable or disable one resource for new task reservations in this runtime."""
+        try:
+            body = await request.json()
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=400, detail="Request body must be JSON") from exc
+        use = body.get("use") if isinstance(body, dict) else None
+        if not isinstance(use, bool):
+            raise HTTPException(status_code=422, detail="Field 'use' must be a boolean")
+        if core.resources is None:
+            raise HTTPException(status_code=404, detail="Resource not found")
+        resource = core.resources.set_use(resource_id, use)
+        if resource is None:
+            raise HTTPException(status_code=404, detail="Resource not found")
+
+        log("webui", "warn", f"Resource {resource_id} use={use} set by user {session['login']}", "control")
+        return {"ok": True, "resource": resource.snapshot()}
+
+    @app.post("/api/resources/{resource_id}/force-release")
+    async def force_release_resource(resource_id: str, session: dict = Depends(_require_session)):
+        """Release idle models from one resource without interrupting active tasks."""
+        if core.resources is None:
+            raise HTTPException(status_code=404, detail="Resource not found")
+        result = await core.resources.force_release(resource_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="Resource not found")
+        if result["active_consumers"]:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Resource has active task(s): {', '.join(result['active_consumers'])}",
+            )
+
+        log("webui", "warn", f"Resource {resource_id} force-released by user {session['login']}", "control")
+        return {"ok": result["released"], **result}
+
     @app.post("/api/restart")
     async def restart_service(
         request: Request,
