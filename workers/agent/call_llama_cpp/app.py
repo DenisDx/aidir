@@ -9,6 +9,7 @@ from typing import Awaitable, Callable
 
 import httpx
 
+from core.call_log import save_llm_call, save_llm_raw_call
 from core.local_server_manager import LocalServerError
 from core.task import Task
 from core.task_types.task_agent import Task_agent
@@ -49,7 +50,8 @@ class CallLlamaCppWorker(OpenAIxWorker):
         payload = self._apply_model_context_window(payload, provider_id=provider_id)
         payload = self._to_openai_payload(payload, task.stream)
         url = f"{self._resolve_base_url(provider_id)}/v1/chat/completions"
-        save_call = self._resolve_save_llm_request(task.payload or {})
+        # Keep the exact llama.cpp exchange available while a task is still streaming.
+        save_call = True
         headers = self._resolve_request_headers(task, provider_id)
 
         try:
@@ -92,18 +94,29 @@ class CallLlamaCppWorker(OpenAIxWorker):
         provider_id = self._resolve_task_provider_id(task) if task is not None else self._provider_id
         history_entry = await self._begin_llm_call(task, url=url, payload=payload, provider_id=provider_id, save_call=save_call) if task else None
         response = await client.post(url, json={**payload, "stream": False})
+        if save_call:
+            save_llm_raw_call(self.id, json.dumps({**payload, "stream": False}, ensure_ascii=False))
+            save_llm_raw_call(self.id, response.content)
         if response.status_code != 200:
             if task:
+                if isinstance(history_entry, dict):
+                    history_entry["raw_response"] = response.text
                 await self._finalize_llm_call(task, history_entry, status="http_error", http_status=response.status_code, error_code="UPSTREAM_ERROR")
             return WorkerResult(ok=False, error={"code": "UPSTREAM_ERROR", "message": f"Upstream returned HTTP {response.status_code}", "body": response.text[:512]})
         try:
             data = self._openai_response_to_ollama(response.json())
         except (ValueError, TypeError, KeyError) as exc:
             if task:
+                if isinstance(history_entry, dict):
+                    history_entry["raw_response"] = response.text
                 await self._finalize_llm_call(task, history_entry, status="invalid_json", http_status=response.status_code, error_code="UPSTREAM_INVALID_JSON")
             return WorkerResult(ok=False, error={"code": "UPSTREAM_INVALID_JSON", "message": str(exc) or "Upstream returned invalid JSON"})
         if task:
+            if isinstance(history_entry, dict):
+                history_entry["raw_response"] = response.text
             await self._finalize_llm_call(task, history_entry, status="ok", http_status=response.status_code, response=data)
+        if save_call:
+            save_llm_call(self.id, task_id or (task.id if task else ""), {**payload, "stream": False}, data)
         return WorkerResult(ok=True, data=data, usage=data.get("usage"))
 
     async def _forward_stream(self, client, url: str, payload: dict, emit_chunk, task=None, *, save_call: bool = False, task_id: str = "") -> WorkerResult:
@@ -111,26 +124,68 @@ class CallLlamaCppWorker(OpenAIxWorker):
         provider_id = self._resolve_task_provider_id(task) if task is not None else self._provider_id
         history_entry = await self._begin_llm_call(task, url=url, payload=payload, provider_id=provider_id, save_call=save_call) if task else None
         final_data: dict | None = None
+        upstream_payload = {**payload, "stream": True}
+        raw_lines: list[str] = []
+        stream_events: list[object] = []
+        if save_call:
+            save_llm_raw_call(self.id, json.dumps(upstream_payload, ensure_ascii=False))
         async with client.stream("POST", url, json={**payload, "stream": True}) as response:
             if response.status_code != 200:
+                raw_response = await response.aread()
+                if save_call:
+                    save_llm_raw_call(self.id, raw_response)
                 if task:
+                    if isinstance(history_entry, dict):
+                        history_entry["raw_response"] = raw_response.decode("utf-8", errors="replace")
                     await self._finalize_llm_call(task, history_entry, status="http_error", http_status=response.status_code, error_code="UPSTREAM_ERROR")
                 return WorkerResult(ok=False, error={"code": "UPSTREAM_ERROR", "message": f"Upstream returned HTTP {response.status_code}"})
             async for line in response.aiter_lines():
+                raw_lines.append(line)
+                if save_call:
+                    save_llm_raw_call(self.id, line)
                 if not line.startswith("data:"):
+                    if isinstance(history_entry, dict):
+                        history_entry["raw_sse"] = raw_lines
+                        await self._persist_llm_call_diagnostics(task)
                     continue
                 raw = line[5:].strip()
                 if raw == "[DONE]":
+                    if isinstance(history_entry, dict):
+                        history_entry["raw_sse"] = raw_lines
+                        history_entry["stream_events"] = stream_events
+                        await self._persist_llm_call_diagnostics(task)
                     break
                 try:
-                    chunk = self._openai_response_to_ollama(json.loads(raw), streaming=True)
+                    raw_event = json.loads(raw)
+                    chunk = self._openai_response_to_ollama(raw_event, streaming=True)
                 except (ValueError, TypeError, KeyError):
+                    if isinstance(history_entry, dict):
+                        history_entry["raw_sse"] = raw_lines
+                        await self._persist_llm_call_diagnostics(task)
                     continue
+                stream_events.append(raw_event)
                 final_data = chunk
+                if isinstance(history_entry, dict):
+                    history_entry["raw_sse"] = raw_lines
+                    history_entry["stream_events"] = stream_events
+                    await self._persist_llm_call_diagnostics(task)
                 if emit_chunk:
                     await emit_chunk(chunk)
         if task:
-            await self._finalize_llm_call(task, history_entry, status="ok", http_status=200, response=final_data or {})
+            await self._finalize_llm_call(
+                task,
+                history_entry,
+                status="ok",
+                http_status=200,
+                response={"raw_sse": raw_lines, "stream_events": stream_events, "final": final_data or {}},
+            )
+        if save_call:
+            save_llm_call(
+                self.id,
+                task_id or (task.id if task else ""),
+                upstream_payload,
+                {"raw_sse": raw_lines, "stream_events": stream_events, "final": final_data or {}},
+            )
         return WorkerResult(ok=True, data=final_data, usage=(final_data or {}).get("usage"))
 
     @staticmethod

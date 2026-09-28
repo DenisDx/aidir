@@ -4,11 +4,13 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 from core.local_server_manager import LocalServerError, LocalServerManager
 from core.endpoints.endpoint_openaix import Endpoint_openaix
 from core.resources import Resources
+from core.task_types.task_agent import Task_agent
 from workers.agent.call_llama_cpp.app import CallLlamaCppWorker
 
 
@@ -36,6 +38,85 @@ class TestLlamaCppWorker(unittest.TestCase):
         self.assertTrue(result["done"])
         self.assertEqual(result["message"]["content"], "hello")
         self.assertEqual(result["prompt_eval_count"], 4)
+
+
+class TestLlamaCppStreamingDiagnostics(unittest.IsolatedAsyncioTestCase):
+    """Validate live persistence of exact llama.cpp SSE diagnostics."""
+
+    async def test_stream_persists_request_raw_events_and_reasoning(self) -> None:
+        """Stores every received SSE line for Show JSON while the stream is active."""
+        class _Queue:
+            """Captures task history persistence calls."""
+
+            def __init__(self) -> None:
+                self.persisted: list[list[dict]] = []
+
+            async def persist_llm_call_diagnostics(self, task) -> None:
+                """Capture a snapshot of persisted call diagnostics."""
+                import copy
+                self.persisted.append(copy.deepcopy(task.llm_call_history))
+
+        class _Core:
+            """Minimal worker core with a diagnostics-aware queue."""
+
+            def __init__(self) -> None:
+                self.queue = _Queue()
+
+        class _Response:
+            """Successful llama.cpp SSE response with a reasoning delta."""
+
+            status_code = 200
+
+            async def __aenter__(self):
+                """Enter the fake response context."""
+                return self
+
+            async def __aexit__(self, exc_type, exc, traceback) -> None:
+                """Leave the fake response context."""
+
+            async def aiter_lines(self):
+                """Yield raw llama.cpp SSE lines."""
+                yield 'data: {"model":"model","choices":[{"delta":{"reasoning_content":"thinking","content":"answer"}}]}'
+                yield "data: [DONE]"
+
+        class _Client:
+            """Minimal client that opens the fake SSE response."""
+
+            @staticmethod
+            def stream(*args, **kwargs):
+                """Return the configured fake stream response."""
+                return _Response()
+
+        worker = CallLlamaCppWorker()
+        worker.id = "call_llama_cpp"
+        worker._core = _Core()
+        task = Task_agent(payload={"model": "model", "messages": []}, stream=True)
+        payload = {"model": "model", "messages": [{"role": "user", "content": "hello"}], "stream": True}
+        emitted: list[dict] = []
+
+        async def emit(chunk: dict) -> None:
+            """Capture endpoint-bound stream chunks."""
+            emitted.append(chunk)
+
+        with patch("workers.agent.call_llama_cpp.app.save_llm_raw_call"), patch(
+            "workers.agent.call_llama_cpp.app.save_llm_call"
+        ):
+            result = await worker._forward_stream(
+                _Client(),
+                "http://127.0.0.1:8888/v1/chat/completions",
+                payload,
+                emit,
+                task=task,
+                save_call=True,
+            )
+
+        entry = task.llm_call_history[0]
+        self.assertTrue(result.ok)
+        self.assertEqual(entry["request"], payload)
+        self.assertEqual(entry["raw_sse"][-1], "data: [DONE]")
+        self.assertEqual(entry["stream_events"][0]["choices"][0]["delta"]["reasoning_content"], "thinking")
+        self.assertEqual(emitted[0]["message"]["content"], "answer")
+        self.assertGreaterEqual(len(worker._core.queue.persisted), 3)
 
 
 class TestLocalServerManager(unittest.IsolatedAsyncioTestCase):

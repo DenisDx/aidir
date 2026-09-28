@@ -16,7 +16,7 @@ import time
 from datetime import datetime, timezone
 from typing import AsyncGenerator
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from core import log
@@ -265,10 +265,7 @@ class Endpoint_openaix(Endpoint_ollama):
             )
 
         if stream:
-            return StreamingResponse(
-                self._openai_stream_response(task, body),
-                media_type="text/event-stream",
-            )
+            return await self._openai_streaming_response(task, body)
 
         return await self._openai_sync_response(task, body)
 
@@ -319,8 +316,9 @@ class Endpoint_openaix(Endpoint_ollama):
         """Finalize Task_agent creation once worker and route are resolved."""
         from core.task_types.task_agent import Task_agent
 
+        payload = dict(payload or {})
+        requested_queue_timeout = payload.pop("queue_timeout", None)
         if route is not None:
-            payload = dict(payload or {})
             payload["model"] = route["resolved_model"]
 
         effective_worker_id = self._resolve_worker_id_for_route(worker_id, route)
@@ -333,9 +331,27 @@ class Endpoint_openaix(Endpoint_ollama):
             task.config["route"] = route
 
         cfg_tasks = self._core.config.get("tasks", {}) or {}
-        task.queue_timeout = int(cfg_tasks.get("queue_timeout", 300))
+        task.queue_timeout = self._resolve_queue_timeout(
+            requested_queue_timeout,
+            int(cfg_tasks.get("queue_timeout", 300)),
+        )
         task.run_timeout = int(cfg_tasks.get("run_timeout", 300))
         return task
+
+    @staticmethod
+    def _resolve_queue_timeout(value: object, default: int) -> int:
+        """Return a request queue timeout or the configured default when omitted."""
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            raise HTTPException(status_code=400, detail="queue_timeout must be a non-negative integer")
+        try:
+            timeout = int(value)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="queue_timeout must be a non-negative integer") from exc
+        if timeout < 0 or str(value).strip() not in {str(timeout), f"+{timeout}"}:
+            raise HTTPException(status_code=400, detail="queue_timeout must be a non-negative integer")
+        return timeout
 
     async def _resolve_smart_route(
         self,
@@ -465,6 +481,9 @@ class Endpoint_openaix(Endpoint_ollama):
         if "worker" in body:
             payload["worker"] = body["worker"]
 
+        if "queue_timeout" in body:
+            payload["queue_timeout"] = body["queue_timeout"]
+
         # Pass through selected optional fields when present.
         passthrough = [
             "envid",
@@ -580,9 +599,17 @@ class Endpoint_openaix(Endpoint_ollama):
             task_id=task.id,
         )
 
-    async def _openai_stream_response(self, task, request_body: dict) -> AsyncGenerator[bytes, None]:
+    async def _openai_stream_response(
+        self,
+        task,
+        request_body: dict,
+        first_chunk: dict | None = None,
+    ) -> AsyncGenerator[bytes, None]:
         """Stream OpenAI-compatible SSE chunks converted from Ollama chunks."""
         try:
+            if first_chunk is not None:
+                openai_chunk = self._ollama_chunk_to_openai(first_chunk, task.id, request_body)
+                yield f"data: {json.dumps(openai_chunk)}\n\n".encode()
             while True:
                 timeout_phase, remaining = self._task_timeout_phase(task)
                 if remaining is not None and remaining <= 0:
@@ -611,6 +638,39 @@ class Endpoint_openaix(Endpoint_ollama):
             yield b"data: [DONE]\n\n"
         finally:
             asyncio.create_task(self._core.delete_task(task.id))
+
+    async def _openai_streaming_response(self, task, request_body: dict) -> StreamingResponse | JSONResponse:
+        """Open SSE only after the first chunk, preserving HTTP errors before output starts."""
+        while True:
+            _, remaining = self._task_timeout_phase(task)
+            if remaining is not None and remaining <= 0:
+                await self._terminate_task_on_timeout(task)
+                return self._error_response(
+                    protocol="openai",
+                    status_code=504,
+                    code="timeout_error",
+                    message="Request timed out",
+                    task_id=task.id,
+                )
+
+            wait_timeout = 1.0 if remaining is None else max(0.01, min(remaining, 1.0))
+            try:
+                chunk = await asyncio.wait_for(task._chunk_queue.get(), timeout=wait_timeout)
+            except asyncio.TimeoutError:
+                continue
+
+            if chunk is None:
+                if task.status != STATUS_COMPLETED:
+                    return await self._openai_sync_response(task, request_body)
+                return StreamingResponse(
+                    self._openai_stream_response(task, request_body),
+                    media_type="text/event-stream",
+                )
+
+            return StreamingResponse(
+                self._openai_stream_response(task, request_body, first_chunk=chunk),
+                media_type="text/event-stream",
+            )
 
     def _collect_models(self) -> list[str]:
         """Collect unique externally visible model ids from configured providers."""

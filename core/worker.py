@@ -173,10 +173,12 @@ class BaseWorker:
             "save_llm_request": bool(save_call),
             "status": "started",
         }
+        if save_call:
+            entry["request"] = request_payload
 
         history = list(getattr(task, "llm_call_history", []) or [])
         history.append(entry)
-        if len(history) > self._MAX_LLM_CALL_HISTORY:
+        if not save_call and len(history) > self._MAX_LLM_CALL_HISTORY:
             history = history[-self._MAX_LLM_CALL_HISTORY :]
         task.llm_call_history = history
         entry = task.llm_call_history[-1]
@@ -217,6 +219,8 @@ class BaseWorker:
         summary = self._summarize_llm_response(response)
         if summary:
             entry["response_summary"] = summary
+        if entry.get("save_llm_request") and isinstance(response, dict):
+            entry["response"] = response
 
         await self._persist_llm_call_diagnostics(task)
 
