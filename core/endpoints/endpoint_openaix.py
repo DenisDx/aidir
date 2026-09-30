@@ -454,7 +454,7 @@ class Endpoint_openaix(Endpoint_ollama):
 
         payload = dict(payload or {})
         requested_timeout = payload.pop("timeout", None)
-        requested_queue_timeout = payload.pop("queue_timeout", requested_timeout)
+        requested_queue_timeout = payload.pop("queue_timeout", None)
         if route is not None:
             payload["model"] = route["resolved_model"]
 
@@ -471,14 +471,22 @@ class Endpoint_openaix(Endpoint_ollama):
             task.config["request_kind"] = request_kind
 
         cfg_tasks = self._core.config.get("tasks", {}) or {}
-        task.queue_timeout = self._resolve_queue_timeout(
-            requested_queue_timeout,
-            int(cfg_tasks.get("queue_timeout", 300)),
-        )
+        default_queue_timeout = int(cfg_tasks.get("queue_timeout", 300))
+        default_run_timeout = int(cfg_tasks.get("run_timeout", 300))
         task.run_timeout = self._resolve_timeout(
             requested_timeout,
-            int(cfg_tasks.get("run_timeout", 300)),
+            default_run_timeout,
         )
+        if requested_queue_timeout is not None:
+            task.queue_timeout = self._resolve_queue_timeout(
+                requested_queue_timeout,
+                default_queue_timeout,
+            )
+        elif requested_timeout is not None:
+            queue_headroom = max(0, default_queue_timeout - default_run_timeout)
+            task.queue_timeout = task.run_timeout + queue_headroom
+        else:
+            task.queue_timeout = default_queue_timeout
         if requested_timeout is not None:
             task.config = dict(task.config or {})
             task.config["request_timeout"] = task.run_timeout

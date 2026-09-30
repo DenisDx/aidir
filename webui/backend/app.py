@@ -14,6 +14,9 @@ import asyncio
 import hmac
 import json
 import secrets
+import shlex
+import subprocess
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
@@ -33,6 +36,91 @@ if TYPE_CHECKING:
 _FRONTEND_DIR = Path(__file__).parent.parent / "frontend"
 _LOGS_DIR     = Path(__file__).parent.parent.parent / "logs"
 _SESSION_PREFIX = "aidir:session:"
+_ROOT = _LOGS_DIR.parent
+_CRON_MARKER = "# aidir-cron"
+
+
+class CronRepairError(RuntimeError):
+    """Raised when the user crontab cannot be safely repaired."""
+
+
+def _aidir_cron_line() -> str:
+    """Return the canonical crontab entry for the aidir maintenance cycle."""
+    python = shlex.quote(str(_ROOT / "venv" / "bin" / "python"))
+    script = shlex.quote(str(_ROOT / "core" / "cron.py"))
+    log_file = shlex.quote(str(_LOGS_DIR / "cron.log"))
+    return f"* * * * * {python} {script} >> {log_file} 2>&1 {_CRON_MARKER}"
+
+
+def _cron_error_message(result: subprocess.CompletedProcess[str]) -> str:
+    """Return a concise diagnostic from a failed crontab command."""
+    return (result.stderr or result.stdout or f"exit code {result.returncode}").strip()
+
+
+def _repair_user_crontab() -> dict[str, str]:
+    """Add or repair exactly one aidir cron entry without modifying unrelated lines."""
+    try:
+        current = subprocess.run(
+            ["crontab", "-l"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise CronRepairError(f"Cannot read crontab: {exc}") from exc
+
+    if current.returncode == 0:
+        content = current.stdout or ""
+    elif current.returncode == 1 and "no crontab for" in (current.stderr or "").lower():
+        content = ""
+    else:
+        raise CronRepairError(f"Cannot read crontab: {_cron_error_message(current)}")
+
+    lines = content.splitlines(keepends=True)
+    marker_indexes = [
+        index
+        for index, line in enumerate(lines)
+        if line.rstrip("\r\n").rstrip().endswith(_CRON_MARKER)
+    ]
+    if len(marker_indexes) > 1:
+        raise CronRepairError("Cannot repair crontab: multiple aidir cron entries were found")
+
+    canonical = _aidir_cron_line()
+    action = "unchanged"
+    if marker_indexes:
+        index = marker_indexes[0]
+        existing = lines[index].rstrip("\r\n")
+        if existing.strip() != canonical:
+            newline = "\r\n" if lines[index].endswith("\r\n") else "\n"
+            lines[index] = f"{canonical}{newline}"
+            action = "repaired"
+    else:
+        if content and not content.endswith(("\n", "\r")):
+            lines.append("\n")
+        lines.append(f"{canonical}\n")
+        action = "added"
+
+    if action == "unchanged":
+        return {"action": action}
+
+    replacement = "".join(lines)
+    try:
+        installed = subprocess.run(
+            ["crontab", "-"],
+            input=replacement,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise CronRepairError(f"Cannot install crontab: {exc}") from exc
+
+    if installed.returncode != 0:
+        raise CronRepairError(f"Crontab validation failed; existing crontab was unchanged: {_cron_error_message(installed)}")
+
+    return {"action": action}
 
 
 # ── Auth helpers ──────────────────────────────────────────────────────────────
@@ -123,6 +211,25 @@ def _task_last_operation_at(task: dict[str, Any]) -> datetime | None:
     return None
 
 
+async def _cron_health(core: "Core") -> dict[str, Any]:
+    """Return cron heartbeat freshness for the Dashboard health panel."""
+    max_age = int(core.config.get("webui.health.cron_max_age") or 180)
+    key = f"{core.config.get('instance', 'aidir')}:cron:last_success_at"
+    raw = await core.redis.get(key)
+    try:
+        last_success = float(raw)
+    except (TypeError, ValueError):
+        last_success = 0.0
+
+    age_seconds = max(0, int(time.time() - last_success)) if last_success else None
+    return {
+        "last_success_at": datetime.fromtimestamp(last_success, timezone.utc).isoformat() if last_success else None,
+        "age_seconds": age_seconds,
+        "max_age_seconds": max_age,
+        "healthy": age_seconds is not None and age_seconds <= max_age,
+    }
+
+
 def _task_to_api_item(task: dict[str, Any]) -> dict[str, Any]:
     """Return a single normalized task shape for WebUI list and detail APIs."""
     last_op = _task_last_operation_at(task)
@@ -139,6 +246,8 @@ def _task_from_hash(task_hash: dict[str, str]) -> dict[str, Any]:
     task: dict[str, Any] = dict(task_hash)
     task["priority"] = int(task.get("priority") or 0)
     task["llm_call_count"] = int(task.get("llm_call_count") or 0)
+    task["queue_timeout"] = int(task.get("queue_timeout") or 0)
+    task["run_timeout"] = int(task.get("run_timeout") or 0)
     raw_history = _parse_json_field(task.get("llm_call_history"))
     task["llm_call_history"] = raw_history if isinstance(raw_history, list) else []
     task["external"] = str(task.get("external") or "0") in {"1", "true", "True"}
@@ -394,6 +503,16 @@ def create_app(
         log("webui", "warn", f"Task termination requested by user {session['login']}: {task_id}", "control")
         return {"ok": True, "task": _task_to_api_item(_task_from_hash(task_hash))}
 
+    @app.post("/api/tasks/{task_id}/extend-timeout")
+    async def extend_task_timeout(task_id: str, session: dict = Depends(_require_session)):
+        """Extend a queued or running task's active timeout by one minute."""
+        task = await core.queue.extend_active_timeout(task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="Active task not found")
+
+        log("webui", "info", f"Task timeout extended by user {session['login']}: {task_id}", "control")
+        return {"ok": True, "task": _task_to_api_item(_task_from_hash(task.to_redis_hash()))}
+
     # ── Status ────────────────────────────────────────────────────────────────
 
     @app.get("/api/status")
@@ -408,7 +527,20 @@ def create_app(
             "tasks":    len(core.queue.list_tasks()),
             "resources": core.resources.snapshot() if core.resources else [],
             "runtime": core.get_runtime_status(),
+            "health": {"cron": await _cron_health(core)},
         }
+
+    @app.post("/api/cron/repair")
+    async def repair_cron(session: dict = Depends(_require_session)):
+        """Safely add or repair the unique aidir cron entry for the current user."""
+        try:
+            result = await asyncio.to_thread(_repair_user_crontab)
+        except CronRepairError as exc:
+            log("webui", "error", f"Cron repair failed for user {session['login']}: {exc}", "control")
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+        log("webui", "info", f"Cron repair {result['action']} by user {session['login']}", "control")
+        return {"ok": True, **result}
 
     @app.post("/api/resources/{resource_id}/use")
     async def set_resource_use(

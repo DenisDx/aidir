@@ -74,6 +74,29 @@ class TestOpenAIxQueueTimeout(unittest.TestCase):
         self.assertEqual(task.config["request_timeout"], 1200)
         self.assertNotIn("timeout", task.payload)
 
+    def test_request_timeout_preserves_configured_queue_headroom(self) -> None:
+        """Extends the total queue deadline by the configured queue/run gap."""
+        class _HeadroomConfig:
+            """Configuration with a 300-second queue headroom."""
+
+            @staticmethod
+            def get(key: str, default=None):
+                """Return test task timeout defaults."""
+                if key == "tasks":
+                    return {"queue_timeout": 1200, "run_timeout": 900}
+                return default
+
+        self.endpoint._core.config = _HeadroomConfig()
+        task = self.endpoint._create_task_for_payload(
+            {"model": "model", "messages": [], "timeout": 1800},
+            False,
+            "openaix",
+            None,
+        )
+
+        self.assertEqual(task.run_timeout, 1800)
+        self.assertEqual(task.queue_timeout, 2100)
+
     def test_queue_timeout_overrides_request_timeout_for_queue_only(self) -> None:
         """Keeps a more specific queue timeout while timeout controls execution."""
         task = self.endpoint._create_task_for_payload(

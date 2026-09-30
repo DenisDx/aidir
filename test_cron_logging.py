@@ -6,6 +6,7 @@ import asyncio
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from core import cron
 
@@ -121,15 +122,117 @@ class TestCronLogging(unittest.TestCase):
             self.assertLessEqual((logs_dir / "worker.log").stat().st_size, 120)
             self.assertLessEqual((logs_dir / "all.log").stat().st_size, 300)
 
+    def test_trim_runs_when_age_wipe_is_disabled(self) -> None:
+        """Uses trim_period rather than wipe_period to schedule size trimming."""
+        with tempfile.TemporaryDirectory() as tmp:
+            logs_dir = Path(tmp)
+            cron._LOGS_DIR = logs_dir
+            cron.config = _DummyConfig({
+                "instance": "aidir",
+                "logging": {
+                    "wipe_period": 0,
+                    "trim_period": 1,
+                    "max_log_size": 100,
+                },
+            })
+
+            async def _always(*_args, **_kwargs):
+                return True
+
+            cron._should_run = _always
+            log_file = logs_dir / "worker.log"
+            log_file.write_text("line\n" * 200, encoding="utf-8")
+
+            asyncio.run(cron.trim_logs_by_size(_FakeRedis()))
+
+            self.assertLessEqual(log_file.stat().st_size, 100)
+
+    def test_trim_uses_raw_log_size_override(self) -> None:
+        """Uses the larger per-file cap configured for raw request logs."""
+        with tempfile.TemporaryDirectory() as tmp:
+            logs_dir = Path(tmp)
+            cron._LOGS_DIR = logs_dir
+            cron.config = _DummyConfig({
+                "instance": "aidir",
+                "logging": {
+                    "trim_period": 1,
+                    "max_log_size": 100,
+                    "logs": {
+                        "openaix_call_raw_log.jsonl": {"max_log_size": 200},
+                    },
+                },
+            })
+
+            async def _always(*_args, **_kwargs):
+                return True
+
+            cron._should_run = _always
+            raw_log = logs_dir / "openaix_call_raw_log.jsonl"
+            normal_log = logs_dir / "worker.log"
+            raw_log.write_text("line\n" * 200, encoding="utf-8")
+            normal_log.write_text("line\n" * 200, encoding="utf-8")
+
+            asyncio.run(cron.trim_logs_by_size(_FakeRedis()))
+
+            self.assertLessEqual(raw_log.stat().st_size, 200)
+            self.assertGreater(raw_log.stat().st_size, 100)
+            self.assertLessEqual(normal_log.stat().st_size, 100)
+
+    def test_trim_discards_partial_first_line_from_bounded_tail(self) -> None:
+        """Keeps only complete lines when the retained tail starts mid-record."""
+        with tempfile.TemporaryDirectory() as tmp:
+            log_file = Path(tmp) / "large.jsonl"
+            log_file.write_bytes(b"old\n" + b"x" * 300 + b"\nrecent\n")
+
+            removed = cron._trim_log_file(log_file, 32)
+
+            self.assertGreater(removed, 0)
+            self.assertEqual(log_file.read_bytes(), b"recent\n")
+
+    def test_loop_workers_cycle_does_not_manage_local_servers(self) -> None:
+        """Cron loop workers must not stop production-owned llama.cpp servers."""
+        class _MaintenanceCore:
+            """Minimal cron Core recording lifecycle ownership mode."""
+
+            created_with: list[bool] = []
+            started = False
+            stopped = False
+
+            def __init__(self, *, manage_local_servers: bool, loop_workers_only: bool) -> None:
+                """Record requested cron Core isolation modes."""
+                type(self).created_with.append(
+                    manage_local_servers is False and loop_workers_only is True
+                )
+                self.loop_workers = []
+
+            async def start(self) -> None:
+                """Record temporary Core startup."""
+                type(self).started = True
+
+            async def stop(self) -> None:
+                """Record temporary Core shutdown."""
+                type(self).stopped = True
+
+        with patch("core.cron.Core", _MaintenanceCore):
+            asyncio.run(cron.run_loop_workers_cycle(object()))
+
+        self.assertEqual(_MaintenanceCore.created_with, [True])
+        self.assertTrue(_MaintenanceCore.started)
+        self.assertTrue(_MaintenanceCore.stopped)
+
     def test_main_runs_remaining_jobs_when_one_fails(self) -> None:
         """Keeps running remaining cron jobs even if one of them raises an exception."""
 
         class _CloseOnlyRedis:
             def __init__(self):
                 self.closed = False
+                self.data: dict[str, str] = {}
 
             async def aclose(self):
                 self.closed = True
+
+            async def set(self, key: str, value: str):
+                self.data[key] = value
 
         redis = _CloseOnlyRedis()
         calls: list[str] = []
@@ -192,6 +295,56 @@ class TestCronLogging(unittest.TestCase):
             "keep_alive",
         ])
         self.assertTrue(redis.closed)
+        self.assertNotIn("aidir111:cron:last_success_at", redis.data)
+
+    def test_main_records_heartbeat_after_successful_cycle(self) -> None:
+        """Records one heartbeat only when every cron job completes successfully."""
+
+        class _Redis:
+            def __init__(self):
+                self.data: dict[str, str] = {}
+
+            async def aclose(self):
+                pass
+
+            async def set(self, key: str, value: str):
+                self.data[key] = value
+
+        redis = _Redis()
+
+        async def _connect():
+            return redis
+
+        async def _ok(_redis):
+            return None
+
+        originals = {
+            "_connect_redis": cron._connect_redis,
+            "run_loop_workers_cycle": cron.run_loop_workers_cycle,
+            "refresh_external_mcp_tools": cron.refresh_external_mcp_tools,
+            "wipe_logs": cron.wipe_logs,
+            "trim_logs_by_size": cron.trim_logs_by_size,
+            "health_check": cron.health_check,
+            "cleanup_stale_tasks": cron.cleanup_stale_tasks,
+            "cleanup_expired_tasks": cron.cleanup_expired_tasks,
+            "keep_alive_ping": cron.keep_alive_ping,
+        }
+        try:
+            cron._connect_redis = _connect
+            cron.run_loop_workers_cycle = _ok
+            cron.refresh_external_mcp_tools = _ok
+            cron.wipe_logs = _ok
+            cron.trim_logs_by_size = _ok
+            cron.health_check = _ok
+            cron.cleanup_stale_tasks = _ok
+            cron.cleanup_expired_tasks = _ok
+            cron.keep_alive_ping = _ok
+            asyncio.run(cron.main())
+        finally:
+            for name, original in originals.items():
+                setattr(cron, name, original)
+
+        self.assertIn("aidir111:cron:last_success_at", redis.data)
 
 
 if __name__ == "__main__":

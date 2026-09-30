@@ -156,6 +156,24 @@ class QueueManager:
     def list_tasks(self) -> list[Task]:
         return list(self._tasks.values())
 
+    async def extend_active_timeout(self, task_id: str, seconds: int = 60) -> Optional[Task]:
+        """Extend both lifetime deadlines of a queued or running live task."""
+        task = self._tasks.get(task_id)
+        if task is None or task.status not in {STATUS_QUEUED, STATUS_RUNNING}:
+            return None
+
+        extension = int(seconds)
+        task.queue_timeout = max(0, int(task.queue_timeout or 0)) + extension
+        task.run_timeout = max(0, int(task.run_timeout or 0)) + extension
+        await self._redis.hset(
+            self._tk(task.id),
+            mapping={
+                "queue_timeout": str(task.queue_timeout),
+                "run_timeout": str(task.run_timeout),
+            },
+        )
+        return task
+
     async def increment_llm_call_count(self, task: Task) -> int:
         """Increment persisted LLM call count for a task and mirror it in memory."""
         next_value = int(getattr(task, "llm_call_count", 0) or 0) + 1

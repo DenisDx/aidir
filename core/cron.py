@@ -157,39 +157,24 @@ def _trim_log_file(log_file: Path, max_bytes: int) -> int:
         size = log_file.stat().st_size
         if size <= max_bytes:
             return 0
-        
-        # Read all lines
-        lines = log_file.read_text(encoding="utf-8").splitlines(keepends=True)
-        
-        # Calculate cumulative size from the end
-        current_size = 0
-        start_idx = len(lines)
-        
-        # Keep lines from the end until we exceed max_bytes
-        for i in range(len(lines) - 1, -1, -1):
-            line_size = len(lines[i].encode("utf-8"))
-            if current_size + line_size > max_bytes:
-                start_idx = i + 1
-                break
-            current_size += line_size
-        else:
-            # All lines fit within max_bytes, but we're being conservative
-            start_idx = 1 if lines else 0
-        
-        # Write trimmed content
-        trimmed_lines = lines[start_idx:]
-        new_content = "".join(trimmed_lines)
-        log_file.write_text(new_content, encoding="utf-8")
-        
-        bytes_removed = size - len(new_content.encode("utf-8"))
-        return bytes_removed
+
+        with log_file.open("rb") as source:
+            source.seek(size - max_bytes)
+            tail = source.read(max_bytes)
+
+        first_newline = tail.find(b"\n")
+        retained = tail[first_newline + 1:] if first_newline >= 0 else b""
+        temp_file = log_file.with_name(f".{log_file.name}.trim")
+        temp_file.write_bytes(retained)
+        temp_file.replace(log_file)
+        return size - len(retained)
     except Exception:
         return 0
 
 
 async def trim_logs_by_size(redis: aioredis.Redis) -> None:
     """Trim log files that exceed configured max_log_size."""
-    global_period = _to_int(config.get("logging.wipe_period") or 0, 0)
+    global_period = _to_int(config.get("logging.trim_period"), 60)
     global_max_size = _to_int(config.get("logging.max_log_size") or 0, 0)
     
     total_trimmed = 0
@@ -199,7 +184,7 @@ async def trim_logs_by_size(redis: aioredis.Redis) -> None:
         _LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
         for log_file in _iter_log_files():
-            period = _effective_log_setting(log_file, "wipe_period", global_period)
+            period = _effective_log_setting(log_file, "trim_period", global_period)
             if period <= 0:
                 continue
             if not await _should_run(redis, f"trim_logs_by_size:{log_file.name}", period):
@@ -280,7 +265,7 @@ async def cleanup_expired_tasks(redis: aioredis.Redis) -> None:
 
 async def run_loop_workers_cycle(redis: aioredis.Redis) -> None:
     """Run loop() for all workers that expose it, rotating start position each cron cycle."""
-    core = Core()
+    core = Core(manage_local_servers=False, loop_workers_only=True)
     try:
         await core.start()
 
@@ -411,21 +396,28 @@ async def main() -> None:
     redis = await _connect_redis()
 
     async def _run_job(name: str, job_coro):
-        """Run one cron job and keep the cycle alive on errors."""
+        """Run one cron job, logging failures without stopping the cycle."""
         try:
             await job_coro
+            return True
         except Exception as exc:
             log("system", "error", f"cron job failed: {name}: {exc}")
+            return False
 
     try:
-        await _run_job("run_loop_workers_cycle", run_loop_workers_cycle(redis))
-        await _run_job("refresh_external_mcp_tools", refresh_external_mcp_tools(redis))
-        await _run_job("wipe_logs", wipe_logs(redis))
-        await _run_job("trim_logs_by_size", trim_logs_by_size(redis))
-        await _run_job("health_check", health_check(redis))
-        await _run_job("cleanup_stale_tasks", cleanup_stale_tasks(redis))
-        await _run_job("cleanup_expired_tasks", cleanup_expired_tasks(redis))
-        await _run_job("keep_alive_ping", keep_alive_ping(redis))
+        jobs_succeeded = [
+            await _run_job("run_loop_workers_cycle", run_loop_workers_cycle(redis)),
+            await _run_job("refresh_external_mcp_tools", refresh_external_mcp_tools(redis)),
+            await _run_job("wipe_logs", wipe_logs(redis)),
+            await _run_job("trim_logs_by_size", trim_logs_by_size(redis)),
+            await _run_job("health_check", health_check(redis)),
+            await _run_job("cleanup_stale_tasks", cleanup_stale_tasks(redis)),
+            await _run_job("cleanup_expired_tasks", cleanup_expired_tasks(redis)),
+            await _run_job("keep_alive_ping", keep_alive_ping(redis)),
+        ]
+        if all(jobs_succeeded):
+            key = f"{config.get('instance', 'aidir')}:cron:last_success_at"
+            await redis.set(key, str(time.time()))
     finally:
         await redis.aclose()
 

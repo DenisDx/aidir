@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import sys
+import time
 import types
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi.testclient import TestClient
 
@@ -58,6 +59,13 @@ class _FakeTaskQueue:
             return self._task
         return None
 
+    async def extend_active_timeout(self, task_id: str, seconds: int = 60):
+        if task_id != self._task.id or self._task.status not in {"queued", "running"}:
+            return None
+        self._task.queue_timeout += seconds
+        self._task.run_timeout += seconds
+        return self._task
+
 
 class _FakeCore:
     """Minimal core stub for WebUI task endpoint tests."""
@@ -66,9 +74,13 @@ class _FakeCore:
         self.config = MagicMock()
         self.config.get.return_value = {}
         self.queue = _FakeTaskQueue(task)
-        self.redis = MagicMock()
+        self.redis = MagicMock(get=AsyncMock(return_value=None))
         self.workers = {}
+        self.resources = None
         self.envid_registry = None
+
+    def get_runtime_status(self):
+        return {}
 
 
 class TestTaskLlmCallCount(unittest.IsolatedAsyncioTestCase):
@@ -87,6 +99,29 @@ class TestTaskLlmCallCount(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second, 2)
         self.assertEqual(task.llm_call_count, 2)
         self.assertEqual(redis.hashes[f"aidir:task:{task.id}"]["llm_call_count"], "2")
+
+    async def test_queue_manager_extends_active_timeout_and_persists_it(self) -> None:
+        """Queue manager should extend the timeout currently governing a live task."""
+        task = Task_agent(payload={"model": "qwen3.5:9b"})
+        redis = _FakeRedisCounter()
+        queue = QueueManager(redis)
+        queue._tasks[task.id] = task
+
+        task.status = "queued"
+        updated = await queue.extend_active_timeout(task.id)
+        self.assertIs(updated, task)
+        self.assertEqual(task.queue_timeout, 360)
+        self.assertEqual(task.run_timeout, 360)
+        self.assertEqual(redis.hashes[f"aidir:task:{task.id}"]["queue_timeout"], "360")
+        self.assertEqual(redis.hashes[f"aidir:task:{task.id}"]["run_timeout"], "360")
+
+        task.status = "running"
+        updated = await queue.extend_active_timeout(task.id)
+        self.assertIs(updated, task)
+        self.assertEqual(task.queue_timeout, 420)
+        self.assertEqual(task.run_timeout, 420)
+        self.assertEqual(redis.hashes[f"aidir:task:{task.id}"]["queue_timeout"], "420")
+        self.assertEqual(redis.hashes[f"aidir:task:{task.id}"]["run_timeout"], "420")
 
     def test_webui_task_endpoints_return_llm_call_count(self) -> None:
         """Dashboard and task viewer APIs should expose llm_call_count."""
@@ -116,6 +151,48 @@ class TestTaskLlmCallCount(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(task_response.json()["task"]["llm_call_history"][0]["status"], "started")
             self.assertEqual(task_response.json()["task"]["llm_call_history"][0]["request_text"], "user: Diagnose the last hanging step in full detail")
             self.assertEqual(task_response.json()["task"]["llm_call_history"][0]["request_preview"], "user: Diagnose the last hanging step")
+
+    def test_webui_extends_the_timeout_for_the_active_task_status(self) -> None:
+        """WebUI should extend the timeout applicable to queued and running tasks."""
+        task = Task_agent(id="task-1", payload={"model": "qwen3.5:9b"}, stream=False)
+        core = _FakeCore(task)
+
+        with patch("webui.backend.app._get_session", return_value={"permissions": ["all"], "login": "tester"}):
+            client = TestClient(create_app(core=core))
+
+            task.status = "queued"
+            queued_response = client.post(f"/api/tasks/{task.id}/extend-timeout")
+            self.assertEqual(queued_response.status_code, 200)
+            self.assertEqual(queued_response.json()["task"]["queue_timeout"], 360)
+            self.assertEqual(queued_response.json()["task"]["run_timeout"], 360)
+
+            task.status = "running"
+            running_response = client.post(f"/api/tasks/{task.id}/extend-timeout")
+            self.assertEqual(running_response.status_code, 200)
+            self.assertEqual(running_response.json()["task"]["queue_timeout"], 420)
+            self.assertEqual(running_response.json()["task"]["run_timeout"], 420)
+
+    def test_webui_status_reports_cron_health(self) -> None:
+        """Dashboard status should report fresh and missing cron heartbeats."""
+        task = Task_agent(id="task-1", payload={"model": "qwen3.5:9b"}, stream=False)
+        core = _FakeCore(task)
+        core.config.get.side_effect = lambda key, default=None: {
+            "instance": "aidir",
+            "webui.health.cron_max_age": 180,
+        }.get(key, default)
+
+        with patch("webui.backend.app._get_session", return_value={"permissions": ["all"], "login": "tester"}):
+            client = TestClient(create_app(core=core))
+
+            core.redis.get = AsyncMock(return_value=str(time.time() - 30))
+            healthy_response = client.get("/api/status")
+            self.assertEqual(healthy_response.status_code, 200)
+            self.assertTrue(healthy_response.json()["health"]["cron"]["healthy"])
+
+            core.redis.get = AsyncMock(return_value=None)
+            stale_response = client.get("/api/status")
+            self.assertEqual(stale_response.status_code, 200)
+            self.assertFalse(stale_response.json()["health"]["cron"]["healthy"])
 
 
 if __name__ == "__main__":

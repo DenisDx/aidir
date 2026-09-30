@@ -20,7 +20,13 @@
     // Seconds between log wipe runs. 0 = never wipe.
     "wipe_period": ${LOG_WIPE_PERIOD:-10000},
     "wipe_max_age": ${LOG_WIPE_MAX_AGE:-1000000}, 
-    max_log_size: ${MAX_LOG_SIZE:-1000000}, // max size in bytes for individual log files; 0 = unlimited
+    // Seconds between size-limit checks. Independent from wipe_period; 0 = never trim.
+    "trim_period": ${LOG_TRIM_PERIOD:-60},
+    max_log_size: ${MAX_LOG_SIZE:-1048576}, // max size in bytes for individual log files; 0 = unlimited
+    "logs": {
+      "openaix_call_raw_log.jsonl": {"max_log_size": 10485760},
+      "call_llama_cpp_call_raw_log.jsonl": {"max_log_size": 10485760}
+    },
     "levels": { // thresholds for individual per-type log files
       "workers": "warning",
       "http": "warning",

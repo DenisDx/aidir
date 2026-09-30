@@ -5,6 +5,8 @@
 let token = '';
 let logWs = null;
 let logTimer = null;
+let logWsGeneration = 0;
+let logLiveUiBound = false;
 let refreshTimer = null;
 let runtimeState = {
   restart_requested: false,
@@ -214,6 +216,7 @@ $('logoff-btn').addEventListener('click', async () => {
 });
 
 $('restart-btn').addEventListener('click', requestRestart);
+$('repair-cron-btn').addEventListener('click', repairCron);
 
 function doLogout() {
   token = '';
@@ -273,6 +276,38 @@ function applyRuntimeStatus(runtime) {
   }
 }
 
+function fmtAge(seconds) {
+  const total = Math.max(0, Number(seconds) || 0);
+  if (total < 60) return `${total}s ago`;
+  const minutes = Math.floor(total / 60);
+  const remainingSeconds = total % 60;
+  return `${minutes}m ${remainingSeconds}s ago`;
+}
+
+function renderSystemHealth(health) {
+  const card = $('system-health-card');
+  const indicator = $('health-cron-indicator');
+  const detail = $('health-cron-detail');
+  if (!card || !indicator || !detail) return;
+
+  const cron = health && health.cron;
+  const isHealthy = Boolean(cron && cron.healthy);
+  card.classList.toggle('alert', !isHealthy);
+  indicator.classList.toggle('alert', !isHealthy);
+
+  if (!cron || !cron.last_success_at) {
+    detail.textContent = 'No successful cycle recorded';
+    return;
+  }
+
+  const threshold = Number(cron.max_age_seconds) || 180;
+  const timestamp = fmtDateTime(cron.last_success_at);
+  const age = fmtAge(cron.age_seconds);
+  detail.textContent = isHealthy
+    ? `Last success ${timestamp} (${age})`
+    : `Last success ${timestamp} (${age}; threshold ${threshold}s)`;
+}
+
 async function requestRestart() {
   const confirmed = window.confirm(
     'Restart the service now? New external tasks will be blocked, queued external tasks will be canceled, and active tasks will be given time to finish before shutdown.'
@@ -291,6 +326,27 @@ async function requestRestart() {
   applyRuntimeStatus(res.data.runtime || { restart_requested: true });
 }
 
+async function repairCron() {
+  const confirmed = window.confirm(
+    'Repair the aidir cron entry? Existing unrelated crontab entries will be preserved.'
+  );
+  if (!confirmed) return;
+
+  const button = $('repair-cron-btn');
+  button.disabled = true;
+  const res = await apiPost('/api/cron/repair', {});
+  button.disabled = false;
+
+  if (!res.ok) {
+    window.alert(res.data.detail || 'Cron repair failed');
+    return;
+  }
+
+  const action = String(res.data.action || 'completed');
+  window.alert(`Cron repair ${action}`);
+  await loadTasks();
+}
+
 // ── Tasks ──────────────────────────────────────────────────────────────────
 async function loadTasks() {
   const [data, status] = await Promise.all([
@@ -299,6 +355,9 @@ async function loadTasks() {
   ]);
   if (status && status.runtime) {
     applyRuntimeStatus(status.runtime);
+  }
+  if (status) {
+    renderSystemHealth(status.health);
   }
   if (!data) return;
 
@@ -309,6 +368,9 @@ async function loadTasks() {
   data.tasks.forEach(t => {
     const tr = document.createElement('tr');
     const canTerminate = ['created', 'queued', 'running'].includes(String(t.status || '').toLowerCase());
+    const timeoutField = t.status === 'queued' ? 'queue_timeout' : t.status === 'running' ? 'run_timeout' : '';
+    const timeoutValue = timeoutField ? Number(t[timeoutField]) : NaN;
+    const timeoutText = Number.isFinite(timeoutValue) ? `${timeoutValue}s` : '—';
     const requestPreview = escapeHtml(firstMessagePreview(t));
     tr.innerHTML = `
       <td style="font-family:monospace;font-size:11px">${escapeHtml(t.id || '')}</td>
@@ -317,6 +379,7 @@ async function loadTasks() {
       <td>${t.worker_id || '—'}</td>
       <td style="color:var(--muted);font-size:12px">${fmtTime(t.created_at)}</td>
       <td style="color:var(--muted);font-size:12px">${fmtTaskDuration(t.started_at)}</td>
+      <td style="white-space:nowrap">${timeoutText} ${timeoutField ? `<button class="btn-sm" data-dashboard-extend-timeout="${escapeHtml(t.id || '')}">add</button>` : ''}</td>
       <td style="color:var(--muted);font-size:12px">${requestPreview}</td>
       <td>${Number(t.llm_call_count || 0)}</td>
       <td>
@@ -336,6 +399,10 @@ async function loadTasks() {
     const terminateBtn = tr.querySelector('[data-dashboard-terminate]');
     if (terminateBtn) {
       terminateBtn.addEventListener('click', () => terminateDashboardTask(t.id, terminateBtn));
+    }
+    const extendTimeoutBtn = tr.querySelector('[data-dashboard-extend-timeout]');
+    if (extendTimeoutBtn) {
+      extendTimeoutBtn.addEventListener('click', () => extendDashboardTaskTimeout(t.id, extendTimeoutBtn));
     }
     body.appendChild(tr);
   });
@@ -358,6 +425,21 @@ async function terminateDashboardTask(taskId, buttonEl) {
   if (!res.ok) {
     if (buttonEl) buttonEl.disabled = false;
     window.alert(res.data.detail || 'Failed to terminate task');
+    return;
+  }
+
+  await loadTasks();
+}
+
+async function extendDashboardTaskTimeout(taskId, buttonEl) {
+  if (!taskId) return;
+
+  if (buttonEl) buttonEl.disabled = true;
+
+  const res = await apiPost(`/api/tasks/${encodeURIComponent(taskId)}/extend-timeout`, {});
+  if (!res.ok) {
+    if (buttonEl) buttonEl.disabled = false;
+    window.alert(res.data.detail || 'Failed to extend task timeout');
     return;
   }
 
@@ -814,19 +896,24 @@ async function openTaskViewerSteps(task) {
 
 // ── Live logs ──────────────────────────────────────────────────────────────
 function startLiveLogs() {
-  connectLogWs();
-  $('log-file-select').addEventListener('change', reconnectLogs);
-  $('log-live').addEventListener('change', () => {
-    if ($('log-live').checked) connectLogWs(); else stopLiveLogs();
-  });
-  $('log-interval').addEventListener('change', () => {
-    if (logWs) { stopLiveLogs(); connectLogWs(); }
-  });
+  if (!logLiveUiBound) {
+    $('log-file-select').addEventListener('change', reconnectLogs);
+    $('log-live').addEventListener('change', () => {
+      if ($('log-live').checked) connectLogWs(); else stopLiveLogs();
+    });
+    $('log-interval').addEventListener('change', () => {
+      if (logWs) { stopLiveLogs(); connectLogWs(); }
+    });
+    logLiveUiBound = true;
+  }
+  if ($('log-live').checked) connectLogWs();
 }
 
 function stopLiveLogs() {
-  if (logWs) { logWs.close(); logWs = null; }
+  logWsGeneration += 1;
   clearTimeout(logTimer);
+  logTimer = null;
+  if (logWs) { logWs.close(); logWs = null; }
 }
 
 function reconnectLogs() {
@@ -836,22 +923,34 @@ function reconnectLogs() {
 }
 
 function connectLogWs() {
+  if (logWs) return;
+  clearTimeout(logTimer);
+  logTimer = null;
+
   const file = $('log-file-select').value;
   const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
   // Cookie is sent automatically by the browser; no token in URL needed
   const url = `${wsProto}://${location.host}/ws/logs?file=${file}`;
+  const generation = logWsGeneration;
+  const ws = new WebSocket(url);
 
-  logWs = new WebSocket(url);
+  logWs = ws;
 
-  logWs.onmessage = e => appendLog(e.data);
-  logWs.onclose = () => {
+  ws.onmessage = e => {
+    if (logWsGeneration === generation && logWs === ws) appendLog(e.data);
+  };
+  ws.onclose = () => {
+    if (logWs !== ws) return;
+    logWs = null;
     // Reconnect after interval if live mode still on
     const secs = parseFloat($('log-interval').value) || 1;
-    if ($('log-live').checked) {
+    if (logWsGeneration === generation && $('log-live').checked) {
       logTimer = setTimeout(connectLogWs, secs * 1000);
     }
   };
-  logWs.onerror = () => logWs.close();
+  ws.onerror = () => {
+    if (logWs === ws) ws.close();
+  };
 }
 
 function appendLog(line) {

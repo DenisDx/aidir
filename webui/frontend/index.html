@@ -120,6 +120,17 @@
     margin-top: 4px; font-size: 12px; color: var(--muted);
     border-top: 1px solid var(--border); padding-top: 8px;
   }
+  .health-card { border-color: rgba(76, 175, 134, 0.3); }
+  .health-card.alert { border-color: rgba(224, 85, 85, 0.55); }
+  .health-row { display: flex; align-items: center; gap: 10px; min-height: 24px; }
+  .health-indicator {
+    width: 9px; height: 9px; border-radius: 50%; background: var(--ok);
+    flex: 0 0 auto;
+  }
+  .health-indicator.alert { background: var(--err); }
+  .health-label { font-weight: 600; }
+  .health-detail { color: var(--muted); font-size: 12px; }
+  .health-repair { margin-left: auto; font-size: 11px; padding: 3px 7px; }
 
   .page { display: none; padding: 20px; }
   .page.active { display: block; }
@@ -137,6 +148,16 @@
 
   .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
   @media (max-width: 600px) { .grid-2 { grid-template-columns: 1fr; } }
+  .dashboard-summary {
+    display: grid;
+    grid-template-columns: minmax(116px, 150px) minmax(116px, 150px) minmax(0, 1fr);
+    gap: 16px;
+    margin-bottom: 16px;
+  }
+  .dashboard-summary .card { margin-bottom: 0; }
+  @media (max-width: 760px) {
+    .dashboard-summary { grid-template-columns: 1fr; }
+  }
 
   /* ── Tasks table ── */
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
@@ -782,7 +803,7 @@
       </div>
     </div>
 
-    <div class="grid-2">
+    <div class="dashboard-summary">
       <div class="card">
         <div class="card-title">Active tasks</div>
         <div class="stat" id="stat-tasks">—</div>
@@ -790,6 +811,15 @@
       <div class="card">
         <div class="card-title">Workers</div>
         <div class="stat" id="stat-workers">—</div>
+      </div>
+      <div id="system-health-card" class="card health-card">
+        <div class="card-title">System health</div>
+        <div class="health-row">
+          <span id="health-cron-indicator" class="health-indicator" aria-label="Cron status"></span>
+          <span class="health-label">Cron</span>
+          <span id="health-cron-detail" class="health-detail">Checking...</span>
+          <button id="repair-cron-btn" class="btn-sm health-repair" type="button" title="Add or repair the aidir cron entry">Repair cron</button>
+        </div>
       </div>
     </div>
 
@@ -799,7 +829,7 @@
         <thead>
           <tr>
             <th>ID</th><th>Type</th><th>Status</th>
-            <th>Worker</th><th>Created</th><th>Duration</th><th>First message</th><th>LLM calls</th><th>JSON</th><th>Action</th>
+            <th>Worker</th><th>Created</th><th>Duration</th><th>Timeout</th><th>First message</th><th>LLM calls</th><th>JSON</th><th>Action</th>
           </tr>
         </thead>
         <tbody id="tasks-body"></tbody>
