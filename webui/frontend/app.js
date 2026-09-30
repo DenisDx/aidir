@@ -895,7 +895,7 @@ async function openTaskViewerSteps(task) {
 }
 
 // ── Live logs ──────────────────────────────────────────────────────────────
-function startLiveLogs() {
+async function startLiveLogs() {
   if (!logLiveUiBound) {
     $('log-file-select').addEventListener('change', reconnectLogs);
     $('log-live').addEventListener('change', () => {
@@ -906,7 +906,25 @@ function startLiveLogs() {
     });
     logLiveUiBound = true;
   }
+  await loadLogFileOptions();
   if ($('log-live').checked) connectLogWs();
+}
+
+async function loadLogFileOptions() {
+  const data = await apiGet('/api/logs/files');
+  if (!data || !Array.isArray(data.files) || data.files.length === 0) return;
+
+  const select = $('log-file-select');
+  const previous = select.value;
+  const normalizedPrevious = previous.includes('.') ? previous : `${previous}.log`;
+  select.replaceChildren();
+  for (const file of data.files) {
+    const option = document.createElement('option');
+    option.value = file;
+    option.textContent = file;
+    select.appendChild(option);
+  }
+  select.value = data.files.includes(normalizedPrevious) ? normalizedPrevious : data.files[0];
 }
 
 function stopLiveLogs() {
@@ -929,8 +947,7 @@ function connectLogWs() {
 
   const file = $('log-file-select').value;
   const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
-  // Cookie is sent automatically by the browser; no token in URL needed
-  const url = `${wsProto}://${location.host}/ws/logs?file=${file}`;
+  const url = `${wsProto}://${location.host}/ws/logs?${new URLSearchParams({ file })}`;
   const generation = logWsGeneration;
   const ws = new WebSocket(url);
 
@@ -942,10 +959,9 @@ function connectLogWs() {
   ws.onclose = () => {
     if (logWs !== ws) return;
     logWs = null;
-    // Reconnect after interval if live mode still on
-    const secs = parseFloat($('log-interval').value) || 1;
+    const seconds = parseFloat($('log-interval').value) || 1;
     if (logWsGeneration === generation && $('log-live').checked) {
-      logTimer = setTimeout(connectLogWs, secs * 1000);
+      logTimer = setTimeout(connectLogWs, seconds * 1000);
     }
   };
   ws.onerror = () => {

@@ -164,9 +164,11 @@ def _trim_log_file(log_file: Path, max_bytes: int) -> int:
 
         first_newline = tail.find(b"\n")
         retained = tail[first_newline + 1:] if first_newline >= 0 else b""
-        temp_file = log_file.with_name(f".{log_file.name}.trim")
-        temp_file.write_bytes(retained)
-        temp_file.replace(log_file)
+        # Keep the inode so long-running child processes keep writing to this path.
+        with log_file.open("r+b") as target:
+            target.seek(0)
+            target.write(retained)
+            target.truncate(len(retained))
         return size - len(retained)
     except Exception:
         return 0

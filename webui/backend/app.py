@@ -17,6 +17,7 @@ import secrets
 import shlex
 import subprocess
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
@@ -38,6 +39,9 @@ _LOGS_DIR     = Path(__file__).parent.parent.parent / "logs"
 _SESSION_PREFIX = "aidir:session:"
 _ROOT = _LOGS_DIR.parent
 _CRON_MARKER = "# aidir-cron"
+_LOG_FILE_SUFFIXES = frozenset({".log", ".jsonl"})
+_LIVE_LOG_INITIAL_LINES = 200
+_LIVE_LOG_INITIAL_BYTES = 256 * 1024
 
 
 class CronRepairError(RuntimeError):
@@ -153,6 +157,17 @@ def _parse_json_field(value: str | None) -> Any:
         return value
 
 
+def _list_log_files() -> list[str]:
+    """Return sorted supported log filenames from the log directory."""
+    if not _LOGS_DIR.exists():
+        return []
+    return sorted(
+        path.name
+        for path in _LOGS_DIR.iterdir()
+        if path.is_file() and path.suffix in _LOG_FILE_SUFFIXES
+    )
+
+
 def _resolve_log_file(file_name: str) -> Path:
     """Resolve a requested log file name safely under the logs directory."""
     requested = (file_name or "").strip()
@@ -161,7 +176,7 @@ def _resolve_log_file(file_name: str) -> Path:
     elif "." not in requested:
         requested = f"{requested}.log"
 
-    if Path(requested).name != requested:
+    if Path(requested).name != requested or Path(requested).suffix not in _LOG_FILE_SUFFIXES:
         raise HTTPException(status_code=400, detail="Invalid log file name")
 
     resolved = (_LOGS_DIR / requested).resolve()
@@ -170,6 +185,73 @@ def _resolve_log_file(file_name: str) -> Path:
         raise HTTPException(status_code=400, detail="Invalid log file path")
 
     return resolved
+
+
+@dataclass(frozen=True)
+class LogTailCursor:
+    """Track one log file identity and the byte position already delivered."""
+
+    device: int | None
+    inode: int | None
+    offset: int
+    initialized: bool
+    pending: bytes = b""
+
+
+def _new_log_tail_cursor(log_file: Path) -> LogTailCursor:
+    """Create a cursor at the current end of a log file."""
+    if not log_file.exists():
+        return LogTailCursor(None, None, 0, False)
+    stat = log_file.stat()
+    return LogTailCursor(stat.st_dev, stat.st_ino, stat.st_size, True)
+
+
+def _read_log_tail_lines(log_file: Path, max_lines: int = _LIVE_LOG_INITIAL_LINES) -> list[str]:
+    """Return a bounded complete-line tail for a newly connected log viewer."""
+    if not log_file.exists() or max_lines <= 0:
+        return []
+
+    size = log_file.stat().st_size
+    start = max(0, size - _LIVE_LOG_INITIAL_BYTES)
+    with log_file.open("rb") as handle:
+        handle.seek(start)
+        data = handle.read()
+
+    if start:
+        newline = data.find(b"\n")
+        data = data[newline + 1:] if newline >= 0 else b""
+    return [line for line in data.decode("utf-8", errors="replace").splitlines() if line][-max_lines:]
+
+
+def _read_appended_log_lines(
+    log_file: Path,
+    cursor: LogTailCursor,
+) -> tuple[LogTailCursor, list[str]]:
+    """Return new lines while handling log creation, replacement, and truncation."""
+    if not log_file.exists():
+        return cursor, []
+
+    stat = log_file.stat()
+    identity = (stat.st_dev, stat.st_ino)
+    cursor_identity = (cursor.device, cursor.inode)
+    if cursor.initialized and identity != cursor_identity:
+        return LogTailCursor(*identity, stat.st_size, True), []
+
+    offset = cursor.offset if cursor.initialized else 0
+    if stat.st_size < offset:
+        return LogTailCursor(*identity, stat.st_size, True), []
+    if stat.st_size == offset:
+        return LogTailCursor(*identity, offset, True, cursor.pending), []
+
+    with log_file.open("rb") as handle:
+        handle.seek(offset)
+        new_data = cursor.pending + handle.read(stat.st_size - offset)
+    complete_data, separator, pending = new_data.rpartition(b"\n")
+    if not separator:
+        return LogTailCursor(*identity, stat.st_size, True, new_data), []
+
+    lines = complete_data.decode("utf-8", errors="replace").splitlines()
+    return LogTailCursor(*identity, stat.st_size, True, pending), [line for line in lines if line]
 
 
 def _find_envid(value: Any, depth: int = 0) -> str:
@@ -603,6 +685,11 @@ def create_app(
 
     # ── Logs (REST) ───────────────────────────────────────────────────────────
 
+    @app.get("/api/logs/files")
+    async def list_logs(session: dict = Depends(_require_session)):
+        """Return log files available to the WebUI viewer."""
+        return {"files": _list_log_files()}
+
     @app.get("/api/logs")
     async def get_logs(
         file: str = "all",
@@ -674,27 +761,19 @@ def create_app(
             return
 
         await websocket.accept()
-        log_file = _LOGS_DIR / f"{file}.log"
+        log_file = _resolve_log_file(file)
 
-        # Start from end of file
-        offset = log_file.stat().st_size if log_file.exists() else 0
+        # Deliver useful context, then stream only later writes.
+        for line in _read_log_tail_lines(log_file):
+            await websocket.send_text(line)
+        cursor = _new_log_tail_cursor(log_file)
 
         try:
             while True:
                 await asyncio.sleep(1)
-                if not log_file.exists():
-                    continue
-                size = log_file.stat().st_size
-                if size <= offset:
-                    continue
-                with open(log_file, "rb") as f:
-                    f.seek(offset)
-                    new_data = f.read(size - offset)
-                offset = size
-                new_lines = new_data.decode("utf-8", errors="replace").splitlines()
+                cursor, new_lines = _read_appended_log_lines(log_file, cursor)
                 for line in new_lines:
-                    if line:
-                        await websocket.send_text(line)
+                    await websocket.send_text(line)
         except WebSocketDisconnect:
             pass
 

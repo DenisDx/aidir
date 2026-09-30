@@ -189,6 +189,21 @@ class TestCronLogging(unittest.TestCase):
             self.assertGreater(removed, 0)
             self.assertEqual(log_file.read_bytes(), b"recent\n")
 
+    def test_trim_preserves_inode_for_open_log_writers(self) -> None:
+        """Keeps active child-process output attached to the visible log path."""
+        with tempfile.TemporaryDirectory() as tmp:
+            log_file = Path(tmp) / "local_llama_cpp.log"
+            log_file.write_bytes(b"old\n" + b"x" * 300 + b"\nrecent\n")
+            original_inode = log_file.stat().st_ino
+
+            with log_file.open("ab", buffering=0) as writer:
+                removed = cron._trim_log_file(log_file, 32)
+                writer.write(b"new process output\n")
+
+            self.assertGreater(removed, 0)
+            self.assertEqual(log_file.stat().st_ino, original_inode)
+            self.assertEqual(log_file.read_bytes(), b"recent\nnew process output\n")
+
     def test_loop_workers_cycle_does_not_manage_local_servers(self) -> None:
         """Cron loop workers must not stop production-owned llama.cpp servers."""
         class _MaintenanceCore:
