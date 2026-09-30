@@ -11,9 +11,9 @@ Expose embedding models through the existing OpenAIx endpoint while retaining no
 The initial test route is:
 
 ```text
-client -> local aidir OpenAIx -> smart model Qwen3-Embedding-4B
+client -> local aidir OpenAIx -> smart model qwen3-embedding:4b
        -> ollama_remote_unmanaged -> http://192.168.1.40:11434
-       -> dengcao/Qwen3-Embedding-4B:Q5_K_M
+  -> qwen3-embedding:4b
 ```
 
 The remote Ollama instance is initially unmanaged. Its resources must not be represented in the local scheduler. After aidir is deployed on `192.168.1.40`, the same public smart model will instead call that remote aidir instance through its OpenAIx protocol and use its queue-state extension during route selection.
@@ -38,7 +38,7 @@ Accepted request shape:
 
 ```json
 {
-  "model": "Qwen3-Embedding-4B",
+  "model": "qwen3-embedding:4b",
   "input": ["first text", "second text"],
   "truncate": true
 }
@@ -70,7 +70,7 @@ Accepted request shape:
 
 ```json
 {
-  "model": "Qwen3-Embedding-4B",
+  "model": "qwen3-embedding:4b",
   "input": ["first text", "second text"],
   "encoding_format": "float"
 }
@@ -89,7 +89,7 @@ The endpoint maps the request to the shared internal embed task, then converts t
   "data": [
     {"object": "embedding", "embedding": [0.1, 0.2], "index": 0}
   ],
-  "model": "Qwen3-Embedding-4B",
+  "model": "qwen3-embedding:4b",
   "usage": {"prompt_tokens": 2, "total_tokens": 2}
 }
 ```
@@ -126,7 +126,7 @@ Add a distinct provider so its unmanaged status is explicit:
   "baseUrl": "http://192.168.1.40:11434",
   "models": [
     {
-      "id": "dengcao/Qwen3-Embedding-4B:Q5_K_M",
+      "id": "qwen3-embedding:4b",
       "embedding": true,
       "estimated_vram_mb": 5000
     }
@@ -142,15 +142,15 @@ Add this model under provider `smart`:
 
 ```json5
 {
-  "id": "Qwen3-Embedding-4B",
-  "alias": "Qwen3-Embedding-4B",
+  "id": "qwen3-embedding:4b",
+  "alias": "qwen3-embedding:4b",
   "type": "first_available",
   "embedding": true,
   "default_tool_injection": false,
   "items": [
     {
       "provider": "ollama_embedding_remote",
-      "model": "dengcao/Qwen3-Embedding-4B:Q5_K_M",
+      "model": "qwen3-embedding:4b",
       "request_timeout_ms": 1500,
       "fallback_prio": 10
     }
@@ -183,7 +183,7 @@ After aidir is deployed on `192.168.1.40` and the embedding model is configured 
 
 1. replace `ollama_embedding_remote` in the local configuration with an `api: "openaix"` provider whose `baseUrl` points to the remote aidir endpoint;
 2. configure the remote aidir model as `embedding: true` with its actual resource requirements;
-3. retain the public smart model id and alias `Qwen3-Embedding-4B` so clients require no change;
+3. retain the public smart model id and alias `qwen3-embedding:4b` so clients require no change;
 4. query remote OpenAIx queue state for the resolved provider/model before selecting the candidate;
 5. use the returned `can_run_now`, queue totals, and priority counts as smart-routing availability evidence, without duplicating remote resource accounting locally;
 6. send the eventual embedding request through remote `POST /api/embed` or remote `POST /v1/embeddings`, selected by the provider adapter.
@@ -192,7 +192,9 @@ The local instance must not mirror or reserve the remote instance's VRAM. The re
 
 ## Verified Initial Model
 
-`GET http://192.168.1.40:11434/api/tags` has been verified to list `dengcao/Qwen3-Embedding-4B:Q5_K_M`.
+`GET http://192.168.1.40:11434/api/tags` has been verified to list `qwen3-embedding:4b`.
+
+The remote embedding endpoint has been live-verified on 2026-09-30: `POST /api/embed` with `qwen3-embedding:4b` returned HTTP `200`, including two ordered vectors of dimension `2560` for a two-string input.
 
 ## Trust Boundary
 
@@ -213,10 +215,10 @@ During the initial deployment, hosts on the local network are trusted. No additi
 
 ## Acceptance Criteria
 
-1. Both `POST /api/embed` and `POST /v1/embeddings` accept `Qwen3-Embedding-4B` and return vectors in their respective protocol formats.
+1. Both `POST /api/embed` and `POST /v1/embeddings` accept `qwen3-embedding:4b` and return vectors in their respective protocol formats.
 2. Requests use the ordinary aidir queue, task history, priority, and timeout mechanics.
 3. Embed requests never invoke chat context construction or tools.
 4. Non-embedding models cannot be selected for embedding requests.
-5. Initial calls reach `dengcao/Qwen3-Embedding-4B:Q5_K_M` at `192.168.1.40:11434` without local remote-VRAM accounting.
+5. Initial calls reach `qwen3-embedding:4b` at `192.168.1.40:11434` without local remote-VRAM accounting.
 6. Automated tests cover successful single/batched input, validation errors, protocol translation, smart routing, task timeouts, and worker upstream errors.
 7. Transitioning the public smart model from unmanaged Ollama to remote aidir does not change client model names or public endpoint contracts.

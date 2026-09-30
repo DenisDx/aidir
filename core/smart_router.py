@@ -43,6 +43,7 @@ class SmartRouter:
         probe_ollama_model_availability: Callable[..., Awaitable[bool]] | None,
         resolve_probe_timeout_ms: Callable[[dict], int],
         resolve_worker_id_for_route: Callable[[str, dict | None], str] | None = None,
+        is_candidate_allowed: Callable[[str, str], bool] | None = None,
         on_selection: Callable[[dict], None] | None = None,
         on_failure: Callable[[dict, str, list[dict]], None] | None = None,
     ) -> None:
@@ -58,6 +59,7 @@ class SmartRouter:
         self._probe_ollama_model_availability = probe_ollama_model_availability
         self._resolve_probe_timeout_ms = resolve_probe_timeout_ms
         self._resolve_worker_id_for_route = resolve_worker_id_for_route
+        self._is_candidate_allowed = is_candidate_allowed
         self._on_selection = on_selection
         self._on_failure = on_failure
 
@@ -168,6 +170,25 @@ class SmartRouter:
         model_id = str(item.get("model") or "").strip()
         if not provider_id or not model_id:
             return None
+
+        if self._is_candidate_allowed is not None and not self._is_candidate_allowed(provider_id, model_id):
+            try:
+                fallback_prio = int(item.get("fallback_prio", index) or index)
+            except (TypeError, ValueError):
+                fallback_prio = index
+            return {
+                "provider": provider_id,
+                "model": model_id,
+                "index": index,
+                "fallback_prio": fallback_prio,
+                "can_run_now": False,
+                "queue_state": None,
+                "probe_ok": False,
+                "probe_source": "capability",
+                "probe_latency_ms": 0,
+                "probe_error": "candidate_not_allowed",
+                "routing_eligible": False,
+            }
 
         started_at = time.perf_counter()
         requirements = self._resolve_model_resource_requirements(provider_id, model_id)

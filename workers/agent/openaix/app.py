@@ -125,10 +125,45 @@ class OpenAIxWorker(BaseWorker):
                 error={"code": "WRONG_TASK_TYPE", "message": f"Expected Task_agent, got {type(task).__name__}"},
             )
 
-        payload = self._apply_generation_defaults(dict(task.payload or {}))
-        task.payload = payload
         provider_id = self._resolve_task_provider_id(task)
         base_url = self._resolve_base_url(provider_id)
+        request_kind = str((task.config or {}).get("request_kind") or "chat").strip().lower()
+        if request_kind == "embed":
+            save_call = self._resolve_save_llm_request(dict(task.payload or {}))
+            payload = self._embed_upstream_payload(dict(task.payload or {}))
+            task.payload = payload
+            url = f"{base_url}/api/embed"
+            request_headers = self._resolve_request_headers(task, provider_id)
+            upstream_timeout = self._resolve_upstream_timeout(task)
+            log(
+                "worker",
+                "debug",
+                f"Forwarding embedding task {task.id} to {url} provider={provider_id}",
+                "openaix",
+            )
+            try:
+                async with httpx.AsyncClient(timeout=upstream_timeout, headers=request_headers) as client:
+                    return await self._forward_sync(
+                        client,
+                        url,
+                        payload,
+                        task=task,
+                        save_call=save_call,
+                        task_id=task.id,
+                    )
+            except httpx.ConnectError as exc:
+                await self._finalize_latest_started_llm_call(task, status="connect_error", error_code="UPSTREAM_UNREACHABLE")
+                return WorkerResult(ok=False, error={"code": "UPSTREAM_UNREACHABLE", "message": str(exc)})
+            except httpx.TimeoutException as exc:
+                await self._finalize_latest_started_llm_call(task, status="timeout", error_code="UPSTREAM_TIMEOUT")
+                return WorkerResult(ok=False, error={"code": "UPSTREAM_TIMEOUT", "message": self._build_timeout_message(exc)})
+            except Exception as exc:
+                await self._finalize_latest_started_llm_call(task, status="exception", error_code="EXCEPTION")
+                log_exception("worker", "openaix", f"Unexpected embedding error task={task.id} provider={provider_id}", exc)
+                return WorkerResult(ok=False, error={"code": "EXCEPTION", "message": self._describe_exception(exc)})
+
+        payload = self._apply_generation_defaults(dict(task.payload or {}))
+        task.payload = payload
 
         log(
             "worker",
@@ -199,6 +234,25 @@ class OpenAIxWorker(BaseWorker):
                 exc,
             )
             return WorkerResult(ok=False, error={"code": "EXCEPTION", "message": error_message})
+
+    @staticmethod
+    def _embed_upstream_payload(payload: dict) -> dict:
+        """Build an Ollama `/api/embed` payload without aidir and OpenAI-only fields."""
+        excluded_fields = {
+            "encoding_format",
+            "envid",
+            "log",
+            "priority",
+            "queue_timeout",
+            "timeout",
+            "user",
+            "worker",
+            "stream",
+            "tools",
+            "tool_choice",
+            "context_builder",
+        }
+        return {key: value for key, value in payload.items() if key not in excluded_fields}
 
     def _resolve_upstream_timeout(self, task: Task) -> int:
         """Return per-request upstream timeout for one HTTP call to the LLM."""

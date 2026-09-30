@@ -346,7 +346,7 @@ class Endpoint_ollama(BaseEndpoint):
         )
         return resolution.route
 
-    def _smart_router(self, worker_id: str) -> SmartRouter:
+    def _smart_router(self, worker_id: str, *, is_candidate_allowed=None) -> SmartRouter:
         """Build the shared smart-router helper bound to this endpoint environment."""
         async def get_local_queue_state(requirements: dict, priority: int) -> dict | None:
             if self._core is None or self._core.queue is None or self._core.resources is None:
@@ -376,6 +376,7 @@ class Endpoint_ollama(BaseEndpoint):
             probe_ollama_model_availability=self._probe_ollama_model_availability,
             resolve_probe_timeout_ms=self._resolve_probe_timeout_ms,
             resolve_worker_id_for_route=self._resolve_worker_id_for_route,
+            is_candidate_allowed=is_candidate_allowed,
             on_selection=self._log_smart_route_selection,
             on_failure=self._log_smart_route_failure,
         )

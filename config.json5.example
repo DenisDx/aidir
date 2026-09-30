@@ -386,6 +386,26 @@
   },
   "models": {
     "providers": {
+      "smart": {
+        "api": "smart",
+        "models": [
+          {
+            id:"qwen3-embedding:4b",
+            alias:"qwen3-embedding:4b",
+            type:"first_available",
+            "embedding": true,
+            "default_tool_injection": false,
+            items:[
+              {
+                provider:"ollama_embedding_remote",
+                model:"qwen3-embedding:4b",
+                request_timeout_ms:1500,
+                fallback_prio:10,
+              },
+            ],
+          },
+        ],
+      },
       "ollama_local": {
         "baseUrl": "${OLLAMA_BASE_URL:-http://127.0.0.1:11434}",
         "api": "ollama",
@@ -495,6 +515,18 @@
               },
           },
         ] 
+      },
+      "ollama_embedding_remote": {
+        // No resources block: remote VRAM is not locally controlled; the upstream server must enable embeddings.
+        "baseUrl": "${OLLAMA_EMBEDDING_REMOTE_BASE_URL:-http://192.168.1.40:11434}",
+        "api": "ollama",
+        "models": [
+          {
+            id:"qwen3-embedding:4b",
+            "embedding": true,
+            "estimated_vram_mb": 5000,
+          },
+        ]
       },
       "llama_local": {
         "api": "llama-cpp",

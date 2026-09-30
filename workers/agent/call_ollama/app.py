@@ -98,6 +98,33 @@ class CallOllamaWorker(BaseWorker):
         payload: dict = dict(task.payload)    # shallow copy; we may mutate stream/options
         provider_id = self._resolve_task_provider_id(task)
         base_url = self._resolve_base_url(provider_id)
+        request_kind = str((task.config or {}).get("request_kind") or "chat").strip().lower()
+        if request_kind == "embed":
+            log_opts: dict = (payload.get("log") or {}).get("options") or {}
+            save_call: bool = bool(log_opts.get("save_llm_request", False))
+            payload = self._embed_upstream_payload(payload)
+            task.payload = payload
+            url = f"{base_url}/api/embed"
+            log(
+                "worker",
+                "debug",
+                f"Forwarding embedding task {task.id} to {url} provider={provider_id}",
+                "call_ollama",
+            )
+            try:
+                async with httpx.AsyncClient(timeout=self._timeout) as client:
+                    return await self._forward_sync(client, url, payload, task, save_call)
+            except httpx.ConnectError as exc:
+                await self._finalize_latest_started_llm_call(task, status="connect_error", error_code="UPSTREAM_UNREACHABLE")
+                return WorkerResult(ok=False, error={"code": "UPSTREAM_UNREACHABLE", "message": str(exc)})
+            except httpx.TimeoutException as exc:
+                await self._finalize_latest_started_llm_call(task, status="timeout", error_code="UPSTREAM_TIMEOUT")
+                return WorkerResult(ok=False, error={"code": "UPSTREAM_TIMEOUT", "message": str(exc)})
+            except Exception as exc:
+                await self._finalize_latest_started_llm_call(task, status="exception", error_code="EXCEPTION")
+                log_exception("worker", "call_ollama", f"Unexpected embedding error task={task.id} provider={provider_id}", exc)
+                return WorkerResult(ok=False, error={"code": "EXCEPTION", "message": self._describe_exception(exc)})
+
         payload = self._apply_model_generation_defaults(payload, provider_id=provider_id)
         payload = self._apply_model_context_window(payload, provider_id=provider_id)
         stream: bool = task.stream
@@ -142,6 +169,25 @@ class CallOllamaWorker(BaseWorker):
                 ok=False,
                 error={"code": "EXCEPTION", "message": error_message},
             )
+
+    @staticmethod
+    def _embed_upstream_payload(payload: dict) -> dict:
+        """Build an Ollama `/api/embed` payload without aidir and OpenAI-only fields."""
+        excluded_fields = {
+            "encoding_format",
+            "envid",
+            "log",
+            "priority",
+            "queue_timeout",
+            "timeout",
+            "user",
+            "worker",
+            "stream",
+            "tools",
+            "tool_choice",
+            "context_builder",
+        }
+        return {key: value for key, value in payload.items() if key not in excluded_fields}
 
     @staticmethod
     def _describe_exception(exc: BaseException) -> str:

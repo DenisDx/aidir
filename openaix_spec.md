@@ -6,6 +6,8 @@ OpenAIx in this project is a **hybrid endpoint** that supports:
 
 1. Ollama-compatible chat API (`/api/chat`, `/api/tags`)
 2. OpenAI-compatible chat API (`/v1/chat/completions`, `/v1/models`)
+3. Ollama-compatible embeddings (`/api/embed`)
+4. OpenAI-compatible embeddings (`/v1/embeddings`)
 
 Important:
 
@@ -17,11 +19,13 @@ Important:
 Base URL (example): `http://127.0.0.1:21434`
 
 1. `POST /api/chat` - Ollama-compatible chat endpoint (with OpenAIx extensions)
-2. `GET /api/tags` - Ollama-compatible models listing
-3. `POST /v1/chat/completions` - OpenAI-compatible chat endpoint (with OpenAIx extensions)
-4. `GET /v1/models` - OpenAI-compatible models listing
-5. `GET /api/providers/{provider}/models/{model}/queue-state` and `GET /v1/providers/{provider}/models/{model}/queue-state` - read-only queue state for a provider/model pair
-6. `GET /health` - health check (`{"status":"ok"}`)
+2. `POST /api/embed` - Ollama-compatible non-streaming embeddings
+3. `GET /api/tags` - Ollama-compatible models listing
+4. `POST /v1/chat/completions` - OpenAI-compatible chat endpoint (with OpenAIx extensions)
+5. `POST /v1/embeddings` - OpenAI-compatible non-streaming embeddings
+6. `GET /v1/models` - OpenAI-compatible models listing
+7. `GET /api/providers/{provider}/models/{model}/queue-state` and `GET /v1/providers/{provider}/models/{model}/queue-state` - read-only queue state for a provider/model pair
+8. `GET /health` - health check (`{"status":"ok"}`)
 
 ## 3. Authentication and envid behavior
 
@@ -219,6 +223,22 @@ This endpoint accepts OpenAI-like chat payload, then maps it to internal Ollama-
 3. Unknown fields are ignored by the mapping layer.
 
 ## 6. Responses
+
+## 6.0 Embeddings
+
+`POST /api/embed` and `POST /v1/embeddings` create normal queued `Task_agent` work with `request_kind = "embed"`. They are non-streaming and skip context builders, internal tools, tool loops, and chat generation defaults.
+
+Embedding-capable configured models must set `embedding: true`. The initial accepted input forms are a string and an array of strings. Token arrays and mixed arrays return `400`.
+
+### Ollama-compatible request and response
+
+`POST /api/embed` requires `model` and `input`. It forwards operation-safe Ollama fields such as `truncate`, `keep_alive`, `dimensions`, and `options` to the upstream `/api/embed` route. A successful result preserves the upstream Ollama embedding payload, including `embeddings` and available timing/token fields.
+
+### OpenAI-compatible request and response
+
+`POST /v1/embeddings` requires `model` and `input`. `dimensions` is forwarded to the upstream model; an upstream rejection is returned as an error. `encoding_format` supports `float` (default) and `base64`; the latter encodes the returned float vector as little-endian float32 bytes. `user` is retained in task metadata and is not sent to Ollama, which has no equivalent field.
+
+The response is an OpenAI embedding list with ordered `data[]` entries. `usage.prompt_tokens` and `usage.total_tokens` are included only when upstream counters are available.
 
 ## 6.1 `POST /api/chat` non-stream response
 

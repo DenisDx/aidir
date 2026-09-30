@@ -10,8 +10,10 @@ between OpenAI and Ollama payload/response formats.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import re
+import struct
 import time
 from datetime import datetime, timezone
 from typing import AsyncGenerator
@@ -82,6 +84,10 @@ class Endpoint_openaix(Endpoint_ollama):
             # Limited Ollama compatibility path.
             return await self._handle_chat(request)
 
+        @app.post("/api/embed")
+        async def api_embed(request: Request):
+            return await self._handle_embed(request, protocol="ollama")
+
         @app.get("/api/tags")
         async def api_tags():
             return self._ollama_tags_response()
@@ -93,6 +99,10 @@ class Endpoint_openaix(Endpoint_ollama):
         @app.post("/v1/chat/completions")
         async def openai_chat_completions(request: Request):
             return await self._handle_openai_chat(request)
+
+        @app.post("/v1/embeddings")
+        async def openai_embeddings(request: Request):
+            return await self._handle_embed(request, protocol="openai")
 
         @app.get("/v1/models")
         async def openai_models():
@@ -269,6 +279,116 @@ class Endpoint_openaix(Endpoint_ollama):
 
         return await self._openai_sync_response(task, body)
 
+    async def _handle_embed(self, request: Request, *, protocol: str) -> JSONResponse:
+        """Handle one non-streaming Ollama or OpenAI embedding request."""
+        try:
+            body = await request.json()
+        except Exception:
+            return self._error_response(
+                protocol=protocol,
+                status_code=400,
+                code="INVALID_REQUEST",
+                message="Invalid JSON body",
+            )
+
+        if not isinstance(body, dict):
+            return self._error_response(
+                protocol=protocol,
+                status_code=400,
+                code="INVALID_REQUEST",
+                message="Request body must be an object",
+            )
+
+        validation_error = self._validate_embed_request(body, protocol=protocol)
+        if validation_error is not None:
+            return validation_error
+
+        auth_error = self._authorize_and_apply_envid(request, body)
+        if auth_error is not None:
+            return auth_error
+
+        incoming_bearer_token = self._extract_bearer_token(request)
+        route_trace = self._build_incoming_route_trace(request.headers)
+        route_trace_error = self._validate_incoming_route_trace(route_trace)
+        if route_trace_error is not None:
+            code, status_code, message = route_trace_error
+            return self._error_response(protocol=protocol, status_code=status_code, code=code, message=message)
+
+        payload = self._openai_embed_to_ollama(body) if protocol == "openai" else dict(body)
+        payload["stream"] = False
+        try:
+            task = await self._build_task_for_payload_async(
+                payload,
+                False,
+                request_kind="embed",
+                incoming_bearer_token=incoming_bearer_token,
+                route_trace=route_trace,
+            )
+        except SmartRouteError as exc:
+            return self._error_response(
+                protocol=protocol,
+                status_code=exc.status_code,
+                code=exc.code,
+                message=str(exc),
+            )
+        except HTTPException as exc:
+            return self._error_response(
+                protocol=protocol,
+                status_code=exc.status_code,
+                code="INVALID_REQUEST",
+                message=str(exc.detail),
+            )
+
+        if protocol == "openai" and "user" in body:
+            task.config = dict(task.config or {})
+            task.config["embedding_user"] = body["user"]
+
+        try:
+            await self._core.on_task_added(task)
+        except Exception as exc:
+            return self._error_response(
+                protocol=protocol,
+                status_code=503,
+                code=getattr(exc, "code", "QUEUE_ERROR"),
+                message=str(exc),
+                task_id=task.id,
+            )
+
+        if protocol == "ollama":
+            return await self._sync_response(task)
+        return await self._openai_embed_sync_response(task, body)
+
+    def _validate_embed_request(self, body: dict, *, protocol: str) -> JSONResponse | None:
+        """Validate the shared text-only, non-streaming embedding request contract."""
+        model = body.get("model")
+        if not isinstance(model, str) or not model.strip():
+            return self._error_response(protocol=protocol, status_code=400, code="INVALID_REQUEST", message="Field 'model' is required")
+
+        value = body.get("input")
+        valid_input = isinstance(value, str) or (
+            isinstance(value, list) and all(isinstance(item, str) for item in value)
+        )
+        if not valid_input:
+            return self._error_response(
+                protocol=protocol,
+                status_code=400,
+                code="INVALID_REQUEST",
+                message="Field 'input' must be a string or an array of strings",
+            )
+
+        if body.get("stream"):
+            return self._error_response(protocol=protocol, status_code=400, code="INVALID_REQUEST", message="Embedding requests do not support streaming")
+
+        for field in ("tools", "tool_choice", "context_builder"):
+            if field in body:
+                return self._error_response(
+                    protocol=protocol,
+                    status_code=400,
+                    code="INVALID_REQUEST",
+                    message=f"Field '{field}' is not supported for embedding requests",
+                )
+        return None
+
     def _build_task_for_payload(self, payload: dict, stream: bool):
         """Create Task_agent with standard timeout and worker selection rules."""
         payload = self._apply_generation_defaults(payload)
@@ -288,6 +408,7 @@ class Endpoint_openaix(Endpoint_ollama):
         payload: dict,
         stream: bool,
         *,
+        request_kind: str = "chat",
         incoming_bearer_token: str = "",
         route_trace: dict | None = None,
     ):
@@ -295,15 +416,22 @@ class Endpoint_openaix(Endpoint_ollama):
         payload = self._apply_generation_defaults(payload)
         worker_id = self._resolve_worker_id(payload)
         route = self._resolve_model_route((payload or {}).get("model"), worker_id)
+        if request_kind == "embed":
+            self._ensure_embedding_route(route)
         if route is not None and self._provider_api(route["resolved_provider"]) == "smart":
+            routing_payload = dict(payload)
+            routing_payload["request_kind"] = request_kind
             route = await self._resolve_smart_route(
                 route,
                 worker_id=worker_id,
-                payload=payload,
+                payload=routing_payload,
                 incoming_bearer_token=incoming_bearer_token,
             )
 
-        task = self._create_task_for_payload(payload, stream, worker_id, route)
+        if request_kind == "embed":
+            self._ensure_embedding_route(route)
+
+        task = self._create_task_for_payload(payload, stream, worker_id, route, request_kind=request_kind)
         if incoming_bearer_token:
             task.config = dict(task.config or {})
             task.config["incoming_bearer_token"] = incoming_bearer_token
@@ -312,7 +440,15 @@ class Endpoint_openaix(Endpoint_ollama):
             task.config["route_trace"] = dict(route_trace)
         return task
 
-    def _create_task_for_payload(self, payload: dict, stream: bool, worker_id: str, route: dict | None):
+    def _create_task_for_payload(
+        self,
+        payload: dict,
+        stream: bool,
+        worker_id: str,
+        route: dict | None,
+        *,
+        request_kind: str = "chat",
+    ):
         """Finalize Task_agent creation once worker and route are resolved."""
         from core.task_types.task_agent import Task_agent
 
@@ -329,6 +465,9 @@ class Endpoint_openaix(Endpoint_ollama):
         if route is not None:
             task.config = dict(task.config or {})
             task.config["route"] = route
+        if request_kind != "chat":
+            task.config = dict(task.config or {})
+            task.config["request_kind"] = request_kind
 
         cfg_tasks = self._core.config.get("tasks", {}) or {}
         task.queue_timeout = self._resolve_queue_timeout(
@@ -337,6 +476,21 @@ class Endpoint_openaix(Endpoint_ollama):
         )
         task.run_timeout = int(cfg_tasks.get("run_timeout", 300))
         return task
+
+    def _ensure_embedding_route(self, route: dict | None) -> None:
+        """Require that a requested embedding route resolves to an embedding-capable model."""
+        if not isinstance(route, dict):
+            raise SmartRouteError(code="INVALID_MODEL", status_code=422, message="Unknown embedding model")
+
+        provider_id = str(route.get("resolved_provider") or "").strip()
+        model_id = str(route.get("resolved_model") or "").strip()
+        model_cfg = self._find_provider_model_cfg(provider_id, model_id)
+        if not isinstance(model_cfg, dict) or model_cfg.get("embedding") is not True:
+            raise SmartRouteError(
+                code="EMBEDDING_NOT_SUPPORTED",
+                status_code=422,
+                message=f"Model '{route.get('requested_model') or model_id}' does not support embeddings",
+            )
 
     @staticmethod
     def _resolve_queue_timeout(value: object, default: int) -> int:
@@ -362,12 +516,23 @@ class Endpoint_openaix(Endpoint_ollama):
         incoming_bearer_token: str = "",
     ) -> dict:
         """Resolve one smart alias route into a concrete provider/model pair."""
-        return await super()._resolve_smart_route(
+        request_kind = str((payload or {}).get("request_kind") or "chat").strip().lower()
+        router = self._smart_router(
+            worker_id,
+            is_candidate_allowed=self._is_embedding_candidate if request_kind == "embed" else None,
+        )
+        resolution = await router.resolve_route(
             route,
-            worker_id=worker_id,
-            payload=payload,
+            request_payload=payload,
+            request_priority=SmartRouter.resolve_request_priority(payload),
             incoming_bearer_token=incoming_bearer_token,
         )
+        return resolution.route
+
+    def _is_embedding_candidate(self, provider_id: str, model_id: str) -> bool:
+        """Return whether one concrete smart-routing candidate supports embeddings."""
+        model_cfg = self._find_provider_model_cfg(provider_id, model_id)
+        return isinstance(model_cfg, dict) and model_cfg.get("embedding") is True
 
     async def _evaluate_smart_candidate(
         self,
@@ -511,6 +676,99 @@ class Endpoint_openaix(Endpoint_ollama):
                 payload[key] = body[key]
 
         return payload
+
+    @staticmethod
+    def _openai_embed_to_ollama(body: dict) -> dict:
+        """Convert an OpenAI embedding request into the shared Ollama-shaped task payload."""
+        payload = dict(body)
+        payload["model"] = body.get("model", "")
+        payload["input"] = body.get("input")
+        payload["stream"] = False
+        return payload
+
+    async def _openai_embed_sync_response(self, task, request_body: dict) -> JSONResponse:
+        """Wait for an embedding task and return an OpenAI-compatible embedding response."""
+        timeout_phase = await self._wait_for_task_terminal(task)
+        if timeout_phase is not None:
+            await self._terminate_task_on_timeout(task)
+            return self._error_response(
+                protocol="openai",
+                status_code=504,
+                code="timeout_error",
+                message="Request timed out",
+                task_id=task.id,
+            )
+
+        asyncio.create_task(self._core.delete_task(task.id))
+        if task.status == STATUS_COMPLETED:
+            return JSONResponse(self._ollama_embed_to_openai(task.result or {}, task.id, request_body))
+        if task.status == STATUS_FAILED:
+            err = task.error or {}
+            if err.get("code") in {"TIMEOUT", "QUEUE_TIMEOUT"}:
+                return self._error_response(
+                    protocol="openai",
+                    status_code=504,
+                    code="timeout_error",
+                    message=err.get("message", "Request timed out"),
+                    task_id=task.id,
+                )
+            mapped_error = self._map_openai_failed_task_error(err)
+            return self._error_response(
+                protocol="openai",
+                status_code=mapped_error["status_code"],
+                code=mapped_error["code"],
+                message=mapped_error["message"],
+                task_id=task.id,
+                error_type=mapped_error.get("error_type"),
+                error_param=mapped_error.get("error_param"),
+            )
+        if task.status == STATUS_CANCELED:
+            return self._error_response(
+                protocol="openai",
+                status_code=503,
+                code="server_error",
+                message="Task was canceled",
+                task_id=task.id,
+            )
+        return self._error_response(
+            protocol="openai",
+            status_code=500,
+            code="server_error",
+            message="Unknown task state",
+            task_id=task.id,
+        )
+
+    @staticmethod
+    def _ollama_embed_to_openai(result: dict, task_id: str, request_body: dict) -> dict:
+        """Convert an Ollama `/api/embed` response into an OpenAI embedding list."""
+        raw_embeddings = result.get("embeddings") if isinstance(result, dict) else None
+        if not isinstance(raw_embeddings, list):
+            raw_embeddings = []
+        encoding_format = str((request_body or {}).get("encoding_format") or "float").lower()
+        data: list[dict] = []
+        for index, vector in enumerate(raw_embeddings):
+            if not isinstance(vector, list):
+                continue
+            embedding: list[float] | str
+            normalized_vector = [float(value) for value in vector]
+            if encoding_format == "base64":
+                raw_vector = struct.pack(f"<{len(normalized_vector)}f", *normalized_vector)
+                embedding = base64.b64encode(raw_vector).decode("ascii")
+            else:
+                embedding = normalized_vector
+            data.append({"object": "embedding", "embedding": embedding, "index": index})
+
+        upstream_usage = result.get("usage") if isinstance(result.get("usage"), dict) else {}
+        prompt_tokens = result.get("prompt_eval_count") or upstream_usage.get("prompt_eval_count") or upstream_usage.get("prompt_tokens")
+        total_tokens = result.get("total_tokens") or upstream_usage.get("total_tokens") or prompt_tokens
+        response = {
+            "object": "list",
+            "data": data,
+            "model": str((request_body or {}).get("model") or result.get("model") or ""),
+        }
+        if prompt_tokens is not None:
+            response["usage"] = {"prompt_tokens": int(prompt_tokens), "total_tokens": int(total_tokens)}
+        return response
 
     async def _openai_sync_response(self, task, request_body: dict) -> JSONResponse:
         """Wait for task completion and return OpenAI chat.completion JSON."""

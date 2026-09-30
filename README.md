@@ -219,9 +219,11 @@ Use the queue-state endpoint to inspect whether a provider/model resource can st
 | Route | Type | Purpose |
 |---|---|---|
 | `/api/chat` | POST | Ollama-compatible chat |
+| `/api/embed` | POST | Ollama-compatible non-streaming embeddings |
 | `/api/tags` | GET | Ollama-style models list |
 | `/api/show` | POST | Configured Ollama-style model metadata (`name` required) |
 | `/v1/chat/completions` | POST | OpenAI-compatible chat |
+| `/v1/embeddings` | POST | OpenAI-compatible non-streaming embeddings |
 | `/v1/models` | GET | OpenAI-style models list |
 | `/api/providers/{provider}/models/{model}/queue-state` | GET | Read-only queue state for a provider/model pair |
 | `/v1/providers/{provider}/models/{model}/queue-state` | GET | Read-only queue state for a provider/model pair |
