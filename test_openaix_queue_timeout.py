@@ -60,6 +60,32 @@ class TestOpenAIxQueueTimeout(unittest.TestCase):
 
         self.assertEqual(task.queue_timeout, 300)
 
+    def test_request_timeout_overrides_run_and_upstream_timeouts(self) -> None:
+        """Persists an explicit request timeout for execution and the LLM call."""
+        task = self.endpoint._create_task_for_payload(
+            {"model": "model", "messages": [], "timeout": 1200},
+            False,
+            "openaix",
+            None,
+        )
+
+        self.assertEqual(task.queue_timeout, 1200)
+        self.assertEqual(task.run_timeout, 1200)
+        self.assertEqual(task.config["request_timeout"], 1200)
+        self.assertNotIn("timeout", task.payload)
+
+    def test_queue_timeout_overrides_request_timeout_for_queue_only(self) -> None:
+        """Keeps a more specific queue timeout while timeout controls execution."""
+        task = self.endpoint._create_task_for_payload(
+            {"model": "model", "messages": [], "timeout": 1200, "queue_timeout": 15},
+            False,
+            "openaix",
+            None,
+        )
+
+        self.assertEqual(task.queue_timeout, 15)
+        self.assertEqual(task.run_timeout, 1200)
+
     def test_invalid_request_queue_timeout_is_rejected(self) -> None:
         """Rejects negative, fractional, boolean, and text timeout values."""
         for value in (-1, 1.5, True, "invalid"):

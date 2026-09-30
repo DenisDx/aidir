@@ -82,10 +82,11 @@ The implementation does not hard-validate message shape, but the following forms
 
 1. `worker: string` - explicit worker override
 2. `envid: string` - target environment id
-3. `timeout: integer` - sets both queue and run timeout for this task
-4. `context_builder: object` - per-request context behavior override
-5. `log: object`
-6. `log.options.save_llm_request: boolean` - per-request LLM call logging override
+3. `timeout: integer` - sets the queue and run timeout for this task and the timeout for each upstream LLM call
+4. `queue_timeout: integer` - overrides only the queue timeout when used with `timeout`
+5. `context_builder: object` - per-request context behavior override
+6. `log: object`
+7. `log.options.save_llm_request: boolean` - per-request LLM call logging override
 
 Generation parameter handling:
 
@@ -215,12 +216,13 @@ This endpoint accepts OpenAI-like chat payload, then maps it to internal Ollama-
 6. `options: object`
 7. `top_k: integer`
 8. `min_p: number`
+9. `timeout: integer`
+10. `queue_timeout: integer`
 
 ### 5.3 Important limitations for `/v1/chat/completions`
 
-1. `timeout` is not mapped from OpenAI request body in current implementation.
-2. Many OpenAI fields are not implemented (for example `n`, `logprobs`, etc.).
-3. Unknown fields are ignored by the mapping layer.
+1. Many OpenAI fields are not implemented (for example `n`, `logprobs`, etc.).
+2. Unknown fields are ignored by the mapping layer.
 
 ## 6. Responses
 
@@ -403,7 +405,7 @@ Compared to standard OpenAI Chat Completions API:
 2. `envid` request field with user-scoped access control
 3. `context_builder` per-request context pipeline overrides
 4. `log.options.save_llm_request` per-request call logging control
-5. `/api/chat` support for `timeout` (task queue/run timeout override)
+5. `/api/chat` and `/v1/chat/completions` support for `timeout` (queue/run and upstream-call timeout override)
 6. Built-in server-side internal tool execution loop
 7. Optional protocol-specific error envelope mode (`errors_compatibility_mode`)
 

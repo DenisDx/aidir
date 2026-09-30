@@ -595,6 +595,15 @@ class TestOpenAIxTimeoutBehavior(unittest.TestCase):
 
         self.assertEqual(worker._resolve_upstream_timeout(task), 100)
 
+    def test_resolve_upstream_timeout_prefers_explicit_request_timeout(self) -> None:
+        """An explicit request timeout overrides the worker timeout for its model call."""
+        worker = OpenAIxWorker()
+        worker._timeout = 100
+        task = Task_agent(payload={}, stream=False)
+        task.config["request_timeout"] = 1200
+
+        self.assertEqual(worker._resolve_upstream_timeout(task), 1200)
+
     def test_resolve_upstream_timeout_falls_back_to_worker_timeout(self) -> None:
         """Uses worker timeout when task timeout is not set."""
         worker = OpenAIxWorker()

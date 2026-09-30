@@ -257,6 +257,8 @@ class Scheduler:
     @staticmethod
     def _run_timeout_source(task: Task) -> str:
         """Describe where the effective task run timeout came from."""
+        if (getattr(task, "config", None) or {}).get("request_timeout") is not None:
+            return "request.timeout"
         return "tasks.run_timeout / TASK_RUN_TIMEOUT_SECONDS"
 
     @staticmethod

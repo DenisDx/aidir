@@ -29,6 +29,14 @@ class TestSchedulerTimeoutDiagnostics(unittest.TestCase):
             "tasks.run_timeout / TASK_RUN_TIMEOUT_SECONDS",
         )
 
+    def test_run_timeout_source_uses_request_timeout_when_explicit(self) -> None:
+        """An explicit request timeout should be identified in diagnostics."""
+        task = Task_agent(payload={}, stream=False)
+        task.run_timeout = 1200
+        task.config["request_timeout"] = 1200
+
+        self.assertEqual(Scheduler._run_timeout_source(task), "request.timeout")
+
     def test_build_run_timeout_message_includes_elapsed_limit_and_source(self) -> None:
         """Diagnostic timeout message should include elapsed time, limit, and source."""
         task = Task_agent(payload={}, stream=False)

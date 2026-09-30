@@ -256,6 +256,12 @@ class OpenAIxWorker(BaseWorker):
 
     def _resolve_upstream_timeout(self, task: Task) -> int:
         """Return per-request upstream timeout for one HTTP call to the LLM."""
+        requested_timeout = (task.config or {}).get("request_timeout")
+        if requested_timeout is not None:
+            try:
+                return max(1, int(requested_timeout))
+            except (TypeError, ValueError):
+                pass
         try:
             configured_timeout = int(self._timeout)
         except (TypeError, ValueError):

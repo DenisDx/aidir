@@ -453,7 +453,8 @@ class Endpoint_openaix(Endpoint_ollama):
         from core.task_types.task_agent import Task_agent
 
         payload = dict(payload or {})
-        requested_queue_timeout = payload.pop("queue_timeout", None)
+        requested_timeout = payload.pop("timeout", None)
+        requested_queue_timeout = payload.pop("queue_timeout", requested_timeout)
         if route is not None:
             payload["model"] = route["resolved_model"]
 
@@ -474,7 +475,13 @@ class Endpoint_openaix(Endpoint_ollama):
             requested_queue_timeout,
             int(cfg_tasks.get("queue_timeout", 300)),
         )
-        task.run_timeout = int(cfg_tasks.get("run_timeout", 300))
+        task.run_timeout = self._resolve_timeout(
+            requested_timeout,
+            int(cfg_tasks.get("run_timeout", 300)),
+        )
+        if requested_timeout is not None:
+            task.config = dict(task.config or {})
+            task.config["request_timeout"] = task.run_timeout
         return task
 
     def _ensure_embedding_route(self, route: dict | None) -> None:
@@ -495,16 +502,21 @@ class Endpoint_openaix(Endpoint_ollama):
     @staticmethod
     def _resolve_queue_timeout(value: object, default: int) -> int:
         """Return a request queue timeout or the configured default when omitted."""
+        return Endpoint_openaix._resolve_timeout(value, default, "queue_timeout")
+
+    @staticmethod
+    def _resolve_timeout(value: object, default: int, field_name: str = "timeout") -> int:
+        """Return a non-negative request timeout or its configured default."""
         if value is None:
             return default
         if isinstance(value, bool):
-            raise HTTPException(status_code=400, detail="queue_timeout must be a non-negative integer")
+            raise HTTPException(status_code=400, detail=f"{field_name} must be a non-negative integer")
         try:
             timeout = int(value)
         except (TypeError, ValueError) as exc:
-            raise HTTPException(status_code=400, detail="queue_timeout must be a non-negative integer") from exc
+            raise HTTPException(status_code=400, detail=f"{field_name} must be a non-negative integer") from exc
         if timeout < 0 or str(value).strip() not in {str(timeout), f"+{timeout}"}:
-            raise HTTPException(status_code=400, detail="queue_timeout must be a non-negative integer")
+            raise HTTPException(status_code=400, detail=f"{field_name} must be a non-negative integer")
         return timeout
 
     async def _resolve_smart_route(
@@ -648,6 +660,9 @@ class Endpoint_openaix(Endpoint_ollama):
 
         if "queue_timeout" in body:
             payload["queue_timeout"] = body["queue_timeout"]
+
+        if "timeout" in body:
+            payload["timeout"] = body["timeout"]
 
         # Pass through selected optional fields when present.
         passthrough = [
