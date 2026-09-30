@@ -24,7 +24,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from core import log
 from core.error_logging import attach_request_id_middleware, get_or_create_request_id, log_exception
 from core.endpoints.endpoint_ollama import Endpoint_ollama
-from core.smart_router import SmartRouteError
+from core.smart_router import SmartRouteError, SmartRouter
 from core.task import STATUS_CANCELED, STATUS_COMPLETED, STATUS_FAILED
 
 

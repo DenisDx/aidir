@@ -397,7 +397,7 @@
             "default_tool_injection": false,
             items:[
               {
-                provider:"ollama_embedding_remote",
+                provider:"remote_aidir",
                 model:"qwen3-embedding:4b",
                 request_timeout_ms:1500,
                 fallback_prio:10,
@@ -516,15 +516,23 @@
           },
         ] 
       },
-      "ollama_embedding_remote": {
-        // No resources block: remote VRAM is not locally controlled; the upstream server must enable embeddings.
-        "baseUrl": "${OLLAMA_EMBEDDING_REMOTE_BASE_URL:-http://192.168.1.40:11434}",
-        "api": "ollama",
+      "remote_aidir": {
+        // Remote aidir owns its own queue and resource accounting.
+        "baseUrl": "${REMOTE_AIDIR_BASE_URL:-https://remote-aidir.example:21434}",
+        "api": "openaix",
         "models": [
+          {
+            id:"qwen3.5:9b",
+          },
+          {
+            id:"qwen3.5:4b",
+          },
+          {
+            id:"bjoernb/gemma4-e2b-fast:latest",
+          },
           {
             id:"qwen3-embedding:4b",
             "embedding": true,
-            "estimated_vram_mb": 5000,
           },
         ]
       },
