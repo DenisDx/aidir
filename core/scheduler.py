@@ -66,74 +66,90 @@ class Scheduler:
             dispatched = False
 
             for task_type in _SUPPORTED_TYPES:
+                deferred_tasks: list[Task] = []
                 task_id = await self._queue.pop_next(task_type)
-                if task_id is None:
-                    continue
-
-                task = self._queue.get_task(task_id)
-                if task is None:
-                    log("system", "warn", f"Task {task_id} popped but not in memory")
-                    continue
-
-                if await self._expire_queued_task_if_needed(task):
-                    continue
-
-                # Task is scheduled for later retry.
-                if task.next_retry_at and task.next_retry_at > time.time():
-                    await self._queue.add_task(task)
-                    continue
-
-                worker = self._select_worker(task)
-                if worker is None:
-                    # No compatible worker – re-enqueue and skip
-                    await self._queue.add_task(task)
-                    log("system", "warn",
-                        f"No worker for task {task_id} (type={task_type}), re-queued")
-                    continue
-
-                await self._refresh_smart_route_for_dispatch(task, worker.id)
-
-                reqs = self._resolve_resource_requirements(task, worker.id)
-                requested_model_id = str(((task.payload or {}).get("model") or "")).strip()
-                requested_provider_id = self._resolve_task_provider_id(task, worker.id)
-                if reqs and self._resources and not self._resources.check_available(reqs):
-                    if requested_model_id and self._resources.check_available_for_reuse(
-                        reqs, requested_model_id, requested_provider_id
-                    ):
-                        log("system", "info", f"Task {task.id} reusing warm model {requested_model_id}")
-                    elif self._resources.check_available_after_unload(reqs):
-                        # Soft consumers (alive-time models) block the resource; force-unload them.
-                        log("system", "info",
-                            f"Task {task.id} needs force-unload of idle models to free resources")
-                        await self._resources.force_unload_for(
-                            reqs,
-                            self._full_config,
-                            keep_model_id=requested_model_id or None,
-                            keep_provider_id=requested_provider_id or None,
-                        )
-                        # Re-check actual soft reservations; a failed unload must keep its VRAM occupied.
-                        if not self._resources.check_available(reqs):
-                            task.next_retry_at = time.time() + 5
-                            await self._queue.add_task(task)
-                            log("system", "warn",
-                                f"Task {task.id} delayed: resource unload did not free enough space")
-                            continue
-                        # Fall through — resources are now available
-                    else:
-                        # Not enough even with force unload
-                        task.next_retry_at = time.time() + 1
-                        await self._queue.add_task(task)
-                        log("system", "info", f"Task {task.id} delayed: insufficient resources")
+                while task_id is not None:
+                    task = self._queue.get_task(task_id)
+                    if task is None:
+                        log("system", "warn", f"Task {task_id} popped but not in memory")
+                        task_id = await self._queue.pop_next(task_type)
                         continue
 
-                bg_task = asyncio.create_task(
-                    self._run_task(task, worker, reqs),
-                    name=f"task:{task.id}:{worker.id}",
-                )
-                self._active_runs.add(bg_task)
-                self._idle.clear()
-                bg_task.add_done_callback(self._on_run_done)
-                dispatched = True
+                    if await self._expire_queued_task_if_needed(task):
+                        task_id = await self._queue.pop_next(task_type)
+                        continue
+
+                    # Task is scheduled for later retry.
+                    if task.next_retry_at and task.next_retry_at > time.time():
+                        deferred_tasks.append(task)
+                        task_id = await self._queue.pop_next(task_type)
+                        continue
+
+                    worker = self._select_worker(task)
+                    if worker is None:
+                        # No compatible worker – re-enqueue and skip
+                        deferred_tasks.append(task)
+                        log("system", "warn",
+                            f"No worker for task {task_id} (type={task_type}), re-queued")
+                        task_id = await self._queue.pop_next(task_type)
+                        continue
+
+                    await self._refresh_smart_route_for_dispatch(task, worker.id)
+
+                    reqs = self._resolve_resource_requirements(task, worker.id)
+                    requested_model_id = str(((task.payload or {}).get("model") or "")).strip()
+                    requested_provider_id = self._resolve_task_provider_id(task, worker.id)
+                    if reqs and self._resources and not self._resources.check_available(reqs):
+                        if requested_model_id and self._resources.check_available_for_reuse(
+                            reqs, requested_model_id, requested_provider_id
+                        ):
+                            log("system", "info", f"Task {task.id} reusing warm model {requested_model_id}")
+                        elif self._resources.check_available_after_unload(reqs):
+                            # Soft consumers (alive-time models) block the resource; force-unload them.
+                            log("system", "info",
+                                f"Task {task.id} needs force-unload of idle models to free resources")
+                            await self._resources.force_unload_for(
+                                reqs,
+                                self._full_config,
+                                keep_model_id=requested_model_id or None,
+                                keep_provider_id=requested_provider_id or None,
+                            )
+                            # Re-check actual soft reservations; a failed unload must keep its VRAM occupied.
+                            if not self._resources.check_available(reqs):
+                                task.next_retry_at = time.time() + 5
+                                deferred_tasks.append(task)
+                                log("system", "warn",
+                                    f"Task {task.id} delayed: resource unload did not free enough space")
+                                task_id = await self._queue.pop_next(task_type)
+                                continue
+                            # Fall through — resources are now available
+                        else:
+                            # Not enough even with force unload
+                            task.next_retry_at = time.time() + 1
+                            deferred_tasks.append(task)
+                            log("system", "info", f"Task {task.id} delayed: insufficient resources")
+                            task_id = await self._queue.pop_next(task_type)
+                            continue
+
+                    if self._resources and reqs:
+                        await self._resources.reserve_blind_for(
+                            reqs,
+                            consumer_id=f"{task.id}:{worker.id}",
+                            model_id=(task.payload or {}).get("model") or None,
+                            provider_id=requested_provider_id,
+                        )
+                    bg_task = asyncio.create_task(
+                        self._run_task(task, worker, reqs, resources_reserved=True),
+                        name=f"task:{task.id}:{worker.id}",
+                    )
+                    self._active_runs.add(bg_task)
+                    self._idle.clear()
+                    bg_task.add_done_callback(self._on_run_done)
+                    dispatched = True
+                    task_id = await self._queue.pop_next(task_type)
+
+                for deferred_task in deferred_tasks:
+                    await self._queue.add_task(deferred_task)
 
             if not dispatched:
                 # Sleep until a new task arrives or polling interval elapses
@@ -329,6 +345,7 @@ class Scheduler:
         task: Task,
         worker: "BaseWorker",
         reserved_reqs: dict[str, dict[str, int]] | None = None,
+        resources_reserved: bool = False,
     ) -> None:
         """Execute one task; handle timeouts and exceptions."""
         log("worker", "info", f"Starting task {task.id}", worker.id)
@@ -338,7 +355,7 @@ class Scheduler:
         model_id: str | None = (task.payload or {}).get("model") or None
         provider_id = self._resolve_task_provider_id(task, worker.id)
 
-        if self._resources and reserved_reqs:
+        if self._resources and reserved_reqs and not resources_reserved:
             await self._resources.reserve_blind_for(
                 reserved_reqs,
                 consumer_id=consumer_id,
