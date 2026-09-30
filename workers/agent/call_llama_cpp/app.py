@@ -153,7 +153,7 @@ class CallLlamaCppWorker(OpenAIxWorker):
                     if isinstance(history_entry, dict):
                         history_entry["raw_sse"] = raw_lines
                         history_entry["stream_events"] = stream_events
-                        await self._persist_llm_call_diagnostics(task)
+                        await self._persist_llm_call_diagnostics(task, force=True)
                     break
                 try:
                     raw_event = json.loads(raw)

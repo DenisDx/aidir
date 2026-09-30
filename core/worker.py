@@ -4,6 +4,7 @@ All workers must expose a module-level `worker` instance of a BaseWorker subclas
 """
 from __future__ import annotations
 
+import time
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
@@ -36,6 +37,7 @@ class BaseWorker:
     tags: list[str] = field(default_factory=list)
     _core: Any | None = None
     _MAX_LLM_CALL_HISTORY: int = 20
+    _LLM_DIAGNOSTICS_MIN_INTERVAL_SECONDS: float = 1.0
 
     async def initialize(self, config: dict) -> None:
         """Called by core at startup with the worker's config section."""
@@ -117,8 +119,14 @@ class BaseWorker:
         task.llm_call_count = int(getattr(task, "llm_call_count", 0) or 0) + 1
         return task.llm_call_count
 
-    async def _persist_llm_call_diagnostics(self, task: Task) -> None:
-        """Persist task LLM diagnostics when queue access is available."""
+    async def _persist_llm_call_diagnostics(self, task: Task, *, force: bool = False) -> None:
+        """Persist task LLM diagnostics at a bounded rate, or immediately when forced."""
+        now = time.monotonic()
+        last_persisted = float(getattr(task, "_last_llm_diagnostics_persist_at", 0.0) or 0.0)
+        if not force and now - last_persisted < self._LLM_DIAGNOSTICS_MIN_INTERVAL_SECONDS:
+            return
+        task._last_llm_diagnostics_persist_at = now
+
         core = self._core
         queue = getattr(core, "queue", None) if core is not None else None
         persist = getattr(queue, "persist_llm_call_diagnostics", None)
@@ -182,7 +190,7 @@ class BaseWorker:
             history = history[-self._MAX_LLM_CALL_HISTORY :]
         task.llm_call_history = history
         entry = task.llm_call_history[-1]
-        await self._persist_llm_call_diagnostics(task)
+        await self._persist_llm_call_diagnostics(task, force=True)
         return entry
 
     async def _finalize_llm_call(
@@ -222,7 +230,7 @@ class BaseWorker:
         if entry.get("save_llm_request") and isinstance(response, dict):
             entry["response"] = response
 
-        await self._persist_llm_call_diagnostics(task)
+        await self._persist_llm_call_diagnostics(task, force=True)
 
     async def _finalize_latest_started_llm_call(
         self,

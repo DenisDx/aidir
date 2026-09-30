@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 import time
 import types
@@ -99,6 +100,25 @@ class TestTaskLlmCallCount(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second, 2)
         self.assertEqual(task.llm_call_count, 2)
         self.assertEqual(redis.hashes[f"aidir:task:{task.id}"]["llm_call_count"], "2")
+
+    async def test_queue_manager_serializes_diagnostics_off_event_loop(self) -> None:
+        """Queue manager should offload growing stream diagnostics serialization."""
+        task = Task_agent(payload={"model": "qwen3.5:9b"})
+        task.llm_call_history = [{"raw_sse": ["data: chunk"] * 100}]
+        redis = _FakeRedisCounter()
+        queue = QueueManager(redis)
+
+        with patch(
+            "core.queue_manager.asyncio.to_thread",
+            new_callable=AsyncMock,
+            return_value="[\"serialized\"]",
+        ) as serialize:
+            await queue.persist_llm_call_diagnostics(task)
+
+        serialize.assert_awaited_once()
+        self.assertEqual(serialize.await_args.args[0], json.dumps)
+        self.assertEqual(serialize.await_args.args[1], task.llm_call_history)
+        self.assertEqual(redis.hashes[f"aidir:task:{task.id}"]["llm_call_history"], "[\"serialized\"]")
 
     async def test_queue_manager_extends_active_timeout_and_persists_it(self) -> None:
         """Queue manager should extend the timeout currently governing a live task."""

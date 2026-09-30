@@ -5,6 +5,7 @@ All ZSET scores are task.priority (lower = higher priority per spec: 0=max, 100=
 """
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Awaitable, Callable, Optional
@@ -193,11 +194,15 @@ class QueueManager:
 
     async def persist_llm_call_diagnostics(self, task: Task) -> None:
         """Persist task-level LLM call diagnostics without rewriting unrelated task state."""
+        serialized_history = await asyncio.to_thread(
+            json.dumps,
+            getattr(task, "llm_call_history", []) or [],
+        )
         await self._redis.hset(
             self._tk(task.id),
             mapping={
                 "llm_call_count": str(int(getattr(task, "llm_call_count", 0) or 0)),
-                "llm_call_history": json.dumps(getattr(task, "llm_call_history", []) or []),
+                "llm_call_history": serialized_history,
             },
         )
 
