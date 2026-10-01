@@ -147,6 +147,29 @@ Key sections:
 - **`logging`** — log levels per subsystem (0=EMERG … 7=DEBUG)
 - **`resources`** — hardware resources to track (VRAM etc.; enforced in future releases)
 
+### Audit storage and task retention
+
+`logging.audit` stores task-correlated client and LLM request/response events in
+`logs/audit/`. JSON and small UTF-8 text bodies are inline; binary bodies and
+bodies larger than `logging.audit.max_inline_body_bytes` are file-backed. The
+default inline limit is 1 MiB. Audit partitions are retained according to
+`retention_days` and `max_total_bytes`; `emergency_max_total_bytes` is used only
+when normal retention cannot keep storage within the emergency limit.
+
+The authenticated Task Viewer exposes compact task summaries at
+`/api/tasks/viewer/search`. Individual task details include an audit-event
+manifest at `/api/tasks/viewer/{task_id}/detail`; request and raw event bodies
+are loaded only through `/api/tasks/viewer/{task_id}/request` and
+`/api/tasks/viewer/{task_id}/raw`. File-backed bodies use the opaque
+`/api/tasks/viewer/audit-files/{file_id}` endpoint.
+
+External terminal task metadata is removed by cron after
+`tasks.external_task_live` seconds (default: 86400). Queued and running tasks
+are never removed by this retention job. On service startup, persisted queued
+agent and tool tasks are restored before scheduling; malformed queue members
+are quarantined, while persisted running tasks are marked failed with
+`SERVICE_RESTARTED` rather than replayed.
+
 ### llama.cpp providers
 
 Set a provider's `api` to `llama-cpp` to use `llama-server` through its OpenAI-compatible API. `call_llama_cpp` automatically converts incoming Ollama requests to `/v1/chat/completions`; OpenAI requests follow the same internal route.
@@ -189,6 +212,9 @@ Rules:
 - nginx always listens on container port `80`; Docker publishes it to host `${NGINX_HTTP_PORT}`.
 - HTML and WebSocket share the same public nginx port. WS uses `/ws/*`; it does not need a separate port.
 - `WEBUI_PORT` is the backend port behind nginx and must not equal `NGINX_HTTP_PORT`.
+- The nginx container renders its upstream from `WEBUI_HOST` and `WEBUI_PORT` at
+  startup, runs `nginx -t` on the rendered configuration, then starts serving
+  traffic. Change either value in `.env` and recreate the nginx container.
 
 #### Routes
 

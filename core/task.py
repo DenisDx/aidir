@@ -76,6 +76,12 @@ class Task:
     # Map: resource_id -> {metric: amount}
     resource_requirements: dict[str, dict[str, int]] = field(default_factory=dict)
 
+    # ── Viewer summary (persisted without decoding full request bodies) ─────
+    request_preview: str = ""
+    route_provider_id: str = ""
+    model_id: str = ""
+    envid: str = ""
+
     # ── Origin ────────────────────────────────────────────────────────────
     # True for tasks created by endpoints (from external clients).
     # External tasks are preserved in Redis after completion and cleaned by cron.
@@ -136,4 +142,77 @@ class Task:
             "resource_requirements": json.dumps(self.resource_requirements),
             "config":      json.dumps(self.config),
             "context":     context_json,
+            "stream":      "1" if getattr(self, "stream", False) else "0",
+            "request_preview": self.request_preview or self._request_preview(),
+            "route_provider_id": self.route_provider_id or str(self.config.get("provider_id") or ""),
+            "model_id": self.model_id or str(self.payload.get("model") or ""),
+            "envid": self.envid or (self.context.envid if self.context else ""),
         }
+
+    def _request_preview(self) -> str:
+        """Build a bounded body-free request description for task search."""
+        messages = self.payload.get("messages") if isinstance(self.payload, dict) else None
+        message_count = len(messages) if isinstance(messages, list) else 0
+        return f"type={self.type} model={self.payload.get('model', '')} messages={message_count}"
+
+    @classmethod
+    def from_redis_hash(cls, data: dict[str, str]) -> "Task":
+        """Reconstruct a task subtype from its persisted Redis hash."""
+        from core.task_types.task_agent import Task_agent
+        from core.task_types.task_tool import Task_tool
+
+        task_classes = {
+            "agent": Task_agent,
+            "tool": Task_tool,
+        }
+        task_type = str(data.get("type") or "")
+        task_class = task_classes.get(task_type)
+        if task_class is None:
+            raise ValueError(f"unsupported task type: {task_type!r}")
+
+        def parse_json(name: str, default):
+            raw = data.get(name) or ""
+            if not raw:
+                return default
+            value = json.loads(raw)
+            return value if isinstance(value, type(default)) else default
+
+        def parse_datetime(name: str) -> datetime | None:
+            raw = data.get(name) or ""
+            return datetime.fromisoformat(raw.replace("Z", "+00:00")) if raw else None
+
+        context_data = parse_json("context", {})
+        task = task_class(
+            id=str(data["id"]),
+            payload=parse_json("payload", {}),
+            worker_id=data.get("worker_id") or None,
+            priority=int(data.get("priority") or PRIORITY_NORMAL),
+            status=str(data.get("status") or STATUS_CREATED),
+            created_at=parse_datetime("created_at") or datetime.now(timezone.utc),
+            updated_at=parse_datetime("updated_at") or datetime.now(timezone.utc),
+            started_at=parse_datetime("started_at"),
+            finished_at=parse_datetime("finished_at"),
+            result=parse_json("result", None),
+            error=parse_json("error", None),
+            llm_call_count=int(data.get("llm_call_count") or 0),
+            llm_call_history=parse_json("llm_call_history", []),
+            queue_timeout=int(data.get("queue_timeout") or 0),
+            run_timeout=int(data.get("run_timeout") or 0),
+            retry_count=int(data.get("retry_count") or 0),
+            retry_period=int(data.get("retry_period") or 0),
+            retry_attempt=int(data.get("retry_attempt") or 0),
+            fallback_index=int(data.get("fallback_index") or 0),
+            resource_requirements=parse_json("resource_requirements", {}),
+            external=str(data.get("external") or "0").lower() in {"1", "true"},
+            parent_worker=data.get("parent_worker") or None,
+            parent_context=parse_json("parent_context", {}),
+            config=parse_json("config", {}),
+            context=Context.from_dict(context_data) if context_data else None,
+            request_preview=data.get("request_preview") or "",
+            route_provider_id=data.get("route_provider_id") or "",
+            model_id=data.get("model_id") or "",
+            envid=data.get("envid") or "",
+        )
+        if hasattr(task, "stream"):
+            task.stream = str(data.get("stream") or "0").lower() in {"1", "true"}
+        return task

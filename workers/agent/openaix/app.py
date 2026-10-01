@@ -1286,6 +1286,12 @@ class OpenAIxWorker(BaseWorker):
             await self._core.queue.mark_canceled(task)
             await self._core.delete_task(task.id)
             return WorkerResult(ok=False, error={"code": "TOOL_TIMEOUT", "message": f"Internal tool timed out: {tool_name}"})
+        except asyncio.CancelledError:
+            await self._core.terminate_task(task.id)
+            raise
+        except Exception:
+            await self._core.terminate_task(task.id)
+            raise
 
         await self._core.delete_task(task.id)
 
@@ -1617,7 +1623,7 @@ class OpenAIxWorker(BaseWorker):
             final_data: dict | None = None
             chunks: list[dict] = [] if save_call else []
             emitted_any_chunk = False
-            raw_parts: list[bytes] = []
+            response_spool = None
 
             async def tracked_emit_chunk(chunk: dict) -> None:
                 nonlocal emitted_any_chunk
@@ -1655,31 +1661,33 @@ class OpenAIxWorker(BaseWorker):
                             },
                         )
                     else:
-                        final_data = await self._consume_stream_response(resp, tracked_emit_chunk, chunks, raw_parts, save_call)
+                        audit_log = getattr(self._core, "audit_log", None)
+                        response_spool = audit_log.open_body_spool() if task is not None and audit_log is not None else None
+                        final_data = await self._consume_stream_response(resp, tracked_emit_chunk, chunks, response_spool, save_call)
 
                         if save_call:
                             save_llm_call(self.id, effective_task_id, upstream_payload, {"stream_chunks": chunks})
                         if task is not None:
-                            await self._finalize_llm_call(task, history_entry, status="ok", http_status=200, response={"stream_chunks": chunks, **(final_data or {})}, response_body=b"".join(raw_parts), response_content_type=self._response_content_type(resp, "application/x-ndjson"))
+                            await self._finalize_llm_call(task, history_entry, status="ok", http_status=200, response={"stream_chunks": chunks, **(final_data or {})}, response_spool=response_spool, response_content_type=self._response_content_type(resp, "application/x-ndjson"))
                         return WorkerResult(ok=True, data=final_data, usage=(final_data or {}).get("usage"))
             except httpx.ConnectError as exc:
                 if task is not None:
-                    await self._finalize_llm_call(task, history_entry, status="connect_error", error_code="UPSTREAM_UNREACHABLE", response_body=b"".join(raw_parts), response_content_type="application/x-ndjson")
+                    await self._finalize_llm_call(task, history_entry, status="connect_error", error_code="UPSTREAM_UNREACHABLE", response_spool=response_spool, response_content_type="application/x-ndjson")
                 log("worker", "warning", f"Upstream unreachable: {exc}", "openaix")
                 result = WorkerResult(ok=False, error={"code": "UPSTREAM_UNREACHABLE", "message": str(exc)})
             except httpx.TimeoutException as exc:
                 if task is not None:
-                    await self._finalize_llm_call(task, history_entry, status="timeout", error_code="UPSTREAM_TIMEOUT", response_body=b"".join(raw_parts), response_content_type="application/x-ndjson")
+                    await self._finalize_llm_call(task, history_entry, status="timeout", error_code="UPSTREAM_TIMEOUT", response_spool=response_spool, response_content_type="application/x-ndjson")
                 timeout_message = self._build_timeout_message(exc)
                 log("worker", "warning", f"Upstream timeout: {timeout_message}", "openaix")
                 result = WorkerResult(ok=False, error={"code": "UPSTREAM_TIMEOUT", "message": timeout_message})
             except asyncio.CancelledError:
                 if task is not None:
-                    await self._finalize_llm_call(task, history_entry, status="cancelled", error_code="CANCELLED", response_body=b"".join(raw_parts), response_content_type="application/x-ndjson")
+                    await self._finalize_llm_call(task, history_entry, status="cancelled", error_code="CANCELLED", response_spool=response_spool, response_content_type="application/x-ndjson")
                 raise
             except Exception as exc:
                 if task is not None:
-                    await self._finalize_llm_call(task, history_entry, status="exception", error_code="EXCEPTION", response_body=b"".join(raw_parts), response_content_type="application/x-ndjson")
+                    await self._finalize_llm_call(task, history_entry, status="exception", error_code="EXCEPTION", response_spool=response_spool, response_content_type="application/x-ndjson")
                 error_message = self._describe_exception(exc)
                 log_exception(
                     "worker",
@@ -1778,7 +1786,7 @@ class OpenAIxWorker(BaseWorker):
         return data
 
     @staticmethod
-    async def _consume_stream_response(resp, emit_chunk, chunks: list[dict], raw_parts: list[bytes], save_call: bool) -> dict | None:
+    async def _consume_stream_response(resp, emit_chunk, chunks: list[dict], response_spool, save_call: bool) -> dict | None:
         """Parse Ollama NDJSON stream while preserving raw bytes for logging."""
         final_data: dict | None = None
 
@@ -1787,7 +1795,8 @@ class OpenAIxWorker(BaseWorker):
             decoder = codecs.getincrementaldecoder("utf-8")()
             text_buffer = ""
             async for raw_chunk in aiter_raw():
-                raw_parts.append(raw_chunk)
+                if response_spool is not None:
+                    response_spool.write(raw_chunk)
                 decoded = decoder.decode(raw_chunk)
                 text_buffer += decoded
                 while "\n" in text_buffer:
@@ -1829,8 +1838,8 @@ class OpenAIxWorker(BaseWorker):
         aiter_lines = getattr(resp, "aiter_lines", None)
         if callable(aiter_lines):
             async for line in aiter_lines():
-                if save_call:
-                    raw_parts.append(line.encode("utf-8") + b"\n")
+                if response_spool is not None:
+                    response_spool.write(line.encode("utf-8") + b"\n")
                 if not line.strip():
                     continue
                 try:

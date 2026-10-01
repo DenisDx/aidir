@@ -402,6 +402,8 @@ class Endpoint_ollama(BaseEndpoint):
         if route is not None:
             task.config = dict(task.config or {})
             task.config["route"] = route
+            task.route_provider_id = str(route.get("resolved_provider") or "")
+            task.model_id = str(route.get("resolved_model") or "")
         return task
 
     def _resolve_worker_id_for_route(self, worker_id: str, route: dict | None) -> str:
@@ -1001,7 +1003,7 @@ class Endpoint_ollama(BaseEndpoint):
         """Read chunks from task queue and yield as NDJSON lines."""
         audit_log = getattr(self._core, "audit_log", None)
         audit_context = getattr(task, "_audit_client_context", None)
-        spool_path = audit_log.open_body_spool() if audit_log is not None and isinstance(audit_context, dict) else None
+        spool = audit_log.open_body_spool() if audit_log is not None and isinstance(audit_context, dict) else None
         try:
             while True:
                 timeout_phase, remaining = self._task_timeout_phase(task)
@@ -1012,9 +1014,8 @@ class Endpoint_ollama(BaseEndpoint):
                         "done": True,
                     }) + "\n").encode()
                     yield encoded
-                    if spool_path is not None:
-                        with spool_path.open("ab") as spool:
-                            spool.write(encoded)
+                    if spool is not None:
+                        spool.write(encoded)
                     break
 
                 try:
@@ -1029,14 +1030,13 @@ class Endpoint_ollama(BaseEndpoint):
 
                 encoded = (json.dumps(chunk) + "\n").encode()
                 yield encoded
-                if spool_path is not None:
-                    with spool_path.open("ab") as spool:
-                        spool.write(encoded)
+                if spool is not None:
+                    spool.write(encoded)
         finally:
-            if spool_path is not None:
+            if spool is not None:
                 try:
                     event = audit_log.finalize_body_spool(
-                        "client_response", spool_path, content_type="application/x-ndjson",
+                        "client_response", spool, content_type="application/x-ndjson",
                         task_id=task.id, request_id=audit_context["request_id"], protocol=audit_context["protocol"],
                         endpoint=audit_context["endpoint"], worker_id=task.worker_id,
                         http={"status_code": 200, "content_type": "application/x-ndjson"},

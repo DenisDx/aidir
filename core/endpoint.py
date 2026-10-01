@@ -93,9 +93,12 @@ class BaseEndpoint(ABC):
             await queue.mark_canceled(task)
 
     async def _read_json_body(self, request: Any) -> tuple[Any, bytes]:
-        """Read a request body once and return its JSON value with original bytes."""
+        """Read one JSON-object request body with its original bytes."""
         raw_body = await request.body()
-        return json.loads(raw_body), raw_body
+        body = json.loads(raw_body)
+        if not isinstance(body, dict):
+            raise ValueError("Request body must be a JSON object")
+        return body, raw_body
 
     def _audit_pre_task_rejection(
         self,

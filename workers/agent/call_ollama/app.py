@@ -5,6 +5,7 @@ Handles both streaming (stream=true) and non-streaming (stream=false) modes.
 """
 from __future__ import annotations
 
+import asyncio
 import codecs
 import json
 from typing import Any, Awaitable, Callable
@@ -157,12 +158,11 @@ class CallOllamaWorker(BaseWorker):
                 error={"code": "UPSTREAM_TIMEOUT", "message": str(exc)},
             )
         except asyncio.CancelledError:
-            raw_parts = getattr(task, "_audit_stream_raw_parts", [])
             await self._finalize_latest_started_llm_call(
                 task,
                 status="cancelled",
                 error_code="CANCELLED",
-                response_body=b"".join(raw_parts),
+                response_spool=getattr(task, "_audit_stream_spool", None),
                 response_content_type="application/x-ndjson",
             )
             raise
@@ -411,8 +411,7 @@ class CallOllamaWorker(BaseWorker):
         final_data: dict | None = None
         chunks: list[dict] = [] if save_call else []
         stream_context = await self._open_stream_request(client, request, upstream_payload)
-        raw_parts: list[bytes] = []
-        task._audit_stream_raw_parts = raw_parts
+        response_spool = None
         async with stream_context as resp:
             if resp.status_code != 200:
                 raw_error = await self._read_response_body(resp)
@@ -431,11 +430,14 @@ class CallOllamaWorker(BaseWorker):
                     },
                 )
 
-            final_data = await self._consume_stream_response(resp, emit_chunk, chunks, raw_parts, save_call)
+            audit_log = getattr(self._core, "audit_log", None)
+            response_spool = audit_log.open_body_spool() if audit_log is not None else None
+            task._audit_stream_spool = response_spool
+            final_data = await self._consume_stream_response(resp, emit_chunk, chunks, response_spool, save_call)
 
         if save_call:
             save_llm_call(self.id, task.id, upstream_payload, {"stream_chunks": chunks})
-        await self._finalize_llm_call(task, history_entry, status="ok", http_status=200, response={"stream_chunks": chunks, **(final_data or {})}, response_body=b"".join(raw_parts), response_content_type="application/x-ndjson")
+        await self._finalize_llm_call(task, history_entry, status="ok", http_status=200, response={"stream_chunks": chunks, **(final_data or {})}, response_spool=response_spool, response_content_type="application/x-ndjson")
         return WorkerResult(ok=True, data=final_data, usage=(final_data or {}).get("usage"))
 
     @staticmethod
@@ -511,7 +513,7 @@ class CallOllamaWorker(BaseWorker):
         return data
 
     @staticmethod
-    async def _consume_stream_response(resp, emit_chunk, chunks: list[dict], raw_parts: list[bytes], save_call: bool) -> dict | None:
+    async def _consume_stream_response(resp, emit_chunk, chunks: list[dict], response_spool, save_call: bool) -> dict | None:
         """Parse Ollama NDJSON stream while preserving raw bytes for logging."""
         final_data: dict | None = None
 
@@ -520,7 +522,8 @@ class CallOllamaWorker(BaseWorker):
             decoder = codecs.getincrementaldecoder("utf-8")()
             text_buffer = ""
             async for raw_chunk in aiter_raw():
-                raw_parts.append(raw_chunk)
+                if response_spool is not None:
+                    response_spool.write(raw_chunk)
                 decoded = decoder.decode(raw_chunk)
                 text_buffer += decoded
                 while "\n" in text_buffer:
@@ -564,7 +567,8 @@ class CallOllamaWorker(BaseWorker):
         aiter_lines = getattr(resp, "aiter_lines", None)
         if callable(aiter_lines):
             async for line in aiter_lines():
-                raw_parts.append(line.encode("utf-8") + b"\n")
+                if response_spool is not None:
+                    response_spool.write(line.encode("utf-8") + b"\n")
                 if not line.strip():
                     continue
                 try:

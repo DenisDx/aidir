@@ -25,7 +25,7 @@ if TYPE_CHECKING:
     from core.resources import Resources
     from core.worker import BaseWorker
 
-_SUPPORTED_TYPES = ("agent", "tool", "context")  # TODO: extend with request, tts, stt…
+_SUPPORTED_TYPES = ("agent", "tool")  # TODO: extend with request, tts, stt…
 
 
 class Scheduler:

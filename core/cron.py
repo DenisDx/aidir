@@ -251,7 +251,7 @@ async def cleanup_expired_tasks(redis: aioredis.Redis) -> None:
     max_age = int(
         config.get("tasks.external_task_live")
         or config.get("external_task_live")
-        or 2500000
+        or 86400
     )
     if max_age <= 0:
         return

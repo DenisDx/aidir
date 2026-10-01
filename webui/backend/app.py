@@ -11,6 +11,7 @@ Provides:
 from __future__ import annotations
 
 import asyncio
+import heapq
 import hmac
 import json
 import secrets
@@ -345,7 +346,8 @@ def _task_summary_from_hash(task_hash: dict[str, str]) -> dict[str, Any]:
         for key in (
             "id", "type", "status", "worker_id", "created_at", "updated_at",
             "started_at", "finished_at", "priority", "llm_call_count", "queue_timeout",
-            "run_timeout", "external",
+            "run_timeout", "external", "request_preview", "route_provider_id", "model_id",
+            "envid", "error_code",
         )
     }
     task["priority"] = int(task["priority"] or 0)
@@ -353,13 +355,8 @@ def _task_summary_from_hash(task_hash: dict[str, str]) -> dict[str, Any]:
     task["queue_timeout"] = int(task["queue_timeout"] or 0)
     task["run_timeout"] = int(task["run_timeout"] or 0)
     task["external"] = str(task["external"] or "0") in {"1", "true", "True"}
-    error = _parse_json_field(task_hash.get("error"))
-    task["error_code"] = error.get("code") if isinstance(error, dict) else None
-    context = _parse_json_field(task_hash.get("context"))
-    task["envid"] = context.get("envid", "") if isinstance(context, dict) else ""
     last_op = _task_last_operation_at(task)
     task["last_operation_at"] = last_op.isoformat() if last_op else None
-    task["request_preview"] = ""
     return task
 
 
@@ -551,40 +548,61 @@ def create_app(
         limit = max(1, min(limit, 1000))
 
         ns = core.config.get("instance", "aidir")
-        items: list[dict[str, Any]] = []
+        items: list[tuple[str, int, dict[str, Any]]] = []
+        matching_count = 0
+        sequence = 0
+        cursor = 0
+        while True:
+            cursor, keys = await core.redis.scan(cursor, match=f"{ns}:task:*", count=200)
+            if keys:
+                pipeline = core.redis.pipeline(transaction=False)
+                for key in keys:
+                    pipeline.hgetall(key)
+                raw_items = await pipeline.execute()
+            else:
+                raw_items = []
 
-        async for key in core.redis.scan_iter(match=f"{ns}:task:*", count=200):
-            raw = await core.redis.hgetall(key)
-            if not raw:
-                continue
+            for raw in raw_items:
+                if not raw:
+                    continue
 
-            task = _task_summary_from_hash(raw)
-            task_envid = str(task.get("envid") or "")
-            if envid and task_envid != envid:
-                continue
-            if statuses and str(task.get("status") or "").lower() not in statuses:
-                continue
-            if workers and str(task.get("worker_id") or "") not in workers:
-                continue
+                task = _task_summary_from_hash(raw)
+                task_envid = str(task.get("envid") or "")
+                if envid and task_envid != envid:
+                    continue
+                if statuses and str(task.get("status") or "").lower() not in statuses:
+                    continue
+                if workers and str(task.get("worker_id") or "") not in workers:
+                    continue
 
-            created_at = _parse_dt(task.get("created_at"))
-            last_op = _task_last_operation_at(task)
+                created_at = _parse_dt(task.get("created_at"))
+                last_op = _task_last_operation_at(task)
 
-            if created_from and created_at and created_at < created_from:
-                continue
-            if created_to and created_at and created_at > created_to:
-                continue
-            if op_from and last_op and last_op < op_from:
-                continue
-            if op_to and last_op and last_op > op_to:
-                continue
+                if created_from and created_at and created_at < created_from:
+                    continue
+                if created_to and created_at and created_at > created_to:
+                    continue
+                if op_from and last_op and last_op < op_from:
+                    continue
+                if op_to and last_op and last_op > op_to:
+                    continue
 
-            items.append(task)
+                matching_count += 1
+                sequence += 1
+                sort_key = task.get("last_operation_at") or task.get("created_at") or ""
+                candidate = (sort_key, sequence, task)
+                if len(items) < limit:
+                    heapq.heappush(items, candidate)
+                elif candidate[:2] > items[0][:2]:
+                    heapq.heapreplace(items, candidate)
 
-        items.sort(key=lambda item: item.get("last_operation_at") or item.get("created_at") or "", reverse=True)
+            if cursor == 0:
+                break
+
+        items.sort(reverse=True)
         return {
-            "tasks": items[:limit],
-            "count": len(items),
+            "tasks": [item[2] for item in items],
+            "count": matching_count,
         }
 
     @app.get("/api/tasks/viewer/{task_id}")

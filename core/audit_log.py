@@ -35,6 +35,51 @@ _SECRET_METADATA_KEYS = {"authorization", "cookie", "set-cookie", "token", "api_
 _DATA_URI_RE = re.compile(r"^data:((?:image|audio|video)/[a-z0-9.+-]+);base64,([a-z0-9+/=\s]+)$", re.IGNORECASE)
 
 
+class AuditBodySpool:
+    """Incrementally write one stream body with stable byte metadata."""
+
+    def __init__(self, path: Path) -> None:
+        """Open the temporary spool file at the given path."""
+        self.path = path
+        self._handle = path.open("wb")
+        self._digest = hashlib.sha256()
+        self.bytes = 0
+        self.closed = False
+
+    def write(self, data: bytes) -> None:
+        """Append bytes and update the stream metadata."""
+        if self.closed:
+            raise ValueError("Audit spool is already closed")
+        self._handle.write(data)
+        self._digest.update(data)
+        self.bytes += len(data)
+
+    def close(self) -> None:
+        """Flush and close the spool once before finalization."""
+        if self.closed:
+            return
+        self._handle.flush()
+        self._handle.close()
+        self.closed = True
+
+    @property
+    def sha256(self) -> str:
+        """Return the incremental digest for bytes written to the spool."""
+        return self._digest.hexdigest()
+
+    def open(self, *args, **kwargs):
+        """Expose the underlying path during the endpoint migration window."""
+        return self.path.open(*args, **kwargs)
+
+    def exists(self) -> bool:
+        """Return whether the temporary spool file still exists."""
+        return self.path.exists()
+
+    def __fspath__(self) -> str:
+        """Provide a path-like interface for filesystem maintenance helpers."""
+        return str(self.path)
+
+
 class AuditLog:
     """Write daily audit JSONL journals and maintain a disposable event index."""
 
@@ -43,28 +88,36 @@ class AuditLog:
         directory: str | Path | None = None,
         secret_metadata_keys: list[str] | None = None,
         emergency_max_total_bytes: int = 2147483648,
+        max_inline_body_bytes: int = 1048576,
     ) -> None:
         """Create an audit writer rooted at the given directory or the default path."""
         self.directory = Path(directory) if directory is not None else _DEFAULT_DIRECTORY
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._health = {
             "status": "ok", "write_failures": 0, "dropped_events": 0,
             "dropped_recent": 0, "last_drop_at": None, "last_error": None,
             "disk_usage_bytes": 0, "retention_status": "unknown", "last_retention_at": None,
         }
         self._emergency_max_total_bytes = max(0, int(emergency_max_total_bytes))
+        self._max_inline_body_bytes = max(0, int(max_inline_body_bytes))
         self._drop_times: deque[float] = deque()
-        self._writer_queue: queue.Queue[tuple[str, str, dict[str, Any], threading.Event | None, list[BaseException]] | None] | None = None
+        self._writer_queue: queue.Queue | None = None
         self._writer_thread: threading.Thread | None = None
         self._overflow_policy = "best_effort"
+        self._event_receipts: dict[str, dict[str, Any]] = {}
+        self._terminal_records: dict[str, dict[str, Any]] = {}
         configured_keys = secret_metadata_keys if isinstance(secret_metadata_keys, list) else []
         self._secret_metadata_keys = _SECRET_METADATA_KEYS | {str(key).lower() for key in configured_keys}
         self._initialize_index()
+        self._restore_terminal_reservations()
 
     def health(self) -> dict[str, Any]:
         """Return a compact audit-storage health snapshot for operational reporting."""
+        persisted = self._load_retention_health()
         with self._lock:
-            return dict(self._health)
+            health = dict(self._health)
+        health.update(persisted)
+        return health
 
     def start_writer(self, queue_size: int = 256, overflow_policy: str = "best_effort") -> None:
         """Start the bounded background writer used by the running Core service."""
@@ -98,12 +151,13 @@ class AuditLog:
             try:
                 if item is None:
                     return
-                journal_stem, day, record, completion, failures = item
+                journal_stem, day, record, completion, failures, receipt = item
                 try:
-                    self._append_record_sync(journal_stem, day, record)
+                    self._append_record_sync(journal_stem, day, record, receipt)
                 except (OSError, sqlite3.Error) as exc:
                     self._record_failure(exc)
                     failures.append(exc)
+                    self._complete_receipt(receipt, "failed")
                 finally:
                     if completion is not None:
                         completion.set()
@@ -133,11 +187,21 @@ class AuditLog:
     def record_task_terminal(self, **fields: Any) -> dict[str, Any]:
         """Append one terminal task record and return its completed record."""
         task_id = fields.get("task_id")
-        if isinstance(task_id, str):
-            existing = self.find_task_terminal(task_id)
+        if not isinstance(task_id, str):
+            return self.record_raw_event("task", **fields)
+        record = self._new_record("task", fields)
+        with self._lock:
+            existing = self._terminal_records.get(task_id) or self.find_task_terminal(task_id)
             if existing is not None:
                 return existing
-        return self.record_raw_event("task", **fields)
+            self._terminal_records[task_id] = record
+        try:
+            return self._record_prepared_event(record)
+        except Exception:
+            with self._lock:
+                if self._terminal_records.get(task_id) is record:
+                    self._terminal_records.pop(task_id, None)
+            raise
 
     def record_task_reconciliation(self, **fields: Any) -> dict[str, Any]:
         """Append late raw-event references for an already terminal task."""
@@ -157,6 +221,30 @@ class AuditLog:
             for row in rows
         ]
         return [event for event in events if self._partition_visible(event["journal_path"])]
+
+    def confirmed_task_events(self, task_id: str) -> list[dict[str, Any]]:
+        """Wait for accepted task writes and return only persisted event metadata."""
+        with self._lock:
+            receipts = [receipt for receipt in self._event_receipts.values() if receipt["task_id"] == task_id]
+        for receipt in receipts:
+            receipt["completed"].wait()
+
+        events = {event["event_id"]: event for event in self.list_task_events(task_id)}
+        with self._lock:
+            for receipt in receipts:
+                if receipt["status"] != "persisted":
+                    continue
+                record = receipt["record"]
+                events.setdefault(
+                    record["event_id"],
+                    {
+                        "event_id": record["event_id"],
+                        "task_id": task_id,
+                        "type": record["type"],
+                        "recorded_at": record["recorded_at"],
+                    },
+                )
+        return sorted(events.values(), key=lambda event: (event.get("recorded_at", ""), event["event_id"]))
 
     def find_task_terminal(self, task_id: str) -> dict[str, Any] | None:
         """Return the existing terminal task record when the task was already journaled."""
@@ -235,11 +323,14 @@ class AuditLog:
             self._delete_partition(day, files)
             total -= bytes_removed
             removed.append(day)
+            if force_emergency and total <= emergency_max_total_bytes:
+                break
         remaining = self.disk_usage_bytes()
         with self._lock:
             self._health["disk_usage_bytes"] = remaining
             self._health["retention_status"] = "error" if remaining > max_total_bytes else "ok"
             self._health["last_retention_at"] = datetime.now().astimezone().isoformat(timespec="milliseconds")
+        self._persist_retention_health()
         return removed
 
     def _partition_usage_bytes(self, day: str, journals: list[Path]) -> int:
@@ -331,16 +422,32 @@ class AuditLog:
         body_fields = self._body_fields(body, content_type, now.date().isoformat())
         return self.record_raw_event(event_type, **fields, **body_fields)
 
-    def open_body_spool(self) -> Path:
+    def open_body_spool(self) -> AuditBodySpool:
         """Create one temporary audit spool path for incremental stream bytes."""
         file_id = str(uuid.uuid4())
         path = self.directory / ".spool" / file_id
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.touch()
-        return path
+        return AuditBodySpool(path)
 
-    def finalize_body_spool(self, event_type: str, spool_path: Path, *, content_type: str, **fields: Any) -> dict[str, Any]:
-        """Move a completed stream spool into audit files and append one event."""
+    def finalize_body_spool(self, event_type: str, spool: AuditBodySpool | Path, *, content_type: str, **fields: Any) -> dict[str, Any]:
+        """Classify and store a completed spool using the normal body policy."""
+        if isinstance(spool, AuditBodySpool):
+            spool.close()
+            spool_path = spool.path
+            body_size = spool.bytes
+            body_sha256 = spool.sha256
+        else:
+            spool_path = spool
+            body_size, body_sha256 = self._file_metadata(spool_path)
+
+        normalized_content_type = content_type.split(";", 1)[0].strip().lower()
+        if body_size <= self._max_inline_body_bytes and not self._must_store_body_as_file(normalized_content_type):
+            body = spool_path.read_bytes()
+            body_fields = self._body_fields(body, content_type, datetime.now().astimezone().date().isoformat())
+            event = self.record_raw_event(event_type, **fields, **body_fields)
+            spool_path.unlink(missing_ok=True)
+            return event
+
         now = datetime.now().astimezone()
         file_id = str(uuid.uuid4())
         relative_path = Path("files") / now.date().isoformat() / file_id
@@ -348,7 +455,6 @@ class AuditLog:
         with self._lock:
             destination.parent.mkdir(parents=True, exist_ok=True)
             os.replace(spool_path, destination)
-        body_size, body_sha256 = self._file_metadata(destination)
         return self.record_raw_event(
             event_type,
             **fields,
@@ -375,6 +481,10 @@ class AuditLog:
 
     def record_raw_event(self, event_type: str, **fields: Any) -> dict[str, Any]:
         """Append one event of the given type and index its JSONL byte range."""
+        return self._record_prepared_event(self._new_record(event_type, fields))
+
+    def _new_record(self, event_type: str, fields: Mapping[str, Any]) -> dict[str, Any]:
+        """Build one redacted audit record before it enters the writer."""
         if event_type not in _JOURNALS:
             raise ValueError(f"Unsupported audit event type: {event_type}")
 
@@ -390,7 +500,23 @@ class AuditLog:
             },
         }
         record.setdefault("task_id", None)
-        return self._append_record(_JOURNALS[event_type], now.date().isoformat(), record)
+        return record
+
+    def _record_prepared_event(self, record: dict[str, Any]) -> dict[str, Any]:
+        """Register one receipt and submit its prepared record to the writer."""
+        receipt = {
+            "record": record,
+            "task_id": record.get("task_id"),
+            "status": "pending",
+            "completed": threading.Event(),
+        }
+        with self._lock:
+            self._event_receipts[record["event_id"]] = receipt
+        try:
+            return self._append_record(_JOURNALS[record["type"]], record["recorded_at"][:10], record, receipt)
+        except Exception:
+            self._complete_receipt(receipt, "failed")
+            raise
 
     def _redact_metadata(self, value: Any) -> Any:
         """Redact credential-like metadata while leaving event bodies untouched."""
@@ -453,23 +579,44 @@ class AuditLog:
                 for journal_path in sorted(self.directory.glob("*.jsonl")):
                     rebuilt += self._index_journal(connection, journal_path)
                 connection.commit()
+                self._restore_terminal_reservations()
                 return rebuilt
 
-    def _append_record(self, journal_stem: str, day: str, record: dict[str, Any]) -> dict[str, Any]:
+    def _restore_terminal_reservations(self) -> None:
+        """Restore terminal task reservations from append-only task journals."""
+        restored: dict[str, dict[str, Any]] = {}
+        for journal_path in sorted(self.directory.glob("tasks-*.jsonl")):
+            try:
+                with journal_path.open("rb") as handle:
+                    for encoded in handle:
+                        try:
+                            record = json.loads(encoded)
+                        except json.JSONDecodeError:
+                            continue
+                        task_id = record.get("task_id") if isinstance(record, dict) else None
+                        if record.get("type") == "task" and isinstance(task_id, str):
+                            restored.setdefault(task_id, record)
+            except OSError:
+                continue
+        with self._lock:
+            self._terminal_records.update(restored)
+
+    def _append_record(self, journal_stem: str, day: str, record: dict[str, Any], receipt: dict[str, Any]) -> dict[str, Any]:
         """Queue or synchronously write one completed JSONL record."""
         with self._lock:
             writer_queue = self._writer_queue
             policy = self._overflow_policy
         if writer_queue is None:
             try:
-                return self._append_record_sync(journal_stem, day, record)
+                return self._append_record_sync(journal_stem, day, record, receipt)
             except (OSError, sqlite3.Error) as exc:
                 self._record_failure(exc)
+                self._complete_receipt(receipt, "failed")
                 raise
 
         completion = threading.Event() if policy == "durable" else None
         failures: list[BaseException] = []
-        item = (journal_stem, day, record, completion, failures)
+        item = (journal_stem, day, record, completion, failures, receipt)
         try:
             if policy == "durable":
                 writer_queue.put(item)
@@ -479,10 +626,10 @@ class AuditLog:
             else:
                 writer_queue.put_nowait(item)
         except queue.Full:
-            self._record_drop()
+            self._record_drop(receipt)
         return record
 
-    def _append_record_sync(self, journal_stem: str, day: str, record: dict[str, Any]) -> dict[str, Any]:
+    def _append_record_sync(self, journal_stem: str, day: str, record: dict[str, Any], receipt: dict[str, Any] | None = None) -> dict[str, Any]:
         """Write one completed JSONL record and commit its index entry afterwards."""
         encoded = (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
         journal_path = self.directory / f"{journal_stem}-{day}.jsonl"
@@ -498,9 +645,21 @@ class AuditLog:
             with closing(self._connect()) as connection:
                 self._insert_index(connection, record, relative_path, offset, len(encoded))
                 connection.commit()
+        if receipt is not None:
+            self._complete_receipt(receipt, "persisted")
         return record
 
-    def _record_drop(self) -> None:
+    def _complete_receipt(self, receipt: dict[str, Any], status: str) -> None:
+        """Publish a final writer outcome for one submitted audit event."""
+        with self._lock:
+            receipt["status"] = status
+            task_id = receipt["record"].get("task_id")
+            if receipt["record"].get("type") == "task" and status != "persisted" and isinstance(task_id, str):
+                if self._terminal_records.get(task_id) is receipt["record"]:
+                    self._terminal_records.pop(task_id, None)
+            receipt["completed"].set()
+
+    def _record_drop(self, receipt: dict[str, Any]) -> None:
         """Record a best-effort queue overflow without delaying task execution."""
         now = time.monotonic()
         with self._lock:
@@ -512,6 +671,7 @@ class AuditLog:
             self._health["last_drop_at"] = datetime.now().astimezone().isoformat(timespec="milliseconds")
             self._health["status"] = "error" if len(self._drop_times) >= 10 else "warning"
         logging.getLogger(__name__).warning("Audit writer queue overflow; event was dropped")
+        self._complete_receipt(receipt, "dropped")
 
     def _record_failure(self, exc: BaseException) -> None:
         """Mark audit storage unhealthy after an I/O or SQLite writer failure."""
@@ -643,7 +803,59 @@ class AuditLog:
             connection.execute(
                 "CREATE TABLE IF NOT EXISTS partitions (partition_date TEXT PRIMARY KEY, state TEXT NOT NULL)"
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS audit_health (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    disk_usage_bytes INTEGER NOT NULL,
+                    retention_status TEXT NOT NULL,
+                    last_retention_at TEXT
+                )
+                """
+            )
             connection.commit()
+
+    def _load_retention_health(self) -> dict[str, Any]:
+        """Read the process-independent retention state from the audit sidecar."""
+        try:
+            with closing(self._connect()) as connection:
+                row = connection.execute(
+                    "SELECT disk_usage_bytes, retention_status, last_retention_at FROM audit_health WHERE id = 1"
+                ).fetchone()
+        except sqlite3.Error:
+            return {}
+        if row is None:
+            return {}
+        return {
+            "disk_usage_bytes": int(row[0]),
+            "retention_status": row[1],
+            "last_retention_at": row[2],
+        }
+
+    def _persist_retention_health(self) -> None:
+        """Store the latest retention result for cron and Core status readers."""
+        with self._lock:
+            values = (
+                int(self._health["disk_usage_bytes"]),
+                str(self._health["retention_status"]),
+                self._health["last_retention_at"],
+            )
+        try:
+            with closing(self._connect()) as connection:
+                connection.execute(
+                    """
+                    INSERT INTO audit_health(id, disk_usage_bytes, retention_status, last_retention_at)
+                    VALUES (1, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        disk_usage_bytes = excluded.disk_usage_bytes,
+                        retention_status = excluded.retention_status,
+                        last_retention_at = excluded.last_retention_at
+                    """,
+                    values,
+                )
+                connection.commit()
+        except sqlite3.Error as exc:
+            self._record_failure(exc)
 
     def _connect(self) -> sqlite3.Connection:
         """Open one short-lived SQLite connection for an index operation."""

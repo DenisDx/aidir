@@ -127,6 +127,7 @@ class Core:
             audit_directory,
             secret_metadata_keys=self.config.get("logging.audit.secret_metadata_keys", []),
             emergency_max_total_bytes=self.config.get("logging.audit.emergency_max_total_bytes", 2147483648),
+            max_inline_body_bytes=self.config.get("logging.audit.max_inline_body_bytes", 1048576),
         )
         self.audit_log.start_writer(
             queue_size=self.config.get("logging.audit.writer_queue_size", 256),
@@ -157,6 +158,9 @@ class Core:
             status_change_callback=self._on_task_status_change,
             audit_log=self.audit_log,
         )
+        recovery = await self.queue.recover_startup_tasks()
+        if any(recovery.values()):
+            log("system", "info", f"Task recovery: {recovery}")
 
         # ── Envid registry ─────────────────────────────────────────────────
         self.envid_registry = EnvidRegistry(self.redis, instance)

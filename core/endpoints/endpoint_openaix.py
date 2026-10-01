@@ -550,6 +550,8 @@ class Endpoint_openaix(Endpoint_ollama):
         if route is not None:
             task.config = dict(task.config or {})
             task.config["route"] = route
+            task.route_provider_id = str(route.get("resolved_provider") or "")
+            task.model_id = str(route.get("resolved_model") or "")
         if request_kind != "chat":
             task.config = dict(task.config or {})
             task.config["request_kind"] = request_kind
@@ -973,15 +975,14 @@ class Endpoint_openaix(Endpoint_ollama):
         """Stream OpenAI-compatible SSE chunks converted from Ollama chunks."""
         audit_log = getattr(self._core, "audit_log", None)
         audit_context = getattr(task, "_audit_client_context", None)
-        spool_path = audit_log.open_body_spool() if audit_log is not None and isinstance(audit_context, dict) else None
+        spool = audit_log.open_body_spool() if audit_log is not None and isinstance(audit_context, dict) else None
         try:
             if first_chunk is not None:
                 openai_chunk = self._ollama_chunk_to_openai(first_chunk, task.id, request_body)
                 encoded = f"data: {json.dumps(openai_chunk)}\n\n".encode()
                 yield encoded
-                if spool_path is not None:
-                    with spool_path.open("ab") as spool:
-                        spool.write(encoded)
+                if spool is not None:
+                    spool.write(encoded)
             while True:
                 timeout_phase, remaining = self._task_timeout_phase(task)
                 if remaining is not None and remaining <= 0:
@@ -993,9 +994,8 @@ class Endpoint_openaix(Endpoint_ollama):
                     )
                     encoded = f"data: {json.dumps(err)}\n\n".encode()
                     yield encoded
-                    if spool_path is not None:
-                        with spool_path.open("ab") as spool:
-                            spool.write(encoded)
+                    if spool is not None:
+                        spool.write(encoded)
                     break
 
                 try:
@@ -1010,21 +1010,19 @@ class Endpoint_openaix(Endpoint_ollama):
                 openai_chunk = self._ollama_chunk_to_openai(chunk, task.id, request_body)
                 encoded = f"data: {json.dumps(openai_chunk)}\n\n".encode()
                 yield encoded
-                if spool_path is not None:
-                    with spool_path.open("ab") as spool:
-                        spool.write(encoded)
+                if spool is not None:
+                    spool.write(encoded)
 
             # OpenAI streaming terminator.
             encoded = b"data: [DONE]\n\n"
             yield encoded
-            if spool_path is not None:
-                with spool_path.open("ab") as spool:
-                    spool.write(encoded)
+            if spool is not None:
+                spool.write(encoded)
         finally:
-            if spool_path is not None:
+            if spool is not None:
                 try:
                     event = audit_log.finalize_body_spool(
-                        "client_response", spool_path, content_type="text/event-stream",
+                        "client_response", spool, content_type="text/event-stream",
                         task_id=task.id, request_id=audit_context["request_id"], protocol=audit_context["protocol"],
                         endpoint=audit_context["endpoint"], worker_id=task.worker_id,
                         http={"status_code": 200, "content_type": "text/event-stream"},

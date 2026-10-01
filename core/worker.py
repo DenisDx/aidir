@@ -228,6 +228,7 @@ class BaseWorker:
         error_code: str = "",
         response: dict | None = None,
         response_body: bytes | None = None,
+        response_spool=None,
         response_content_type: str = "application/json",
     ) -> None:
         """Finalize one compact LLM-call summary entry and persist it."""
@@ -261,19 +262,31 @@ class BaseWorker:
         audit_log = getattr(core, "audit_log", None) if core is not None else None
         if audit_log is not None:
             try:
-                event = audit_log.record_body_event(
-                    "llm_response",
-                    response_body if response_body is not None else json.dumps(response or {}, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
-                    task_id=task.id,
-                    exchange_id=f"{task.id}:llm:{entry.get('call_index', 0)}",
-                    exchange_number=entry.get("call_index"),
-                    worker_id=self.id,
-                    provider_id=entry.get("provider_id"),
-                    model=entry.get("model"),
-                    http={"status_code": http_status, "url_path": entry.get("url_path"), "content_type": response_content_type},
-                    terminal_status=status,
-                    error_code=error_code or None,
-                )
+                event_fields = {
+                    "task_id": task.id,
+                    "exchange_id": f"{task.id}:llm:{entry.get('call_index', 0)}",
+                    "exchange_number": entry.get("call_index"),
+                    "worker_id": self.id,
+                    "provider_id": entry.get("provider_id"),
+                    "model": entry.get("model"),
+                    "http": {"status_code": http_status, "url_path": entry.get("url_path"), "content_type": response_content_type},
+                    "terminal_status": status,
+                    "error_code": error_code or None,
+                }
+                if response_spool is not None:
+                    event = audit_log.finalize_body_spool(
+                        "llm_response",
+                        response_spool,
+                        content_type=response_content_type,
+                        **event_fields,
+                    )
+                else:
+                    event = audit_log.record_body_event(
+                        "llm_response",
+                        response_body if response_body is not None else json.dumps(response or {}, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+                        content_type=response_content_type,
+                        **event_fields,
+                    )
                 entry["audit_response_event_id"] = event["event_id"]
             except Exception as exc:
                 log("audit", "error", f"Failed to audit LLM response task={task.id}: {exc}", self.id or "worker")
@@ -287,6 +300,7 @@ class BaseWorker:
         status: str,
         error_code: str = "",
         response_body: bytes | None = None,
+        response_spool=None,
         response_content_type: str = "application/json",
     ) -> None:
         """Finalize the most recent started LLM-call entry when an outer exception interrupts execution."""
@@ -299,6 +313,7 @@ class BaseWorker:
                     status=status,
                     error_code=error_code,
                     response_body=response_body,
+                    response_spool=response_spool,
                     response_content_type=response_content_type,
                 )
                 return

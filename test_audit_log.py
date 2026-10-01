@@ -14,6 +14,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from core.audit_log import AuditLog
+from core.queue_manager import QueueManager
+from core.task import STATUS_COMPLETED, Task
 
 
 class AuditLogTests(unittest.TestCase):
@@ -105,6 +107,33 @@ class AuditLogTests(unittest.TestCase):
             body_path = Path(temporary_directory) / binary_event["body_file"]["relative_path"]
             self.assertEqual(body_path.read_bytes(), b"\x89PNG\r\n\x1a\n")
 
+    def test_finalized_spool_uses_body_policy_and_inline_limit(self):
+        """Classify streamed JSON, text, binary, and large text without retaining all bytes."""
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            audit_log = AuditLog(temporary_directory, max_inline_body_bytes=8)
+            json_spool = audit_log.open_body_spool()
+            json_spool.write(b'{"ok":1}')
+            json_event = audit_log.finalize_body_spool("llm_response", json_spool, content_type="application/json")
+
+            text_spool = audit_log.open_body_spool()
+            text_spool.write(b"hello")
+            text_event = audit_log.finalize_body_spool("llm_response", text_spool, content_type="text/plain")
+
+            binary_spool = audit_log.open_body_spool()
+            binary_spool.write(b"\x89PNG")
+            binary_event = audit_log.finalize_body_spool("llm_response", binary_spool, content_type="image/png")
+
+            large_spool = audit_log.open_body_spool()
+            large_spool.write(b"too-large")
+            large_event = audit_log.finalize_body_spool("llm_response", large_spool, content_type="text/plain")
+
+            self.assertEqual(json_event["data"], {"ok": 1})
+            self.assertEqual(text_event["data"], "hello")
+            self.assertEqual(binary_event["body_storage"], "file")
+            self.assertEqual(large_event["body_storage"], "file")
+            self.assertFalse(json_spool.exists())
+            self.assertFalse(text_spool.exists())
+
     def test_terminal_snapshot_merges_late_client_response_reconciliation(self):
         """Combine append-only late stream references without mutating the terminal record."""
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -125,6 +154,33 @@ class AuditLogTests(unittest.TestCase):
             self.assertEqual(snapshot["raw_event_refs"]["client_request"], ["request-1"])
             self.assertEqual(snapshot["raw_event_refs"]["client_response"], ["response-1"])
 
+    def test_concurrent_terminal_writes_append_one_task_record(self):
+        """Reserve a task terminal record before concurrent writers can append duplicates."""
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            audit_log = AuditLog(temporary_directory)
+            barrier = threading.Barrier(8)
+            events: list[dict] = []
+
+            def write_terminal() -> None:
+                barrier.wait()
+                events.append(audit_log.record_task_terminal(task_id="task-1", status="completed", task={}, raw_event_refs={}))
+
+            writers = [threading.Thread(target=write_terminal) for _ in range(8)]
+            for writer in writers:
+                writer.start()
+            for writer in writers:
+                writer.join(timeout=2)
+                self.assertFalse(writer.is_alive())
+
+            journals = list(audit_log.directory.glob("tasks-*.jsonl"))
+            records = [json.loads(line) for journal in journals for line in journal.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(len(records), 1)
+            self.assertEqual({event["event_id"] for event in events}, {records[0]["event_id"]})
+
+            audit_log.rebuild_index()
+            restarted = AuditLog(temporary_directory)
+            self.assertEqual(restarted.record_task_terminal(task_id="task-1", status="failed", task={}, raw_event_refs={})["event_id"], records[0]["event_id"])
+
     def test_reconciliation_hides_and_completes_interrupted_partition_deletion(self):
         """Hide a deleting partition before recovery removes its journal and index rows."""
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -144,6 +200,8 @@ class AuditLogTests(unittest.TestCase):
             audit_log = AuditLog(temporary_directory)
             stale = audit_log.open_body_spool()
             recent = audit_log.open_body_spool()
+            stale.close()
+            recent.close()
             os.utime(stale, (time.time() - 120, time.time() - 120))
 
             self.assertEqual(audit_log.cleanup_stale_spools(60), 1)
@@ -187,6 +245,44 @@ class AuditLogTests(unittest.TestCase):
                 health = audit_log.health()
                 self.assertEqual(health["status"], "warning")
                 self.assertEqual(health["dropped_events"], 1)
+            finally:
+                release.set()
+                audit_log.stop_writer()
+
+    def test_terminal_record_waits_for_confirmed_task_event_receipts(self):
+        """Reference accepted queued events only after the writer has persisted them."""
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            audit_log = AuditLog(temporary_directory)
+            queue_manager = QueueManager(None, audit_log=audit_log)
+            task = Task(id="task-1", type="agent")
+            task.status = STATUS_COMPLETED
+            started = threading.Event()
+            release = threading.Event()
+            finished = threading.Event()
+            original_append = audit_log._append_record_sync
+
+            def blocked_append(*args, **kwargs):
+                started.set()
+                release.wait(timeout=2)
+                return original_append(*args, **kwargs)
+
+            audit_log.start_writer(queue_size=4, overflow_policy="best_effort")
+            try:
+                with patch.object(audit_log, "_append_record_sync", side_effect=blocked_append):
+                    audit_log.record_client_request(task_id=task.id, data={"sequence": 1})
+                    self.assertTrue(started.wait(timeout=1))
+                    audit_log.record_llm_response(task_id=task.id, data={"sequence": 2})
+                    terminal_thread = threading.Thread(target=lambda: (queue_manager._record_terminal_audit(task), finished.set()))
+                    terminal_thread.start()
+                    self.assertFalse(finished.wait(timeout=0.05))
+                    release.set()
+                    terminal_thread.join(timeout=2)
+                    self.assertTrue(finished.is_set())
+
+                audit_log.stop_writer()
+                snapshot = audit_log.task_terminal_snapshot(task.id)
+                self.assertEqual(len(snapshot["raw_event_refs"]["client_request"]), 1)
+                self.assertEqual(len(snapshot["raw_event_refs"]["llm_responses"]), 1)
             finally:
                 release.set()
                 audit_log.stop_writer()
@@ -259,6 +355,18 @@ class AuditLogTests(unittest.TestCase):
             self.assertTrue(recent_journal.exists())
             self.assertEqual(audit_log.health()["retention_status"], "ok")
 
+    def test_retention_health_is_visible_to_another_audit_log_instance(self):
+        """Expose cron retention results through the Core-owned audit writer instance."""
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            retention_writer = AuditLog(temporary_directory)
+            retention_writer.retain_partitions(max_total_bytes=10**9)
+
+            core_writer = AuditLog(temporary_directory)
+            health = core_writer.health()
+            self.assertEqual(health["retention_status"], "ok")
+            self.assertIsNotNone(health["last_retention_at"])
+            self.assertEqual(health["disk_usage_bytes"], retention_writer.health()["disk_usage_bytes"])
+
     def test_emergency_retention_deletes_closed_but_not_active_partition(self):
         """Emergency quota may remove yesterday's partition but must retain the active local day."""
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -279,6 +387,31 @@ class AuditLogTests(unittest.TestCase):
             self.assertEqual(removed, [closed_day])
             self.assertFalse(closed_journal.exists())
             self.assertTrue(active_journal.exists())
+
+    def test_forced_emergency_retention_stops_after_reaching_target(self):
+        """Avoid deleting later closed partitions after one deletion meets the emergency target."""
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            audit_log = AuditLog(temporary_directory)
+            today = datetime.now().astimezone().date()
+            first_day = (today - timedelta(days=3)).isoformat()
+            second_day = (today - timedelta(days=2)).isoformat()
+            first_journal = audit_log.directory / f"raw_client_requests-{first_day}.jsonl"
+            second_journal = audit_log.directory / f"raw_client_requests-{second_day}.jsonl"
+            first_journal.write_bytes(b"first\n")
+            second_journal.write_bytes(b"second\n")
+
+            with patch.object(audit_log, "disk_usage_bytes", side_effect=[100, 50]), \
+                 patch.object(audit_log, "_partition_usage_bytes", return_value=50):
+                removed = audit_log.retain_partitions(
+                    retention_days=365,
+                    max_total_bytes=50,
+                    emergency_max_total_bytes=50,
+                    force_emergency=True,
+                )
+
+            self.assertEqual(removed, [first_day])
+            self.assertFalse(first_journal.exists())
+            self.assertTrue(second_journal.exists())
 
     def test_enospc_failure_forces_emergency_cleanup_of_closed_partition(self):
         """Free closed audit evidence after an ENOSPC write failure without touching the active day."""

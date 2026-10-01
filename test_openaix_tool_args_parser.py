@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import unittest
 import base64
@@ -172,7 +173,7 @@ class TestOpenAIxToolArgsParser(unittest.TestCase):
             emitted.append(chunk)
 
         async def _run() -> None:
-            data = await worker._consume_stream_response(_FakeStreamResponse(['{"message": {"content": "", "thinking": "hello"}}\n']), _emit, [], [], False)
+            data = await worker._consume_stream_response(_FakeStreamResponse(['{"message": {"content": "", "thinking": "hello"}}\n']), _emit, [], None, False)
             self.assertEqual(data["message"]["content"], "hello")
             self.assertEqual(emitted[0]["message"]["content"], "hello")
 
@@ -936,6 +937,66 @@ class TestWorkerWarningLogs(unittest.IsolatedAsyncioTestCase):
 
 class TestRawCallLogs(unittest.IsolatedAsyncioTestCase):
     """Regression checks for raw request/response call logging."""
+
+    async def test_call_ollama_execute_propagates_cancellation(self) -> None:
+        """Preserve cancellation after finalizing the started Ollama call summary."""
+        worker = CallOllamaWorker()
+        task = Task_agent(payload={"model": "example", "messages": []}, stream=True)
+
+        async def cancelled_forward(*args, **kwargs):
+            await worker._begin_llm_call(task, url="http://example.test/api/chat", payload=task.payload)
+            raise asyncio.CancelledError
+
+        class _AsyncClient:
+            """Minimal async HTTP client context used before the worker forwarder."""
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, traceback):
+                return False
+
+        worker._forward_stream = cancelled_forward
+        with patch("workers.agent.call_ollama.app.httpx.AsyncClient", return_value=_AsyncClient()):
+            with self.assertRaises(asyncio.CancelledError):
+                await worker.execute(task)
+
+        self.assertEqual(task.llm_call_history[0]["status"], "cancelled")
+
+    async def test_internal_tool_cancellation_terminates_child_task(self) -> None:
+        """Terminate an enqueued tool child when its waiting parent is canceled."""
+        worker = OpenAIxWorker()
+        enqueued = asyncio.Event()
+        terminated: list[str] = []
+        deleted: list[str] = []
+
+        class _Core:
+            """Record child lifecycle requests without executing the child worker."""
+
+            async def on_task_added(self, task):
+                self.child = task
+                enqueued.set()
+
+            async def terminate_task(self, task_id: str):
+                terminated.append(task_id)
+
+            async def delete_task(self, task_id: str):
+                deleted.append(task_id)
+
+        core = _Core()
+        worker._core = core
+        parent = Task_agent(payload={"messages": []}, stream=False)
+        parent.context = Context.empty()
+        parent.context.tools = {"blocking": {"worker": "blocking_worker"}}
+
+        running = asyncio.create_task(worker._execute_internal_tool({"name": "blocking", "arguments": {}}, parent))
+        await enqueued.wait()
+        running.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await running
+
+        self.assertEqual(terminated, [core.child.id])
+        self.assertEqual(deleted, [])
 
     async def test_call_ollama_forward_sync_increments_task_llm_call_count(self) -> None:
         """Each non-streaming Ollama upstream call increments task llm_call_count once."""

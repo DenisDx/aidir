@@ -116,10 +116,11 @@ class TestLlamaCppStreamingDiagnostics(unittest.IsolatedAsyncioTestCase):
         entry = task.llm_call_history[0]
         self.assertTrue(result.ok)
         self.assertEqual(entry["request"], payload)
-        self.assertEqual(entry["raw_sse"][-1], "data: [DONE]")
-        self.assertEqual(entry["stream_events"][0]["choices"][0]["delta"]["reasoning_content"], "thinking")
+        self.assertEqual(entry["response"]["final"]["message"]["content"], "answer")
+        self.assertNotIn("raw_sse", entry)
+        self.assertNotIn("stream_events", entry)
         self.assertEqual(emitted[0]["message"]["content"], "answer")
-        self.assertGreaterEqual(len(worker._core.queue.persisted), 3)
+        self.assertGreaterEqual(len(worker._core.queue.persisted), 2)
         records = []
         for journal in worker._core.audit_log.directory.glob("raw_llm_*.jsonl"):
             records.extend(json.loads(line) for line in journal.read_text(encoding="utf-8").splitlines())

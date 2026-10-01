@@ -23,10 +23,6 @@
     // Seconds between size-limit checks. Independent from wipe_period; 0 = never trim.
     "trim_period": ${LOG_TRIM_PERIOD:-60},
     max_log_size: ${MAX_LOG_SIZE:-1048576}, // max size in bytes for individual log files; 0 = unlimited
-    "logs": {
-      "openaix_call_raw_log.jsonl": {"max_log_size": 10485760},
-      "call_llama_cpp_call_raw_log.jsonl": {"max_log_size": 10485760}
-    },
     "audit": {
       "directory": "logs/audit",
       "retention_days": 30,
@@ -34,6 +30,7 @@
       "max_total_bytes": 1073741824,
       "emergency_max_total_bytes": 2147483648,
       "max_spool_age_seconds": 86400,
+      "max_inline_body_bytes": 1048576,
       "secret_metadata_keys": [],
       "writer_queue_size": 256,
       "overflow_policy": "best_effort"
@@ -99,8 +96,6 @@
       },
       // worker used for agent tasks; falls back to workers.default if omitted
       "worker": "openaix",
-      // worker used for pre-agent context building
-      "context_builder_worker": "context_builder",
       "middlewares": [] // TODO: add middleware ids here when needed
     },
     {
@@ -618,7 +613,8 @@
     "queue_timeout": ${TASK_QUEUE_TIMEOUT_SECONDS:-300},
     // Max execution time after the task actually starts running.
     "run_timeout": ${TASK_RUN_TIMEOUT_SECONDS:-300},
-    "external_task_live": ${EXTERNAL_TASK_LIVE_SECONDS:-2500000}
+    // Retain completed external task metadata for one day; set 0 to disable cleanup.
+    "external_task_live": ${EXTERNAL_TASK_LIVE_SECONDS:-86400}
   },
   "envids": {
     "check_period_minutes": ${ENVIDS_CHECK_PERIOD_MINUTES:-600},

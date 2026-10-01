@@ -105,6 +105,31 @@ class EndpointAuditTests(unittest.TestCase):
             self.assertEqual(event["error_code"], "INVALID_REQUEST")
             self.assertNotIn("data", event)
 
+    def test_non_object_json_is_rejected_by_every_task_endpoint(self) -> None:
+        """Reject valid JSON scalars and arrays before task construction."""
+        endpoints = (
+            (Endpoint_ollama({"id": "ollama", "worker": "call_ollama"}), "/api/chat"),
+            (Endpoint_openaix({"id": "openaix", "worker": "openaix"}), "/api/chat"),
+            (Endpoint_openaix({"id": "openaix", "worker": "openaix"}), "/v1/chat/completions"),
+            (Endpoint_openaix({"id": "openaix", "worker": "openaix"}), "/api/embed"),
+            (Endpoint_openaix({"id": "openaix", "worker": "openaix"}), "/v1/embeddings"),
+            (Endpoint_mcp({"id": "mcp", "tools": {"echo": "echo_worker"}}), "/mcp"),
+        )
+        values = (None, [], "text", 1, True)
+
+        for endpoint, path in endpoints:
+            for value in values:
+                with self.subTest(path=path, value=value), tempfile.TemporaryDirectory() as temporary_directory:
+                    core = _Core(AuditLog(temporary_directory))
+                    with TestClient(endpoint.create_app(core)) as client:
+                        response = client.post(path, content=json.dumps(value), headers={"content-type": "application/json"})
+
+                    self.assertEqual(response.status_code, 400)
+                    self.assertEqual(core.tasks, [])
+                    journal = next(core.audit_log.directory.glob("rejected_requests-*.jsonl"))
+                    event = json.loads(journal.read_text(encoding="utf-8"))
+                    self.assertNotIn("data", event)
+
     def test_authorization_rejection_is_compact_and_does_not_create_task(self) -> None:
         """Audit a pre-task authorization failure without retaining its request body."""
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -148,7 +173,7 @@ class EndpointAuditTests(unittest.TestCase):
             self.assertEqual(event["request_id"], "request-mcp-1")
             self.assertEqual(event["data"], json.loads(raw_body))
 
-    def test_stream_chat_records_one_file_backed_response_with_sent_bytes(self) -> None:
+    def test_stream_chat_records_one_inline_response_with_sent_bytes(self) -> None:
         """Capture the complete NDJSON stream once after delivering the same bytes."""
         with tempfile.TemporaryDirectory() as temporary_directory:
             core = _Core(AuditLog(temporary_directory))
@@ -175,12 +200,11 @@ class EndpointAuditTests(unittest.TestCase):
             self.assertEqual(len(records), 1)
             event = records[0]
             self.assertEqual(event["task_id"], task.id)
-            self.assertEqual(event["body_storage"], "file")
-            body_path = core.audit_log.directory / event["body_file"]["relative_path"]
-            self.assertEqual(body_path.read_bytes(), delivered)
+            self.assertEqual(event["body_storage"], "inline")
+            self.assertEqual(event["data"].encode("utf-8"), delivered)
             self.assertEqual(event["body_bytes"], len(delivered))
 
-    def test_openai_stream_records_one_file_backed_response_with_sent_bytes(self) -> None:
+    def test_openai_stream_records_one_inline_response_with_sent_bytes(self) -> None:
         """Capture terminal SSE bytes after OpenAI-compatible stream delivery."""
         with tempfile.TemporaryDirectory() as temporary_directory:
             core = _Core(AuditLog(temporary_directory))
@@ -206,9 +230,8 @@ class EndpointAuditTests(unittest.TestCase):
             records = [json.loads(line) for line in journal.read_text(encoding="utf-8").splitlines()]
             self.assertEqual(len(records), 1)
             event = records[0]
-            body_path = core.audit_log.directory / event["body_file"]["relative_path"]
-            self.assertEqual(event["body_storage"], "file")
-            self.assertEqual(body_path.read_bytes(), delivered)
+            self.assertEqual(event["body_storage"], "inline")
+            self.assertEqual(event["data"].encode("utf-8"), delivered)
             self.assertTrue(delivered.endswith(b"data: [DONE]\n\n"))
 
 

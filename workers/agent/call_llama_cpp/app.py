@@ -67,12 +67,11 @@ class CallLlamaCppWorker(OpenAIxWorker):
             await self._finalize_latest_started_llm_call(task, status="timeout", error_code="UPSTREAM_TIMEOUT")
             return WorkerResult(ok=False, error={"code": "UPSTREAM_TIMEOUT", "message": self._build_timeout_message(exc)})
         except asyncio.CancelledError:
-            raw_parts = getattr(task, "_audit_stream_raw_parts", [])
             await self._finalize_latest_started_llm_call(
                 task,
                 status="cancelled",
                 error_code="CANCELLED",
-                response_body=b"".join(raw_parts),
+                response_spool=getattr(task, "_audit_stream_spool", None),
                 response_content_type="text/event-stream",
             )
             raise
@@ -135,11 +134,7 @@ class CallLlamaCppWorker(OpenAIxWorker):
         provider_id = self._resolve_task_provider_id(task) if task is not None else self._provider_id
         final_data: dict | None = None
         upstream_payload = {**payload, "stream": True}
-        raw_lines: list[str] = []
-        raw_parts: list[bytes] = []
-        if task is not None:
-            task._audit_stream_raw_parts = raw_parts
-        stream_events: list[object] = []
+        response_spool = None
         request = self._build_json_request(client, url, upstream_payload)
         history_entry = await self._begin_llm_call(task, url=url, payload=upstream_payload, provider_id=provider_id, save_call=save_call, request_body=request.content) if task else None
         stream_context = await self._open_stream_request(client, request, upstream_payload)
@@ -151,34 +146,21 @@ class CallLlamaCppWorker(OpenAIxWorker):
                         history_entry["raw_response"] = raw_response.decode("utf-8", errors="replace")
                     await self._finalize_llm_call(task, history_entry, status="http_error", http_status=response.status_code, error_code="UPSTREAM_ERROR", response_body=raw_response, response_content_type=self._response_content_type(response, "application/octet-stream"))
                 return WorkerResult(ok=False, error={"code": "UPSTREAM_ERROR", "message": f"Upstream returned HTTP {response.status_code}"})
-            async for line in self._iter_sse_lines(response, raw_parts):
-                raw_lines.append(line)
+            audit_log = getattr(self._core, "audit_log", None)
+            response_spool = audit_log.open_body_spool() if task is not None and audit_log is not None else None
+            if task is not None:
+                task._audit_stream_spool = response_spool
+            async for line in self._iter_sse_lines(response, response_spool):
                 if not line.startswith("data:"):
-                    if isinstance(history_entry, dict):
-                        history_entry["raw_sse"] = raw_lines
-                        await self._persist_llm_call_diagnostics(task)
                     continue
                 raw = line[5:].strip()
                 if raw == "[DONE]":
-                    if isinstance(history_entry, dict):
-                        history_entry["raw_sse"] = raw_lines
-                        history_entry["stream_events"] = stream_events
-                        await self._persist_llm_call_diagnostics(task, force=True)
                     break
                 try:
-                    raw_event = json.loads(raw)
-                    chunk = self._openai_response_to_ollama(raw_event, streaming=True)
+                    chunk = self._openai_response_to_ollama(json.loads(raw), streaming=True)
                 except (ValueError, TypeError, KeyError):
-                    if isinstance(history_entry, dict):
-                        history_entry["raw_sse"] = raw_lines
-                        await self._persist_llm_call_diagnostics(task)
                     continue
-                stream_events.append(raw_event)
                 final_data = chunk
-                if isinstance(history_entry, dict):
-                    history_entry["raw_sse"] = raw_lines
-                    history_entry["stream_events"] = stream_events
-                    await self._persist_llm_call_diagnostics(task)
                 if emit_chunk:
                     await emit_chunk(chunk)
         if task:
@@ -187,8 +169,8 @@ class CallLlamaCppWorker(OpenAIxWorker):
                 history_entry,
                 status="ok",
                 http_status=200,
-                response={"raw_sse": raw_lines, "stream_events": stream_events, "final": final_data or {}},
-                response_body=b"".join(raw_parts),
+                response={"final": final_data or {}},
+                response_spool=response_spool,
                 response_content_type=self._response_content_type(response, "text/event-stream"),
             )
         if save_call:
@@ -196,19 +178,20 @@ class CallLlamaCppWorker(OpenAIxWorker):
                 self.id,
                 task_id or (task.id if task else ""),
                 upstream_payload,
-                {"raw_sse": raw_lines, "stream_events": stream_events, "final": final_data or {}},
+                {"final": final_data or {}},
             )
         return WorkerResult(ok=True, data=final_data, usage=(final_data or {}).get("usage"))
 
     @staticmethod
-    async def _iter_sse_lines(response, raw_parts: list[bytes]):
+    async def _iter_sse_lines(response, response_spool):
         """Yield decoded SSE lines while retaining each raw transport byte sequence."""
         aiter_raw = getattr(response, "aiter_raw", None)
         if callable(aiter_raw):
             buffer = ""
             decoder = codecs.getincrementaldecoder("utf-8")()
             async for raw_chunk in aiter_raw():
-                raw_parts.append(raw_chunk)
+                if response_spool is not None:
+                    response_spool.write(raw_chunk)
                 buffer += decoder.decode(raw_chunk)
                 while "\n" in buffer:
                     line, buffer = buffer.split("\n", 1)
@@ -219,7 +202,8 @@ class CallLlamaCppWorker(OpenAIxWorker):
             return
 
         async for line in response.aiter_lines():
-            raw_parts.append(line.encode("utf-8") + b"\n")
+            if response_spool is not None:
+                response_spool.write(line.encode("utf-8") + b"\n")
             yield line
 
     @staticmethod

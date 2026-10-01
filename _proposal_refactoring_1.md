@@ -1,7 +1,7 @@
 # Refactoring Plan 1
 
 Date: 2026-10-01
-Status: proposed; no runtime changes are included in this document.
+Status: Execution 1 complete; deferred security work remains out of scope.
 
 ## 1. Scope and Baseline
 
@@ -339,7 +339,7 @@ the next phase. Run the affected focused tests after each phase and the complete
 
 ## Phase 1: Immediate Correctness and Input Contracts
 
-### 1.1 Fix `call_ollama` cancellation handling
+- [x] **1.1 Fix `call_ollama` cancellation handling**
 
 Implement P5 by importing `asyncio` in `workers/agent/call_ollama/app.py` and
 covering cancellation in both synchronous and streaming execution paths. The
@@ -350,7 +350,7 @@ generic worker error.
 **Validation:** cancellation regression tests for sync and stream execution;
 existing Ollama/audit suites remain green.
 
-### 1.2 Reject non-object JSON before endpoint logic
+- [x] **1.2 Reject non-object JSON before endpoint logic**
 
 Implement P6 through one shared `BaseEndpoint` helper that distinguishes invalid
 JSON from a valid JSON value that is not an object. Apply it to all
@@ -360,7 +360,7 @@ existing error envelope, create no task, and write one compact rejection record.
 **Validation:** parameterized tests for `null`, arrays, strings, numbers, and
 booleans on every endpoint family, asserting HTTP 400 rather than HTTP 500.
 
-### 1.3 Stop a child tool when its parent agent is canceled
+- [x] **1.3 Stop a child tool when its parent agent is canceled**
 
 Implement P4 in `OpenAIxWorker._execute_internal_tool()`. Track the enqueued
 child until cleanup completes. On parent cancellation or any abnormal exit,
@@ -373,7 +373,7 @@ does not run or complete afterwards; resource reservations are released.
 
 ## Phase 2: Audit Journal Correctness
 
-### 2.1 Make terminal-event references deterministic
+- [x] **2.1 Make terminal-event references deterministic**
 
 Implement L1. Give queued audit writes a receipt state: persisted, dropped, or
 failed. Before recording a terminal task snapshot, collect only confirmed
@@ -386,7 +386,7 @@ when another event class can legitimately arrive late.
 events, then release it. Verify that every persisted event is reachable from the
 terminal snapshot and that a queue-dropped event is not referenced.
 
-### 2.2 Enforce one terminal record per task
+- [x] **2.2 Enforce one terminal record per task**
 
 Implement L2 inside the writer-owned critical section. Reserve a task ID before
 enqueueing its terminal write and re-check journal/index state immediately
@@ -396,7 +396,7 @@ existing journals at startup.
 **Validation:** concurrently invoke completed, failed, and canceled finalizers
 for one task; assert one `task` JSONL record and one terminal index entry.
 
-### 2.3 Repair retention reporting and emergency stopping condition
+- [x] **2.3 Repair retention reporting and emergency stopping condition**
 
 Implement L5 without changing retention eligibility rules. Store the small
 retention health snapshot in the audit sidecar so a cron-created `AuditLog` and
@@ -408,7 +408,7 @@ minimum deletion and active-partition preservation.
 
 ## Phase 3: Bounded Streaming Storage
 
-### 3.1 Introduce a shared incremental audit spool primitive
+- [x] **3.1 Introduce a shared incremental audit spool primitive**
 
 Implement the minimum common primitive required by L3: one open spool per
 stream, incremental byte count and SHA-256, a bounded decode/parser buffer, and
@@ -426,7 +426,7 @@ HTTP error, timeout, cancellation, and unexpected exception.
 byte equality, one terminal LLM event, bounded in-memory buffering, and no stale
 spool. Add a client stream test covering one open/close lifecycle.
 
-### 3.2 Apply the normal body policy to finished spools
+- [x] **3.2 Apply the normal body policy to finished spools**
 
 Implement L4 using the shared finalizer. A completed spool must be classified
 as valid JSON, UTF-8 text, or file-backed binary/large data by the same policy
@@ -439,7 +439,7 @@ tests verify schema fields and preserve client-delivered bytes.
 
 ## Phase 4: Viewer, Operational Scale, and Deployment Correctness
 
-### 4.1 Complete the summary-only Task Viewer contract
+- [x] **4.1 Complete the summary-only Task Viewer contract**
 
 Implement L6. At task creation, persist a bounded safe request preview plus
 route/provider/model summary as dedicated summary fields. Search must use those
@@ -449,7 +449,7 @@ current smoke-only Viewer search check with asserting API coverage.
 **Validation:** search returns the expected summary fields, excludes raw bodies,
 and does not read the heavy Redis fields in a test double.
 
-### 4.2 Bound Task Viewer search work
+- [x] **4.2 Bound Task Viewer search work**
 
 Implement P8 after 4.1 so the new summary fields are used consistently. Pipeline
 Redis reads per SCAN page and keep only the best requested number of matches in
@@ -458,7 +458,7 @@ a bounded top-k collection. Preserve filters and current ordering.
 **Validation:** a large seeded task dataset returns identical ordered results
 with bounded intermediate memory and no one-request-per-key Redis pattern.
 
-### 4.3 Repair non-security deployment configuration
+- [x] **4.3 Repair non-security deployment configuration**
 
 Implement only the nginx half of P7: render nginx's upstream host and port from
 `WEBUI_HOST` and `WEBUI_PORT` during container startup, then run `nginx -t` on
@@ -468,7 +468,7 @@ out of scope because it belongs to the later security update.
 **Validation:** container/proxy test with a non-default WebUI port verifies both
 an `/api/` request and `/ws/` upgrade through nginx.
 
-### 4.4 Reduce stale external-task accumulation
+- [x] **4.4 Reduce stale external-task accumulation**
 
 Implement F12 from `_proposal_update_1.md` as an operational retention change.
 Choose a lower default lifetime based on the documented task timeout envelope,
@@ -480,7 +480,7 @@ queued and running tasks remain untouched.
 
 ## Phase 5: Queue Restart Recovery
 
-### 5.1 Hydrate persisted queued tasks before scheduling
+- [x] **5.1 Hydrate persisted queued tasks before scheduling**
 
 Implement the queued-task part of P2. Add subtype-aware deserialization from a
 Redis task hash, recover valid queued tasks during Core startup before Scheduler
@@ -490,7 +490,7 @@ discarding unrelated queue entries.
 **Validation:** seed Redis with each supported queued task type, start a new
 Core, and prove each valid task executes exactly once.
 
-### 5.2 Define stale running-task recovery
+- [x] **5.2 Define stale running-task recovery**
 
 Implement the remaining P2 policy explicitly. Unless a worker provides an
 idempotent resumable contract, mark startup-discovered running tasks terminal
@@ -503,7 +503,7 @@ reservations.
 
 ## Phase 6: Retire Proven Legacy Surfaces and Document the Result
 
-### 6.1 Remove obsolete raw-call references
+- [x] **6.1 Remove obsolete raw-call references**
 
 Implement the code/config portion of L7. Remove obsolete raw-call log overrides
 and fixtures from the example configuration and log-maintenance tests. Convert
@@ -513,7 +513,7 @@ has an operational use; otherwise remove the obsolete utility.
 **Validation:** repository search finds no runtime `*_call_raw_log.jsonl`
 writer or configuration reference; focused log/audit tests pass.
 
-### 6.2 Remove the inert queued context-builder surface
+- [x] **6.2 Remove the inert queued context-builder surface**
 
 Implement P9 after a reference/config regression establishes that the
 synchronous OpenAIx context chain is the only supported path. Remove
@@ -524,7 +524,7 @@ unchanged.
 **Validation:** configuration loading and context/tool-injection regressions
 pass, and no shipped configuration advertises the removed queue mode.
 
-### 6.3 Update operator documentation
+- [x] **6.3 Update operator documentation**
 
 Finish L7 by documenting audit storage configuration, retention health, Task
 Viewer raw-event access, stream body behavior, the updated external-task
@@ -536,11 +536,11 @@ against the resulting source and configuration template.
 
 ## Final Validation
 
-1. Run the focused audit, endpoint, worker, queue/scheduler, cron, WebUI, and
-	deployment tests added by these phases.
-2. Run the existing 154-test baseline and JavaScript syntax checks.
-3. Run `git diff --check`.
-4. Perform one restart-recovery integration run with Redis fixtures and one
-	nginx proxy run using a non-default backend port.
-5. Do not include security assertions in this execution; they belong to the
-	later dedicated security update.
+- [x] Run the focused audit, endpoint, worker, queue/scheduler, cron, WebUI,
+  and deployment tests added by these phases.
+- [x] Run the existing 154-test baseline and JavaScript syntax checks.
+- [x] Run `git diff --check`.
+- [x] Perform one restart-recovery integration run with Redis fixtures and one
+  nginx proxy run using a non-default backend port.
+- [x] Do not include security assertions in this execution; they belong to the
+  later dedicated security update.

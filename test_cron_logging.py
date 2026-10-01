@@ -147,8 +147,8 @@ class TestCronLogging(unittest.TestCase):
 
             self.assertLessEqual(log_file.stat().st_size, 100)
 
-    def test_trim_uses_raw_log_size_override(self) -> None:
-        """Uses the larger per-file cap configured for raw request logs."""
+    def test_trim_uses_per_file_size_override(self) -> None:
+        """Uses a larger cap configured for one ordinary log file."""
         with tempfile.TemporaryDirectory() as tmp:
             logs_dir = Path(tmp)
             cron._LOGS_DIR = logs_dir
@@ -158,7 +158,7 @@ class TestCronLogging(unittest.TestCase):
                     "trim_period": 1,
                     "max_log_size": 100,
                     "logs": {
-                        "openaix_call_raw_log.jsonl": {"max_log_size": 200},
+                        "large.jsonl": {"max_log_size": 200},
                     },
                 },
             })
@@ -167,7 +167,7 @@ class TestCronLogging(unittest.TestCase):
                 return True
 
             cron._should_run = _always
-            raw_log = logs_dir / "openaix_call_raw_log.jsonl"
+            raw_log = logs_dir / "large.jsonl"
             normal_log = logs_dir / "worker.log"
             raw_log.write_text("line\n" * 200, encoding="utf-8")
             normal_log.write_text("line\n" * 200, encoding="utf-8")

@@ -1,63 +1,118 @@
-from fastapi.testclient import TestClient
-from unittest.mock import MagicMock, patch
-import os
-import sys
+"""Regression tests for bounded, summary-only Task Viewer search."""
+from __future__ import annotations
 
-# Ensure the webui and core modules are importable
-sys.path.append(os.getcwd())
+import unittest
+from unittest.mock import MagicMock, patch
+
+from fastapi.testclient import TestClient
 
 from webui.backend.app import create_app
 
-class FakeCore:
-    def __init__(self):
+
+class _Pipeline:
+    """Collect batched hash reads for the viewer search fake."""
+
+    def __init__(self, redis):
+        """Keep the Redis fake and requested keys."""
+        self.redis = redis
+        self.keys = []
+
+    def hgetall(self, key):
+        """Queue one hash read."""
+        self.keys.append(key)
+        return self
+
+    async def execute(self):
+        """Return all requested hash values together."""
+        self.redis.executed_batches.append(list(self.keys))
+        return [dict(self.redis.hashes.get(key, {})) for key in self.keys]
+
+
+class _Redis:
+    """Redis fake that exposes one SCAN page and pipeline reads."""
+
+    def __init__(self, hashes):
+        """Store task hashes keyed by Redis key name."""
+        self.hashes = hashes
+        self.scan_calls = 0
+        self.executed_batches = []
+
+    async def scan(self, cursor, match, count):
+        """Return all seeded task keys in one bounded page."""
+        self.scan_calls += 1
+        return 0, list(self.hashes)
+
+    def pipeline(self, transaction=False):
+        """Create a single batched hash-read pipeline."""
+        return _Pipeline(self)
+
+
+class _Core:
+    """Minimal Core surface needed by the Viewer route."""
+
+    def __init__(self, redis):
+        """Initialize request dependencies with the supplied Redis fake."""
         self.config = MagicMock()
-        self.config.get.return_value = {}
-        self.config.get_raw.return_value = {}
-        self.redis = MagicMock()
+        self.config.get.side_effect = lambda key, default=None: "aidir" if key == "instance" else default
+        self.redis = redis
         self.queue = MagicMock()
-        self.workers = MagicMock()
-        self.envid_registry = MagicMock()
+        self.workers = {}
+        self.envid_registry = None
 
-def test_viewer_search():
-    fake_core = FakeCore()
-    
-    # Mocking session/auth. Note: monkeypatching _get_session in the webui.backend.app module
-    # or wherever it's used. Since we import create_app from webui.backend.app,
-    # we patch it there.
-    with patch('webui.backend.app._get_session', return_value={'permissions': ['all'], 'user': 'test_user'}):
-        app = create_app(core=fake_core)
-        client = TestClient(app)
 
-        urls = [
-            "/api/tasks/viewer/search",
-            "/api/tasks/viewer/search?status=completed",
-            "/api/tasks/viewer/search?envid=test-12345"
-        ]
+def _summary(task_id: str, timestamp: str, model: str) -> dict[str, str]:
+    """Build one task hash with malformed heavy fields that search must not decode."""
+    return {
+        "id": task_id,
+        "type": "agent",
+        "status": "completed",
+        "worker_id": "call_ollama",
+        "created_at": timestamp,
+        "updated_at": timestamp,
+        "finished_at": timestamp,
+        "priority": "5",
+        "llm_call_count": "1",
+        "queue_timeout": "300",
+        "run_timeout": "300",
+        "external": "1",
+        "request_preview": f"type=agent model={model} messages=1",
+        "route_provider_id": "local",
+        "model_id": model,
+        "envid": "test-envid",
+        "error_code": "",
+        "payload": "not-json",
+        "result": "not-json",
+        "config": "not-json",
+        "context": "not-json",
+        "llm_call_history": "not-json",
+    }
 
-        # We also need to mock the core's task store or whatever the route uses.
-        # Minimal FakeCore might need search_tasks or similar.
-        # Let's see if it works or which attribute is missing.
-        fake_core.search_tasks = MagicMock(return_value=[])
 
-        for url in urls:
-            response = client.get(url)
-            print(f"URL: {url}")
-            print(f"Status: {response.status_code}")
-            try:
-                data = response.json()
-                if isinstance(data, dict):
-                    count = data.get('total', data.get('count', len(data.get('tasks', []))))
-                else:
-                    count = len(data)
-                print(f"Count: {count}")
-            except:
-                print("JSON parsing failed")
-            print("-" * 10)
+class ViewerSearchTests(unittest.TestCase):
+    """Verify the Viewer search contract against summary-only Redis hashes."""
 
-if __name__ == "__main__":
-    try:
-        test_viewer_search()
-    except Exception as e:
-        print(f"Execution failed: {e}")
-        import traceback
-        traceback.print_exc()
+    def test_search_uses_batched_summary_hashes_only(self):
+        """Return top-k summary rows without decoding any heavy Redis task field."""
+        hashes = {
+            "aidir:task:old": _summary("old", "2026-10-01T10:00:00+00:00", "old-model"),
+            "aidir:task:middle": _summary("middle", "2026-10-01T11:00:00+00:00", "middle-model"),
+            "aidir:task:new": _summary("new", "2026-10-01T12:00:00+00:00", "new-model"),
+        }
+        redis = _Redis(hashes)
+        core = _Core(redis)
+
+        async def session(*args, **kwargs):
+            """Provide an authenticated Viewer session."""
+            return {"permissions": ["all"], "login": "test"}
+
+        with patch("webui.backend.app._get_session", session):
+            response = TestClient(create_app(core)).get("/api/tasks/viewer/search?limit=2&envid=test-envid")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["count"], 3)
+        self.assertEqual([task["id"] for task in body["tasks"]], ["new", "middle"])
+        self.assertEqual(body["tasks"][0]["request_preview"], "type=agent model=new-model messages=1")
+        self.assertEqual(body["tasks"][0]["model_id"], "new-model")
+        self.assertEqual(redis.scan_calls, 1)
+        self.assertEqual(redis.executed_batches, [list(hashes)])

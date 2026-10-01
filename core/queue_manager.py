@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Awaitable, Callable, Optional
 
 import redis.asyncio as aioredis
 
+from core import log
 from core.task import (
     Task,
     STATUS_QUEUED, STATUS_RUNNING,
@@ -41,7 +42,7 @@ class QueueManager:
         self._status_change_callback = status_change_callback
         self._audit_log = audit_log
 
-    _QUEUE_TASK_TYPES = ("agent", "request", "tool", "context_builder")
+    _QUEUE_TASK_TYPES = ("agent", "tool")
 
     # ── Key helpers ──────────────────────────────────────────────────────────
 
@@ -63,6 +64,56 @@ class QueueManager:
         await pipe.execute()
         self._tasks[task.id] = task
         await self._notify_status_change(task)
+
+    async def recover_startup_tasks(self) -> dict[str, int]:
+        """Restore queued tasks and terminalize abandoned running tasks after restart."""
+        recovered = 0
+        quarantined = 0
+        restarted = 0
+
+        for task_type in self._QUEUE_TASK_TYPES:
+            task_ids = await self._redis.zrange(self._q(task_type), 0, -1)
+            for raw_task_id in task_ids:
+                task_id = raw_task_id.decode() if isinstance(raw_task_id, bytes) else str(raw_task_id)
+                raw = await self._redis.hgetall(self._tk(task_id))
+                try:
+                    task = Task.from_redis_hash(raw)
+                    if task.status != STATUS_QUEUED or task.type != task_type:
+                        raise ValueError("queue member does not match a queued task hash")
+                except Exception as exc:
+                    await self._redis.zrem(self._q(task_type), task_id)
+                    await self._redis.hset(
+                        f"{self._ns}:queue:quarantine",
+                        task_id,
+                        json.dumps({"task_type": task_type, "reason": str(exc)}),
+                    )
+                    quarantined += 1
+                    log("system", "warning", f"Quarantined persisted queue entry {task_id}: {exc}")
+                    continue
+                self._tasks[task.id] = task
+                recovered += 1
+
+        async for raw_key in self._redis.scan_iter(match=f"{self._ns}:task:*", count=200):
+            key = raw_key.decode() if isinstance(raw_key, bytes) else str(raw_key)
+            raw = await self._redis.hgetall(key)
+            if raw.get("status") != STATUS_RUNNING:
+                continue
+            task_id = str(raw.get("id") or key.rsplit(":", 1)[-1])
+            now = datetime.now(timezone.utc).isoformat()
+            error = {"code": "SERVICE_RESTARTED", "message": "Task interrupted by service restart"}
+            pipe = self._redis.pipeline(transaction=True)
+            pipe.hset(self._tk(task_id), mapping={
+                "status": STATUS_FAILED,
+                "updated_at": now,
+                "finished_at": now,
+                "error": json.dumps(error),
+            })
+            for task_type in self._QUEUE_TASK_TYPES:
+                pipe.zrem(self._q(task_type), task_id)
+            await pipe.execute()
+            restarted += 1
+
+        return {"recovered": recovered, "quarantined": quarantined, "restarted": restarted}
 
     async def pop_next(self, task_type: str) -> Optional[str]:
         """Pop the highest-priority (lowest score) task id from the queue."""
@@ -119,6 +170,7 @@ class QueueManager:
             "updated_at":  now.isoformat(),
             "finished_at": task.finished_at.isoformat(),
             "error":       json.dumps(error),
+            "error_code":  str(error.get("code") or ""),
         })
         await task._chunk_queue.put(None)   # stream sentinel
         task._done_event.set()
@@ -330,7 +382,7 @@ class QueueManager:
         try:
             route = task.config.get("route") if isinstance(task.config, dict) else {}
             route = route if isinstance(route, dict) else {}
-            events = self._audit_log.list_task_events(task.id)
+            events = self._audit_log.confirmed_task_events(task.id)
             references: dict[str, list[str]] = {
                 "client_request": [],
                 "client_response": [],
