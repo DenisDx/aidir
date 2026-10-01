@@ -11,6 +11,7 @@ from typing import Awaitable, Callable
 import httpx
 
 from core.call_log import save_llm_call
+from core.generation_options import OLLAMA_TO_OPENAI_OPTION_FIELDS
 from core.local_server_manager import LocalServerError
 from core.task import Task
 from core.task_types.task_agent import Task_agent
@@ -79,23 +80,25 @@ class CallLlamaCppWorker(OpenAIxWorker):
     @classmethod
     def _to_openai_payload(cls, payload: dict, stream: bool) -> dict:
         """Convert the internal Ollama-shaped task payload to OpenAI chat-completions syntax."""
-        out = {"model": payload.get("model", ""), "messages": list(payload.get("messages") or []), "stream": bool(stream)}
-        for key in ("tools", "tool_choice", "stop", "response_format"):
-            if key in payload:
-                out[key] = payload[key]
+        internal_fields = {
+            "context_builder", "envid", "log", "options", "priority", "queue_timeout",
+            "request_kind", "timeout", "worker",
+        }
+        out = {
+            key: value
+            for key, value in payload.items()
+            if key not in internal_fields and key not in {"model", "messages", "stream", "num_predict"}
+        }
+        out["model"] = payload.get("model", "")
+        out["messages"] = list(payload.get("messages") or [])
+        out["stream"] = bool(stream)
 
         options = payload.get("options") if isinstance(payload.get("options"), dict) else {}
-        option_map = {
-            "temperature": "temperature",
-            "top_p": "top_p",
-            "num_predict": "max_tokens",
-            "seed": "seed",
-            "presence_penalty": "presence_penalty",
-            "frequency_penalty": "frequency_penalty",
-        }
-        for source, destination in option_map.items():
-            value = payload.get(source, options.get(source))
-            if value is not None:
+        for source, destination in OLLAMA_TO_OPENAI_OPTION_FIELDS.items():
+            value = payload.get(source)
+            if value is None:
+                value = options.get(source)
+            if value is not None and destination not in out:
                 out[destination] = value
         return out
 

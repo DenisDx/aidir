@@ -28,8 +28,41 @@ class TestLlamaCppWorker(unittest.TestCase):
 
         self.assertEqual(payload["model"], "model")
         self.assertTrue(payload["stream"])
-        self.assertEqual(payload["max_tokens"], 12)
+        self.assertEqual(payload["max_completion_tokens"], 12)
         self.assertEqual(payload["temperature"], 0.3)
+
+    def test_preserves_openai_parameters_and_completion_limit(self) -> None:
+        """Forward OpenAI fields unchanged and prefer their explicit completion limit."""
+        payload = CallLlamaCppWorker._to_openai_payload(
+            {
+                "model": "model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_completion_tokens": 17,
+                "reasoning_effort": "low",
+                "custom_upstream_option": {"enabled": True},
+                "options": {"num_predict": 12},
+            },
+            stream=False,
+        )
+
+        self.assertEqual(payload["max_completion_tokens"], 17)
+        self.assertEqual(payload["reasoning_effort"], "low")
+        self.assertEqual(payload["custom_upstream_option"], {"enabled": True})
+
+    def test_converts_ollama_options_to_openai_generation_fields(self) -> None:
+        """Translate compatible Ollama options for the llama.cpp OpenAI API."""
+        payload = CallLlamaCppWorker._to_openai_payload(
+            {
+                "model": "model",
+                "messages": [],
+                "options": {"num_predict": 24, "repeat_penalty": 1.1, "top_k": 40},
+            },
+            stream=False,
+        )
+
+        self.assertEqual(payload["max_completion_tokens"], 24)
+        self.assertEqual(payload["repetition_penalty"], 1.1)
+        self.assertEqual(payload["top_k"], 40)
 
     def test_converts_openai_response_to_ollama(self) -> None:
         """Maps OpenAI message and usage fields to the internal endpoint response shape."""

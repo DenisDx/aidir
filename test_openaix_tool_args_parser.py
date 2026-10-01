@@ -1359,6 +1359,22 @@ class TestOpenAIxGenerationParameters(unittest.TestCase):
         self.assertEqual(payload["repeat_last_n"], 72)
         self.assertEqual(payload["num_predict"], 333)
 
+    def test_openai_request_mapping_retains_unknown_openai_fields(self) -> None:
+        """Keep OpenAI-compatible fields for a same-protocol upstream worker."""
+        payload = Endpoint_openaix._openai_request_to_ollama(
+            {
+                "model": "qwen3",
+                "messages": [{"role": "user", "content": "Hi"}],
+                "max_completion_tokens": 123,
+                "reasoning_effort": "low",
+                "custom_upstream_option": {"enabled": True},
+            }
+        )
+
+        self.assertEqual(payload["max_completion_tokens"], 123)
+        self.assertEqual(payload["reasoning_effort"], "low")
+        self.assertEqual(payload["custom_upstream_option"], {"enabled": True})
+
     def test_build_task_for_payload_applies_worker_generation_defaults(self) -> None:
         """Stores per-worker generation defaults in task payload so they are persisted with the task."""
         endpoint = Endpoint_openaix({"id": "openaix", "worker": "openaix"})
@@ -1453,12 +1469,14 @@ class TestOpenAIxGenerationParameters(unittest.TestCase):
                 "repetition_penalty": 1.17,
                 "repeat_last_n": 48,
                 "num_predict": 321,
+                "max_completion_tokens": 257,
                 "max_tokens": 123,
                 "seed": 77,
                 "presence_penalty": 0.45,
                 "frequency_penalty": 0.55,
                 "top_k": 27,
                 "min_p": 0.04,
+                "stop": ["END"],
                 "options": {"repeat_penalty": 1.05, "seed": 9},
             },
             stream=False,
@@ -1471,12 +1489,13 @@ class TestOpenAIxGenerationParameters(unittest.TestCase):
                 "top_p": 0.88,
                 "repeat_penalty": 1.05,
                 "repeat_last_n": 48,
-                "num_predict": 321,
+                "num_predict": 257,
                 "seed": 9,
                 "presence_penalty": 0.45,
                 "frequency_penalty": 0.55,
                 "top_k": 27,
                 "min_p": 0.04,
+                "stop": ["END"],
             },
         )
         self.assertIs(normalized.get("think"), False)

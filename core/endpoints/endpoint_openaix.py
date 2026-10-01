@@ -24,6 +24,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from core import log
 from core.error_logging import attach_request_id_middleware, get_or_create_request_id, log_exception
 from core.endpoints.endpoint_ollama import Endpoint_ollama
+from core.generation_options import GENERATION_OPTION_FIELDS
 from core.request_limits import RequestBodyLimitMiddleware
 from core.smart_router import SmartRouteError, SmartRouter
 from core.task import STATUS_CANCELED, STATUS_COMPLETED, STATUS_FAILED
@@ -33,20 +34,7 @@ class Endpoint_openaix(Endpoint_ollama):
     """Endpoint implementing OpenAI-compatible API plus limited /api/chat."""
 
     api = "openaix"
-    _GENERATION_OPTION_FIELDS = {
-        "temperature": "temperature",
-        "top_p": "top_p",
-        "repeat_penalty": "repeat_penalty",
-        "repetition_penalty": "repeat_penalty",
-        "repeat_last_n": "repeat_last_n",
-        "num_predict": "num_predict",
-        "max_tokens": "num_predict",
-        "seed": "seed",
-        "presence_penalty": "presence_penalty",
-        "frequency_penalty": "frequency_penalty",
-        "top_k": "top_k",
-        "min_p": "min_p",
-    }
+    _GENERATION_OPTION_FIELDS = GENERATION_OPTION_FIELDS
 
     def __init__(self, endpoint_cfg: dict) -> None:
         super().__init__(endpoint_cfg)
@@ -742,47 +730,10 @@ class Endpoint_openaix(Endpoint_ollama):
     @staticmethod
     def _openai_request_to_ollama(body: dict) -> dict:
         """Convert OpenAI chat.completions request to Ollama /api/chat payload."""
-        payload = {
-            "model": body.get("model", ""),
-            "messages": body.get("messages", []),
-            "stream": bool(body.get("stream", False)),
-        }
-
-        # Keep explicit worker override if caller uses aidir extension.
-        if "worker" in body:
-            payload["worker"] = body["worker"]
-
-        if "queue_timeout" in body:
-            payload["queue_timeout"] = body["queue_timeout"]
-
-        if "timeout" in body:
-            payload["timeout"] = body["timeout"]
-
-        # Pass through selected optional fields when present.
-        passthrough = [
-            "envid",
-            "context_builder",
-            "log",
-            "options",
-            "tools",
-            "tool_choice",
-            "temperature",
-            "top_p",
-            "repeat_penalty",
-            "repetition_penalty",
-            "repeat_last_n",
-            "num_predict",
-            "max_tokens",
-            "seed",
-            "presence_penalty",
-            "frequency_penalty",
-            "top_k",
-            "min_p",
-            "stop",
-        ]
-        for key in passthrough:
-            if key in body:
-                payload[key] = body[key]
+        payload = dict(body)
+        payload["model"] = body.get("model", "")
+        payload["messages"] = body.get("messages", [])
+        payload["stream"] = bool(body.get("stream", False))
 
         return payload
 

@@ -30,6 +30,7 @@ from core import log
 from core.call_log import save_llm_call
 from core.context import Context
 from core.error_logging import log_exception
+from core.generation_options import GENERATION_OPTION_FIELDS
 from core.task import Task, STATUS_COMPLETED, STATUS_FAILED, STATUS_CANCELED
 from core.task_types.task_agent import Task_agent
 from core.task_types.task_tool import Task_tool
@@ -46,20 +47,7 @@ class OpenAIxWorker(BaseWorker):
         "UPSTREAM_ERROR",
         "UPSTREAM_INVALID_JSON",
     }
-    _GENERATION_OPTION_FIELDS = {
-        "temperature": "temperature",
-        "top_p": "top_p",
-        "repeat_penalty": "repeat_penalty",
-        "repetition_penalty": "repeat_penalty",
-        "repeat_last_n": "repeat_last_n",
-        "num_predict": "num_predict",
-        "max_tokens": "num_predict",
-        "seed": "seed",
-        "presence_penalty": "presence_penalty",
-        "frequency_penalty": "frequency_penalty",
-        "top_k": "top_k",
-        "min_p": "min_p",
-    }
+    _GENERATION_OPTION_FIELDS = GENERATION_OPTION_FIELDS
 
     def __init__(self) -> None:
         self._base_url: str = "http://127.0.0.1:11434"
@@ -429,7 +417,6 @@ class OpenAIxWorker(BaseWorker):
             "worker",
             "tools",
             "tool_choice",
-            "stop",
             "think",
             "response_format",
         ]
@@ -439,7 +426,12 @@ class OpenAIxWorker(BaseWorker):
 
         options = payload.get("options")
         out_options = dict(options) if isinstance(options, dict) else {}
+        completion_limit = payload.get("max_completion_tokens")
+        if completion_limit is not None:
+            out_options["num_predict"] = completion_limit
         for field_name, option_name in cls._GENERATION_OPTION_FIELDS.items():
+            if option_name == "num_predict" and completion_limit is not None:
+                continue
             field_value = payload.get(field_name)
             if field_value is None or out_options.get(option_name) is not None:
                 continue

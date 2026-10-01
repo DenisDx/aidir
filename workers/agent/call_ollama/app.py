@@ -27,6 +27,7 @@ import httpx
 
 from core.call_log import save_llm_call
 from core.error_logging import log_exception
+from core.generation_options import GENERATION_OPTION_FIELDS
 from core.worker import BaseWorker, WorkerResult
 from core.task import Task
 from core.task_types.task_agent import Task_agent
@@ -37,20 +38,7 @@ class CallOllamaWorker(BaseWorker):
     """Proxy worker: forwards agent tasks to upstream Ollama API."""
 
     task_type = "agent"
-    _GENERATION_OPTION_FIELDS = {
-        "temperature": "temperature",
-        "top_p": "top_p",
-        "repeat_penalty": "repeat_penalty",
-        "repetition_penalty": "repeat_penalty",
-        "repeat_last_n": "repeat_last_n",
-        "num_predict": "num_predict",
-        "max_tokens": "num_predict",
-        "seed": "seed",
-        "presence_penalty": "presence_penalty",
-        "frequency_penalty": "frequency_penalty",
-        "top_k": "top_k",
-        "min_p": "min_p",
-    }
+    _GENERATION_OPTION_FIELDS = GENERATION_OPTION_FIELDS
 
     def __init__(self) -> None:
         self._base_url: str = "http://127.0.0.1:11434"
