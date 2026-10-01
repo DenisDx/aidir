@@ -55,6 +55,19 @@ class RequestBodyLimitMiddlewareTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sent[0]["status"], 200)
         self.assertEqual(sent[1]["body"], b"hello")
 
+    async def test_replay_waits_for_the_real_disconnect_after_the_body(self):
+        """Avoid an empty-request busy loop in streaming response disconnect listeners."""
+        source_messages = [{"type": "http.disconnect"}]
+
+        async def receive():
+            """Return the real disconnect event after the middleware consumed the body."""
+            return source_messages.pop(0)
+
+        replay = RequestBodyLimitMiddleware._replay_receive(b"{}", False, receive)
+
+        self.assertEqual(await replay(), {"type": "http.request", "body": b"{}", "more_body": False})
+        self.assertEqual(await replay(), {"type": "http.disconnect"})
+
     async def test_rejects_oversized_content_length_without_reading_body(self):
         """Return HTTP 413 before calling receive when Content-Length exceeds the limit."""
         middleware = RequestBodyLimitMiddleware(lambda *_: None, 5)

@@ -249,7 +249,7 @@
     return line;
   }
 
-  function jsonTreeNode(value, key, depth) {
+  function jsonTreeNode(value, key, depth, expanded) {
     if (value === null) return primitiveNode(key, 'json-null', 'null');
     if (typeof value === 'string') return primitiveNode(key, 'json-string', JSON.stringify(value));
     if (typeof value === 'number') return primitiveNode(key, 'json-number', String(value));
@@ -257,7 +257,7 @@
 
     if (Array.isArray(value)) {
       const details = document.createElement('details');
-      if (depth <= 1) details.open = true;
+      if (expanded && depth <= 1) details.open = true;
       const summary = document.createElement('summary');
       const line = createElement('span', 'json-tree-summary-line');
       if (key !== null && key !== undefined) {
@@ -270,7 +270,7 @@
       if (!value.length) {
         children.appendChild(createElement('div', 'json-tree-line', '[]'));
       } else {
-        value.forEach((item, index) => children.appendChild(jsonTreeNode(item, index, depth + 1)));
+        value.forEach((item, index) => children.appendChild(jsonTreeNode(item, index, depth + 1, expanded)));
       }
       details.appendChild(children);
       return details;
@@ -279,7 +279,7 @@
     if (typeof value === 'object') {
       const entries = Object.entries(value);
       const details = document.createElement('details');
-      if (depth <= 1) details.open = true;
+      if (expanded && depth <= 1) details.open = true;
       const summary = document.createElement('summary');
       const line = createElement('span', 'json-tree-summary-line');
       if (key !== null && key !== undefined) {
@@ -292,7 +292,7 @@
       if (!entries.length) {
         children.appendChild(createElement('div', 'json-tree-line', '{}'));
       } else {
-        entries.forEach(([childKey, childValue]) => children.appendChild(jsonTreeNode(childValue, childKey, depth + 1)));
+        entries.forEach(([childKey, childValue]) => children.appendChild(jsonTreeNode(childValue, childKey, depth + 1, expanded)));
       }
       details.appendChild(children);
       return details;
@@ -301,9 +301,9 @@
     return primitiveNode(key, 'json-string', JSON.stringify(String(value)));
   }
 
-  function renderJsonTree(value) {
+  function renderJsonTree(value, expanded = true) {
     const root = createElement('div', 'json-tree');
-    root.appendChild(jsonTreeNode(value, null, 0));
+    root.appendChild(jsonTreeNode(value, null, 0, expanded));
     return root;
   }
 

@@ -572,6 +572,7 @@ class Core:
 # ── Server builders ───────────────────────────────────────────────────────────
 
 _UVICORN_GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS = 5.0
+_SERVICE_TASK_SHUTDOWN_TIMEOUT_SECONDS = _UVICORN_GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS + 2.0
 
 
 class _Server(uvicorn.Server):
@@ -710,7 +711,10 @@ async def main() -> None:
             srv.should_exit = True
         servers_elapsed = time.monotonic() - servers_started
         log("core", "info", f"All server stop requests sent in {servers_elapsed:.2f}s (source={source})")
-        stopped_cleanly = await _wait_for_service_tasks(service_tasks, timeout=5.0)
+        stopped_cleanly = await _wait_for_service_tasks(
+            service_tasks,
+            timeout=_SERVICE_TASK_SHUTDOWN_TIMEOUT_SECONDS,
+        )
         log("core", "info", f"Service task shutdown complete clean={stopped_cleanly}")
         
         total_elapsed = time.monotonic() - shutdown_started

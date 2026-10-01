@@ -5,7 +5,7 @@ import asyncio
 import tempfile
 import unittest
 
-from core.app import _build_server_config, _wait_for_service_tasks
+from core.app import _SERVICE_TASK_SHUTDOWN_TIMEOUT_SECONDS, _build_server_config, _wait_for_service_tasks
 from core.app import Core
 from core.audit_log import AuditLog
 
@@ -36,10 +36,11 @@ class ShutdownLifecycleTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(audit_log.stop_writer(timeout=1.0))
 
     async def test_server_config_bounds_stream_connection_shutdown(self):
-        """Set a deadline for Uvicorn tasks that outlive listener shutdown."""
+        """Give Uvicorn time to cancel connection tasks before outer cancellation."""
         config = _build_server_config(lambda scope, receive, send: None, "127.0.0.1", 0)
 
         self.assertEqual(config.timeout_graceful_shutdown, 5.0)
+        self.assertGreater(_SERVICE_TASK_SHUTDOWN_TIMEOUT_SECONDS, config.timeout_graceful_shutdown)
 
     async def test_sigterm_drains_active_tasks_for_five_seconds_before_canceling(self):
         """Give active work a short drain window before cancellation."""

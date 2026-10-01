@@ -25,6 +25,10 @@ let taskViewerMetaLoading = null;
 let taskViewerRows = [];
 let taskViewerWorkersMeta = [];
 let taskViewerUiBound = false;
+let taskViewerModalCopyText = '';
+let taskViewerModalJsonValue = null;
+let taskViewerModalJsonText = '';
+let taskViewerModalJsonMode = 'tree';
 
 const TEXT_PICKERS = [
   {
@@ -780,9 +784,98 @@ function resetTaskViewerFilters() {
   $('task-viewer-summary').textContent = 'Filters cleared.';
 }
 
+function setTaskViewerModalCopyText(text) {
+  taskViewerModalCopyText = String(text || '');
+  const copyButton = $('task-json-modal-copy');
+  copyButton.disabled = !taskViewerModalCopyText;
+}
+
+function renderTaskViewerModalJson() {
+  const body = $('task-json-modal-body');
+  const textButton = $('task-json-modal-text');
+  textButton.hidden = false;
+  if (taskViewerModalJsonMode === 'text') {
+    textButton.textContent = 'Tree';
+    textButton.title = 'Show JSON as tree';
+    body.classList.add('is-text');
+    body.replaceChildren(document.createTextNode(taskViewerModalJsonText));
+    return;
+  }
+  textButton.textContent = 'Text';
+  textButton.title = 'Show JSON as text';
+  body.classList.remove('is-text');
+  const viewer = window.TaskStepsViewer;
+  const tree = viewer && typeof viewer.renderJsonTree === 'function'
+    ? viewer.renderJsonTree(taskViewerModalJsonValue, false)
+    : document.createTextNode(taskViewerModalJsonText);
+  body.replaceChildren(tree);
+}
+
+function openTaskViewerJsonModal(title, subtitle, value) {
+  const modal = $('task-json-modal');
+  taskViewerModalJsonValue = value;
+  taskViewerModalJsonText = JSON.stringify(value, null, 2);
+  taskViewerModalJsonMode = 'tree';
+  setTaskViewerModalCopyText(taskViewerModalJsonText);
+  $('task-json-modal-title').textContent = title;
+  $('task-json-modal-subtitle').textContent = subtitle;
+  renderTaskViewerModalJson();
+  modal.classList.add('is-open');
+  modal.setAttribute('aria-hidden', 'false');
+}
+
+function toggleTaskViewerModalJsonMode() {
+  if (taskViewerModalJsonValue === null) return;
+  taskViewerModalJsonMode = taskViewerModalJsonMode === 'tree' ? 'text' : 'tree';
+  renderTaskViewerModalJson();
+}
+
+async function copyTaskViewerModalJson() {
+  if (!taskViewerModalCopyText) return;
+  const copyButton = $('task-json-modal-copy');
+  try {
+    if (navigator.clipboard?.writeText) {
+      try {
+        await navigator.clipboard.writeText(taskViewerModalCopyText);
+      } catch (error) {
+        const textarea = document.createElement('textarea');
+        textarea.value = taskViewerModalCopyText;
+        textarea.setAttribute('readonly', '');
+        textarea.style.position = 'fixed';
+        textarea.style.opacity = '0';
+        document.body.appendChild(textarea);
+        textarea.select();
+        const copied = document.execCommand('copy');
+        textarea.remove();
+        if (!copied) throw error;
+      }
+    } else {
+      const textarea = document.createElement('textarea');
+      textarea.value = taskViewerModalCopyText;
+      textarea.setAttribute('readonly', '');
+      textarea.style.position = 'fixed';
+      textarea.style.opacity = '0';
+      document.body.appendChild(textarea);
+      textarea.select();
+      const copied = document.execCommand('copy');
+      textarea.remove();
+      if (!copied) throw new Error('Clipboard copy was rejected');
+    }
+    copyButton.textContent = 'Copied';
+  } catch (error) {
+    copyButton.textContent = 'Copy failed';
+  }
+  window.setTimeout(() => {
+    copyButton.textContent = 'Copy';
+  }, 1500);
+}
+
 function openTaskViewerTextModal(title, subtitle, bodyText) {
   const modal = $('task-json-modal');
   const body = $('task-json-modal-body');
+  taskViewerModalJsonValue = null;
+  $('task-json-modal-text').hidden = true;
+  setTaskViewerModalCopyText(bodyText);
   $('task-json-modal-title').textContent = title;
   $('task-json-modal-subtitle').textContent = subtitle;
   body.classList.add('is-text');
@@ -792,9 +885,12 @@ function openTaskViewerTextModal(title, subtitle, bodyText) {
   modal.setAttribute('aria-hidden', 'false');
 }
 
-function openTaskViewerNodeModal(title, subtitle, bodyNode) {
+function openTaskViewerNodeModal(title, subtitle, bodyNode, copyText = '') {
   const modal = $('task-json-modal');
   const body = $('task-json-modal-body');
+  taskViewerModalJsonValue = null;
+  $('task-json-modal-text').hidden = true;
+  setTaskViewerModalCopyText(copyText);
   $('task-json-modal-title').textContent = title;
   $('task-json-modal-subtitle').textContent = subtitle;
   body.classList.remove('is-text');
@@ -808,12 +904,13 @@ function openTaskViewerNodeModal(title, subtitle, bodyNode) {
 
 function openTaskViewerModal(task) {
   const subtitle = `${task.status || 'created'} · ${task.worker_id || 'no worker'}${task.envid ? ` · envid ${task.envid}` : ''} · ${Number(task.llm_call_count || 0)} LLM calls`;
+  const taskJson = JSON.stringify(task, null, 2);
   const viewer = window.TaskStepsViewer;
   if (viewer && typeof viewer.renderTaskDetailsView === 'function') {
-    openTaskViewerNodeModal(`Task ${task.id || ''} details`, subtitle, viewer.renderTaskDetailsView(task));
+    openTaskViewerNodeModal(`Task ${task.id || ''} details`, subtitle, viewer.renderTaskDetailsView(task), taskJson);
     return;
   }
-  openTaskViewerTextModal(`Task ${task.id || ''} JSON`, subtitle, JSON.stringify(task, null, 2));
+  openTaskViewerJsonModal(`Task ${task.id || ''} JSON`, subtitle, task);
 }
 
 function closeTaskViewerModal() {
@@ -830,7 +927,7 @@ async function openTaskViewerJson(taskId) {
     window.alert('Request audit data is unavailable');
     return;
   }
-  openTaskViewerTextModal(`Task ${taskId} request`, 'Lazy-loaded audit event', JSON.stringify(data.event, null, 2));
+  openTaskViewerJsonModal(`Task ${taskId} request`, 'Lazy-loaded audit event', data.event);
 }
 
 function taskViewerLogFile(task) {
@@ -876,7 +973,7 @@ async function openTaskViewerSteps(task) {
         `/api/tasks/viewer/${encodeURIComponent(taskId)}/raw?type=${encodeURIComponent(event.type)}&event_id=${encodeURIComponent(event.event_id)}`,
       );
       if (raw?.event) {
-        openTaskViewerTextModal(`Task ${taskId} ${event.type}`, 'Lazy-loaded audit event', JSON.stringify(raw.event, null, 2));
+        openTaskViewerJsonModal(`Task ${taskId} ${event.type}`, 'Lazy-loaded audit event', raw.event);
         files.replaceChildren();
         const fileReferences = [raw.event.body_file, ...(Array.isArray(raw.event.attachments) ? raw.event.attachments : [])];
         for (const fileReference of fileReferences) {
@@ -1045,6 +1142,8 @@ function bindTaskViewerUi() {
   $('task-viewer-show-btn').addEventListener('click', loadTaskViewerTasks);
   $('task-viewer-clear-btn').addEventListener('click', resetTaskViewerFilters);
   $('task-viewer-worker-type').addEventListener('change', applyTaskViewerWorkerTypeFilter);
+  $('task-json-modal-text').addEventListener('click', toggleTaskViewerModalJsonMode);
+  $('task-json-modal-copy').addEventListener('click', copyTaskViewerModalJson);
   $('task-json-modal-close').addEventListener('click', closeTaskViewerModal);
   $('task-json-modal-backdrop').addEventListener('click', closeTaskViewerModal);
 

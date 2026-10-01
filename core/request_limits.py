@@ -50,7 +50,7 @@ class RequestBodyLimitMiddleware:
             await self._reject(scope, send, received_size)
             return
 
-        await self.app(scope, self._replay_receive(body, disconnected), send)
+        await self.app(scope, self._replay_receive(body, disconnected, receive), send)
 
     @staticmethod
     def _declared_size(scope: dict) -> int | None:
@@ -85,17 +85,23 @@ class RequestBodyLimitMiddleware:
                 return b"".join(chunks), False, received_size
 
     @staticmethod
-    def _replay_receive(body: bytes, disconnected: bool) -> Callable[[], Awaitable[dict]]:
-        """Return a receive callable that replays a buffered body once to the wrapped app."""
+    def _replay_receive(
+        body: bytes,
+        disconnected: bool,
+        receive: Callable[[], Awaitable[dict]],
+    ) -> Callable[[], Awaitable[dict]]:
+        """Replay a buffered body once, then await the original receive channel."""
         delivered = False
 
         async def replay() -> dict:
-            """Deliver the buffered body, then report normal request completion."""
+            """Deliver the buffered body, then wait for the actual disconnect event."""
             nonlocal delivered
             if not delivered:
                 delivered = True
                 return {"type": "http.request", "body": body, "more_body": False}
-            return {"type": "http.disconnect"} if disconnected else {"type": "http.request", "body": b"", "more_body": False}
+            if disconnected:
+                return {"type": "http.disconnect"}
+            return await receive()
 
         return replay
 
