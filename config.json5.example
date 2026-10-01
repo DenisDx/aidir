@@ -27,6 +27,17 @@
       "openaix_call_raw_log.jsonl": {"max_log_size": 10485760},
       "call_llama_cpp_call_raw_log.jsonl": {"max_log_size": 10485760}
     },
+    "audit": {
+      "directory": "logs/audit",
+      "retention_days": 30,
+      "retention_period": 3600,
+      "max_total_bytes": 1073741824,
+      "emergency_max_total_bytes": 2147483648,
+      "max_spool_age_seconds": 86400,
+      "secret_metadata_keys": [],
+      "writer_queue_size": 256,
+      "overflow_policy": "best_effort"
+    },
     "levels": { // thresholds for individual per-type log files
       "workers": "warning",
       "http": "warning",
@@ -38,6 +49,10 @@
       "http": 3, // INFO
       "webui": 3
     }
+  },
+  "http": {
+    // Maximum accepted inbound request-body size in bytes (100 MiB).
+    "max_request_size": 104857600
   },
   // Resources to track (VRAM etc).
   // alive_time: seconds model stays in VRAM after last task (Ollama default is 300s).

@@ -25,6 +25,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from core.endpoint import BaseEndpoint
 from core.error_logging import attach_request_id_middleware, get_or_create_request_id, log_exception
+from core.request_limits import RequestBodyLimitMiddleware
 from core.smart_router import SmartRouteError, SmartRouter
 from core.task_types.task_agent import Task_agent
 from core.task import STATUS_COMPLETED, STATUS_FAILED, STATUS_CANCELED
@@ -60,6 +61,11 @@ class Endpoint_ollama(BaseEndpoint):
     def create_app(self, core: "Core") -> FastAPI:
         self._core = core
         app = FastAPI(title=f"aidir-{self.id}", docs_url=None, redoc_url=None)
+        app.add_middleware(
+            RequestBodyLimitMiddleware,
+            max_request_size=core.config.get("http.max_request_size", 104857600),
+            audit_log=getattr(core, "audit_log", None),
+        )
         attach_request_id_middleware(app)
 
         @app.exception_handler(Exception)
@@ -94,8 +100,15 @@ class Endpoint_ollama(BaseEndpoint):
     async def _handle_chat(self, request: Request) -> StreamingResponse | JSONResponse:
         """Handle POST /api/chat."""
         try:
-            body = await request.json()
+            body, raw_body = await self._read_json_body(request)
         except Exception:
+            self._audit_pre_task_rejection(
+                request,
+                protocol="ollama",
+                status_code=_HTTP_INVALID,
+                error_code="INVALID_REQUEST",
+                reason="Invalid JSON body",
+            )
             return JSONResponse(
                 {"error": {"code": "INVALID_REQUEST", "message": "Invalid JSON body"}},
                 status_code=_HTTP_INVALID,
@@ -103,6 +116,7 @@ class Endpoint_ollama(BaseEndpoint):
 
         auth_error = self._authorize_and_apply_envid(request, body)
         if auth_error is not None:
+            self._audit_rejection_response(request, "ollama", auth_error, "Authorization or envid validation failed")
             return auth_error
 
         stream: bool = bool(body.get("stream", False))
@@ -111,6 +125,13 @@ class Endpoint_ollama(BaseEndpoint):
         route_trace_error = self._validate_incoming_route_trace(route_trace)
         if route_trace_error is not None:
             code, status_code, message = route_trace_error
+            self._audit_pre_task_rejection(
+                request,
+                protocol="ollama",
+                status_code=status_code,
+                error_code=code,
+                reason=message,
+            )
             return JSONResponse({"error": {"code": code, "message": message}}, status_code=status_code)
 
         # Build task
@@ -122,10 +143,19 @@ class Endpoint_ollama(BaseEndpoint):
                 route_trace=route_trace,
             )
         except SmartRouteError as exc:
+            self._audit_pre_task_rejection(
+                request,
+                protocol="ollama",
+                status_code=exc.status_code,
+                error_code=exc.code,
+                reason=str(exc),
+            )
             return JSONResponse(
                 {"error": {"code": exc.code, "message": str(exc)}},
                 status_code=exc.status_code,
             )
+
+        self._audit_client_request(task, request, body, protocol="ollama", raw_body=raw_body)
 
         # Apply timeouts from config
         cfg_tasks = self._core.config.get("tasks", {}) or {}
@@ -142,6 +172,13 @@ class Endpoint_ollama(BaseEndpoint):
         except Exception as exc:
             error_code = getattr(exc, "code", "QUEUE_ERROR")
             log("http", "error", f"Failed to enqueue task {task.id}: {exc}", self.id)
+            self._audit_pre_task_rejection(
+                request,
+                protocol="ollama",
+                status_code=_HTTP_BUSY,
+                error_code=error_code,
+                reason=str(exc),
+            )
             return JSONResponse(
                 {"error": {"code": error_code, "message": str(exc)}},
                 status_code=_HTTP_BUSY,
@@ -152,8 +189,75 @@ class Endpoint_ollama(BaseEndpoint):
                 self._stream_response(task),
                 media_type="application/x-ndjson",
             )
-        else:
-            return await self._sync_response(task)
+        response = await self._sync_response(task)
+        self._audit_client_response(task, response)
+        return response
+
+    def _audit_client_request(
+        self,
+        task: Task_agent,
+        request: Request,
+        body: dict,
+        *,
+        protocol: str,
+        raw_body: bytes | None = None,
+    ) -> None:
+        """Record an accepted client request and retain its response audit context."""
+        audit_log = getattr(self._core, "audit_log", None)
+        if audit_log is None:
+            return
+        route = task.config.get("route") if isinstance(task.config, dict) else {}
+        route = route if isinstance(route, dict) else {}
+        context = {
+            "request_id": get_or_create_request_id(request),
+            "protocol": protocol,
+            "endpoint": request.url.path,
+            "http": {
+                "method": request.method,
+                "url": str(request.url),
+                "content_type": request.headers.get("content-type", "application/json"),
+            },
+            "model": body.get("model"),
+            "worker_id": task.worker_id,
+            "provider_id": route.get("resolved_provider"),
+        }
+        task._audit_client_context = context
+        try:
+            audit_log.record_body_event(
+                "client_request",
+                raw_body if raw_body is not None else json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+                task_id=task.id,
+                **context,
+            )
+        except Exception as exc:
+            log("audit", "error", f"Failed to audit client request task={task.id}: {exc}", self.id)
+
+    def _audit_client_response(self, task: Task_agent, response: JSONResponse) -> None:
+        """Record a completed non-streaming client response without changing delivery."""
+        audit_log = getattr(self._core, "audit_log", None)
+        context = getattr(task, "_audit_client_context", None)
+        if audit_log is None or not isinstance(context, dict):
+            return
+        try:
+            audit_log.record_body_event(
+                "client_response",
+                response.body,
+                task_id=task.id,
+                request_id=context["request_id"],
+                protocol=context["protocol"],
+                endpoint=context["endpoint"],
+                model=context.get("model"),
+                worker_id=task.worker_id,
+                provider_id=context.get("provider_id"),
+                http={
+                    "status_code": response.status_code,
+                    "content_type": response.headers.get("content-type", "application/json"),
+                },
+                terminal_status=task.status,
+                error_code=(task.error or {}).get("code") if isinstance(task.error, dict) else None,
+            )
+        except Exception as exc:
+            log("audit", "error", f"Failed to audit client response task={task.id}: {exc}", self.id)
 
     def _authorize_and_apply_envid(self, request: Request, body: dict) -> JSONResponse | None:
         """Validate API token, check envid access, and apply user autoassign_envid."""
@@ -895,15 +999,22 @@ class Endpoint_ollama(BaseEndpoint):
 
     async def _stream_response(self, task: Task_agent) -> AsyncGenerator[bytes, None]:
         """Read chunks from task queue and yield as NDJSON lines."""
+        audit_log = getattr(self._core, "audit_log", None)
+        audit_context = getattr(task, "_audit_client_context", None)
+        spool_path = audit_log.open_body_spool() if audit_log is not None and isinstance(audit_context, dict) else None
         try:
             while True:
                 timeout_phase, remaining = self._task_timeout_phase(task)
                 if remaining is not None and remaining <= 0:
                     await self._terminate_task_on_timeout(task)
-                    yield (json.dumps({
+                    encoded = (json.dumps({
                         "error": {"code": "TIMEOUT", "message": "Request timed out"},
                         "done": True,
                     }) + "\n").encode()
+                    yield encoded
+                    if spool_path is not None:
+                        with spool_path.open("ab") as spool:
+                            spool.write(encoded)
                     break
 
                 try:
@@ -916,6 +1027,25 @@ class Endpoint_ollama(BaseEndpoint):
                     # Sentinel: stream is finished; yield final done marker if needed
                     break
 
-                yield (json.dumps(chunk) + "\n").encode()
+                encoded = (json.dumps(chunk) + "\n").encode()
+                yield encoded
+                if spool_path is not None:
+                    with spool_path.open("ab") as spool:
+                        spool.write(encoded)
         finally:
+            if spool_path is not None:
+                try:
+                    event = audit_log.finalize_body_spool(
+                        "client_response", spool_path, content_type="application/x-ndjson",
+                        task_id=task.id, request_id=audit_context["request_id"], protocol=audit_context["protocol"],
+                        endpoint=audit_context["endpoint"], worker_id=task.worker_id,
+                        http={"status_code": 200, "content_type": "application/x-ndjson"},
+                        terminal_status=task.status,
+                    )
+                    queue = getattr(self._core, "queue", None)
+                    reconcile = getattr(queue, "record_client_response_reconciliation", None)
+                    if callable(reconcile):
+                        reconcile(task, event["event_id"])
+                except Exception as exc:
+                    log("audit", "error", f"Failed to audit stream response task={task.id}: {exc}", self.id)
             asyncio.create_task(self._core.delete_task(task.id))

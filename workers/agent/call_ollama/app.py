@@ -24,7 +24,7 @@ class _AsyncContextWrapper:
 
 import httpx
 
-from core.call_log import save_llm_call, save_llm_raw_call
+from core.call_log import save_llm_call
 from core.error_logging import log_exception
 from core.worker import BaseWorker, WorkerResult
 from core.task import Task
@@ -156,6 +156,16 @@ class CallOllamaWorker(BaseWorker):
                 ok=False,
                 error={"code": "UPSTREAM_TIMEOUT", "message": str(exc)},
             )
+        except asyncio.CancelledError:
+            raw_parts = getattr(task, "_audit_stream_raw_parts", [])
+            await self._finalize_latest_started_llm_call(
+                task,
+                status="cancelled",
+                error_code="CANCELLED",
+                response_body=b"".join(raw_parts),
+                response_content_type="application/x-ndjson",
+            )
+            raise
         except Exception as exc:
             await self._finalize_latest_started_llm_call(task, status="exception", error_code="EXCEPTION")
             error_message = self._describe_exception(exc)
@@ -342,22 +352,18 @@ class CallOllamaWorker(BaseWorker):
         self, client: httpx.AsyncClient, url: str, payload: dict, task: Task_agent, save_call: bool = False
     ) -> WorkerResult:
         """Non-streaming: send request, wait for full response, return it."""
+        upstream_payload = {**payload, "stream": False}
+        request = self._build_json_request(client, url, upstream_payload)
         history_entry = await self._begin_llm_call(
             task,
             url=url,
             payload=payload,
             provider_id=self._resolve_task_provider_id(task),
             save_call=save_call,
+            request_body=request.content,
         )
-        upstream_payload = {**payload, "stream": False}
-        request = self._build_json_request(client, url, upstream_payload)
-        if save_call:
-            save_llm_raw_call(self.id, request.content)
-
         resp = await self._send_json_request(client, request, upstream_payload)
         raw_response = await self._read_response_body(resp)
-        if save_call:
-            save_llm_raw_call(self.id, raw_response)
 
         if resp.status_code != 200:
             log(
@@ -366,7 +372,7 @@ class CallOllamaWorker(BaseWorker):
                 f"Task {task.id} upstream sync error: status={resp.status_code} body={resp.text[:512]!r}",
                 "call_ollama",
             )
-            await self._finalize_llm_call(task, history_entry, status="http_error", http_status=resp.status_code, error_code="UPSTREAM_ERROR")
+            await self._finalize_llm_call(task, history_entry, status="http_error", http_status=resp.status_code, error_code="UPSTREAM_ERROR", response_body=raw_response, response_content_type=self._response_content_type(resp, "application/octet-stream"))
             return WorkerResult(
                 ok=False,
                 error={
@@ -377,7 +383,7 @@ class CallOllamaWorker(BaseWorker):
             )
 
         data = self._normalize_upstream_response_data(json.loads(raw_response))
-        await self._finalize_llm_call(task, history_entry, status="ok", http_status=resp.status_code, response=data)
+        await self._finalize_llm_call(task, history_entry, status="ok", http_status=resp.status_code, response=data, response_body=raw_response, response_content_type=self._response_content_type(resp, "application/json"))
         if save_call:
             save_llm_call(self.id, task.id, upstream_payload, data)
         return WorkerResult(ok=True, data=data, usage=data.get("usage"))
@@ -392,34 +398,31 @@ class CallOllamaWorker(BaseWorker):
         save_call: bool = False,
     ) -> WorkerResult:
         """Streaming: forward chunks from upstream to emit_chunk; return final state."""
+        upstream_payload = {**payload, "stream": True}
+        request = self._build_json_request(client, url, upstream_payload)
         history_entry = await self._begin_llm_call(
             task,
             url=url,
             payload=payload,
             provider_id=self._resolve_task_provider_id(task),
             save_call=save_call,
+            request_body=request.content,
         )
-        upstream_payload = {**payload, "stream": True}
         final_data: dict | None = None
         chunks: list[dict] = [] if save_call else []
-        request = self._build_json_request(client, url, upstream_payload)
-        if save_call:
-            save_llm_raw_call(self.id, request.content)
-
         stream_context = await self._open_stream_request(client, request, upstream_payload)
-        raw_parts: list[bytes] = [] if save_call else []
+        raw_parts: list[bytes] = []
+        task._audit_stream_raw_parts = raw_parts
         async with stream_context as resp:
             if resp.status_code != 200:
                 raw_error = await self._read_response_body(resp)
-                if save_call:
-                    save_llm_raw_call(self.id, raw_error)
                 log(
                     "worker",
                     "warning",
                     f"Task {task.id} upstream stream error: status={resp.status_code}",
                     "call_ollama",
                 )
-                await self._finalize_llm_call(task, history_entry, status="http_error", http_status=resp.status_code, error_code="UPSTREAM_ERROR")
+                await self._finalize_llm_call(task, history_entry, status="http_error", http_status=resp.status_code, error_code="UPSTREAM_ERROR", response_body=raw_error, response_content_type=self._response_content_type(resp, "application/octet-stream"))
                 return WorkerResult(
                     ok=False,
                     error={
@@ -431,11 +434,8 @@ class CallOllamaWorker(BaseWorker):
             final_data = await self._consume_stream_response(resp, emit_chunk, chunks, raw_parts, save_call)
 
         if save_call:
-            save_llm_raw_call(self.id, b"".join(raw_parts))
-
-        if save_call:
             save_llm_call(self.id, task.id, upstream_payload, {"stream_chunks": chunks})
-        await self._finalize_llm_call(task, history_entry, status="ok", http_status=200, response={"stream_chunks": chunks, **(final_data or {})})
+        await self._finalize_llm_call(task, history_entry, status="ok", http_status=200, response={"stream_chunks": chunks, **(final_data or {})}, response_body=b"".join(raw_parts), response_content_type="application/x-ndjson")
         return WorkerResult(ok=True, data=final_data, usage=(final_data or {}).get("usage"))
 
     @staticmethod
@@ -480,6 +480,12 @@ class CallOllamaWorker(BaseWorker):
         return str(content)
 
     @staticmethod
+    def _response_content_type(resp, default: str) -> str:
+        """Return an upstream response content type when it is available."""
+        headers = getattr(resp, "headers", {})
+        return headers.get("content-type", default) if hasattr(headers, "get") else default
+
+    @staticmethod
     def _normalize_upstream_response_data(data: object) -> object:
         """Fill empty content from thinking/reasoning fields when the upstream response omits content."""
         if not isinstance(data, dict):
@@ -514,8 +520,7 @@ class CallOllamaWorker(BaseWorker):
             decoder = codecs.getincrementaldecoder("utf-8")()
             text_buffer = ""
             async for raw_chunk in aiter_raw():
-                if save_call:
-                    raw_parts.append(raw_chunk)
+                raw_parts.append(raw_chunk)
                 decoded = decoder.decode(raw_chunk)
                 text_buffer += decoded
                 while "\n" in text_buffer:
@@ -559,8 +564,7 @@ class CallOllamaWorker(BaseWorker):
         aiter_lines = getattr(resp, "aiter_lines", None)
         if callable(aiter_lines):
             async for line in aiter_lines():
-                if save_call:
-                    raw_parts.append(line.encode("utf-8") + b"\n")
+                raw_parts.append(line.encode("utf-8") + b"\n")
                 if not line.strip():
                     continue
                 try:

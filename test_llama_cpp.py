@@ -1,6 +1,7 @@
 """Focused regressions for the llama.cpp worker and local server lifecycle."""
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,6 +9,7 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 from core.local_server_manager import LocalServerError, LocalServerManager
+from core.audit_log import AuditLog
 from core.endpoints.endpoint_openaix import Endpoint_openaix
 from core.resources import Resources
 from core.task_types.task_agent import Task_agent
@@ -59,8 +61,9 @@ class TestLlamaCppStreamingDiagnostics(unittest.IsolatedAsyncioTestCase):
         class _Core:
             """Minimal worker core with a diagnostics-aware queue."""
 
-            def __init__(self) -> None:
+            def __init__(self, directory: str) -> None:
                 self.queue = _Queue()
+                self.audit_log = AuditLog(directory)
 
         class _Response:
             """Successful llama.cpp SSE response with a reasoning delta."""
@@ -89,7 +92,9 @@ class TestLlamaCppStreamingDiagnostics(unittest.IsolatedAsyncioTestCase):
 
         worker = CallLlamaCppWorker()
         worker.id = "call_llama_cpp"
-        worker._core = _Core()
+        temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary_directory.cleanup)
+        worker._core = _Core(temporary_directory.name)
         task = Task_agent(payload={"model": "model", "messages": []}, stream=True)
         payload = {"model": "model", "messages": [{"role": "user", "content": "hello"}], "stream": True}
         emitted: list[dict] = []
@@ -98,9 +103,7 @@ class TestLlamaCppStreamingDiagnostics(unittest.IsolatedAsyncioTestCase):
             """Capture endpoint-bound stream chunks."""
             emitted.append(chunk)
 
-        with patch("workers.agent.call_llama_cpp.app.save_llm_raw_call"), patch(
-            "workers.agent.call_llama_cpp.app.save_llm_call"
-        ):
+        with patch("workers.agent.call_llama_cpp.app.save_llm_call"):
             result = await worker._forward_stream(
                 _Client(),
                 "http://127.0.0.1:8888/v1/chat/completions",
@@ -117,6 +120,16 @@ class TestLlamaCppStreamingDiagnostics(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(entry["stream_events"][0]["choices"][0]["delta"]["reasoning_content"], "thinking")
         self.assertEqual(emitted[0]["message"]["content"], "answer")
         self.assertGreaterEqual(len(worker._core.queue.persisted), 3)
+        records = []
+        for journal in worker._core.audit_log.directory.glob("raw_llm_*.jsonl"):
+            records.extend(json.loads(line) for line in journal.read_text(encoding="utf-8").splitlines())
+        request_event = next(event for event in records if event["type"] == "llm_request")
+        response_event = next(event for event in records if event["type"] == "llm_response")
+        self.assertEqual(request_event["data"], payload)
+        self.assertEqual(
+            response_event["data"],
+            'data: {"model":"model","choices":[{"delta":{"reasoning_content":"thinking","content":"answer"}}]}\ndata: [DONE]\n',
+        )
 
 
 class TestLocalServerManager(unittest.IsolatedAsyncioTestCase):

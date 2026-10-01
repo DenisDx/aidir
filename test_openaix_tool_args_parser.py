@@ -972,8 +972,8 @@ class TestRawCallLogs(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(task.llm_call_history[0]["request_text"], "user: Why did the task hang on inference?")
         self.assertEqual(task.llm_call_history[0]["request_preview"], "user: Why did the task hang on inference?")
 
-    async def test_call_ollama_forward_sync_writes_raw_request_and_response(self) -> None:
-        """Writes one raw request line and one raw response line for sync Ollama calls."""
+    async def test_call_ollama_forward_sync_writes_compact_summary(self) -> None:
+        """Writes only a compact operational summary for a sync Ollama call."""
         worker = CallOllamaWorker()
         task = Task_agent(payload={"model": "qwen3.5:9b", "messages": []}, stream=False)
         response_text = '{"message":{"role":"assistant","content":"ok"},"done":true}'
@@ -991,17 +991,14 @@ class TestRawCallLogs(unittest.IsolatedAsyncioTestCase):
             async def send(self, request):
                 return FakeResponse()
 
-        with patch("workers.agent.call_ollama.app.save_llm_raw_call") as raw_log, patch("workers.agent.call_ollama.app.save_llm_call") as parsed_log:
+        with patch("workers.agent.call_ollama.app.save_llm_call") as parsed_log:
             result = await worker._forward_sync(FakeClient(), "http://127.0.0.1:11434/api/chat", {"model": "qwen3.5:9b"}, task, save_call=True)
 
         self.assertTrue(result.ok)
-        self.assertEqual(raw_log.call_count, 2)
-        self.assertIn(b'"stream":false', raw_log.call_args_list[0].args[1])
-        self.assertEqual(raw_log.call_args_list[1].args[1], response_text.encode("utf-8"))
         parsed_log.assert_called_once()
 
-    async def test_openaix_forward_stream_writes_raw_request_and_response(self) -> None:
-        """Writes one raw request line and one raw response line for streaming OpenAIx calls."""
+    async def test_openaix_forward_stream_writes_compact_summary(self) -> None:
+        """Writes only a compact operational summary for a streaming OpenAIx call."""
         worker = OpenAIxWorker()
         raw_line_1 = '{"message":{"role":"assistant","content":"hi"},"done":false}\n'
         raw_line_2 = '{"message":{"role":"assistant","content":"there"},"done":true}\n'
@@ -1032,7 +1029,7 @@ class TestRawCallLogs(unittest.IsolatedAsyncioTestCase):
         async def emit_chunk(chunk: dict) -> None:
             emitted.append(chunk)
 
-        with patch("workers.agent.openaix.app.save_llm_raw_call") as raw_log, patch("workers.agent.openaix.app.save_llm_call") as parsed_log:
+        with patch("workers.agent.openaix.app.save_llm_call") as parsed_log:
             result = await worker._forward_stream(
                 FakeClient(),
                 "http://127.0.0.1:11434/api/chat",
@@ -1044,9 +1041,6 @@ class TestRawCallLogs(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(result.ok)
         self.assertEqual(len(emitted), 2)
-        self.assertEqual(raw_log.call_count, 2)
-        self.assertIn(b'"stream":true', raw_log.call_args_list[0].args[1])
-        self.assertEqual(raw_log.call_args_list[1].args[1], (raw_line_1 + raw_line_2).encode("utf-8"))
         parsed_log.assert_called_once()
 
     async def test_openaix_forward_sync_increments_task_llm_call_count(self) -> None:

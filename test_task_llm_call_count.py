@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sys
+import tempfile
 import time
 import types
 import unittest
@@ -26,6 +27,7 @@ sys.modules.setdefault("redis", redis_module)
 sys.modules.setdefault("redis.asyncio", redis_asyncio)
 
 from core.queue_manager import QueueManager
+from core.audit_log import AuditLog
 from core.task_types.task_agent import Task_agent
 from webui.backend.app import create_app
 
@@ -71,10 +73,11 @@ class _FakeTaskQueue:
 class _FakeCore:
     """Minimal core stub for WebUI task endpoint tests."""
 
-    def __init__(self, task: Task_agent) -> None:
+    def __init__(self, task: Task_agent, audit_log: AuditLog | None = None) -> None:
         self.config = MagicMock()
         self.config.get.return_value = {}
         self.queue = _FakeTaskQueue(task)
+        self.audit_log = audit_log
         self.redis = MagicMock(get=AsyncMock(return_value=None))
         self.workers = {}
         self.resources = None
@@ -101,8 +104,8 @@ class TestTaskLlmCallCount(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(task.llm_call_count, 2)
         self.assertEqual(redis.hashes[f"aidir:task:{task.id}"]["llm_call_count"], "2")
 
-    async def test_queue_manager_serializes_diagnostics_off_event_loop(self) -> None:
-        """Queue manager should offload growing stream diagnostics serialization."""
+    async def test_queue_manager_serializes_bounded_diagnostics_off_event_loop(self) -> None:
+        """Queue manager should offload compact diagnostics without raw stream bodies."""
         task = Task_agent(payload={"model": "qwen3.5:9b"})
         task.llm_call_history = [{"raw_sse": ["data: chunk"] * 100}]
         redis = _FakeRedisCounter()
@@ -117,7 +120,7 @@ class TestTaskLlmCallCount(unittest.IsolatedAsyncioTestCase):
 
         serialize.assert_awaited_once()
         self.assertEqual(serialize.await_args.args[0], json.dumps)
-        self.assertEqual(serialize.await_args.args[1], task.llm_call_history)
+        self.assertEqual(serialize.await_args.args[1], [{}])
         self.assertEqual(redis.hashes[f"aidir:task:{task.id}"]["llm_call_history"], "[\"serialized\"]")
 
     async def test_queue_manager_extends_active_timeout_and_persists_it(self) -> None:
@@ -191,6 +194,35 @@ class TestTaskLlmCallCount(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(running_response.status_code, 200)
             self.assertEqual(running_response.json()["task"]["queue_timeout"], 420)
             self.assertEqual(running_response.json()["task"]["run_timeout"], 420)
+
+    def test_task_viewer_keeps_detail_compact_and_serves_attachment_by_id(self) -> None:
+        """Expose only audit manifest metadata and resolve an image body through its opaque ID."""
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            task = Task_agent(id="task-1", payload={"model": "example"}, stream=False)
+            audit_log = AuditLog(temporary_directory)
+            event = audit_log.record_body_event(
+                "client_response",
+                b"image-bytes",
+                content_type="image/png",
+                task_id=task.id,
+            )
+            core = _FakeCore(task, audit_log)
+
+            with patch("webui.backend.app._get_session", return_value={"permissions": ["all"], "login": "tester"}):
+                client = TestClient(create_app(core=core))
+                detail = client.get(f"/api/tasks/viewer/{task.id}/detail")
+                self.assertEqual(detail.status_code, 200)
+                self.assertNotIn("data", detail.json()["audit_events"][0])
+
+                unsupported = client.get(f"/api/tasks/viewer/{task.id}/raw?type=task&event_id={event['event_id']}")
+                self.assertEqual(unsupported.status_code, 400)
+
+                file_id = event["body_file"]["file_id"]
+                response = client.get(f"/api/tasks/viewer/audit-files/{file_id}")
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.headers["content-disposition"], f'inline; filename="{file_id}"')
+                self.assertEqual(response.headers["x-content-type-options"], "nosniff")
+                self.assertEqual(response.content, b"image-bytes")
 
     def test_webui_status_reports_cron_health(self) -> None:
         """Dashboard status should report fresh and missing cron heartbeats."""

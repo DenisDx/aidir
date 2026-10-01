@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
+import json
 from typing import TYPE_CHECKING, Any
 
 from core import log
@@ -90,6 +91,63 @@ class BaseEndpoint(ABC):
         queue = getattr(core, "queue", None)
         if queue is not None:
             await queue.mark_canceled(task)
+
+    async def _read_json_body(self, request: Any) -> tuple[Any, bytes]:
+        """Read a request body once and return its JSON value with original bytes."""
+        raw_body = await request.body()
+        return json.loads(raw_body), raw_body
+
+    def _audit_pre_task_rejection(
+        self,
+        request: Any,
+        *,
+        protocol: str,
+        status_code: int,
+        error_code: str,
+        reason: str,
+    ) -> None:
+        """Record one compact rejection that occurred before task creation."""
+        core = getattr(self, "_core", None)
+        audit_log = getattr(core, "audit_log", None)
+        if audit_log is None:
+            return
+        try:
+            from core.error_logging import get_or_create_request_id
+
+            audit_log.record_rejected_request(
+                request_id=get_or_create_request_id(request),
+                protocol=protocol,
+                endpoint=request.url.path,
+                http={"method": request.method, "status_code": status_code},
+                error_code=error_code,
+                reason=reason,
+            )
+        except Exception as exc:
+            log("audit", "error", f"Failed to audit pre-task rejection: {exc}", self.id or None)
+
+    def _audit_rejection_response(
+        self,
+        request: Any,
+        protocol: str,
+        response: Any,
+        reason: str,
+    ) -> None:
+        """Record compact rejection metadata from a JSON error response."""
+        error_code = "INVALID_REQUEST"
+        try:
+            response_body = json.loads(response.body)
+            error = response_body.get("error") if isinstance(response_body, dict) else {}
+            if isinstance(error, dict) and error.get("code"):
+                error_code = str(error["code"])
+        except Exception:
+            pass
+        self._audit_pre_task_rejection(
+            request,
+            protocol=protocol,
+            status_code=int(getattr(response, "status_code", 400)),
+            error_code=error_code,
+            reason=reason,
+        )
 
     @abstractmethod
     def create_app(self, core: "Core") -> Any:

@@ -25,6 +25,7 @@ if str(_ROOT) not in sys.path:
 import redis.asyncio as aioredis
 import uvicorn
 
+from core.audit_log import AuditLog
 from core.config import Config, config as _global_config
 from core.error_logging import log_exception
 from core.envid import EnvidRegistry
@@ -87,6 +88,7 @@ class Core:
         self.resources = Resources([])
         self.llama_cpp_server_manager = LocalServerManager({}, _ROOT)
         self.envid_registry: EnvidRegistry | None = None
+        self.audit_log: AuditLog | None = None
         self._background_tasks: set[asyncio.Task] = set()
         self._restart_requested = False
         self._shutdown_started = False
@@ -118,6 +120,19 @@ class Core:
     async def start(self) -> None:
         log("core", "info", "Core starting")
 
+        audit_directory = Path(self.config.get("logging.audit.directory", "logs/audit"))
+        if not audit_directory.is_absolute():
+            audit_directory = _ROOT / audit_directory
+        self.audit_log = AuditLog(
+            audit_directory,
+            secret_metadata_keys=self.config.get("logging.audit.secret_metadata_keys", []),
+            emergency_max_total_bytes=self.config.get("logging.audit.emergency_max_total_bytes", 2147483648),
+        )
+        self.audit_log.start_writer(
+            queue_size=self.config.get("logging.audit.writer_queue_size", 256),
+            overflow_policy=self.config.get("logging.audit.overflow_policy", "best_effort"),
+        )
+
         # ── Redis ──────────────────────────────────────────────────────────
         redis_cfg = self.config.get("redis") or {}
         redis_url = (
@@ -136,7 +151,12 @@ class Core:
 
         # ── Queue ──────────────────────────────────────────────────────────
         instance = self.config.get("instance", "aidir")
-        self.queue = QueueManager(self.redis, instance, status_change_callback=self._on_task_status_change)
+        self.queue = QueueManager(
+            self.redis,
+            instance,
+            status_change_callback=self._on_task_status_change,
+            audit_log=self.audit_log,
+        )
 
         # ── Envid registry ─────────────────────────────────────────────────
         self.envid_registry = EnvidRegistry(self.redis, instance)
@@ -215,6 +235,9 @@ class Core:
             self.scheduler.stop()
             sched_elapsed = time.monotonic() - sched_started
             log("core", "info", f"Scheduler stopped in {sched_elapsed:.2f}s")
+
+        if self.audit_log:
+            await asyncio.to_thread(self.audit_log.stop_writer)
 
         if self._manage_local_servers:
             try:

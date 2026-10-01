@@ -338,6 +338,31 @@ def _task_from_hash(task_hash: dict[str, str]) -> dict[str, Any]:
     return task
 
 
+def _task_summary_from_hash(task_hash: dict[str, str]) -> dict[str, Any]:
+    """Return search-safe task metadata without decoding raw task bodies or histories."""
+    task: dict[str, Any] = {
+        key: task_hash.get(key, "")
+        for key in (
+            "id", "type", "status", "worker_id", "created_at", "updated_at",
+            "started_at", "finished_at", "priority", "llm_call_count", "queue_timeout",
+            "run_timeout", "external",
+        )
+    }
+    task["priority"] = int(task["priority"] or 0)
+    task["llm_call_count"] = int(task["llm_call_count"] or 0)
+    task["queue_timeout"] = int(task["queue_timeout"] or 0)
+    task["run_timeout"] = int(task["run_timeout"] or 0)
+    task["external"] = str(task["external"] or "0") in {"1", "true", "True"}
+    error = _parse_json_field(task_hash.get("error"))
+    task["error_code"] = error.get("code") if isinstance(error, dict) else None
+    context = _parse_json_field(task_hash.get("context"))
+    task["envid"] = context.get("envid", "") if isinstance(context, dict) else ""
+    last_op = _task_last_operation_at(task)
+    task["last_operation_at"] = last_op.isoformat() if last_op else None
+    task["request_preview"] = ""
+    return task
+
+
 def _normalize_filter_values(values: list[str] | str | None) -> list[str]:
     """Normalize comma-separated or repeated query values into a flat string list."""
     if values is None:
@@ -533,8 +558,8 @@ def create_app(
             if not raw:
                 continue
 
-            task = _task_from_hash(raw)
-            task_envid = _task_envid(task)
+            task = _task_summary_from_hash(raw)
+            task_envid = str(task.get("envid") or "")
             if envid and task_envid != envid:
                 continue
             if statuses and str(task.get("status") or "").lower() not in statuses:
@@ -554,7 +579,7 @@ def create_app(
             if op_to and last_op and last_op > op_to:
                 continue
 
-            items.append(_task_to_api_item(task))
+            items.append(task)
 
         items.sort(key=lambda item: item.get("last_operation_at") or item.get("created_at") or "", reverse=True)
         return {
@@ -574,6 +599,80 @@ def create_app(
         if not raw:
             raise HTTPException(status_code=404, detail="Task not found")
         return {"task": _task_to_api_item(_task_from_hash(raw))}
+
+    @app.get("/api/tasks/viewer/{task_id}/detail")
+    async def task_viewer_detail(task_id: str, session: dict = Depends(_require_session)):
+        """Return compact task metadata and lazy audit-event manifest."""
+        live_task = core.queue.get_task(task_id) if core.queue else None
+        if live_task is not None:
+            task = _task_summary_from_hash(live_task.to_redis_hash())
+        else:
+            ns = core.config.get("instance", "aidir")
+            raw = await core.redis.hgetall(f"{ns}:task:{task_id}")
+            if not raw:
+                raise HTTPException(status_code=404, detail="Task not found")
+            task = _task_summary_from_hash(raw)
+        audit_log = getattr(core, "audit_log", None)
+        events = audit_log.list_task_events(task_id) if audit_log is not None else []
+        terminal_audit = audit_log.task_terminal_snapshot(task_id) if audit_log is not None else None
+        return {
+            "task": task,
+            "audit_events": events,
+            "terminal_audit": terminal_audit,
+            "active": task.get("status") in {"created", "queued", "running"},
+        }
+
+    @app.get("/api/tasks/viewer/{task_id}/request")
+    async def task_viewer_request(task_id: str, session: dict = Depends(_require_session)):
+        """Return the client-request body only when its audit event exists."""
+        audit_log = getattr(core, "audit_log", None)
+        if audit_log is None:
+            raise HTTPException(status_code=404, detail="Audit is unavailable")
+        for event in audit_log.list_task_events(task_id):
+            if event["type"] == "client_request":
+                return {"event": audit_log.read_event(event["event_id"])}
+        raise HTTPException(status_code=404, detail="Client request audit event is unavailable")
+
+    @app.get("/api/tasks/viewer/{task_id}/raw")
+    async def task_viewer_raw(task_id: str, type: str, event_id: str, session: dict = Depends(_require_session)):
+        """Return one task-owned audit event selected by a manifest event ID."""
+        if type not in {"client_request", "client_response", "llm_request", "llm_response"}:
+            raise HTTPException(status_code=400, detail="Unsupported audit event type")
+        audit_log = getattr(core, "audit_log", None)
+        if audit_log is None:
+            raise HTTPException(status_code=404, detail="Audit is unavailable")
+        event = audit_log.read_event(event_id)
+        if event is None or event.get("task_id") != task_id or event.get("type") != type:
+            raise HTTPException(status_code=404, detail="Audit event not found")
+        return {"event": event}
+
+    @app.get("/api/tasks/viewer/audit-files/{file_id}")
+    async def task_viewer_audit_file(file_id: str, session: dict = Depends(_require_session)):
+        """Serve a file-backed audit body by its opaque indexed identifier only."""
+        audit_log = getattr(core, "audit_log", None)
+        if audit_log is None:
+            raise HTTPException(status_code=404, detail="Audit is unavailable")
+        event = audit_log.find_body_file(file_id)
+        body_file = event.get("body_file") if isinstance(event, dict) else None
+        if not isinstance(body_file, dict):
+            raise HTTPException(status_code=404, detail="Audit file not found")
+        relative_path = Path(str(body_file.get("relative_path") or ""))
+        if relative_path.is_absolute() or ".." in relative_path.parts:
+            raise HTTPException(status_code=404, detail="Audit file not found")
+        path = audit_log.directory / relative_path
+        if not path.is_file():
+            raise HTTPException(status_code=404, detail="Audit file not found")
+        content_type = str(body_file.get("content_type") or "application/octet-stream")
+        inline = content_type.startswith(("image/png", "image/jpeg", "image/gif", "image/webp"))
+        disposition = "inline" if inline else "attachment"
+        return FileResponse(
+            path,
+            media_type=content_type,
+            headers={
+                "Content-Disposition": f'{disposition}; filename="{file_id}"',
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
 
     @app.post("/api/tasks/{task_id}/terminate")
     async def terminate_task(task_id: str, session: dict = Depends(_require_session)):
@@ -609,7 +708,10 @@ def create_app(
             "tasks":    len(core.queue.list_tasks()),
             "resources": core.resources.snapshot() if core.resources else [],
             "runtime": core.get_runtime_status(),
-            "health": {"cron": await _cron_health(core)},
+            "health": {
+                "cron": await _cron_health(core),
+                "audit": core.audit_log.health() if core.audit_log else {"status": "unavailable"},
+            },
         }
 
     @app.post("/api/cron/repair")

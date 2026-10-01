@@ -4,6 +4,7 @@ All workers must expose a module-level `worker` instance of a BaseWorker subclas
 """
 from __future__ import annotations
 
+import json
 import time
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
@@ -144,10 +145,15 @@ class BaseWorker:
         payload: dict | None = None,
         provider_id: str = "",
         save_call: bool = False,
+        request_body: bytes | None = None,
+        request_content_type: str = "application/json",
     ) -> dict[str, Any]:
         """Append one compact LLM-call summary entry to the task and persist it."""
         request_payload = payload if isinstance(payload, dict) else {}
-        messages = request_payload.get("messages") if isinstance(request_payload.get("messages"), list) else []
+        preview_payload = request_payload
+        if not request_payload.get("messages") and isinstance(getattr(task, "payload", None), dict):
+            preview_payload = {**request_payload, "messages": task.payload.get("messages", [])}
+        messages = preview_payload.get("messages") if isinstance(preview_payload.get("messages"), list) else []
         input_value = request_payload.get("input")
         input_count = 0
         if isinstance(input_value, str):
@@ -176,13 +182,32 @@ class BaseWorker:
             "last_role": str(messages[-1].get("role") or "") if messages and isinstance(messages[-1], dict) else "",
             "has_tools": bool(request_payload.get("tools")),
             "input_count": input_count,
-            "request_text": self._extract_llm_request_text(request_payload),
-            "request_preview": self._summarize_llm_request(request_payload),
+            "request_text": self._extract_llm_request_text(preview_payload),
+            "request_preview": self._summarize_llm_request(preview_payload),
             "save_llm_request": bool(save_call),
             "status": "started",
         }
         if save_call:
             entry["request"] = request_payload
+
+        core = getattr(self, "_core", None)
+        audit_log = getattr(core, "audit_log", None) if core is not None else None
+        if audit_log is not None:
+            try:
+                event = audit_log.record_body_event(
+                    "llm_request",
+                    request_body if request_body is not None else json.dumps(request_payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+                    task_id=task.id,
+                    exchange_id=f"{task.id}:llm:{task.llm_call_count}",
+                    exchange_number=task.llm_call_count,
+                    worker_id=self.id,
+                    provider_id=provider_id,
+                    model=entry["model"],
+                    http={"method": "POST", "url": url, "content_type": request_content_type},
+                )
+                entry["audit_request_event_id"] = event["event_id"]
+            except Exception as exc:
+                log("audit", "error", f"Failed to audit LLM request task={task.id}: {exc}", self.id or "worker")
 
         history = list(getattr(task, "llm_call_history", []) or [])
         history.append(entry)
@@ -202,6 +227,8 @@ class BaseWorker:
         http_status: int | None = None,
         error_code: str = "",
         response: dict | None = None,
+        response_body: bytes | None = None,
+        response_content_type: str = "application/json",
     ) -> None:
         """Finalize one compact LLM-call summary entry and persist it."""
         if not isinstance(entry, dict):
@@ -230,6 +257,27 @@ class BaseWorker:
         if entry.get("save_llm_request") and isinstance(response, dict):
             entry["response"] = response
 
+        core = getattr(self, "_core", None)
+        audit_log = getattr(core, "audit_log", None) if core is not None else None
+        if audit_log is not None:
+            try:
+                event = audit_log.record_body_event(
+                    "llm_response",
+                    response_body if response_body is not None else json.dumps(response or {}, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+                    task_id=task.id,
+                    exchange_id=f"{task.id}:llm:{entry.get('call_index', 0)}",
+                    exchange_number=entry.get("call_index"),
+                    worker_id=self.id,
+                    provider_id=entry.get("provider_id"),
+                    model=entry.get("model"),
+                    http={"status_code": http_status, "url_path": entry.get("url_path"), "content_type": response_content_type},
+                    terminal_status=status,
+                    error_code=error_code or None,
+                )
+                entry["audit_response_event_id"] = event["event_id"]
+            except Exception as exc:
+                log("audit", "error", f"Failed to audit LLM response task={task.id}: {exc}", self.id or "worker")
+
         await self._persist_llm_call_diagnostics(task, force=True)
 
     async def _finalize_latest_started_llm_call(
@@ -238,12 +286,21 @@ class BaseWorker:
         *,
         status: str,
         error_code: str = "",
+        response_body: bytes | None = None,
+        response_content_type: str = "application/json",
     ) -> None:
         """Finalize the most recent started LLM-call entry when an outer exception interrupts execution."""
         history = list(getattr(task, "llm_call_history", []) or [])
         for entry in reversed(history):
             if isinstance(entry, dict) and entry.get("status") == "started":
-                await self._finalize_llm_call(task, entry, status=status, error_code=error_code)
+                await self._finalize_llm_call(
+                    task,
+                    entry,
+                    status=status,
+                    error_code=error_code,
+                    response_body=response_body,
+                    response_content_type=response_content_type,
+                )
                 return
 
     @staticmethod

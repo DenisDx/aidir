@@ -24,6 +24,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from core import log
 from core.error_logging import attach_request_id_middleware, get_or_create_request_id, log_exception
 from core.endpoints.endpoint_ollama import Endpoint_ollama
+from core.request_limits import RequestBodyLimitMiddleware
 from core.smart_router import SmartRouteError, SmartRouter
 from core.task import STATUS_CANCELED, STATUS_COMPLETED, STATUS_FAILED
 
@@ -60,6 +61,11 @@ class Endpoint_openaix(Endpoint_ollama):
         """Create FastAPI app exposing both ollama and openai chat endpoints."""
         self._core = core
         app = FastAPI(title=f"aidir-{self.id}", docs_url=None, redoc_url=None)
+        app.add_middleware(
+            RequestBodyLimitMiddleware,
+            max_request_size=core.config.get("http.max_request_size", 104857600),
+            audit_log=getattr(core, "audit_log", None),
+        )
         attach_request_id_middleware(app)
 
         @app.exception_handler(Exception)
@@ -151,8 +157,15 @@ class Endpoint_openaix(Endpoint_ollama):
     async def _handle_chat(self, request: Request) -> StreamingResponse | JSONResponse:
         """Handle Ollama-compatible /api/chat and queue the openaix worker."""
         try:
-            body = await request.json()
+            body, raw_body = await self._read_json_body(request)
         except Exception:
+            self._audit_pre_task_rejection(
+                request,
+                protocol="ollama",
+                status_code=400,
+                error_code="INVALID_REQUEST",
+                reason="Invalid JSON body",
+            )
             return self._error_response(
                 protocol="ollama",
                 status_code=400,
@@ -162,6 +175,7 @@ class Endpoint_openaix(Endpoint_ollama):
 
         auth_error = self._authorize_and_apply_envid(request, body)
         if auth_error is not None:
+            self._audit_rejection_response(request, "ollama", auth_error, "Authorization or envid validation failed")
             return auth_error
 
         stream = bool(body.get("stream", False))
@@ -170,6 +184,7 @@ class Endpoint_openaix(Endpoint_ollama):
         route_trace_error = self._validate_incoming_route_trace(route_trace)
         if route_trace_error is not None:
             code, status_code, message = route_trace_error
+            self._audit_pre_task_rejection(request, protocol="ollama", status_code=status_code, error_code=code, reason=message)
             return self._error_response(
                 protocol="ollama",
                 status_code=status_code,
@@ -184,6 +199,7 @@ class Endpoint_openaix(Endpoint_ollama):
                 route_trace=route_trace,
             )
         except SmartRouteError as exc:
+            self._audit_pre_task_rejection(request, protocol="ollama", status_code=exc.status_code, error_code=exc.code, reason=str(exc))
             return self._error_response(
                 protocol="ollama",
                 status_code=exc.status_code,
@@ -191,9 +207,18 @@ class Endpoint_openaix(Endpoint_ollama):
                 message=str(exc),
             )
 
+        self._audit_client_request(task, request, body, protocol="ollama", raw_body=raw_body)
+
         try:
             await self._core.on_task_added(task)
         except Exception as exc:
+            self._audit_pre_task_rejection(
+                request,
+                protocol="ollama",
+                status_code=503,
+                error_code=getattr(exc, "code", "QUEUE_ERROR"),
+                reason=str(exc),
+            )
             return self._error_response(
                 protocol="ollama",
                 status_code=503,
@@ -208,6 +233,7 @@ class Endpoint_openaix(Endpoint_ollama):
                 media_type="application/x-ndjson",
             )
         response = await self._sync_response(task)
+        self._audit_client_response(task, response)
         log(
             "http",
             "info",
@@ -222,8 +248,15 @@ class Endpoint_openaix(Endpoint_ollama):
     async def _handle_openai_chat(self, request: Request) -> StreamingResponse | JSONResponse:
         """Handle OpenAI chat completions request and map it to Task_agent flow."""
         try:
-            body = await request.json()
+            body, raw_body = await self._read_json_body(request)
         except Exception:
+            self._audit_pre_task_rejection(
+                request,
+                protocol="openai",
+                status_code=400,
+                error_code="invalid_request_error",
+                reason="Invalid JSON body",
+            )
             return self._error_response(
                 protocol="openai",
                 status_code=400,
@@ -233,6 +266,7 @@ class Endpoint_openaix(Endpoint_ollama):
 
         auth_error = self._authorize_and_apply_envid(request, body)
         if auth_error is not None:
+            self._audit_rejection_response(request, "openai", auth_error, "Authorization or envid validation failed")
             return auth_error
 
         stream = bool(body.get("stream", False))
@@ -241,6 +275,7 @@ class Endpoint_openaix(Endpoint_ollama):
         route_trace_error = self._validate_incoming_route_trace(route_trace)
         if route_trace_error is not None:
             code, status_code, message = route_trace_error
+            self._audit_pre_task_rejection(request, protocol="openai", status_code=status_code, error_code=code, reason=message)
             return self._error_response(
                 protocol="openai",
                 status_code=status_code,
@@ -256,6 +291,7 @@ class Endpoint_openaix(Endpoint_ollama):
                 route_trace=route_trace,
             )
         except SmartRouteError as exc:
+            self._audit_pre_task_rejection(request, protocol="openai", status_code=exc.status_code, error_code=exc.code, reason=str(exc))
             return self._error_response(
                 protocol="openai",
                 status_code=exc.status_code,
@@ -263,9 +299,18 @@ class Endpoint_openaix(Endpoint_ollama):
                 message=str(exc),
             )
 
+        self._audit_client_request(task, request, body, protocol="openai", raw_body=raw_body)
+
         try:
             await self._core.on_task_added(task)
         except Exception as exc:
+            self._audit_pre_task_rejection(
+                request,
+                protocol="openai",
+                status_code=503,
+                error_code=getattr(exc, "code", "QUEUE_ERROR"),
+                reason=str(exc),
+            )
             return self._error_response(
                 protocol="openai",
                 status_code=503,
@@ -277,13 +322,22 @@ class Endpoint_openaix(Endpoint_ollama):
         if stream:
             return await self._openai_streaming_response(task, body)
 
-        return await self._openai_sync_response(task, body)
+        response = await self._openai_sync_response(task, body)
+        self._audit_client_response(task, response)
+        return response
 
     async def _handle_embed(self, request: Request, *, protocol: str) -> JSONResponse:
         """Handle one non-streaming Ollama or OpenAI embedding request."""
         try:
-            body = await request.json()
+            body, raw_body = await self._read_json_body(request)
         except Exception:
+            self._audit_pre_task_rejection(
+                request,
+                protocol=protocol,
+                status_code=400,
+                error_code="INVALID_REQUEST",
+                reason="Invalid JSON body",
+            )
             return self._error_response(
                 protocol=protocol,
                 status_code=400,
@@ -292,6 +346,13 @@ class Endpoint_openaix(Endpoint_ollama):
             )
 
         if not isinstance(body, dict):
+            self._audit_pre_task_rejection(
+                request,
+                protocol=protocol,
+                status_code=400,
+                error_code="INVALID_REQUEST",
+                reason="Request body must be an object",
+            )
             return self._error_response(
                 protocol=protocol,
                 status_code=400,
@@ -301,10 +362,12 @@ class Endpoint_openaix(Endpoint_ollama):
 
         validation_error = self._validate_embed_request(body, protocol=protocol)
         if validation_error is not None:
+            self._audit_rejection_response(request, protocol, validation_error, "Embedding request validation failed")
             return validation_error
 
         auth_error = self._authorize_and_apply_envid(request, body)
         if auth_error is not None:
+            self._audit_rejection_response(request, protocol, auth_error, "Authorization or envid validation failed")
             return auth_error
 
         incoming_bearer_token = self._extract_bearer_token(request)
@@ -312,6 +375,7 @@ class Endpoint_openaix(Endpoint_ollama):
         route_trace_error = self._validate_incoming_route_trace(route_trace)
         if route_trace_error is not None:
             code, status_code, message = route_trace_error
+            self._audit_pre_task_rejection(request, protocol=protocol, status_code=status_code, error_code=code, reason=message)
             return self._error_response(protocol=protocol, status_code=status_code, code=code, message=message)
 
         payload = self._openai_embed_to_ollama(body) if protocol == "openai" else dict(body)
@@ -325,6 +389,7 @@ class Endpoint_openaix(Endpoint_ollama):
                 route_trace=route_trace,
             )
         except SmartRouteError as exc:
+            self._audit_pre_task_rejection(request, protocol=protocol, status_code=exc.status_code, error_code=exc.code, reason=str(exc))
             return self._error_response(
                 protocol=protocol,
                 status_code=exc.status_code,
@@ -332,6 +397,13 @@ class Endpoint_openaix(Endpoint_ollama):
                 message=str(exc),
             )
         except HTTPException as exc:
+            self._audit_pre_task_rejection(
+                request,
+                protocol=protocol,
+                status_code=exc.status_code,
+                error_code="INVALID_REQUEST",
+                reason=str(exc.detail),
+            )
             return self._error_response(
                 protocol=protocol,
                 status_code=exc.status_code,
@@ -343,9 +415,18 @@ class Endpoint_openaix(Endpoint_ollama):
             task.config = dict(task.config or {})
             task.config["embedding_user"] = body["user"]
 
+        self._audit_client_request(task, request, body, protocol=protocol, raw_body=raw_body)
+
         try:
             await self._core.on_task_added(task)
         except Exception as exc:
+            self._audit_pre_task_rejection(
+                request,
+                protocol=protocol,
+                status_code=503,
+                error_code=getattr(exc, "code", "QUEUE_ERROR"),
+                reason=str(exc),
+            )
             return self._error_response(
                 protocol=protocol,
                 status_code=503,
@@ -355,8 +436,11 @@ class Endpoint_openaix(Endpoint_ollama):
             )
 
         if protocol == "ollama":
-            return await self._sync_response(task)
-        return await self._openai_embed_sync_response(task, body)
+            response = await self._sync_response(task)
+        else:
+            response = await self._openai_embed_sync_response(task, body)
+        self._audit_client_response(task, response)
+        return response
 
     def _validate_embed_request(self, body: dict, *, protocol: str) -> JSONResponse | None:
         """Validate the shared text-only, non-streaming embedding request contract."""
@@ -887,10 +971,17 @@ class Endpoint_openaix(Endpoint_ollama):
         first_chunk: dict | None = None,
     ) -> AsyncGenerator[bytes, None]:
         """Stream OpenAI-compatible SSE chunks converted from Ollama chunks."""
+        audit_log = getattr(self._core, "audit_log", None)
+        audit_context = getattr(task, "_audit_client_context", None)
+        spool_path = audit_log.open_body_spool() if audit_log is not None and isinstance(audit_context, dict) else None
         try:
             if first_chunk is not None:
                 openai_chunk = self._ollama_chunk_to_openai(first_chunk, task.id, request_body)
-                yield f"data: {json.dumps(openai_chunk)}\n\n".encode()
+                encoded = f"data: {json.dumps(openai_chunk)}\n\n".encode()
+                yield encoded
+                if spool_path is not None:
+                    with spool_path.open("ab") as spool:
+                        spool.write(encoded)
             while True:
                 timeout_phase, remaining = self._task_timeout_phase(task)
                 if remaining is not None and remaining <= 0:
@@ -900,7 +991,11 @@ class Endpoint_openaix(Endpoint_ollama):
                         message="Request timed out",
                         task_id=task.id,
                     )
-                    yield f"data: {json.dumps(err)}\n\n".encode()
+                    encoded = f"data: {json.dumps(err)}\n\n".encode()
+                    yield encoded
+                    if spool_path is not None:
+                        with spool_path.open("ab") as spool:
+                            spool.write(encoded)
                     break
 
                 try:
@@ -913,11 +1008,34 @@ class Endpoint_openaix(Endpoint_ollama):
                     break
 
                 openai_chunk = self._ollama_chunk_to_openai(chunk, task.id, request_body)
-                yield f"data: {json.dumps(openai_chunk)}\n\n".encode()
+                encoded = f"data: {json.dumps(openai_chunk)}\n\n".encode()
+                yield encoded
+                if spool_path is not None:
+                    with spool_path.open("ab") as spool:
+                        spool.write(encoded)
 
             # OpenAI streaming terminator.
-            yield b"data: [DONE]\n\n"
+            encoded = b"data: [DONE]\n\n"
+            yield encoded
+            if spool_path is not None:
+                with spool_path.open("ab") as spool:
+                    spool.write(encoded)
         finally:
+            if spool_path is not None:
+                try:
+                    event = audit_log.finalize_body_spool(
+                        "client_response", spool_path, content_type="text/event-stream",
+                        task_id=task.id, request_id=audit_context["request_id"], protocol=audit_context["protocol"],
+                        endpoint=audit_context["endpoint"], worker_id=task.worker_id,
+                        http={"status_code": 200, "content_type": "text/event-stream"},
+                        terminal_status=task.status,
+                    )
+                    queue = getattr(self._core, "queue", None)
+                    reconcile = getattr(queue, "record_client_response_reconciliation", None)
+                    if callable(reconcile):
+                        reconcile(task, event["event_id"])
+                except Exception as exc:
+                    log("audit", "error", f"Failed to audit OpenAI stream response task={task.id}: {exc}", self.id)
             asyncio.create_task(self._core.delete_task(task.id))
 
     async def _openai_streaming_response(self, task, request_body: dict) -> StreamingResponse | JSONResponse:

@@ -339,6 +339,7 @@ class TestCronLogging(unittest.TestCase):
             "refresh_external_mcp_tools": cron.refresh_external_mcp_tools,
             "wipe_logs": cron.wipe_logs,
             "trim_logs_by_size": cron.trim_logs_by_size,
+            "retain_audit_logs": cron.retain_audit_logs,
             "health_check": cron.health_check,
             "cleanup_stale_tasks": cron.cleanup_stale_tasks,
             "cleanup_expired_tasks": cron.cleanup_expired_tasks,
@@ -350,6 +351,7 @@ class TestCronLogging(unittest.TestCase):
             cron.refresh_external_mcp_tools = _ok
             cron.wipe_logs = _ok
             cron.trim_logs_by_size = _ok
+            cron.retain_audit_logs = _ok
             cron.health_check = _ok
             cron.cleanup_stale_tasks = _ok
             cron.cleanup_expired_tasks = _ok

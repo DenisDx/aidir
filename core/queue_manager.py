@@ -33,11 +33,13 @@ class QueueManager:
         redis_client: aioredis.Redis,
         instance: str = "aidir",
         status_change_callback: Callable[[Task], Awaitable[None]] | None = None,
+        audit_log=None,
     ) -> None:
         self._redis = redis_client
         self._ns = instance                        # key namespace
         self._tasks: dict[str, Task] = {}          # task_id -> Task
         self._status_change_callback = status_change_callback
+        self._audit_log = audit_log
 
     _QUEUE_TASK_TYPES = ("agent", "request", "tool", "context_builder")
 
@@ -102,6 +104,7 @@ class QueueManager:
         })
         await task._chunk_queue.put(None)   # stream sentinel
         task._done_event.set()
+        self._record_terminal_audit(task)
         await self._notify_status_change(task)
 
     async def mark_failed(self, task: Task, error: dict) -> None:
@@ -119,6 +122,7 @@ class QueueManager:
         })
         await task._chunk_queue.put(None)   # stream sentinel
         task._done_event.set()
+        self._record_terminal_audit(task)
         await self._notify_status_change(task)
 
     async def mark_canceled(self, task: Task) -> None:
@@ -134,6 +138,7 @@ class QueueManager:
         })
         await task._chunk_queue.put(None)   # stream sentinel
         task._done_event.set()
+        self._record_terminal_audit(task)
         await self._notify_status_change(task)
 
     async def delete_task(self, task_id: str) -> None:
@@ -193,10 +198,22 @@ class QueueManager:
         return task.llm_call_count
 
     async def persist_llm_call_diagnostics(self, task: Task) -> None:
-        """Persist task-level LLM call diagnostics without rewriting unrelated task state."""
+        """Persist bounded LLM summaries without raw request, response, or stream bodies."""
+        allowed_fields = {
+            "call_index", "started_at", "finished_at", "duration_ms", "worker_id",
+            "provider_id", "request_kind", "url_path", "model", "stream",
+            "message_count", "last_role", "has_tools", "input_count", "request_text",
+            "request_preview", "status", "http_status", "error_code",
+            "response_summary", "audit_request_event_id", "audit_response_event_id",
+        }
+        history = [
+            {key: value for key, value in entry.items() if key in allowed_fields}
+            for entry in (getattr(task, "llm_call_history", []) or [])
+            if isinstance(entry, dict)
+        ]
         serialized_history = await asyncio.to_thread(
             json.dumps,
-            getattr(task, "llm_call_history", []) or [],
+            history,
         )
         await self._redis.hset(
             self._tk(task.id),
@@ -304,4 +321,57 @@ class QueueManager:
             await self._status_change_callback(task)
         except Exception:
             # Status updates must stay best-effort; callback failures are logged upstream.
+            return
+
+    def _record_terminal_audit(self, task: Task) -> None:
+        """Write one compact terminal audit record without affecting task completion."""
+        if self._audit_log is None:
+            return
+        try:
+            route = task.config.get("route") if isinstance(task.config, dict) else {}
+            route = route if isinstance(route, dict) else {}
+            events = self._audit_log.list_task_events(task.id)
+            references: dict[str, list[str]] = {
+                "client_request": [],
+                "client_response": [],
+                "llm_requests": [],
+                "llm_responses": [],
+            }
+            reference_groups = {
+                "client_request": "client_request",
+                "client_response": "client_response",
+                "llm_request": "llm_requests",
+                "llm_response": "llm_responses",
+            }
+            for event in events:
+                group = reference_groups.get(event["type"])
+                if group is not None:
+                    references[group].append(event["event_id"])
+            self._audit_log.record_task_terminal(
+                task_id=task.id,
+                status=task.status,
+                task={
+                    "type": task.type, "priority": task.priority, "worker_id": task.worker_id,
+                    "created_at": task.created_at.isoformat(),
+                    "started_at": task.started_at.isoformat() if task.started_at else None,
+                    "finished_at": task.finished_at.isoformat() if task.finished_at else None,
+                    "queue_timeout": task.queue_timeout, "run_timeout": task.run_timeout,
+                    "route": route, "error": task.error,
+                    "result_summary": {"llm_call_count": task.llm_call_count},
+                },
+                raw_event_refs=references,
+            )
+        except Exception:
+            return
+
+    def record_client_response_reconciliation(self, task: Task, event_id: str) -> None:
+        """Append a late client-response reference after terminal stream delivery."""
+        if self._audit_log is None or not event_id:
+            return
+        try:
+            self._audit_log.record_task_reconciliation(
+                task_id=task.id,
+                raw_event_refs={"client_response": [event_id]},
+            )
+        except Exception:
             return

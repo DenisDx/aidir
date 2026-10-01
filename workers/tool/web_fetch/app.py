@@ -176,6 +176,21 @@ class WebFetchWorker(BaseToolWorker):
 
         self._providers: list[_ProviderState] = [_ProviderState(p) for p in raw_list]
 
+    def _provider_states(self) -> list[_ProviderState]:
+        """Return initialized providers or synthesize one from legacy worker fields."""
+        providers = getattr(self, "_providers", None)
+        if isinstance(providers, list):
+            return providers
+        provider_type = str(getattr(self, "_provider", "brave") or "brave")
+        self._cooldown = float(getattr(self, "_cooldown", 60) or 60)
+        self._providers = [_ProviderState({
+            "id": provider_type,
+            "type": provider_type,
+            "apiKey": getattr(self, "_api_key", ""),
+            "baseUrl": getattr(self, "_base_url", ""),
+        })]
+        return self._providers
+
     # ── utilities ─────────────────────────────────────────────────────────────
 
     @staticmethod
@@ -447,14 +462,15 @@ class WebFetchWorker(BaseToolWorker):
         if not parsed.scheme or not parsed.netloc:
             return WorkerResult(ok=False, error={"code": "INVALID_ARGUMENT", "message": "url must be absolute (https://...)"})
 
-        configured = len(self._providers)
+        providers = self._provider_states()
+        configured = len(providers)
         enabled = 0
         tried = 0
         blacklisted_ids: list[str] = []
         empty_result: WorkerResult | None = None
         last_error: dict = {"code": "NO_PROVIDER", "message": "No fetch providers are configured or available"}
 
-        for state in self._providers:
+        for state in providers:
             if not state.enabled:
                 continue
             enabled += 1

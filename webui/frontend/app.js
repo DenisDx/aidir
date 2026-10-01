@@ -745,8 +745,8 @@ function renderTaskViewerRows(tasks) {
       <td style="color:var(--muted);font-size:12px">${requestPreview}</td>
       <td>${escapeHtml(String(Number(task.llm_call_count || 0)))}</td>
       <td style="color:var(--muted);font-size:12px">${escapeHtml(fmtDateTime(task.last_operation_at))}</td>
-      <td><button class="btn-sm" data-task-json-id="${escapeHtml(task.id || '')}">Show JSON</button></td>
-      <td><button class="btn-sm" data-task-steps-id="${escapeHtml(task.id || '')}">Show steps</button></td>
+      <td><button class="btn-sm" data-task-json-id="${escapeHtml(task.id || '')}">Show Request</button></td>
+      <td><button class="btn-sm" data-task-steps-id="${escapeHtml(task.id || '')}">Show Task</button></td>
     `;
     tr.querySelector('[data-task-json-id]').addEventListener('click', () => openTaskViewerJson(task.id));
     tr.querySelector('[data-task-steps-id]').addEventListener('click', () => openTaskViewerSteps(task));
@@ -825,12 +825,12 @@ function closeTaskViewerModal() {
 
 async function openTaskViewerJson(taskId) {
   if (!taskId) return;
-  const data = await apiGet(`/api/tasks/viewer/${encodeURIComponent(taskId)}`);
-  if (!data || !data.task) {
-    window.alert('Task not found');
+  const data = await apiGet(`/api/tasks/viewer/${encodeURIComponent(taskId)}/request`);
+  if (!data || !data.event) {
+    window.alert('Request audit data is unavailable');
     return;
   }
-  openTaskViewerModal(data.task);
+  openTaskViewerTextModal(`Task ${taskId} request`, 'Lazy-loaded audit event', JSON.stringify(data.event, null, 2));
 }
 
 function taskViewerLogFile(task) {
@@ -858,39 +858,48 @@ async function openTaskViewerSteps(task) {
   const taskId = task?.id;
   if (!taskId) return;
 
-  let currentTask = task;
-  const taskData = await apiGet(`/api/tasks/viewer/${encodeURIComponent(taskId)}`);
-  if (taskData?.task) {
-    currentTask = taskData.task;
-  }
-
-  const logFile = taskViewerLogFile(currentTask);
-  const contains = `"task_id": "${taskId}"`;
-  const params = new URLSearchParams({
-    file: logFile,
-    contains,
-    limit: '200',
-  });
-
-  const data = await apiGet(`/api/logs/search?${params.toString()}`);
+  const data = await apiGet(`/api/tasks/viewer/${encodeURIComponent(taskId)}/detail`);
   if (!data) return;
+  const container = document.createElement('div');
+  const metadata = document.createElement('pre');
+  metadata.textContent = JSON.stringify(data.task || {}, null, 2);
+  container.appendChild(metadata);
 
-  const subtitleParts = [logFile, `${data.count ?? 0} entr${(data.count ?? 0) === 1 ? 'y' : 'ies'}`];
-  if (data.truncated) {
-    subtitleParts.push(`showing first ${(data.lines || []).length}`);
+  for (const event of data.audit_events || []) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'btn secondary';
+    button.textContent = `${event.type || 'audit event'} ${event.recorded_at || ''}`;
+    const files = document.createElement('div');
+    button.addEventListener('click', async () => {
+      const raw = await apiGet(
+        `/api/tasks/viewer/${encodeURIComponent(taskId)}/raw?type=${encodeURIComponent(event.type)}&event_id=${encodeURIComponent(event.event_id)}`,
+      );
+      if (raw?.event) {
+        openTaskViewerTextModal(`Task ${taskId} ${event.type}`, 'Lazy-loaded audit event', JSON.stringify(raw.event, null, 2));
+        files.replaceChildren();
+        const fileReferences = [raw.event.body_file, ...(Array.isArray(raw.event.attachments) ? raw.event.attachments : [])];
+        for (const fileReference of fileReferences) {
+          const fileId = String(fileReference?.file_id || '').trim();
+          if (!fileId) continue;
+          const link = document.createElement('a');
+          link.href = `/api/tasks/viewer/audit-files/${encodeURIComponent(fileId)}`;
+          link.target = '_blank';
+          link.rel = 'noopener';
+          link.className = 'btn secondary';
+          link.textContent = fileReference === raw.event.body_file ? 'Open body file' : 'Open attachment';
+          files.appendChild(link);
+        }
+      }
+    });
+    container.appendChild(button);
+    container.appendChild(files);
   }
 
-  const viewer = window.TaskStepsViewer;
-  if (viewer && typeof viewer.renderStepsView === 'function') {
-    const rendered = viewer.renderStepsView(currentTask, data);
-    openTaskViewerNodeModal(rendered.title, rendered.subtitle, rendered.bodyNode);
-    return;
-  }
-
-  openTaskViewerTextModal(
-    `Task ${taskId} steps`,
-    subtitleParts.join(' · '),
-    formatTaskViewerStepLines(data.lines || []),
+  openTaskViewerNodeModal(
+    `Task ${taskId}`,
+    data.active ? 'Task is active; completed audit events only.' : 'Compact task metadata and audit manifest',
+    container,
   );
 }
 

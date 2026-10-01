@@ -27,7 +27,7 @@ class _AsyncContextWrapper:
 import httpx
 
 from core import log
-from core.call_log import save_llm_call, save_llm_raw_call
+from core.call_log import save_llm_call
 from core.context import Context
 from core.error_logging import log_exception
 from core.task import Task, STATUS_COMPLETED, STATUS_FAILED, STATUS_CANCELED
@@ -1334,24 +1334,18 @@ class OpenAIxWorker(BaseWorker):
         result = WorkerResult(ok=False, error={"code": "EXCEPTION", "message": "retry loop not entered"})
 
         for attempt in range(1, max(upstream_retry_count, error_retry_count) + 2):
-            history_entry = None
-            if task is not None:
+            try:
+                request = self._build_json_request(client, url, upstream_payload)
                 history_entry = await self._begin_llm_call(
                     task,
                     url=url,
-                    payload=payload,
+                    payload=upstream_payload,
                     provider_id=provider_id,
                     save_call=save_call,
-                )
-            try:
-                request = self._build_json_request(client, url, upstream_payload)
-                if save_call:
-                    save_llm_raw_call(self.id, request.content)
-
+                    request_body=request.content,
+                ) if task is not None else None
                 resp = await self._send_json_request(client, request, upstream_payload)
                 raw_response = await self._read_response_body(resp)
-                if save_call:
-                    save_llm_raw_call(self.id, raw_response)
 
                 if resp.status_code != 200:
                     body_preview = resp.text[:512]
@@ -1370,13 +1364,16 @@ class OpenAIxWorker(BaseWorker):
                             "openaix",
                         )
                         compat_request = self._build_json_request(client, url, compat_payload)
-                        if save_call:
-                            save_llm_raw_call(self.id, compat_request.content)
-
+                        compat_history_entry = await self._begin_llm_call(
+                            task,
+                            url=url,
+                            payload=compat_payload,
+                            provider_id=provider_id,
+                            save_call=save_call,
+                            request_body=compat_request.content,
+                        ) if task is not None else None
                         compat_resp = await self._send_json_request(client, compat_request, compat_payload)
                         compat_raw_response = await self._read_response_body(compat_resp)
-                        if save_call:
-                            save_llm_raw_call(self.id, compat_raw_response)
 
                         if compat_resp.status_code == 200:
                             try:
@@ -1385,12 +1382,39 @@ class OpenAIxWorker(BaseWorker):
                                 body_preview = compat_resp.text[:512]
                                 continue
                             if task is not None:
-                                await self._finalize_llm_call(task, history_entry, status="ok", http_status=compat_resp.status_code, response=data)
+                                await self._finalize_llm_call(
+                                    task,
+                                    compat_history_entry,
+                                    status="ok",
+                                    http_status=compat_resp.status_code,
+                                    response=data,
+                                    response_body=compat_raw_response,
+                                    response_content_type=self._response_content_type(compat_resp, "application/json"),
+                                )
+                                await self._finalize_llm_call(
+                                    task,
+                                    history_entry,
+                                    status="http_error",
+                                    http_status=resp.status_code,
+                                    error_code="UPSTREAM_ERROR",
+                                    response_body=raw_response,
+                                    response_content_type=self._response_content_type(resp, "application/octet-stream"),
+                                )
                             if save_call:
                                 save_llm_call(self.id, effective_task_id, compat_payload, data)
                             return WorkerResult(ok=True, data=data, usage=data.get("usage"))
 
                         body_preview = compat_resp.text[:512]
+                        if task is not None:
+                            await self._finalize_llm_call(
+                                task,
+                                compat_history_entry,
+                                status="http_error",
+                                http_status=compat_resp.status_code,
+                                error_code="UPSTREAM_ERROR",
+                                response_body=compat_raw_response,
+                                response_content_type=self._response_content_type(compat_resp, "application/octet-stream"),
+                            )
                     log(
                         "worker",
                         "warning",
@@ -1401,7 +1425,7 @@ class OpenAIxWorker(BaseWorker):
                         "openaix",
                     )
                     if task is not None:
-                        await self._finalize_llm_call(task, history_entry, status="http_error", http_status=resp.status_code, error_code="UPSTREAM_ERROR")
+                        await self._finalize_llm_call(task, history_entry, status="http_error", http_status=resp.status_code, error_code="UPSTREAM_ERROR", response_body=raw_response, response_content_type=self._response_content_type(resp, "application/octet-stream"))
                     result = WorkerResult(
                         ok=False,
                         error={
@@ -1425,7 +1449,7 @@ class OpenAIxWorker(BaseWorker):
                             "openaix",
                         )
                         if task is not None:
-                            await self._finalize_llm_call(task, history_entry, status="invalid_json", http_status=resp.status_code, error_code="UPSTREAM_INVALID_JSON")
+                            await self._finalize_llm_call(task, history_entry, status="invalid_json", http_status=resp.status_code, error_code="UPSTREAM_INVALID_JSON", response_body=raw_response, response_content_type=self._response_content_type(resp, "application/octet-stream"))
                         result = WorkerResult(
                             ok=False,
                             error={
@@ -1437,7 +1461,7 @@ class OpenAIxWorker(BaseWorker):
                     else:
                         data = self._normalize_upstream_response_data(data)
                         if task is not None:
-                            await self._finalize_llm_call(task, history_entry, status="ok", http_status=resp.status_code, response=data)
+                            await self._finalize_llm_call(task, history_entry, status="ok", http_status=resp.status_code, response=data, response_body=raw_response, response_content_type=self._response_content_type(resp, "application/json"))
 
                         if save_call:
                             save_llm_call(self.id, effective_task_id, upstream_payload, data)
@@ -1589,18 +1613,11 @@ class OpenAIxWorker(BaseWorker):
 
         for attempt in range(1, max(upstream_retry_count, error_retry_count) + 2):
             history_entry = None
-            if task is not None:
-                history_entry = await self._begin_llm_call(
-                    task,
-                    url=url,
-                    payload=payload,
-                    provider_id=provider_id,
-                    save_call=save_call,
-                )
             upstream_payload = {**payload, "stream": True}
             final_data: dict | None = None
             chunks: list[dict] = [] if save_call else []
             emitted_any_chunk = False
+            raw_parts: list[bytes] = []
 
             async def tracked_emit_chunk(chunk: dict) -> None:
                 nonlocal emitted_any_chunk
@@ -1610,16 +1627,18 @@ class OpenAIxWorker(BaseWorker):
 
             try:
                 request = self._build_json_request(client, url, upstream_payload)
-                if save_call:
-                    save_llm_raw_call(self.id, request.content)
-
+                history_entry = await self._begin_llm_call(
+                    task,
+                    url=url,
+                    payload=upstream_payload,
+                    provider_id=provider_id,
+                    save_call=save_call,
+                    request_body=request.content,
+                ) if task is not None else None
                 stream_context = await self._open_stream_request(client, request, upstream_payload)
-                raw_parts: list[bytes] = [] if save_call else []
                 async with stream_context as resp:
                     if resp.status_code != 200:
                         raw_error = await self._read_response_body(resp)
-                        if save_call:
-                            save_llm_raw_call(self.id, raw_error)
                         log(
                             "worker",
                             "warning",
@@ -1627,7 +1646,7 @@ class OpenAIxWorker(BaseWorker):
                             "openaix",
                         )
                         if task is not None:
-                            await self._finalize_llm_call(task, history_entry, status="http_error", http_status=resp.status_code, error_code="UPSTREAM_ERROR")
+                            await self._finalize_llm_call(task, history_entry, status="http_error", http_status=resp.status_code, error_code="UPSTREAM_ERROR", response_body=raw_error, response_content_type=self._response_content_type(resp, "application/octet-stream"))
                         result = WorkerResult(
                             ok=False,
                             error={
@@ -1639,27 +1658,28 @@ class OpenAIxWorker(BaseWorker):
                         final_data = await self._consume_stream_response(resp, tracked_emit_chunk, chunks, raw_parts, save_call)
 
                         if save_call:
-                            save_llm_raw_call(self.id, b"".join(raw_parts))
-
-                        if save_call:
                             save_llm_call(self.id, effective_task_id, upstream_payload, {"stream_chunks": chunks})
                         if task is not None:
-                            await self._finalize_llm_call(task, history_entry, status="ok", http_status=200, response={"stream_chunks": chunks, **(final_data or {})})
+                            await self._finalize_llm_call(task, history_entry, status="ok", http_status=200, response={"stream_chunks": chunks, **(final_data or {})}, response_body=b"".join(raw_parts), response_content_type=self._response_content_type(resp, "application/x-ndjson"))
                         return WorkerResult(ok=True, data=final_data, usage=(final_data or {}).get("usage"))
             except httpx.ConnectError as exc:
                 if task is not None:
-                    await self._finalize_llm_call(task, history_entry, status="connect_error", error_code="UPSTREAM_UNREACHABLE")
+                    await self._finalize_llm_call(task, history_entry, status="connect_error", error_code="UPSTREAM_UNREACHABLE", response_body=b"".join(raw_parts), response_content_type="application/x-ndjson")
                 log("worker", "warning", f"Upstream unreachable: {exc}", "openaix")
                 result = WorkerResult(ok=False, error={"code": "UPSTREAM_UNREACHABLE", "message": str(exc)})
             except httpx.TimeoutException as exc:
                 if task is not None:
-                    await self._finalize_llm_call(task, history_entry, status="timeout", error_code="UPSTREAM_TIMEOUT")
+                    await self._finalize_llm_call(task, history_entry, status="timeout", error_code="UPSTREAM_TIMEOUT", response_body=b"".join(raw_parts), response_content_type="application/x-ndjson")
                 timeout_message = self._build_timeout_message(exc)
                 log("worker", "warning", f"Upstream timeout: {timeout_message}", "openaix")
                 result = WorkerResult(ok=False, error={"code": "UPSTREAM_TIMEOUT", "message": timeout_message})
+            except asyncio.CancelledError:
+                if task is not None:
+                    await self._finalize_llm_call(task, history_entry, status="cancelled", error_code="CANCELLED", response_body=b"".join(raw_parts), response_content_type="application/x-ndjson")
+                raise
             except Exception as exc:
                 if task is not None:
-                    await self._finalize_llm_call(task, history_entry, status="exception", error_code="EXCEPTION")
+                    await self._finalize_llm_call(task, history_entry, status="exception", error_code="EXCEPTION", response_body=b"".join(raw_parts), response_content_type="application/x-ndjson")
                 error_message = self._describe_exception(exc)
                 log_exception(
                     "worker",
@@ -1727,6 +1747,12 @@ class OpenAIxWorker(BaseWorker):
         return str(content)
 
     @staticmethod
+    def _response_content_type(resp, default: str) -> str:
+        """Return an upstream response content type when it is available."""
+        headers = getattr(resp, "headers", {})
+        return headers.get("content-type", default) if hasattr(headers, "get") else default
+
+    @staticmethod
     def _normalize_upstream_response_data(data: object) -> object:
         """Fill empty content from thinking/reasoning fields when the upstream response omits content."""
         if not isinstance(data, dict):
@@ -1761,8 +1787,7 @@ class OpenAIxWorker(BaseWorker):
             decoder = codecs.getincrementaldecoder("utf-8")()
             text_buffer = ""
             async for raw_chunk in aiter_raw():
-                if save_call:
-                    raw_parts.append(raw_chunk)
+                raw_parts.append(raw_chunk)
                 decoded = decoder.decode(raw_chunk)
                 text_buffer += decoded
                 while "\n" in text_buffer:

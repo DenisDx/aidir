@@ -27,6 +27,9 @@ class TestWebUiLiveLogs(unittest.TestCase):
             (logs_dir / "worker.log").touch()
             (logs_dir / "openaix_call_log.jsonl").touch()
             (logs_dir / "secrets.txt").touch()
+            audit_dir = logs_dir / "audit"
+            audit_dir.mkdir()
+            (audit_dir / "raw_client_requests-2026-10-01.jsonl").touch()
 
             with patch("webui.backend.app._LOGS_DIR", logs_dir):
                 self.assertEqual(
@@ -36,6 +39,8 @@ class TestWebUiLiveLogs(unittest.TestCase):
                 self.assertEqual(_resolve_log_file("worker.log"), logs_dir / "worker.log")
                 with self.assertRaises(HTTPException):
                     _resolve_log_file("secrets.txt")
+                with self.assertRaises(HTTPException):
+                    _resolve_log_file("audit/raw_client_requests-2026-10-01.jsonl")
 
     def test_initial_tail_keeps_only_complete_recent_lines(self) -> None:
         """Returns the requested recent lines without a partial leading record."""

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import codecs
 import json
 import time
 from datetime import datetime, timezone
@@ -9,7 +10,7 @@ from typing import Awaitable, Callable
 
 import httpx
 
-from core.call_log import save_llm_call, save_llm_raw_call
+from core.call_log import save_llm_call
 from core.local_server_manager import LocalServerError
 from core.task import Task
 from core.task_types.task_agent import Task_agent
@@ -65,6 +66,16 @@ class CallLlamaCppWorker(OpenAIxWorker):
         except httpx.TimeoutException as exc:
             await self._finalize_latest_started_llm_call(task, status="timeout", error_code="UPSTREAM_TIMEOUT")
             return WorkerResult(ok=False, error={"code": "UPSTREAM_TIMEOUT", "message": self._build_timeout_message(exc)})
+        except asyncio.CancelledError:
+            raw_parts = getattr(task, "_audit_stream_raw_parts", [])
+            await self._finalize_latest_started_llm_call(
+                task,
+                status="cancelled",
+                error_code="CANCELLED",
+                response_body=b"".join(raw_parts),
+                response_content_type="text/event-stream",
+            )
+            raise
 
     @classmethod
     def _to_openai_payload(cls, payload: dict, stream: bool) -> dict:
@@ -92,16 +103,16 @@ class CallLlamaCppWorker(OpenAIxWorker):
     async def _forward_sync(self, client, url: str, payload: dict, *, task=None, save_call: bool = False, task_id: str = "") -> WorkerResult:
         """Send an OpenAI-compatible llama.cpp request and normalize the response for endpoints."""
         provider_id = self._resolve_task_provider_id(task) if task is not None else self._provider_id
-        history_entry = await self._begin_llm_call(task, url=url, payload=payload, provider_id=provider_id, save_call=save_call) if task else None
-        response = await client.post(url, json={**payload, "stream": False})
-        if save_call:
-            save_llm_raw_call(self.id, json.dumps({**payload, "stream": False}, ensure_ascii=False))
-            save_llm_raw_call(self.id, response.content)
+        upstream_payload = {**payload, "stream": False}
+        request = self._build_json_request(client, url, upstream_payload)
+        history_entry = await self._begin_llm_call(task, url=url, payload=upstream_payload, provider_id=provider_id, save_call=save_call, request_body=request.content) if task else None
+        response = await self._send_json_request(client, request, upstream_payload)
+        raw_response = await self._read_response_body(response)
         if response.status_code != 200:
             if task:
                 if isinstance(history_entry, dict):
                     history_entry["raw_response"] = response.text
-                await self._finalize_llm_call(task, history_entry, status="http_error", http_status=response.status_code, error_code="UPSTREAM_ERROR")
+                await self._finalize_llm_call(task, history_entry, status="http_error", http_status=response.status_code, error_code="UPSTREAM_ERROR", response_body=raw_response, response_content_type=self._response_content_type(response, "application/octet-stream"))
             return WorkerResult(ok=False, error={"code": "UPSTREAM_ERROR", "message": f"Upstream returned HTTP {response.status_code}", "body": response.text[:512]})
         try:
             data = self._openai_response_to_ollama(response.json())
@@ -109,12 +120,12 @@ class CallLlamaCppWorker(OpenAIxWorker):
             if task:
                 if isinstance(history_entry, dict):
                     history_entry["raw_response"] = response.text
-                await self._finalize_llm_call(task, history_entry, status="invalid_json", http_status=response.status_code, error_code="UPSTREAM_INVALID_JSON")
+                await self._finalize_llm_call(task, history_entry, status="invalid_json", http_status=response.status_code, error_code="UPSTREAM_INVALID_JSON", response_body=raw_response, response_content_type=self._response_content_type(response, "application/octet-stream"))
             return WorkerResult(ok=False, error={"code": "UPSTREAM_INVALID_JSON", "message": str(exc) or "Upstream returned invalid JSON"})
         if task:
             if isinstance(history_entry, dict):
                 history_entry["raw_response"] = response.text
-            await self._finalize_llm_call(task, history_entry, status="ok", http_status=response.status_code, response=data)
+            await self._finalize_llm_call(task, history_entry, status="ok", http_status=response.status_code, response=data, response_body=raw_response, response_content_type=self._response_content_type(response, "application/json"))
         if save_call:
             save_llm_call(self.id, task_id or (task.id if task else ""), {**payload, "stream": False}, data)
         return WorkerResult(ok=True, data=data, usage=data.get("usage"))
@@ -122,27 +133,26 @@ class CallLlamaCppWorker(OpenAIxWorker):
     async def _forward_stream(self, client, url: str, payload: dict, emit_chunk, task=None, *, save_call: bool = False, task_id: str = "") -> WorkerResult:
         """Translate llama.cpp OpenAI SSE chunks into internal Ollama-compatible chunks."""
         provider_id = self._resolve_task_provider_id(task) if task is not None else self._provider_id
-        history_entry = await self._begin_llm_call(task, url=url, payload=payload, provider_id=provider_id, save_call=save_call) if task else None
         final_data: dict | None = None
         upstream_payload = {**payload, "stream": True}
         raw_lines: list[str] = []
+        raw_parts: list[bytes] = []
+        if task is not None:
+            task._audit_stream_raw_parts = raw_parts
         stream_events: list[object] = []
-        if save_call:
-            save_llm_raw_call(self.id, json.dumps(upstream_payload, ensure_ascii=False))
-        async with client.stream("POST", url, json={**payload, "stream": True}) as response:
+        request = self._build_json_request(client, url, upstream_payload)
+        history_entry = await self._begin_llm_call(task, url=url, payload=upstream_payload, provider_id=provider_id, save_call=save_call, request_body=request.content) if task else None
+        stream_context = await self._open_stream_request(client, request, upstream_payload)
+        async with stream_context as response:
             if response.status_code != 200:
                 raw_response = await response.aread()
-                if save_call:
-                    save_llm_raw_call(self.id, raw_response)
                 if task:
                     if isinstance(history_entry, dict):
                         history_entry["raw_response"] = raw_response.decode("utf-8", errors="replace")
-                    await self._finalize_llm_call(task, history_entry, status="http_error", http_status=response.status_code, error_code="UPSTREAM_ERROR")
+                    await self._finalize_llm_call(task, history_entry, status="http_error", http_status=response.status_code, error_code="UPSTREAM_ERROR", response_body=raw_response, response_content_type=self._response_content_type(response, "application/octet-stream"))
                 return WorkerResult(ok=False, error={"code": "UPSTREAM_ERROR", "message": f"Upstream returned HTTP {response.status_code}"})
-            async for line in response.aiter_lines():
+            async for line in self._iter_sse_lines(response, raw_parts):
                 raw_lines.append(line)
-                if save_call:
-                    save_llm_raw_call(self.id, line)
                 if not line.startswith("data:"):
                     if isinstance(history_entry, dict):
                         history_entry["raw_sse"] = raw_lines
@@ -178,6 +188,8 @@ class CallLlamaCppWorker(OpenAIxWorker):
                 status="ok",
                 http_status=200,
                 response={"raw_sse": raw_lines, "stream_events": stream_events, "final": final_data or {}},
+                response_body=b"".join(raw_parts),
+                response_content_type=self._response_content_type(response, "text/event-stream"),
             )
         if save_call:
             save_llm_call(
@@ -187,6 +199,28 @@ class CallLlamaCppWorker(OpenAIxWorker):
                 {"raw_sse": raw_lines, "stream_events": stream_events, "final": final_data or {}},
             )
         return WorkerResult(ok=True, data=final_data, usage=(final_data or {}).get("usage"))
+
+    @staticmethod
+    async def _iter_sse_lines(response, raw_parts: list[bytes]):
+        """Yield decoded SSE lines while retaining each raw transport byte sequence."""
+        aiter_raw = getattr(response, "aiter_raw", None)
+        if callable(aiter_raw):
+            buffer = ""
+            decoder = codecs.getincrementaldecoder("utf-8")()
+            async for raw_chunk in aiter_raw():
+                raw_parts.append(raw_chunk)
+                buffer += decoder.decode(raw_chunk)
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
+                    yield line
+            buffer += decoder.decode(b"", final=True)
+            if buffer:
+                yield buffer
+            return
+
+        async for line in response.aiter_lines():
+            raw_parts.append(line.encode("utf-8") + b"\n")
+            yield line
 
     @staticmethod
     def _openai_response_to_ollama(data: dict, streaming: bool = False) -> dict:

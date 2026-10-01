@@ -5,6 +5,7 @@ Provides minimal tools discovery and tools invocation routes for MVP usage.
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import TYPE_CHECKING
 
 from fastapi import FastAPI, Request
@@ -12,6 +13,7 @@ from fastapi.responses import JSONResponse, Response
 
 from core.endpoint import BaseEndpoint
 from core.error_logging import attach_request_id_middleware, get_or_create_request_id, log_exception
+from core.request_limits import RequestBodyLimitMiddleware
 from core.task import STATUS_CANCELED, STATUS_COMPLETED, STATUS_FAILED
 from core.task_types.task_tool import Task_tool
 from core.worker import BaseToolWorker
@@ -44,6 +46,11 @@ class Endpoint_mcp(BaseEndpoint):
         """Create FastAPI app for MCP methods over JSON-RPC style HTTP."""
         self._core = core
         app = FastAPI(title=f"aidir-{self.id}", docs_url=None, redoc_url=None)
+        app.add_middleware(
+            RequestBodyLimitMiddleware,
+            max_request_size=core.config.get("http.max_request_size", 104857600),
+            audit_log=getattr(core, "audit_log", None),
+        )
         attach_request_id_middleware(app)
 
         @app.exception_handler(Exception)
@@ -84,8 +91,15 @@ class Endpoint_mcp(BaseEndpoint):
     async def _handle_rpc(self, request: Request) -> JSONResponse:
         """Dispatch MCP request by method name."""
         try:
-            body = await request.json()
+            body, raw_body = await self._read_json_body(request)
         except Exception:
+            self._audit_pre_task_rejection(
+                request,
+                protocol="mcp",
+                status_code=400,
+                error_code="PARSE_ERROR",
+                reason="Invalid JSON body",
+            )
             return JSONResponse(
                 {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}},
                 status_code=400,
@@ -126,7 +140,7 @@ class Endpoint_mcp(BaseEndpoint):
 
         if method == "tools/call":
             params = body.get("params") or {}
-            return await self._handle_tool_call(req_id, params)
+            return await self._handle_tool_call(req_id, params, request, body, raw_body)
 
         return JSONResponse(
             {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": f"Method not found: {method}"}},
@@ -183,7 +197,14 @@ class Endpoint_mcp(BaseEndpoint):
 
         return registry
 
-    async def _handle_tool_call(self, req_id, params: dict) -> JSONResponse:
+    async def _handle_tool_call(
+        self,
+        req_id,
+        params: dict,
+        request: Request,
+        request_body: dict,
+        raw_body: bytes,
+    ) -> JSONResponse:
         """Create tool task, wait for completion, and return MCP result."""
         tool_name = params.get("name")
         arguments = params.get("arguments") or {}
@@ -202,6 +223,7 @@ class Endpoint_mcp(BaseEndpoint):
         cfg_tasks = self._core.config.get("tasks", {}) or {}
         task.queue_timeout = int(cfg_tasks.get("queue_timeout", 300))
         task.run_timeout = int(cfg_tasks.get("run_timeout", 300))
+        self._audit_client_request(task, request, request_body, raw_body)
 
         try:
             await self._core.on_task_added(task)
@@ -222,35 +244,88 @@ class Endpoint_mcp(BaseEndpoint):
         timeout_phase = await self._wait_for_task_terminal(task)
         if timeout_phase is not None:
             await self._terminate_task_on_timeout(task)
-            return JSONResponse(
+            return self._audit_client_response(task, JSONResponse(
                 {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32001, "message": "Tool call timed out"}},
                 status_code=504,
-            )
+            ))
 
         asyncio.create_task(self._core.delete_task(task.id))
 
         if task.status == STATUS_COMPLETED:
-            return JSONResponse({"jsonrpc": "2.0", "id": req_id, "result": task.result or {}})
+            return self._audit_client_response(task, JSONResponse({"jsonrpc": "2.0", "id": req_id, "result": task.result or {}}))
 
         if task.status == STATUS_FAILED:
             err = task.error or {"code": "TOOL_ERROR", "message": "Tool failed"}
             if err.get("code") in {"TIMEOUT", "QUEUE_TIMEOUT"}:
-                return JSONResponse(
+                return self._audit_client_response(task, JSONResponse(
                     {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32001, "message": err.get("message", "Tool call timed out")}},
                     status_code=504,
-                )
-            return JSONResponse(
+                ))
+            return self._audit_client_response(task, JSONResponse(
                 {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32002, "message": err.get("message", "Tool failed"), "data": err}},
                 status_code=502,
-            )
+            ))
 
         if task.status == STATUS_CANCELED:
-            return JSONResponse(
+            return self._audit_client_response(task, JSONResponse(
                 {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32003, "message": "Tool call canceled"}},
                 status_code=503,
-            )
+            ))
 
-        return JSONResponse(
+        return self._audit_client_response(task, JSONResponse(
             {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32004, "message": "Unknown tool state"}},
             status_code=500,
-        )
+        ))
+
+    def _audit_client_request(self, task: Task_tool, request: Request, body: dict, raw_body: bytes | None = None) -> None:
+        """Record an accepted MCP client request and keep its response context."""
+        audit_log = getattr(self._core, "audit_log", None)
+        if audit_log is None:
+            return
+        context = {
+            "request_id": get_or_create_request_id(request),
+            "protocol": "mcp",
+            "endpoint": request.url.path,
+            "http": {
+                "method": request.method,
+                "url": str(request.url),
+                "content_type": request.headers.get("content-type", "application/json"),
+            },
+            "worker_id": task.worker_id,
+        }
+        task._audit_client_context = context
+        try:
+            audit_log.record_body_event(
+                "client_request",
+                raw_body if raw_body is not None else json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+                task_id=task.id,
+                **context,
+            )
+        except Exception as exc:
+            log("audit", "error", f"Failed to audit MCP client request task={task.id}: {exc}", self.id)
+
+    def _audit_client_response(self, task: Task_tool, response: JSONResponse) -> JSONResponse:
+        """Record a completed MCP response and return it unchanged to the caller."""
+        audit_log = getattr(self._core, "audit_log", None)
+        context = getattr(task, "_audit_client_context", None)
+        if audit_log is None or not isinstance(context, dict):
+            return response
+        try:
+            audit_log.record_body_event(
+                "client_response",
+                response.body,
+                task_id=task.id,
+                request_id=context["request_id"],
+                protocol="mcp",
+                endpoint=context["endpoint"],
+                worker_id=task.worker_id,
+                http={
+                    "status_code": response.status_code,
+                    "content_type": response.headers.get("content-type", "application/json"),
+                },
+                terminal_status=task.status,
+                error_code=(task.error or {}).get("code") if isinstance(task.error, dict) else None,
+            )
+        except Exception as exc:
+            log("audit", "error", f"Failed to audit MCP client response task={task.id}: {exc}", self.id)
+        return response

@@ -20,6 +20,7 @@ sys.path.insert(0, str(_ROOT))
 from core.config import config  # noqa: E402
 from core import log             # noqa: E402
 from core.app import Core        # noqa: E402
+from core.audit_log import AuditLog  # noqa: E402
 from core.workers_loader import resolve_worker_configs  # noqa: E402
 
 import redis.asyncio as aioredis  # noqa: E402
@@ -206,6 +207,31 @@ async def trim_logs_by_size(redis: aioredis.Redis) -> None:
             log("system", "info", f"Log trim done (max_size={max_log_size}, removed={total_trimmed//1024}KB): {details}")
     except Exception as exc:
         log("system", "error", f"trim_logs_by_size failed: {exc}")
+
+
+async def retain_audit_logs(redis: aioredis.Redis) -> None:
+    """Remove eligible whole audit partitions without touching operational logs."""
+    audit_cfg = config.get("logging.audit") or {}
+    period = _to_int(audit_cfg.get("retention_period"), 3600)
+    if not await _should_run(redis, "retain_audit_logs", period):
+        return
+    directory = Path(audit_cfg.get("directory") or _LOGS_DIR / "audit")
+    if not directory.is_absolute():
+        directory = _ROOT / directory
+    audit_log = AuditLog(directory)
+    recovered = audit_log.reconcile_partitions(
+        max_spool_age_seconds=_to_int(audit_cfg.get("max_spool_age_seconds"), 86400),
+    )
+    removed = audit_log.retain_partitions(
+        retention_days=_to_int(audit_cfg.get("retention_days"), 30),
+        max_total_bytes=_to_int(audit_cfg.get("max_total_bytes"), 1073741824),
+        emergency_max_total_bytes=_to_int(audit_cfg.get("emergency_max_total_bytes"), 2147483648),
+        reconcile=False,
+    )
+    if recovered:
+        log("audit", "warning", f"Recovered interrupted audit partitions: {', '.join(recovered)}", "retention")
+    if removed:
+        log("audit", "info", f"Removed audit partitions: {', '.join(removed)}", "retention")
 
 
 async def cleanup_stale_tasks(redis: aioredis.Redis) -> None:
@@ -412,6 +438,7 @@ async def main() -> None:
             await _run_job("refresh_external_mcp_tools", refresh_external_mcp_tools(redis)),
             await _run_job("wipe_logs", wipe_logs(redis)),
             await _run_job("trim_logs_by_size", trim_logs_by_size(redis)),
+            await _run_job("retain_audit_logs", retain_audit_logs(redis)),
             await _run_job("health_check", health_check(redis)),
             await _run_job("cleanup_stale_tasks", cleanup_stale_tasks(redis)),
             await _run_job("cleanup_expired_tasks", cleanup_expired_tasks(redis)),

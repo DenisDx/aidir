@@ -2,7 +2,27 @@
 
 ## Status
 
-Proposal only. This document does not change runtime behavior.
+Stage 1 is complete. The runtime has an append-only JSONL writer, rebuildable
+SQLite event index, compact pre-task rejection records, task-correlated client
+request/response records, byte-exact upstream LLM exchange records, compact
+terminal task records with append-only client-response reconciliation, basic
+whole-partition retention, lazy Task Viewer event APIs, safe file-ID download,
+and summary-only Redis LLM diagnostics. File-backed bodies are available to the
+writer for normal, partial, timed-out, and cancelled stream completion paths.
+Stage 2 storage lifecycle, bounded writer, health, retention, data-URI
+attachment, and configured secret-redaction work is complete. Stage 3 Viewer,
+Live Logs isolation, legacy raw-call retirement, and focused end-to-end
+validation are complete.
+
+There is no remaining implementation work in this refactoring. Completion is
+based on the focused regression suite, not merely the presence of plumbing.
+
+## Outstanding Implementation
+
+The focused audit suite validates all body classes, streams, retries/tool loops,
+rejection paths, terminal references, Viewer authorization, index rebuild, and
+Live Logs isolation. Legacy raw-call writers have been removed; compact
+operational call summaries remain available.
 
 ## Goal
 
@@ -40,31 +60,33 @@ This makes JSON immediately inspectable while preserving non-JSON data exactly.
 
 ### Request and response capture
 
-- `Endpoint_ollama` and `Endpoint_openaix` use `await request.json()`. They do
-  not retain original bodies, invalid JSON, or non-JSON input.
-- Endpoint response helpers create `JSONResponse` and `StreamingResponse`, but
-  do not persist the complete client-visible response.
-- A stream is sent incrementally. No terminal audit record contains its full
-  body when it completes, fails, or is cancelled.
+- Accepted non-stream requests and responses for Ollama/OpenAIx chat and
+  embeddings, plus MCP tool calls, are written with task correlation.
+- The writer semantically preserves valid JSON; UTF-8 text remains inline,
+  declared binary media is file-backed with byte count and SHA-256, and
+  recognized base64 data-URI media is stored as an indexed attachment without
+  modifying its original JSON value. Configured envelope secret fields are
+  redacted, while `data` remains unchanged.
+- Rejections and client stream terminal paths are task-correlated across the
+  supported endpoint variants.
 
 ### LLM capture
 
-- `core/call_log.py` writes a structured `*_call_log.jsonl` record only after
-  normal LLM completion.
-- Worker `*_call_raw_log.jsonl` files append unframed fragments. They contain
-  no task ID, exchange ID, timestamp, direction, or request/response boundary.
-- Stream cancellation can bypass the final structured call-log write. The data
-  may remain in Redis diagnostics, but it cannot be efficiently found by task.
+- Generic worker lifecycle writes task-correlated byte-exact LLM request and
+  response events with stable call indices.
+- Legacy raw-call journal writes are retired; structured operational call logs
+  contain summaries only. Redis-persisted LLM diagnostics are summary-only and
+  retain audit event references instead of raw stream bodies.
 
 ### Task Viewer and retention
 
-- Task Viewer search scans Redis hashes and decodes full payloads, results,
-  config, and LLM history for every displayed row. Large stream histories make
-  this slow.
-- `Show JSON` renders the full Redis task object. `Show steps` performs a text
-  search in the worker call log.
-- Generic cron trimming rewrites every `.log` and `.jsonl` tail. It is unsafe
-  for large audit records and gives raw data no audit-specific retention policy.
+- Task Viewer has lazy request/detail/raw-event APIs and no longer uses worker
+  call-log search for its actions. Search now returns a summary-only projection
+  without decoding request/result/config/history bodies.
+- Generic trimming excludes `logs/audit/`; a Core-owned bounded writer queue
+  exposes drop and I/O health, while dedicated retention uses partition
+  lifecycle state, restart reconciliation, stale-spool cleanup, normal and
+  emergency quota settings. `/api/status` exposes audit storage health.
 
 ## Requirements
 
@@ -86,6 +108,8 @@ This makes JSON immediately inspectable while preserving non-JSON data exactly.
 8. Treat audit storage as an independent subsystem: it has separate retention,
   is not a Dashboard Live Logs source, and is accessed in the UI only through
   task-correlated audit views.
+9. Reject inbound HTTP request bodies larger than the configured maximum before
+  endpoint JSON parsing or task creation, and record a compact rejection.
 
 ## Proposed Files
 
@@ -147,19 +171,23 @@ uses a distinct file reference:
 }
 ```
 
-Recognized media encoded in a JSON `data:*;base64,...` value also uses
-file-backed storage. The original JSON body is retained as its own file so its
-fields and encoded value remain unchanged; the decoded media is recorded as a
-separate attachment with the same `file_id` schema. This allows Task Viewer to
-open an image directly without heuristic JSON rewrites or loss of the original
-request representation. Unmarked base64-looking strings are not extracted
-heuristically and remain part of the JSON body.
+Recognized media encoded in a JSON `data:*;base64,...` value uses file-backed
+storage for the decoded media. The original JSON value remains inline in
+`data` unchanged, and the decoded media is recorded as a separate attachment
+with the same `file_id` schema. This allows Task Viewer to open an image
+directly without heuristic JSON rewrites or loss of the original request
+representation. Unmarked base64-looking strings are not extracted heuristically
+and remain part of the JSON body.
 
 The raw-data API returns event metadata and authenticated links of the form:
 
 ```text
 GET /api/tasks/viewer/audit-files/{file_id}
 ```
+
+Implemented: the endpoint resolves an opaque file ID through audit events and
+serves only allowlisted image types inline; all other content is downloaded with
+`nosniff`.
 
 The endpoint resolves `file_id` through the audit index, never accepts a file
 path, and is excluded from Dashboard Live Logs. It sends an allowlisted image
@@ -329,6 +357,16 @@ Replace direct task-route `request.json()` usage with a shared helper:
 
 The helper must preserve current validation, authentication, and task behavior.
 
+### 2a. Enforce a request-body limit
+
+Add one shared ASGI request-body limiter to task-producing HTTP applications.
+It checks declared `Content-Length` before consuming the body and counts bytes
+received from chunked requests, returning HTTP 413 before endpoint parsing or
+task creation when the body exceeds `http.max_request_size`. The default is
+`104857600` bytes (100 MiB) when the setting is absent from an existing config.
+Every rejection writes the compact `rejected_requests` record and an
+operational warning without retaining the oversized body.
+
 ### 3. Capture client responses
 
 Use shared response wrappers:
@@ -412,7 +450,7 @@ unbounded Python memory, stream bytes are held in a temporary per-event spool
 under `logs/audit/.spool/`. At terminal completion, failure, or cancellation:
 
 1. close the spool;
-2. parse as JSON when valid, otherwise encode as escaped UTF-8 or Base64;
+2. parse as JSON when valid, otherwise store escaped UTF-8 or a file reference;
 3. calculate byte count and SHA-256;
 4. append one JSONL event; and
 5. delete the spool only after a successful append.
@@ -480,6 +518,9 @@ logging: {
     writer_queue_size: 256,
     overflow_policy: "best_effort"
   }
+},
+http: {
+  max_request_size: 104857600
 }
 ```
 
@@ -525,8 +566,8 @@ Add focused tests for:
 
 1. valid JSON client request keeps an identical JSON value in `data`, without
    added or removed fields;
-2. invalid JSON request stays byte-exact as escaped text or Base64 and has
-   `task_id: null`;
+2. invalid JSON request stays byte-exact as escaped text and has `task_id:
+  null`; binary input is file-backed;
 3. sync client and LLM bodies preserve identical JSON values when valid and
    bytes exactly otherwise;
 4. normal SSE writes one terminal client-response and LLM-response event;
@@ -553,15 +594,17 @@ Add focused tests for:
   record without storing their body or credentials.
 18. emergency quota or `ENOSPC` deletes only closed whole partitions and emits
   an error-level health event.
+19. declared and chunked requests above `http.max_request_size` receive HTTP
+  413, create no task, and write a compact rejection record without retaining
+  the oversized body.
 
-## TBDs
+## Future Scope
 
-1. A future secrets-protection policy, including encryption at rest, access
-  roles, and stronger redaction for audit bodies.
-2. Whether direct MCP request/response auditing should use the same raw event
-  schema when full MCP coverage is introduced.
-3. Whether very large non-media text or JSON bodies need a configurable
-  file-backed threshold in addition to binary and recognized media extraction.
+No unresolved design decisions block the first implementation. This phase
+assumes audit storage is trusted and retention-limited; a future security phase
+may add encryption, access roles, and stronger secret redaction. Direct MCP
+request/response auditing remains deferred, while inference tasks created via
+MCP follow the standard task audit path without a separate integration.
 
 ## Non-Goals
 
@@ -570,3 +613,30 @@ Add focused tests for:
   semantics.
 - Returning raw bodies in the task-list API.
 - Reformatting human-readable operational logs into audit records.
+
+## Minimal Completion Plan
+
+### Stage 1: Complete Audit Capture Contracts
+
+Finish all endpoint rejection paths, client stream terminal capture, and
+byte-exact upstream capture for `call_ollama`, `call_llama_cpp`, and `openaix`.
+Each existing request, response, retry, tool loop, timeout, cancellation, and
+queue-admission path must produce the required compact or raw event without
+changing routing, retry, or delivery behavior. Add terminal-record
+reconciliation after client response finalization so the one logical terminal
+task view contains every raw-event reference.
+
+### Stage 2: Make Audit Storage Durable and Maintainable (Complete)
+
+Implemented the bounded writer queue and health state, partition lifecycle
+state, startup/cron reconciliation, stale-spool cleanup, normal and emergency
+quota retention, disk-usage reporting, metadata redaction, and data-URI media
+attachments while preserving original JSON `data` unchanged.
+
+### Stage 3: Complete Viewer and Validate End to End (Complete)
+
+Implemented file-backed-event links and Task Viewer safety coverage. The
+complete focused audit suite validates byte equality for body classes and
+streams, retries/tool loops, rejection paths, terminal references, writer
+overflow/failure, retention recovery/quota, Viewer authorization, index rebuild,
+and Live Logs isolation.
