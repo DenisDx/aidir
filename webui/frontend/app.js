@@ -29,6 +29,7 @@ let taskViewerModalCopyText = '';
 let taskViewerModalJsonValue = null;
 let taskViewerModalJsonText = '';
 let taskViewerModalJsonMode = 'tree';
+let taskViewerModalBackAction = null;
 
 const TEXT_PICKERS = [
   {
@@ -790,6 +791,11 @@ function setTaskViewerModalCopyText(text) {
   copyButton.disabled = !taskViewerModalCopyText;
 }
 
+function setTaskViewerModalBackAction(action) {
+  taskViewerModalBackAction = typeof action === 'function' ? action : null;
+  $('task-json-modal-back').hidden = !taskViewerModalBackAction;
+}
+
 function renderTaskViewerModalJson() {
   const body = $('task-json-modal-body');
   const textButton = $('task-json-modal-text');
@@ -811,11 +817,12 @@ function renderTaskViewerModalJson() {
   body.replaceChildren(tree);
 }
 
-function openTaskViewerJsonModal(title, subtitle, value) {
+function openTaskViewerJsonModal(title, subtitle, value, backAction = null) {
   const modal = $('task-json-modal');
   taskViewerModalJsonValue = value;
   taskViewerModalJsonText = JSON.stringify(value, null, 2);
   taskViewerModalJsonMode = 'tree';
+  setTaskViewerModalBackAction(backAction);
   setTaskViewerModalCopyText(taskViewerModalJsonText);
   $('task-json-modal-title').textContent = title;
   $('task-json-modal-subtitle').textContent = subtitle;
@@ -828,6 +835,10 @@ function toggleTaskViewerModalJsonMode() {
   if (taskViewerModalJsonValue === null) return;
   taskViewerModalJsonMode = taskViewerModalJsonMode === 'tree' ? 'text' : 'tree';
   renderTaskViewerModalJson();
+}
+
+function returnToTaskViewerModal() {
+  if (taskViewerModalBackAction) taskViewerModalBackAction();
 }
 
 async function copyTaskViewerModalJson() {
@@ -870,10 +881,11 @@ async function copyTaskViewerModalJson() {
   }, 1500);
 }
 
-function openTaskViewerTextModal(title, subtitle, bodyText) {
+function openTaskViewerTextModal(title, subtitle, bodyText, backAction = null) {
   const modal = $('task-json-modal');
   const body = $('task-json-modal-body');
   taskViewerModalJsonValue = null;
+  setTaskViewerModalBackAction(backAction);
   $('task-json-modal-text').hidden = true;
   setTaskViewerModalCopyText(bodyText);
   $('task-json-modal-title').textContent = title;
@@ -885,10 +897,11 @@ function openTaskViewerTextModal(title, subtitle, bodyText) {
   modal.setAttribute('aria-hidden', 'false');
 }
 
-function openTaskViewerNodeModal(title, subtitle, bodyNode, copyText = '') {
+function openTaskViewerNodeModal(title, subtitle, bodyNode, copyText = '', backAction = null) {
   const modal = $('task-json-modal');
   const body = $('task-json-modal-body');
   taskViewerModalJsonValue = null;
+  setTaskViewerModalBackAction(backAction);
   $('task-json-modal-text').hidden = true;
   setTaskViewerModalCopyText(copyText);
   $('task-json-modal-title').textContent = title;
@@ -916,6 +929,7 @@ function openTaskViewerModal(task) {
 function closeTaskViewerModal() {
   const modal = $('task-json-modal');
   if (!modal) return;
+  setTaskViewerModalBackAction(null);
   modal.classList.remove('is-open');
   modal.setAttribute('aria-hidden', 'true');
 }
@@ -961,6 +975,9 @@ async function openTaskViewerSteps(task) {
   const metadata = document.createElement('pre');
   metadata.textContent = JSON.stringify(data.task || {}, null, 2);
   container.appendChild(metadata);
+  const title = `Task ${taskId}`;
+  const subtitle = data.active ? 'Task is active; completed audit events only.' : 'Compact task metadata and audit manifest';
+  const openManifest = () => openTaskViewerNodeModal(title, subtitle, container);
 
   for (const event of data.audit_events || []) {
     const button = document.createElement('button');
@@ -973,7 +990,12 @@ async function openTaskViewerSteps(task) {
         `/api/tasks/viewer/${encodeURIComponent(taskId)}/raw?type=${encodeURIComponent(event.type)}&event_id=${encodeURIComponent(event.event_id)}`,
       );
       if (raw?.event) {
-        openTaskViewerJsonModal(`Task ${taskId} ${event.type}`, 'Lazy-loaded audit event', raw.event);
+        openTaskViewerJsonModal(
+          `Task ${taskId} ${event.type}`,
+          'Lazy-loaded audit event',
+          raw.event,
+          openManifest,
+        );
         files.replaceChildren();
         const fileReferences = [raw.event.body_file, ...(Array.isArray(raw.event.attachments) ? raw.event.attachments : [])];
         for (const fileReference of fileReferences) {
@@ -993,11 +1015,7 @@ async function openTaskViewerSteps(task) {
     container.appendChild(files);
   }
 
-  openTaskViewerNodeModal(
-    `Task ${taskId}`,
-    data.active ? 'Task is active; completed audit events only.' : 'Compact task metadata and audit manifest',
-    container,
-  );
+  openManifest();
 }
 
 // ── Live logs ──────────────────────────────────────────────────────────────
@@ -1142,6 +1160,7 @@ function bindTaskViewerUi() {
   $('task-viewer-show-btn').addEventListener('click', loadTaskViewerTasks);
   $('task-viewer-clear-btn').addEventListener('click', resetTaskViewerFilters);
   $('task-viewer-worker-type').addEventListener('change', applyTaskViewerWorkerTypeFilter);
+  $('task-json-modal-back').addEventListener('click', returnToTaskViewerModal);
   $('task-json-modal-text').addEventListener('click', toggleTaskViewerModalJsonMode);
   $('task-json-modal-copy').addEventListener('click', copyTaskViewerModalJson);
   $('task-json-modal-close').addEventListener('click', closeTaskViewerModal);
