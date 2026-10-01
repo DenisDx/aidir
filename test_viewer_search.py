@@ -56,6 +56,7 @@ class _Core:
         self.config.get.side_effect = lambda key, default=None: "aidir" if key == "instance" else default
         self.redis = redis
         self.queue = MagicMock()
+        self.queue.get_task.return_value = None
         self.workers = {}
         self.envid_registry = None
 
@@ -116,3 +117,64 @@ class ViewerSearchTests(unittest.TestCase):
         self.assertEqual(body["tasks"][0]["model_id"], "new-model")
         self.assertEqual(redis.scan_calls, 1)
         self.assertEqual(redis.executed_batches, [list(hashes)])
+
+    def test_search_prefers_live_status_over_stale_redis_status(self):
+        """Expose an active task's live status while its Redis hash is stale."""
+        task_id = "active-task"
+        hashes = {
+            f"aidir:task:{task_id}": {
+                **_summary(task_id, "2026-10-01T12:00:00+00:00", "live-model"),
+                "status": "failed",
+                "error_code": "UPSTREAM_TIMEOUT",
+            },
+        }
+        redis = _Redis(hashes)
+        core = _Core(redis)
+        live_task = MagicMock()
+        live_task.to_redis_hash.return_value = {
+            **hashes[f"aidir:task:{task_id}"],
+            "status": "running",
+            "error_code": "",
+            "updated_at": "2026-10-01T12:00:01+00:00",
+            "started_at": "2026-10-01T12:00:01+00:00",
+            "finished_at": "",
+        }
+        core.queue.get_task.side_effect = lambda candidate_id: live_task if candidate_id == task_id else None
+
+        async def session(*args, **kwargs):
+            """Provide an authenticated Viewer session."""
+            return {"permissions": ["all"], "login": "test"}
+
+        with patch("webui.backend.app._get_session", session):
+            response = TestClient(create_app(core)).get("/api/tasks/viewer/search")
+
+        self.assertEqual(response.status_code, 200)
+        task = response.json()["tasks"][0]
+        self.assertEqual(task["status"], "running")
+        self.assertEqual(task["error_code"], "")
+
+    def test_search_exposes_persisted_error_message(self):
+        """Return a bounded failure explanation with the task summary."""
+        task_id = "failed-task"
+        hashes = {
+            f"aidir:task:{task_id}": {
+                **_summary(task_id, "2026-10-01T12:00:00+00:00", "failed-model"),
+                "status": "failed",
+                "error_code": "EXCEPTION",
+                "error": '{"code":"EXCEPTION","message":"Server disconnected without sending a response."}',
+            },
+        }
+        redis = _Redis(hashes)
+        core = _Core(redis)
+
+        async def session(*args, **kwargs):
+            """Provide an authenticated Viewer session."""
+            return {"permissions": ["all"], "login": "test"}
+
+        with patch("webui.backend.app._get_session", session):
+            response = TestClient(create_app(core)).get("/api/tasks/viewer/search")
+
+        self.assertEqual(response.status_code, 200)
+        task = response.json()["tasks"][0]
+        self.assertEqual(task["error_code"], "EXCEPTION")
+        self.assertEqual(task["error_details"], "Server disconnected without sending a response.")

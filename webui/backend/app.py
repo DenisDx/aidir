@@ -341,6 +341,10 @@ def _task_from_hash(task_hash: dict[str, str]) -> dict[str, Any]:
 
 def _task_summary_from_hash(task_hash: dict[str, str]) -> dict[str, Any]:
     """Return search-safe task metadata without decoding raw task bodies or histories."""
+    error = _parse_json_field(task_hash.get("error"))
+    error_details = ""
+    if isinstance(error, dict) and error.get("message") is not None:
+        error_details = str(error["message"])[:1000]
     task: dict[str, Any] = {
         key: task_hash.get(key, "")
         for key in (
@@ -350,6 +354,7 @@ def _task_summary_from_hash(task_hash: dict[str, str]) -> dict[str, Any]:
             "envid", "error_code",
         )
     }
+    task["error_details"] = error_details
     task["priority"] = int(task["priority"] or 0)
     task["llm_call_count"] = int(task["llm_call_count"] or 0)
     task["queue_timeout"] = int(task["queue_timeout"] or 0)
@@ -566,6 +571,10 @@ def create_app(
                 if not raw:
                     continue
 
+                task_id = str(raw.get("id") or "")
+                live_task = core.queue.get_task(task_id) if task_id and core.queue else None
+                if live_task is not None:
+                    raw = live_task.to_redis_hash()
                 task = _task_summary_from_hash(raw)
                 task_envid = str(task.get("envid") or "")
                 if envid and task_envid != envid:

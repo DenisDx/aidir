@@ -731,7 +731,7 @@ function renderTaskViewerRows(tasks) {
   body.innerHTML = '';
   if (!tasks.length) {
     const tr = document.createElement('tr');
-    tr.innerHTML = '<td colspan="12" style="color:var(--muted)">No tasks match the current filters.</td>';
+    tr.innerHTML = '<td colspan="13" style="color:var(--muted)">No tasks match the current filters.</td>';
     body.appendChild(tr);
     return;
   }
@@ -742,6 +742,7 @@ function renderTaskViewerRows(tasks) {
     tr.innerHTML = `
       <td style="font-family:monospace;font-size:11px">${escapeHtml(task.id || '')}</td>
       <td><span class="badge badge-${escapeHtml(task.status || 'created')}">${escapeHtml(task.status || 'created')}</span></td>
+      <td style="color:var(--err);font-size:12px;max-width:320px">${escapeHtml(task.error_details || '—')}</td>
       <td>${escapeHtml(task.worker_id || '—')}</td>
       <td>${escapeHtml(task.envid || '—')}</td>
       <td>${escapeHtml(task.type || '—')}</td>
