@@ -146,6 +146,27 @@ class TestTaskLlmCallCount(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(redis.hashes[f"aidir:task:{task.id}"]["queue_timeout"], "420")
         self.assertEqual(redis.hashes[f"aidir:task:{task.id}"]["run_timeout"], "420")
 
+    async def test_queue_manager_clears_errors_when_task_resumes_or_completes(self) -> None:
+        """Remove stale failure data when a task starts or completes successfully."""
+        task = Task_agent(payload={"model": "qwen3.5:9b"})
+        task.error = {"code": "SERVICE_RESTARTED", "message": "Task interrupted by service restart"}
+        redis = _FakeRedisCounter()
+        queue = QueueManager(redis)
+        queue._tasks[task.id] = task
+
+        await queue.mark_running(task.id, "call_ollama")
+        self.assertEqual(task.status, "running")
+        self.assertIsNone(task.error)
+        self.assertEqual(redis.hashes[f"aidir:task:{task.id}"]["error"], "")
+        self.assertEqual(redis.hashes[f"aidir:task:{task.id}"]["error_code"], "")
+
+        task.error = {"code": "EXCEPTION", "message": "old failure"}
+        await queue.mark_completed(task)
+        self.assertEqual(task.status, "completed")
+        self.assertIsNone(task.error)
+        self.assertEqual(redis.hashes[f"aidir:task:{task.id}"]["error"], "")
+        self.assertEqual(redis.hashes[f"aidir:task:{task.id}"]["error_code"], "")
+
     def test_webui_task_endpoints_return_llm_call_count(self) -> None:
         """Dashboard and task viewer APIs should expose llm_call_count."""
         task = Task_agent(id="task-1", payload={"model": "qwen3.5:9b"}, stream=False)

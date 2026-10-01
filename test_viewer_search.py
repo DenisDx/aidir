@@ -178,3 +178,28 @@ class ViewerSearchTests(unittest.TestCase):
         task = response.json()["tasks"][0]
         self.assertEqual(task["error_code"], "EXCEPTION")
         self.assertEqual(task["error_details"], "Server disconnected without sending a response.")
+
+    def test_search_hides_stale_error_message_for_completed_task(self):
+        """Do not expose stale failure data once a task is completed."""
+        task_id = "completed-task"
+        hashes = {
+            f"aidir:task:{task_id}": {
+                **_summary(task_id, "2026-10-01T12:00:00+00:00", "completed-model"),
+                "error_code": "SERVICE_RESTARTED",
+                "error": '{"code":"SERVICE_RESTARTED","message":"Task interrupted by service restart"}',
+            },
+        }
+        redis = _Redis(hashes)
+        core = _Core(redis)
+
+        async def session(*args, **kwargs):
+            """Provide an authenticated Viewer session."""
+            return {"permissions": ["all"], "login": "test"}
+
+        with patch("webui.backend.app._get_session", session):
+            response = TestClient(create_app(core)).get("/api/tasks/viewer/search")
+
+        self.assertEqual(response.status_code, 200)
+        task = response.json()["tasks"][0]
+        self.assertEqual(task["status"], "completed")
+        self.assertEqual(task["error_details"], "")

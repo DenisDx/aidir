@@ -739,10 +739,11 @@ function renderTaskViewerRows(tasks) {
   tasks.forEach(task => {
     const tr = document.createElement('tr');
     const requestPreview = escapeHtml(firstMessagePreview(task));
+    const errorDetails = task.status === 'failed' ? task.error_details || '' : '';
     tr.innerHTML = `
       <td style="font-family:monospace;font-size:11px">${escapeHtml(task.id || '')}</td>
       <td><span class="badge badge-${escapeHtml(task.status || 'created')}">${escapeHtml(task.status || 'created')}</span></td>
-      <td style="color:var(--err);font-size:12px;max-width:320px">${escapeHtml(task.error_details || '—')}</td>
+      <td style="color:var(--err);font-size:12px;max-width:320px">${escapeHtml(errorDetails)}</td>
       <td>${escapeHtml(task.worker_id || '—')}</td>
       <td>${escapeHtml(task.envid || '—')}</td>
       <td>${escapeHtml(task.type || '—')}</td>

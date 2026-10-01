@@ -341,7 +341,8 @@ def _task_from_hash(task_hash: dict[str, str]) -> dict[str, Any]:
 
 def _task_summary_from_hash(task_hash: dict[str, str]) -> dict[str, Any]:
     """Return search-safe task metadata without decoding raw task bodies or histories."""
-    error = _parse_json_field(task_hash.get("error"))
+    status = str(task_hash.get("status") or "")
+    error = _parse_json_field(task_hash.get("error")) if status == "failed" else None
     error_details = ""
     if isinstance(error, dict) and error.get("message") is not None:
         error_details = str(error["message"])[:1000]

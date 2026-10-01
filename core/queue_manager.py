@@ -132,11 +132,14 @@ class QueueManager:
             task.updated_at = now
             task.started_at = now
             task.worker_id = worker_id
+            task.error = None
         await self._redis.hset(self._tk(task_id), mapping={
             "status":     STATUS_RUNNING,
             "updated_at": now.isoformat(),
             "started_at": now.isoformat(),
             "worker_id":  worker_id,
+            "error":      "",
+            "error_code": "",
         })
         if task:
             await self._notify_status_change(task)
@@ -147,11 +150,14 @@ class QueueManager:
         task.status = STATUS_COMPLETED
         task.updated_at = now
         task.finished_at = now
+        task.error = None
         await self._redis.hset(self._tk(task.id), mapping={
             "status":      STATUS_COMPLETED,
             "updated_at":  now.isoformat(),
             "finished_at": task.finished_at.isoformat(),
             "result":      json.dumps(task.result) if task.result is not None else "",
+            "error":       "",
+            "error_code":  "",
         })
         await task._chunk_queue.put(None)   # stream sentinel
         task._done_event.set()
