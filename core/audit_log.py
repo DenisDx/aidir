@@ -130,18 +130,24 @@ class AuditLog:
             self._writer_thread = threading.Thread(target=self._writer_loop, name="aidir-audit-writer", daemon=True)
             self._writer_thread.start()
 
-    def stop_writer(self) -> None:
-        """Drain and stop the background writer before Core shutdown completes."""
+    def stop_writer(self, timeout: float = 3.0) -> bool:
+        """Request writer shutdown and wait only the configured bounded time."""
         with self._lock:
             writer_queue = self._writer_queue
             writer_thread = self._writer_thread
         if writer_queue is None or writer_thread is None:
-            return
-        writer_queue.put(None)
-        writer_thread.join()
+            return True
+        try:
+            writer_queue.put(None, timeout=max(0.0, timeout))
+        except queue.Full:
+            return False
+        writer_thread.join(timeout=max(0.0, timeout))
+        if writer_thread.is_alive():
+            return False
         with self._lock:
             self._writer_queue = None
             self._writer_thread = None
+        return True
 
     def _writer_loop(self) -> None:
         """Persist queued records serially until shutdown requests a drain."""

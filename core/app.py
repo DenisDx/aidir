@@ -219,6 +219,22 @@ class Core:
     async def stop(self) -> None:
         started_at = time.monotonic()
         log("core", "info", "Core stopping")
+
+        async def shutdown_step(name: str, awaitable, timeout: float) -> bool:
+            """Run one shutdown action with a bounded wait and diagnostic logs."""
+            step_started = time.monotonic()
+            log("core", "info", f"Shutdown step BEGIN: {name} timeout={timeout:.1f}s")
+            try:
+                await asyncio.wait_for(awaitable, timeout=timeout)
+            except asyncio.TimeoutError:
+                log("system", "error", f"Shutdown step TIMEOUT: {name} after {timeout:.1f}s")
+                faulthandler.dump_traceback(all_threads=True)
+                return False
+            except Exception as exc:
+                log("system", "warn", f"Shutdown step FAILED: {name}: {exc}")
+                return False
+            log("core", "info", f"Shutdown step OK: {name} in {time.monotonic() - step_started:.2f}s")
+            return True
         
         cancel_started = time.monotonic()
         for task in list(self._background_tasks):
@@ -228,10 +244,11 @@ class Core:
         
         if self._background_tasks:
             log("core", "info", f"Stopping background tasks: count={len(self._background_tasks)}")
-            gather_started = time.monotonic()
-            await asyncio.gather(*self._background_tasks, return_exceptions=True)
-            gather_elapsed = time.monotonic() - gather_started
-            log("core", "info", f"Background tasks stopped in {gather_elapsed:.2f}s")
+            await shutdown_step(
+                "background tasks",
+                asyncio.gather(*self._background_tasks, return_exceptions=True),
+                5.0,
+            )
         
         if self.scheduler:
             log("core", "info", "Stopping scheduler")
@@ -241,23 +258,31 @@ class Core:
             log("core", "info", f"Scheduler stopped in {sched_elapsed:.2f}s")
 
         if self.audit_log:
-            await asyncio.to_thread(self.audit_log.stop_writer)
+            audit_started = time.monotonic()
+            log("core", "info", "Shutdown step BEGIN: audit writer timeout=3.0s")
+            stopped = self.audit_log.stop_writer(timeout=3.0)
+            status = "OK" if stopped else "TIMEOUT"
+            log("core", "info", f"Shutdown step {status}: audit writer in {time.monotonic() - audit_started:.2f}s")
 
         if self._manage_local_servers:
-            try:
-                await self.resources.force_unload_all(self.config.raw())
+            await shutdown_step(
+                "resource unload",
+                self.resources.force_unload_all(self.config.raw()),
+                10.0,
+            )
+            stopped_providers: list[str] = []
+
+            async def stop_local_servers() -> None:
+                """Stop owned llama.cpp processes and clear their soft consumers."""
+                nonlocal stopped_providers
                 stopped_providers = await self.llama_cpp_server_manager.stop_all()
                 self.resources.clear_soft_consumers_for_providers(stopped_providers)
-                log("core", "info", f"Inference resources released; stopped llama.cpp providers={stopped_providers}")
-            except Exception as exc:
-                log("system", "warn", f"Inference resource release during shutdown failed: {exc}")
+
+            await shutdown_step("llama.cpp servers", stop_local_servers(), 15.0)
+            log("core", "info", f"Inference resources released; stopped llama.cpp providers={stopped_providers}")
         
         if self.redis:
-            log("core", "info", "Closing Redis connection")
-            redis_started = time.monotonic()
-            await self.redis.aclose()
-            redis_elapsed = time.monotonic() - redis_started
-            log("core", "info", f"Redis connection closed in {redis_elapsed:.2f}s")
+            await shutdown_step("Redis connection", self.redis.aclose(), 5.0)
         
         total_elapsed = time.monotonic() - started_at
         log("core", "info", f"Core stopping completed in {total_elapsed:.3f}s")
@@ -365,21 +390,41 @@ class Core:
         timed_out = False
         active_tasks = 0
         if self.scheduler:
-            timeout = self.stop_wait_timeout_seconds() if source == "signal" else self.restart_wait_timeout_seconds()
+            timeout = 5.0 if source == "signal" else self.restart_wait_timeout_seconds()
             labels = self.scheduler.active_task_labels()
             log(
                 "system",
                 "warn",
                 f"Graceful shutdown started via {source}; active_tasks={len(labels)} timeout={timeout}s labels={labels}",
             )
-            
-            wait_started = time.monotonic()
-            timed_out = not await self.scheduler.wait_for_active_tasks(timeout)
-            wait_elapsed = time.monotonic() - wait_started
-            active_tasks = self.scheduler.active_task_count()
-            log("core", "info", f"Graceful shutdown: wait_for_active_tasks returned in {wait_elapsed:.2f}s timed_out={timed_out} active_tasks={active_tasks}")
 
-            if timed_out:
+            if source == "signal" and labels:
+                log("system", "info", f"SIGTERM shutdown: allowing active tasks {timeout:.1f}s to finish count={len(labels)} labels={labels}")
+                wait_started = time.monotonic()
+                drained = await self.scheduler.wait_for_active_tasks(timeout)
+                wait_elapsed = time.monotonic() - wait_started
+                active_tasks = self.scheduler.active_task_count()
+                log("core", "info", f"SIGTERM shutdown: short drain completed in {wait_elapsed:.2f}s drained={drained} remaining={active_tasks}")
+                if drained:
+                    timed_out = False
+                else:
+                    timed_out = True
+                    remaining = self.scheduler.active_task_labels()
+                    log("system", "warn", f"SIGTERM shutdown: canceling remaining tasks count={active_tasks} labels={remaining}")
+                cancel_started = time.monotonic()
+                canceled = await self.scheduler.cancel_active_tasks(timeout=5.0) if not drained else 0
+                cancel_elapsed = time.monotonic() - cancel_started
+                active_tasks = self.scheduler.active_task_count()
+                timed_out = timed_out or active_tasks > 0
+                log("core", "info", f"SIGTERM shutdown: cancel_active_tasks completed in {cancel_elapsed:.2f}s canceled={canceled} remaining={active_tasks}")
+            else:
+                wait_started = time.monotonic()
+                timed_out = not await self.scheduler.wait_for_active_tasks(timeout)
+                wait_elapsed = time.monotonic() - wait_started
+                active_tasks = self.scheduler.active_task_count()
+                log("core", "info", f"Graceful shutdown: wait_for_active_tasks returned in {wait_elapsed:.2f}s timed_out={timed_out} active_tasks={active_tasks}")
+
+            if timed_out and source != "signal":
                 remaining = self.scheduler.active_task_labels()
                 log(
                     "system",
@@ -526,6 +571,8 @@ class Core:
 
 # ── Server builders ───────────────────────────────────────────────────────────
 
+_UVICORN_GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS = 5.0
+
 
 class _Server(uvicorn.Server):
     """uvicorn Server that does not install its own signal handlers.
@@ -535,6 +582,35 @@ class _Server(uvicorn.Server):
         pass
 
 
+async def _wait_for_service_tasks(service_tasks: list[asyncio.Task], timeout: float = 5.0) -> bool:
+    """Wait for service tasks to exit, then cancel any server that remains stuck."""
+    pending = [task for task in service_tasks if not task.done()]
+    if not pending:
+        return True
+    try:
+        await asyncio.wait_for(asyncio.gather(*pending, return_exceptions=True), timeout=timeout)
+        return True
+    except asyncio.TimeoutError:
+        stuck = [task.get_name() for task in pending if not task.done()]
+        log("system", "error", f"Service stop timeout after {timeout:.1f}s; canceling tasks={stuck}")
+        for task in pending:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        return False
+
+
+def _build_server_config(app, host: str, port: int) -> uvicorn.Config:
+    """Create a Uvicorn config with a bounded connection-drain deadline."""
+    return uvicorn.Config(
+        app,
+        host=host,
+        port=port,
+        log_level="warning",
+        timeout_graceful_shutdown=_UVICORN_GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS,
+    )
+
+
 def _build_ollama_server(core: Core, ep_cfg: dict) -> uvicorn.Server:
     endpoint = Endpoint_ollama(ep_cfg)
     app = endpoint.create_app(core)
@@ -542,7 +618,7 @@ def _build_ollama_server(core: Core, ep_cfg: dict) -> uvicorn.Server:
         if False else None  # will be awaited in main()
     host = ep_cfg.get("bindAddress", "0.0.0.0")
     port = int(ep_cfg.get("port", 21434))
-    cfg = uvicorn.Config(app, host=host, port=port, log_level="warning")
+    cfg = _build_server_config(app, host, port)
     return _Server(cfg), endpoint
 
 
@@ -553,7 +629,7 @@ def _build_openaix_server(core: Core, ep_cfg: dict) -> uvicorn.Server:
         if False else None
     host = ep_cfg.get("bindAddress", "0.0.0.0")
     port = int(ep_cfg.get("port", 21434))
-    cfg = uvicorn.Config(app, host=host, port=port, log_level="warning")
+    cfg = _build_server_config(app, host, port)
     return _Server(cfg), endpoint
 
 
@@ -565,7 +641,7 @@ def _build_mcp_server(core: Core, ep_cfg: dict) -> uvicorn.Server:
         if False else None
     host = ep_cfg.get("bindAddress", "0.0.0.0")
     port = int(ep_cfg.get("port", 20001))
-    cfg = uvicorn.Config(app, host=host, port=port, log_level="warning")
+    cfg = _build_server_config(app, host, port)
     return _Server(cfg), endpoint
 
 
@@ -596,7 +672,7 @@ def _build_webui_server(core: Core, restart_callback=None) -> uvicorn.Server:
     webui_cfg = core.config.get("webui") or {}
     host = webui_cfg.get("bind", "127.0.0.1")
     port = int(webui_cfg.get("port", 20080))
-    cfg = uvicorn.Config(app, host=host, port=port, log_level="warning")
+    cfg = _build_server_config(app, host, port)
     return _Server(cfg)
 
 
@@ -612,6 +688,8 @@ async def main() -> None:
     loop = asyncio.get_running_loop()
     all_servers: list[uvicorn.Server] = []
     restart_via_self_exit = False
+    shutdown_task: asyncio.Task | None = None
+    service_tasks: list[asyncio.Task] = []
 
     async def _shutdown_async(source: str) -> None:
         """Drain active work and then stop all uvicorn servers."""
@@ -632,13 +710,19 @@ async def main() -> None:
             srv.should_exit = True
         servers_elapsed = time.monotonic() - servers_started
         log("core", "info", f"All server stop requests sent in {servers_elapsed:.2f}s (source={source})")
+        stopped_cleanly = await _wait_for_service_tasks(service_tasks, timeout=5.0)
+        log("core", "info", f"Service task shutdown complete clean={stopped_cleanly}")
         
         total_elapsed = time.monotonic() - shutdown_started
         log("core", "info", f"_shutdown_async total: {total_elapsed:.2f}s")
 
     def _schedule_shutdown(source: str) -> None:
         """Schedule async shutdown from signal-safe contexts."""
-        loop.create_task(_shutdown_async(source))
+        nonlocal shutdown_task
+        if shutdown_task is not None and not shutdown_task.done():
+            log("core", "info", f"Shutdown already in progress; ignoring source={source}")
+            return
+        shutdown_task = loop.create_task(_shutdown_async(source), name=f"shutdown:{source}")
 
     def _loop_exception_handler(_loop: asyncio.AbstractEventLoop, context: dict) -> None:
         """Log unhandled asyncio loop exceptions into application logs."""
@@ -675,15 +759,17 @@ async def main() -> None:
     except (NotImplementedError, AttributeError):
         pass  # Windows
 
-    # Gather: scheduler + all servers
-    coroutines = [core.scheduler.run()]
-    for server, _ in endpoint_servers:
-        coroutines.append(server.serve())
-    coroutines.append(webui_server.serve())
+    # Run each service independently so shutdown can bound/cancel a stuck server.
+    service_tasks.append(asyncio.create_task(core.scheduler.run(), name="service:scheduler"))
+    for index, (server, _) in enumerate(endpoint_servers):
+        service_tasks.append(asyncio.create_task(server.serve(), name=f"service:endpoint:{index}"))
+    service_tasks.append(asyncio.create_task(webui_server.serve(), name="service:webui"))
 
     log("core", "info", "All services starting")
     try:
-        await asyncio.gather(*coroutines)
+        await asyncio.gather(*service_tasks, return_exceptions=True)
+        if shutdown_task is not None:
+            await asyncio.shield(shutdown_task)
     finally:
         log("core", "info", "Application shutdown: executing core.stop()")
         await core.stop()
