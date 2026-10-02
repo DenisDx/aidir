@@ -612,7 +612,7 @@ function setAllTaskViewerChecks(containerId, checked) {
   });
 }
 
-function renderTaskViewerChecklist(containerId, values, groupName) {
+function renderTaskViewerChecklist(containerId, values, groupName, checked = true) {
   const box = $(containerId);
   if (!box) return;
 
@@ -622,7 +622,7 @@ function renderTaskViewerChecklist(containerId, values, groupName) {
     const extra = typeof value === 'string' ? '' : (value.extra || '');
     return `
       <label>
-        <input type="checkbox" name="${groupName}" value="${escapeHtml(itemValue)}" checked>
+        <input type="checkbox" name="${groupName}" value="${escapeHtml(itemValue)}"${checked ? ' checked' : ''}>
         <span>${escapeHtml(label)}${extra ? ` <span style="color:var(--muted)">${escapeHtml(extra)}</span>` : ''}</span>
       </label>
     `;
@@ -633,6 +633,7 @@ function renderTaskViewerMeta(meta) {
   const statuses = Array.isArray(meta?.status_options) && meta.status_options.length ? meta.status_options : TASK_VIEWER_STATUSES;
   const workers = Array.isArray(meta?.workers) ? meta.workers : [];
   const envids = Array.isArray(meta?.envids) ? meta.envids : [];
+  const routes = Array.isArray(meta?.routes) ? meta.routes : [];
 
   taskViewerWorkersMeta = workers.map(worker => ({
     id: String(worker.id || ''),
@@ -648,6 +649,11 @@ function renderTaskViewerMeta(meta) {
     extra: worker.enabled ? '' : '[disabled]',
   }));
   renderTaskViewerChecklist('task-viewer-worker-list', workerItems, 'task-viewer-worker');
+  renderTaskViewerChecklist('task-viewer-route-list', routes.map(route => ({
+    label: route.label || route.value || '',
+    value: route.value || '',
+    extra: Number(route.count || 0) > 0 ? `[${Number(route.count)}]` : '',
+  })), 'task-viewer-route', false);
 
   applyTaskViewerWorkerTypeFilter();
 
@@ -706,6 +712,7 @@ function buildTaskViewerQuery() {
 
   getCheckedValues('task-viewer-status-list').forEach(value => params.append('status', value));
   getCheckedValues('task-viewer-worker-list').forEach(value => params.append('worker', value));
+  getCheckedValues('task-viewer-route-list').forEach(value => params.append('route', value));
 
   const envid = $('task-viewer-envid').value.trim();
   if (envid) params.set('envid', envid);
@@ -814,7 +821,7 @@ function renderTaskViewerModalJson() {
   body.classList.remove('is-text');
   const viewer = window.TaskStepsViewer;
   const tree = viewer && typeof viewer.renderJsonTree === 'function'
-    ? viewer.renderJsonTree(taskViewerModalJsonValue, false)
+    ? viewer.renderJsonTree(taskViewerModalJsonValue, false, true)
     : document.createTextNode(taskViewerModalJsonText);
   body.replaceChildren(tree);
 }

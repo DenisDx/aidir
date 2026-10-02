@@ -205,15 +205,19 @@
     font-size: 13px;
     color: var(--text);
   }
-  .task-date-grid {
+  .task-viewer-timing-grid {
     display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: repeat(5, minmax(0, 1fr));
     gap: 10px;
   }
-  @media (max-width: 760px) {
-    .task-date-grid { grid-template-columns: 1fr; }
+  @media (max-width: 1100px) {
+    .task-viewer-timing-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   }
-  .task-date-grid input,
+  @media (max-width: 760px) {
+    .task-viewer-timing-grid { grid-template-columns: 1fr; }
+  }
+  .task-viewer-timing-grid input,
+  .task-viewer-timing-grid select,
   .task-viewer-group input[type=text],
   .task-viewer-group select {
     width: 100%;
@@ -883,18 +887,31 @@
           <div class="task-viewer-group-title">Status</div>
           <div id="task-viewer-status-list" class="task-checklist"></div>
         </div>
-        <div class="task-viewer-group">
-          <div class="task-viewer-group-title">Created at</div>
-          <div class="task-date-grid">
-            <input id="task-viewer-created-from" type="datetime-local" placeholder="From">
-            <input id="task-viewer-created-to" type="datetime-local" placeholder="To">
+        <div class="task-viewer-timing-grid">
+          <div class="task-viewer-group">
+            <div class="task-viewer-group-title">Created from</div>
+            <input id="task-viewer-created-from" type="datetime-local">
           </div>
-        </div>
-        <div class="task-viewer-group">
-          <div class="task-viewer-group-title">Last operation</div>
-          <div class="task-date-grid">
-            <input id="task-viewer-op-from" type="datetime-local" placeholder="From">
-            <input id="task-viewer-op-to" type="datetime-local" placeholder="To">
+          <div class="task-viewer-group">
+            <div class="task-viewer-group-title">Created to</div>
+            <input id="task-viewer-created-to" type="datetime-local">
+          </div>
+          <div class="task-viewer-group">
+            <div class="task-viewer-group-title">Last operation from</div>
+            <input id="task-viewer-op-from" type="datetime-local">
+          </div>
+          <div class="task-viewer-group">
+            <div class="task-viewer-group-title">Last operation to</div>
+            <input id="task-viewer-op-to" type="datetime-local">
+          </div>
+          <div class="task-viewer-group">
+            <div class="task-viewer-group-title">Worker type</div>
+            <select id="task-viewer-worker-type">
+              <option value="all">all</option>
+              <option value="agent">agent</option>
+              <option value="tool">tool</option>
+              <option value="context">context</option>
+            </select>
           </div>
         </div>
         <div class="task-viewer-group">
@@ -903,17 +920,12 @@
           <datalist id="task-viewer-envid-list"></datalist>
         </div>
         <div class="task-viewer-group">
-          <div class="task-viewer-group-title">Worker type</div>
-          <select id="task-viewer-worker-type">
-            <option value="all">all</option>
-            <option value="agent">agent</option>
-            <option value="tool">tool</option>
-            <option value="context">context</option>
-          </select>
-        </div>
-        <div class="task-viewer-group">
           <div class="task-viewer-group-title">Worker</div>
           <div id="task-viewer-worker-list" class="task-checklist"></div>
+        </div>
+        <div class="task-viewer-group">
+          <div class="task-viewer-group-title">Model + endpoint (last 1000 requests)</div>
+          <div id="task-viewer-route-list" class="task-checklist"></div>
         </div>
         <div class="task-viewer-group">
           <div class="task-viewer-group-title">Max tasks</div>

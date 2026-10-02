@@ -228,6 +228,35 @@ class AuditLog:
         ]
         return [event for event in events if self._partition_visible(event["journal_path"])]
 
+    def recent_client_request_routes(self, limit: int = 1000) -> tuple[list[dict[str, Any]], dict[str, str]]:
+        """Return distinct endpoint/model routes and task IDs from recent client requests."""
+        bounded_limit = max(1, min(int(limit), 1000))
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                """SELECT event_id FROM events WHERE event_type = 'client_request'
+                ORDER BY recorded_at DESC, byte_offset DESC LIMIT ?""",
+                (bounded_limit,),
+            ).fetchall()
+
+        routes: dict[str, dict[str, Any]] = {}
+        task_routes: dict[str, str] = {}
+        for row in rows:
+            event = self.read_event(row[0])
+            if not isinstance(event, dict):
+                continue
+            body = event.get("data")
+            endpoint = str(event.get("endpoint") or "").strip()
+            model = str(body.get("model") or body.get("name") or "").strip() if isinstance(body, dict) else ""
+            task_id = str(event.get("task_id") or "").strip()
+            if not endpoint or not model or not task_id:
+                continue
+            value = f"{endpoint}\x1f{model}"
+            route = routes.setdefault(value, {"value": value, "label": f"{model} | {endpoint}", "count": 0})
+            route["count"] += 1
+            task_routes.setdefault(task_id, value)
+
+        return sorted(routes.values(), key=lambda route: route["label"].lower()), task_routes
+
     def confirmed_task_events(self, task_id: str) -> list[dict[str, Any]]:
         """Wait for accepted task writes and return only persisted event metadata."""
         with self._lock:
@@ -702,13 +731,26 @@ class AuditLog:
             "body_sha256": hashlib.sha256(body).hexdigest(),
         }
         normalized_content_type = content_type.split(";", 1)[0].strip().lower()
+        body_format = self._body_format_for_content_type(normalized_content_type)
         if self._must_store_body_as_file(normalized_content_type):
-            return fields | self._store_body_file(body, normalized_content_type, day)
+            return fields | {"body_format": body_format} | self._store_body_file(body, normalized_content_type, day)
 
         try:
             decoded = body.decode("utf-8")
         except UnicodeDecodeError:
-            return fields | self._store_body_file(body, normalized_content_type, day)
+            return fields | {"body_format": "binary"} | self._store_body_file(body, normalized_content_type, day)
+
+        if normalized_content_type == "text/event-stream":
+            parsed_sse, sse_data = self._parse_single_json_sse(decoded)
+            if parsed_sse:
+                attachments = self._extract_data_uri_attachments(sse_data, day)
+                return fields | {
+                    "body_storage": "inline",
+                    "data": sse_data,
+                    "data_encoding": "json",
+                    "body_format": "sse_json_with_done",
+                    **({"attachments": attachments} if attachments else {}),
+                }
 
         try:
             data = json.loads(decoded)
@@ -717,14 +759,69 @@ class AuditLog:
                 "body_storage": "inline",
                 "data": decoded,
                 "data_encoding": "utf-8",
+                "body_format": body_format,
             }
         attachments = self._extract_data_uri_attachments(data, day)
         return fields | {
             "body_storage": "inline",
             "data": data,
             "data_encoding": "json",
+            "body_format": "json",
             **({"attachments": attachments} if attachments else {}),
         }
+
+    @staticmethod
+    def _body_format_for_content_type(content_type: str) -> str:
+        """Classify a stored body without inspecting or changing its data."""
+        if content_type == "text/event-stream":
+            return "sse"
+        if content_type == "application/json" or content_type.endswith("+json"):
+            return "json"
+        if content_type.startswith(("image/", "audio/", "video/")) or content_type in {
+            "application/octet-stream",
+            "application/pdf",
+        }:
+            return "binary"
+        return "text"
+
+    @staticmethod
+    def _parse_single_json_sse(body: str) -> tuple[bool, Any]:
+        """Return the JSON payload for one standard SSE event followed by [DONE]."""
+        payloads: list[str] = []
+        terminated = False
+
+        for event in re.split(r"\r?\n\r?\n", body):
+            if not event.strip():
+                continue
+            data_lines: list[str] = []
+            for line in event.splitlines():
+                if line.startswith(":"):
+                    continue
+                if line.startswith("data:"):
+                    data_lines.append(line[5:].lstrip(" "))
+                    continue
+                if line.startswith(("event:", "id:", "retry:")):
+                    continue
+                return False, None
+
+            if not data_lines:
+                continue
+            payload = "\n".join(data_lines)
+            if payload == "[DONE]":
+                if terminated:
+                    return False, None
+                terminated = True
+                continue
+            if terminated:
+                return False, None
+            payloads.append(payload)
+
+        if len(payloads) != 1 or not terminated:
+            return False, None
+        try:
+            return True, json.loads(payloads[0])
+        except json.JSONDecodeError:
+            return False, None
 
     def _extract_data_uri_attachments(self, value: Any, day: str) -> list[dict[str, Any]]:
         """Store recognized media data URIs as attachments while preserving the source JSON value."""

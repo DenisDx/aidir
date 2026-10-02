@@ -294,6 +294,15 @@ def _task_last_operation_at(task: dict[str, Any]) -> datetime | None:
     return None
 
 
+async def _recent_task_routes(core: "Core") -> tuple[list[dict[str, Any]], dict[str, str]]:
+    """Load the last 1000 audited endpoint/model task routes without blocking the API loop."""
+    audit_log = getattr(core, "audit_log", None)
+    loader = getattr(audit_log, "recent_client_request_routes", None)
+    if not callable(loader):
+        return [], {}
+    return await asyncio.to_thread(loader, 1000)
+
+
 async def _cron_health(core: "Core") -> dict[str, Any]:
     """Return cron heartbeat freshness for the Dashboard health panel."""
     max_age = int(core.config.get("webui.health.cron_max_age") or 180)
@@ -530,10 +539,12 @@ def create_app(
         envids: list[str] = []
         if core.envid_registry is not None:
             envids = sorted(e.id for e in core.envid_registry.all())
+        routes, _ = await _recent_task_routes(core)
         return {
             "status_options": ["created", "queued", "running", "completed", "failed", "canceled"],
             "workers": workers,
             "envids": envids,
+            "routes": routes,
         }
 
     @app.get("/api/tasks/viewer/search")
@@ -545,6 +556,7 @@ def create_app(
             for value in _normalize_filter_values(query.getlist("status") or query.get("status"))
         }
         workers = set(_normalize_filter_values(query.getlist("worker") or query.get("worker")))
+        routes = set(_normalize_filter_values(query.getlist("route") or query.get("route")))
         envid = (query.get("envid") or "").strip()
         created_from = _parse_dt(query.get("created_from"))
         created_to = _parse_dt(query.get("created_to"))
@@ -552,6 +564,7 @@ def create_app(
         op_to = _parse_dt(query.get("last_operation_to"))
         limit = int(query.get("limit") or 300)
         limit = max(1, min(limit, 1000))
+        _, task_routes = await _recent_task_routes(core) if routes else ([], {})
 
         ns = core.config.get("instance", "aidir")
         items: list[tuple[str, int, dict[str, Any]]] = []
@@ -583,6 +596,8 @@ def create_app(
                 if statuses and str(task.get("status") or "").lower() not in statuses:
                     continue
                 if workers and str(task.get("worker_id") or "") not in workers:
+                    continue
+                if routes and task_routes.get(task_id) not in routes:
                     continue
 
                 created_at = _parse_dt(task.get("created_at"))

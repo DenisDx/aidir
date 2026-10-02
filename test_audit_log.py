@@ -93,6 +93,16 @@ class AuditLogTests(unittest.TestCase):
                 b"data: partial\n\n",
                 content_type="text/event-stream",
             )
+            single_json_sse_event = audit_log.record_body_event(
+                "client_response",
+                b'data: {"ok":true}\n\ndata: [DONE]\n\n',
+                content_type="text/event-stream",
+            )
+            multi_json_sse_event = audit_log.record_body_event(
+                "client_response",
+                b'data: {"part":1}\n\ndata: {"part":2}\n\ndata: [DONE]\n\n',
+                content_type="text/event-stream",
+            )
             binary_event = audit_log.record_body_event(
                 "client_response",
                 b"\x89PNG\r\n\x1a\n",
@@ -101,8 +111,15 @@ class AuditLogTests(unittest.TestCase):
 
             self.assertEqual(json_event["data"], {"model": "example"})
             self.assertEqual(json_event["data_encoding"], "json")
+            self.assertEqual(json_event["body_format"], "json")
             self.assertEqual(text_event["data"], "data: partial\n\n")
             self.assertEqual(text_event["data_encoding"], "utf-8")
+            self.assertEqual(text_event["body_format"], "sse")
+            self.assertEqual(single_json_sse_event["data"], {"ok": True})
+            self.assertEqual(single_json_sse_event["data_encoding"], "json")
+            self.assertEqual(single_json_sse_event["body_format"], "sse_json_with_done")
+            self.assertEqual(multi_json_sse_event["data_encoding"], "utf-8")
+            self.assertEqual(multi_json_sse_event["body_format"], "sse")
             self.assertEqual(binary_event["body_storage"], "file")
             body_path = Path(temporary_directory) / binary_event["body_file"]["relative_path"]
             self.assertEqual(body_path.read_bytes(), b"\x89PNG\r\n\x1a\n")
@@ -119,6 +136,11 @@ class AuditLogTests(unittest.TestCase):
             text_spool.write(b"hello")
             text_event = audit_log.finalize_body_spool("llm_response", text_spool, content_type="text/plain")
 
+            inline_audit_log = AuditLog(Path(temporary_directory) / "inline")
+            sse_spool = inline_audit_log.open_body_spool()
+            sse_spool.write(b'data: {"ok":true}\n\ndata: [DONE]\n\n')
+            sse_event = inline_audit_log.finalize_body_spool("client_response", sse_spool, content_type="text/event-stream")
+
             binary_spool = audit_log.open_body_spool()
             binary_spool.write(b"\x89PNG")
             binary_event = audit_log.finalize_body_spool("llm_response", binary_spool, content_type="image/png")
@@ -129,6 +151,9 @@ class AuditLogTests(unittest.TestCase):
 
             self.assertEqual(json_event["data"], {"ok": 1})
             self.assertEqual(text_event["data"], "hello")
+            self.assertEqual(sse_event["data"], {"ok": True})
+            self.assertEqual(sse_event["data_encoding"], "json")
+            self.assertEqual(sse_event["body_format"], "sse_json_with_done")
             self.assertEqual(binary_event["body_storage"], "file")
             self.assertEqual(large_event["body_storage"], "file")
             self.assertFalse(json_spool.exists())

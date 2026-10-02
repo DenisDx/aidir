@@ -57,6 +57,7 @@ class _Core:
         self.redis = redis
         self.queue = MagicMock()
         self.queue.get_task.return_value = None
+        self.audit_log = None
         self.workers = {}
         self.envid_registry = None
 
@@ -203,3 +204,31 @@ class ViewerSearchTests(unittest.TestCase):
         task = response.json()["tasks"][0]
         self.assertEqual(task["status"], "completed")
         self.assertEqual(task["error_details"], "")
+
+    def test_search_filters_by_recent_audited_model_and_endpoint(self):
+        """Match tasks by a route from the bounded recent-request audit map."""
+        llama_route = "/v1/chat/completions\x1fllama"
+        hashes = {
+            "aidir:task:llama": _summary("llama", "2026-10-01T12:00:00+00:00", "llama"),
+            "aidir:task:embed": _summary("embed", "2026-10-01T12:01:00+00:00", "embed"),
+        }
+        redis = _Redis(hashes)
+        core = _Core(redis)
+        core.audit_log = MagicMock()
+        core.audit_log.recent_client_request_routes.return_value = (
+            [{"value": llama_route, "label": "llama | /v1/chat/completions", "count": 1}],
+            {"llama": llama_route},
+        )
+
+        async def session(*args, **kwargs):
+            """Provide an authenticated Viewer session."""
+            return {"permissions": ["all"], "login": "test"}
+
+        with patch("webui.backend.app._get_session", session):
+            response = TestClient(create_app(core)).get(
+                "/api/tasks/viewer/search",
+                params=[("route", llama_route)],
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([task["id"] for task in response.json()["tasks"]], ["llama"])

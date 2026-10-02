@@ -231,7 +231,9 @@ class EndpointAuditTests(unittest.TestCase):
             self.assertEqual(len(records), 1)
             event = records[0]
             self.assertEqual(event["body_storage"], "inline")
-            self.assertEqual(event["data"].encode("utf-8"), delivered)
+            payload = delivered.split(b"data: ", 1)[1].split(b"\n\n", 1)[0]
+            self.assertEqual(event["data"], json.loads(payload))
+            self.assertEqual(event["body_format"], "sse_json_with_done")
             self.assertTrue(delivered.endswith(b"data: [DONE]\n\n"))
 
 
