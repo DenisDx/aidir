@@ -32,6 +32,7 @@ from core.envid import EnvidRegistry
 from core.logger import logger
 from core.local_server_manager import LocalServerManager
 from core.queue_manager import QueueManager
+from core.resource_monitor import ResourceMonitor
 from core.resources import Resources
 from core.scheduler import Scheduler
 from core.task import STATUS_CREATED, STATUS_QUEUED, STATUS_RUNNING
@@ -86,6 +87,7 @@ class Core:
         self.workers_cfg: dict[str, dict] = {}
         self.loop_workers: list[tuple[str, object]] = []
         self.resources = Resources([])
+        self.resource_monitor: ResourceMonitor | None = None
         self.llama_cpp_server_manager = LocalServerManager({}, _ROOT)
         self.envid_registry: EnvidRegistry | None = None
         self.audit_log: AuditLog | None = None
@@ -213,12 +215,18 @@ class Core:
             resources=self.resources,
             full_config=self.config.raw(),
         )
+        self.resource_monitor = ResourceMonitor(self.resources)
+        self._track_background_task(
+            asyncio.create_task(self.resource_monitor.run(), name="resource-monitor")
+        )
 
         log("core", "info", "Core started")
 
     async def stop(self) -> None:
         started_at = time.monotonic()
         log("core", "info", "Core stopping")
+        if self.resource_monitor is not None:
+            self.resource_monitor.stop()
 
         async def shutdown_step(name: str, awaitable, timeout: float) -> bool:
             """Run one shutdown action with a bounded wait and diagnostic logs."""

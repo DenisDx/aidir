@@ -458,7 +458,7 @@ function renderResources(resources) {
 
   if (!resources.length) {
     const tr = document.createElement('tr');
-    tr.innerHTML = '<td colspan="6" style="color:var(--muted)">No resources configured</td>';
+    tr.innerHTML = '<td colspan="7" style="color:var(--muted)">No resources configured</td>';
     body.appendChild(tr);
     return;
   }
@@ -492,6 +492,17 @@ function renderResources(resources) {
       return `<div style="margin-bottom:2px;color:var(--red)"><span style="font-family:monospace">${escapeHtml(providerModel)}</span> ${escapeHtml(detail)}</div>`;
     }).join('');
 
+    const sensors = ((r.monitoring || {}).sensors || []).map(sensor => {
+      const unit = sensor.unit ? ` ${sensor.unit}` : '';
+      const value = sensor.value == null ? '—' : `${sensor.value}${unit}`;
+      const threshold = sensor.threshold && sensor.threshold.value != null
+        ? ` (${sensor.threshold.operator || 'above'} ${sensor.threshold.value}${unit})`
+        : '';
+      const color = sensor.status === 'alert' ? 'var(--red)' : sensor.status === 'error' ? 'var(--yellow)' : 'var(--muted)';
+      const detail = sensor.error ? `: ${sensor.error}` : threshold;
+      return `<div style="margin-bottom:2px;color:${color}"><span>${escapeHtml(sensor.label || sensor.id || 'sensor')}</span> <strong>${escapeHtml(value)}</strong><span style="color:var(--muted)">${escapeHtml(detail)}</span></div>`;
+    }).join('') || '<span style="color:var(--muted)">—</span>';
+
     const tr = document.createElement('tr');
     tr.innerHTML = `
       <td>${escapeHtml(r.id || '—')}</td>
@@ -499,6 +510,7 @@ function renderResources(resources) {
       <td><input type="checkbox" data-resource-use ${r.use !== false ? 'checked' : ''} aria-label="Use resource ${escapeHtml(r.id || '')}"></td>
       <td>${escapeHtml(usageParts.join(' | ') || '—')}</td>
       <td>${consumers}${softConsumers}${startupErrors}</td>
+      <td>${sensors}</td>
       <td><button class="btn-sm" data-resource-force-release>Force release</button></td>
     `;
     const useCheckbox = tr.querySelector('[data-resource-use]');

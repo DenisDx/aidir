@@ -147,6 +147,62 @@ Key sections:
 - **`logging`** — log levels per subsystem (0=EMERG … 7=DEBUG)
 - **`resources`** — hardware resources to track (VRAM etc.; enforced in future releases)
 
+### Resource sensor monitoring
+
+Each resource may optionally define `monitoring`. aidir runs each configured
+sensor command at `poll_interval` seconds, parses one numeric value, and shows
+the latest value and alert/error state on the Resources panel. Commands run as
+the aidir service user; only trusted administrators must be able to edit the
+configuration.
+
+```json5
+{
+  id: "local_machine",
+  type: "cuda",
+  limits: { VRAM: 10000 },
+  monitoring: {
+    poll_interval: 10,
+    command_timeout: 5,
+    sensors: [
+      {
+        id: "gpu_temperature",
+        label: "GPU temperature",
+        unit: "C",
+        command: "nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader,nounits",
+        threshold: {
+          operator: "above",
+          value: 85,
+          reactions: ["notify", "release_resource"],
+          cooldown: 300
+        }
+      },
+      {
+        id: "cpu_temperature",
+        label: "CPU temperature",
+        unit: "C",
+        command: "sensors",
+        pattern: "Package id 0:\\s+\\+([0-9.]+)",
+        threshold: { operator: "above", value: 90, reactions: ["notify"] }
+      }
+    ]
+  }
+}
+```
+
+Without `pattern`, a command must write exactly one finite number to standard
+output. With `pattern`, its first capture group is parsed as the number; use
+`match_group` to select another numbered or named group. This accommodates
+motherboard and fan readings from `sensors`, SSD readings from a configured
+`smartctl` command, and any other executable probe.
+
+A threshold uses `above` (strictly greater than) or `below` (strictly less
+than). `notify` records a visible alert and a warning in the system log.
+`release_resource` reuses the dashboard's safe release behavior: it unloads
+only idle models, and reports that active tasks prevent release rather than
+interrupting them. Reactions run once on crossing a threshold, then no more
+often than `cooldown` seconds (300 seconds by default); a normal reading re-arms
+the sensor.
+
 ### Audit storage and task retention
 
 `logging.audit` stores task-correlated client and LLM request/response events in

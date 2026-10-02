@@ -32,6 +32,7 @@ class Resources:
                 keep_alive=int(it.get("keep_alive") or 0),
                 keep_alive_period=int(it.get("keep_alive_period") or 0),
                 provider=it.get("provider"),
+                monitoring=it.get("monitoring"),
             )
         self._redis: "aioredis.Redis | None" = None
         self._ns: str = "aidir"

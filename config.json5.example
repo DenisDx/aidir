@@ -68,7 +68,38 @@
             "alive_time": 300,       // Ollama keeps models in VRAM ~5min after last call
             "keep_alive": 5000,      // Keep model loaded for 5000s after last call (0=disabled)
             "keep_alive_period": 250, // Ping every 250s so model stays before Ollama's 300s unload
-            "provider": "ollama_local" // Provider id for force-unload / keep-alive API calls
+            "provider": "ollama_local", // Provider id for force-unload / keep-alive API calls
+            // Optional command-based hardware monitoring. Commands run as the aidir service user.
+            "monitoring": {
+                "poll_interval": 10,
+                "command_timeout": 5,
+                "sensors": [
+                    {
+                        "id": "gpu_temperature",
+                        "label": "GPU temperature",
+                        "unit": "C",
+                        "command": "nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader,nounits",
+                        "threshold": {
+                            "operator": "above",
+                            "value": 85,
+                            "reactions": ["notify", "release_resource"],
+                            "cooldown": 300
+                        }
+                    },
+                    {
+                        "id": "gpu_memory_free",
+                        "label": "Free GPU memory",
+                        "unit": "MiB",
+                        "command": "nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits",
+                        "threshold": {
+                            "operator": "below",
+                            "value": 1000,
+                            "reactions": ["notify"],
+                            "cooldown": 60
+                        }
+                    }
+                ]
+            }
         },
         {
             "id":"remote_machine",

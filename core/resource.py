@@ -29,6 +29,7 @@ class Resource:
         keep_alive: int = 0,
         keep_alive_period: int = 0,
         provider: str | None = None,
+        monitoring: dict | None = None,
     ) -> None:
         self.id = rid
         self.type = rtype
@@ -40,6 +41,8 @@ class Resource:
         self.keep_alive_period: int = int(keep_alive_period)
         self.provider: str | None = provider
         self.use: bool = True
+        self.monitoring: dict = dict(monitoring) if isinstance(monitoring, dict) else {}
+        self._sensor_states: dict[str, dict] = {}
         # Soft consumers: models still in memory after task release (within alive_time window).
         # Each entry: {consumer_id, resources, released_at, model_id, provider_id}
         self._soft_used: list[dict] = []
@@ -187,6 +190,45 @@ class Resource:
             "persistent": persistent,
         })
 
+    def sensor_configurations(self) -> list[dict]:
+        """Return configured sensor definitions for this resource."""
+        sensors = self.monitoring.get("sensors")
+        return [dict(sensor) for sensor in sensors if isinstance(sensor, dict)] if isinstance(sensors, list) else []
+
+    def set_sensor_state(self, sensor_id: str, state: dict) -> None:
+        """Store the latest serializable runtime state for one monitored sensor."""
+        self._sensor_states[sensor_id] = dict(state)
+
+    def sensor_snapshot(self) -> dict:
+        """Return public monitoring settings and latest state without executable commands."""
+        sensors: list[dict] = []
+        for config in self.sensor_configurations():
+            sensor_id = str(config.get("id") or "").strip()
+            if not sensor_id:
+                continue
+            threshold = config.get("threshold")
+            state = self._sensor_states.get(sensor_id, {})
+            item = {
+                "id": sensor_id,
+                "label": str(config.get("label") or sensor_id),
+                "unit": str(config.get("unit") or ""),
+                "status": str(state.get("status") or "pending"),
+                "value": state.get("value"),
+                "updated_at": state.get("updated_at"),
+                "error": state.get("error"),
+                "alert": bool(state.get("alert")),
+            }
+            if isinstance(threshold, dict):
+                item["threshold"] = {
+                    "operator": str(threshold.get("operator") or "above"),
+                    "value": threshold.get("value"),
+                }
+            sensors.append(item)
+        return {
+            "poll_interval": self.monitoring.get("poll_interval"),
+            "sensors": sensors,
+        }
+
 
     async def reserve_blind(
         self,
@@ -280,4 +322,5 @@ class Resource:
             "soft_used": soft,
             "consumers": consumers,
             "soft_consumers": soft_consumers,
+            "monitoring": self.sensor_snapshot(),
         }
