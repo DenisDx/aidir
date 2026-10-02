@@ -41,6 +41,12 @@ class ResourceMonitor:
         """Stop the monitoring loop after its current polling cycle."""
         self._stopped.set()
 
+    def _seconds_until_next_poll(self) -> float:
+        """Return the delay until the earliest scheduled resource poll."""
+        if not self._next_poll_at:
+            return 1.0
+        return max(0.0, min(self._next_poll_at.values()) - time.monotonic())
+
     async def poll_due_resources(self) -> None:
         """Poll each configured resource when its poll interval has elapsed."""
         now = time.monotonic()

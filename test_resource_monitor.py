@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import unittest
 from unittest.mock import AsyncMock
 
@@ -74,6 +75,19 @@ class TestResourceMonitor(unittest.IsolatedAsyncioTestCase):
         sensor = resources.snapshot()[0]["monitoring"]["sensors"][0]
         self.assertEqual(sensor["status"], "alert")
         self.assertEqual(sensor["value"], 700.0)
+
+    async def test_run_polls_then_stops_cleanly(self) -> None:
+        """Run the background loop once and stop it without an attribute error."""
+        resources = self._resources({"id": "temperature", "command": "nvidia-smi"})
+        monitor = ResourceMonitor(resources)
+        monitor._run_command = AsyncMock(return_value="42")  # type: ignore[method-assign]
+
+        task = asyncio.create_task(monitor.run())
+        await asyncio.sleep(0)
+        monitor.stop()
+        await task
+
+        self.assertEqual(monitor._run_command.await_count, 1)
 
     async def test_invalid_command_output_is_exposed_as_sensor_error(self) -> None:
         """Expose invalid numeric output instead of treating it as a successful zero reading."""
