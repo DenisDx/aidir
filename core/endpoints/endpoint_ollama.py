@@ -21,7 +21,7 @@ from urllib.parse import quote
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from core.endpoint import BaseEndpoint
 from core.error_logging import attach_request_id_middleware, get_or_create_request_id, log_exception
@@ -30,6 +30,8 @@ from core.smart_router import SmartRouteError, SmartRouter
 from core.task_types.task_agent import Task_agent
 from core.task import STATUS_COMPLETED, STATUS_FAILED, STATUS_CANCELED
 from core import log
+from core.upstream_errors import upstream_error_payload, upstream_error_response
+from core.upstream_response import UpstreamChunk, original_chunk, original_response
 
 if TYPE_CHECKING:
     from core.app import Core
@@ -97,7 +99,7 @@ class Endpoint_ollama(BaseEndpoint):
 
     # ── Request handling ──────────────────────────────────────────────────────
 
-    async def _handle_chat(self, request: Request) -> StreamingResponse | JSONResponse:
+    async def _handle_chat(self, request: Request) -> Response:
         """Handle POST /api/chat."""
         try:
             body, raw_body = await self._read_json_body(request)
@@ -185,10 +187,7 @@ class Endpoint_ollama(BaseEndpoint):
             )
 
         if stream:
-            return StreamingResponse(
-                self._stream_response(task),
-                media_type="application/x-ndjson",
-            )
+            return await self._streaming_response(task)
         response = await self._sync_response(task)
         self._audit_client_response(task, response)
         return response
@@ -232,7 +231,7 @@ class Endpoint_ollama(BaseEndpoint):
         except Exception as exc:
             log("audit", "error", f"Failed to audit client request task={task.id}: {exc}", self.id)
 
-    def _audit_client_response(self, task: Task_agent, response: JSONResponse) -> None:
+    def _audit_client_response(self, task: Task_agent, response: Response) -> None:
         """Record a completed non-streaming client response without changing delivery."""
         audit_log = getattr(self._core, "audit_log", None)
         context = getattr(task, "_audit_client_context", None)
@@ -968,7 +967,7 @@ class Endpoint_ollama(BaseEndpoint):
                 out[str(resource_id)] = normalized_metrics
         return out
 
-    async def _sync_response(self, task: Task_agent) -> JSONResponse:
+    async def _sync_response(self, task: Task_agent) -> Response:
         """Wait for task completion and return a single JSON response."""
         timeout_phase = await self._wait_for_task_terminal(task)
         if timeout_phase is not None:
@@ -981,9 +980,13 @@ class Endpoint_ollama(BaseEndpoint):
         asyncio.create_task(self._core.delete_task(task.id))
 
         if task.status == STATUS_COMPLETED:
-            return JSONResponse(task.result or {})
+            upstream = original_response(task.upstream_response, "ollama")
+            return upstream if upstream is not None else JSONResponse(task.result or {})
         if task.status == STATUS_FAILED:
             error = task.error or {"message": "Worker error"}
+            upstream_response = upstream_error_response(error)
+            if upstream_response is not None:
+                return upstream_response
             if error.get("code") in {"TIMEOUT", "QUEUE_TIMEOUT"}:
                 return JSONResponse(
                     {"error": {"code": error.get("code"), "message": error.get("message", "Request timed out")}},
@@ -999,13 +1002,52 @@ class Endpoint_ollama(BaseEndpoint):
             status_code=_HTTP_BUSY,
         )
 
-    async def _stream_response(self, task: Task_agent) -> AsyncGenerator[bytes, None]:
+    async def _streaming_response(self, task: Task_agent) -> Response:
+        """Wait for first output so executor failures can retain their HTTP status."""
+        while True:
+            _, remaining = self._task_timeout_phase(task)
+            if remaining is not None and remaining <= 0:
+                await self._terminate_task_on_timeout(task)
+                return await self._sync_response(task)
+            wait_timeout = 1.0 if remaining is None else max(0.01, min(remaining, 1.0))
+            try:
+                chunk = await asyncio.wait_for(task._chunk_queue.get(), timeout=wait_timeout)
+            except asyncio.TimeoutError:
+                continue
+            if chunk is None and task.status != STATUS_COMPLETED:
+                response = await self._sync_response(task)
+                self._audit_client_response(task, response)
+                return response
+            return StreamingResponse(
+                self._stream_response(task, first_chunk=chunk),
+                headers={"content-type": chunk.content_type if isinstance(chunk, UpstreamChunk) and chunk.protocol == "ollama" else "application/x-ndjson"},
+            )
+
+    @staticmethod
+    def _encode_ollama_chunk(chunk: dict) -> bytes | None:
+        """Return original Ollama transport or a converted JSON event, omitting SSE controls."""
+        raw = original_chunk(chunk, "ollama")
+        if raw is not None:
+            return raw
+        if isinstance(chunk, UpstreamChunk) and chunk.original is None:
+            return None
+        return (json.dumps(chunk) + "\n").encode()
+
+    async def _stream_response(self, task: Task_agent, first_chunk: dict | None = None) -> AsyncGenerator[bytes, None]:
         """Read chunks from task queue and yield as NDJSON lines."""
         audit_log = getattr(self._core, "audit_log", None)
         audit_context = getattr(task, "_audit_client_context", None)
         spool = audit_log.open_body_spool() if audit_log is not None and isinstance(audit_context, dict) else None
         try:
+            if first_chunk is not None:
+                encoded = self._encode_ollama_chunk(first_chunk)
+                if encoded is not None:
+                    yield encoded
+                    if spool is not None:
+                        spool.write(encoded)
             while True:
+                if task.status == STATUS_COMPLETED and task._chunk_queue.empty():
+                    break
                 timeout_phase, remaining = self._task_timeout_phase(task)
                 if remaining is not None and remaining <= 0:
                     await self._terminate_task_on_timeout(task)
@@ -1025,13 +1067,18 @@ class Endpoint_ollama(BaseEndpoint):
                     continue
 
                 if chunk is None:
-                    # Sentinel: stream is finished; yield final done marker if needed
+                    if task.status == STATUS_FAILED:
+                        encoded = (json.dumps(upstream_error_payload(task.error or {})) + "\n").encode()
+                        yield encoded
+                        if spool is not None:
+                            spool.write(encoded)
                     break
 
-                encoded = (json.dumps(chunk) + "\n").encode()
-                yield encoded
-                if spool is not None:
-                    spool.write(encoded)
+                encoded = self._encode_ollama_chunk(chunk)
+                if encoded is not None:
+                    yield encoded
+                    if spool is not None:
+                        spool.write(encoded)
         finally:
             if spool is not None:
                 try:

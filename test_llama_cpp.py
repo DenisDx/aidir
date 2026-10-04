@@ -2,17 +2,23 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
+import httpx
 from fastapi.testclient import TestClient
 from core.local_server_manager import LocalServerError, LocalServerManager
 from core.audit_log import AuditLog
 from core.endpoints.endpoint_openaix import Endpoint_openaix
+from core.endpoints.endpoint_ollama import Endpoint_ollama
 from core.resources import Resources
 from core.task_types.task_agent import Task_agent
+from core.task import STATUS_COMPLETED, STATUS_FAILED
+from core.upstream_errors import build_upstream_error
 from workers.agent.call_llama_cpp.app import CallLlamaCppWorker
 
 
@@ -112,8 +118,10 @@ class TestLlamaCppStreamingDiagnostics(unittest.IsolatedAsyncioTestCase):
 
             async def aiter_lines(self):
                 """Yield raw llama.cpp SSE lines."""
-                yield 'data: {"model":"model","choices":[{"delta":{"reasoning_content":"thinking","content":"answer"}}]}'
+                yield 'data: {"model":"model","choices":[{"index":0,"delta":{"reasoning_content":"thinking","content":"answer"},"finish_reason":"stop"}]}'
+                yield ""
                 yield "data: [DONE]"
+                yield ""
 
         class _Client:
             """Minimal client that opens the fake SSE response."""
@@ -153,6 +161,8 @@ class TestLlamaCppStreamingDiagnostics(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("raw_sse", entry)
         self.assertNotIn("stream_events", entry)
         self.assertEqual(emitted[0]["message"]["content"], "answer")
+        self.assertEqual(emitted[0]["message"]["reasoning_content"], "thinking")
+        self.assertEqual(emitted[0]["message"]["thinking"], "thinking")
         self.assertGreaterEqual(len(worker._core.queue.persisted), 2)
         records = []
         for journal in worker._core.audit_log.directory.glob("raw_llm_*.jsonl"):
@@ -160,10 +170,205 @@ class TestLlamaCppStreamingDiagnostics(unittest.IsolatedAsyncioTestCase):
         request_event = next(event for event in records if event["type"] == "llm_request")
         response_event = next(event for event in records if event["type"] == "llm_response")
         self.assertEqual(request_event["data"], payload)
-        self.assertEqual(
-            response_event["data"],
-            'data: {"model":"model","choices":[{"delta":{"reasoning_content":"thinking","content":"answer"}}]}\ndata: [DONE]\n',
+        raw_stream = b'data: {"model":"model","choices":[{"index":0,"delta":{"reasoning_content":"thinking","content":"answer"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
+        self.assertEqual(response_event["data"], {
+            "model": "model",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {"reasoning_content": "thinking", "content": "answer"},
+                "finish_reason": "stop",
+            }],
+        })
+        self.assertEqual(response_event["body_sha256"], hashlib.sha256(raw_stream).hexdigest())
+        self.assertEqual(response_event["body_bytes"], len(raw_stream))
+
+
+class TestLlamaCppErrorForwarding(unittest.IsolatedAsyncioTestCase):
+    """Verify exact executor errors survive worker and endpoint delivery."""
+
+    def setUp(self) -> None:
+        """Create the reported context-limit error and isolated endpoint core."""
+        self.payload = {"error": {
+            "code": 400,
+            "message": "request (132703 tokens) exceeds the available context size (130048 tokens), try increasing it",
+            "type": "exceed_context_size_error",
+            "n_prompt_tokens": 132703,
+            "n_ctx": 130048,
+        }}
+        self.body = json.dumps(self.payload, indent=2).encode()
+        self.core = SimpleNamespace(delete_task=AsyncMock())
+
+    def failed_task(self, error: dict, *, stream: bool = False) -> Task_agent:
+        """Return a terminal task holding a JSON-roundtripped worker error."""
+        task = Task_agent(payload={"model": "model"}, stream=stream)
+        task.status = STATUS_FAILED
+        task.error = json.loads(json.dumps(error))
+        task._done_event.set()
+        task._chunk_queue.put_nowait(None)
+        return task
+
+    async def test_http_errors_survive_sync_and_stream_workers_and_endpoints(self) -> None:
+        """Preserve status, content type, exact bytes, and all executor fields."""
+        cases = (
+            (400, self.body, "application/json"),
+            (429, json.dumps({"error": {"code": None, "message": "retry later", "param": None, "type": "rate_limit_error", "extra": "x" * 2048}}).encode(), "application/json; charset=utf-8"),
+            (503, b"executor unavailable\n" + b"x" * 1024, "text/plain"),
+            (500, b"\xff\x00executor failure", "application/octet-stream"),
         )
+        for status, body, content_type in cases:
+            for stream in (False, True):
+                with self.subTest(status=status, stream=stream):
+                    async def respond(request: httpx.Request) -> httpx.Response:
+                        """Return the configured executor failure without network access."""
+                        return httpx.Response(status, content=body, headers={"content-type": content_type})
+
+                    worker = CallLlamaCppWorker()
+                    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+                        if stream:
+                            result = await worker._forward_stream(client, "http://executor/v1/chat/completions", {}, None)
+                        else:
+                            result = await worker._forward_sync(client, "http://executor/v1/chat/completions", {})
+                    self.assertFalse(result.ok)
+                    self.assertEqual(result.error["code"], "UPSTREAM_ERROR")
+                    if status == 400:
+                        self.assertEqual(result.error["message"], self.payload["error"]["message"])
+
+                    endpoint = Endpoint_openaix({"id": "test", "errors_compatibility_mode": False})
+                    endpoint._core = self.core
+                    handlers = (
+                        endpoint._openai_sync_response,
+                        endpoint._openai_embed_sync_response,
+                        endpoint._openai_streaming_response,
+                    )
+                    for handler in handlers:
+                        task = self.failed_task(result.error, stream=stream)
+                        response = await handler(task, {})
+                        self.assertEqual(response.status_code, status)
+                        self.assertEqual(response.body, body)
+                        self.assertEqual(response.headers["content-type"], content_type)
+                    for endpoint_type in (Endpoint_ollama, Endpoint_openaix):
+                        endpoint = endpoint_type({"id": "test"})
+                        endpoint._core = self.core
+                        for handler in (endpoint._sync_response, endpoint._streaming_response):
+                            response = await handler(self.failed_task(result.error, stream=stream))
+                            self.assertEqual(response.status_code, status)
+                            self.assertEqual(response.body, body)
+
+    async def test_sse_error_is_not_converted_to_success(self) -> None:
+        """Return the original llama.cpp error received inside an HTTP 200 SSE stream."""
+        async def respond(request: httpx.Request) -> httpx.Response:
+            """Return the context-limit error as an SSE data event."""
+            return httpx.Response(200, stream=httpx.ByteStream(b"data: " + self.body.replace(b"\n", b"") + b"\n\n"), headers={"content-type": "text/event-stream"})
+
+        worker = CallLlamaCppWorker()
+        emit = AsyncMock()
+        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+            result = await worker._forward_stream(client, "http://executor/v1/chat/completions", {}, emit)
+        self.assertFalse(result.ok)
+        emit.assert_not_awaited()
+        endpoint = Endpoint_openaix({"id": "test"})
+        endpoint._core = self.core
+        response = await endpoint._openai_streaming_response(self.failed_task(result.error, stream=True), {})
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(json.loads(response.body), self.payload)
+
+    async def test_late_sse_error_records_failure_and_keeps_partial_output(self) -> None:
+        """Persist failed SSE diagnostics and deliver a late error after a real delta."""
+        first = b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'
+        failure = b"data: " + json.dumps(self.payload).encode() + b"\n\n"
+
+        async def respond(request: httpx.Request) -> httpx.Response:
+            """Stream one successful delta followed by the executor error."""
+            return httpx.Response(200, stream=httpx.ByteStream(first + failure), headers={"content-type": "text/event-stream"})
+
+        with tempfile.TemporaryDirectory() as directory:
+            worker = CallLlamaCppWorker()
+            worker._core = SimpleNamespace(audit_log=AuditLog(directory))
+            task = Task_agent(payload={"model": "model"}, stream=True)
+            emitted = []
+
+            async def emit(chunk: dict) -> None:
+                """Capture partial output sent before the error."""
+                emitted.append(chunk)
+
+            async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+                result = await worker._forward_stream(client, "http://executor/v1/chat/completions", {}, emit, task=task)
+            self.assertFalse(result.ok)
+            self.assertEqual(len(emitted), 1)
+            self.assertEqual(emitted[0]["message"]["content"], "partial")
+            self.assertEqual(task.llm_call_history[0]["status"], "http_error")
+            records = [
+                json.loads(line)
+                for journal in worker._core.audit_log.directory.glob("raw_llm_*.jsonl")
+                for line in journal.read_text().splitlines()
+            ]
+            event = next(record for record in records if record["type"] == "llm_response")
+            self.assertEqual(event["data"], (first + failure).decode())
+
+    def test_http_routes_forward_context_error_unchanged(self) -> None:
+        """Verify real HTTP chat routes return the original error in both request modes."""
+        error = build_upstream_error(400, self.body, "application/json")
+        routes = (
+            (Endpoint_ollama, "/api/chat"),
+            (Endpoint_openaix, "/api/chat"),
+            (Endpoint_openaix, "/v1/chat/completions"),
+        )
+        for endpoint_type, route in routes:
+            for stream in (False, True):
+                with self.subTest(endpoint=endpoint_type.__name__, route=route, stream=stream):
+                    endpoint = endpoint_type({"id": "test"})
+                    task = self.failed_task(error, stream=stream)
+                    core = SimpleNamespace(
+                        config=SimpleNamespace(get=lambda key, default=None: default),
+                        on_task_added=AsyncMock(),
+                        delete_task=AsyncMock(),
+                    )
+                    with patch.object(endpoint, "_build_task_for_payload_async", AsyncMock(return_value=task)):
+                        with TestClient(endpoint.create_app(core)) as client:
+                            response = client.post(route, json={"model": "model", "messages": [], "stream": stream})
+                    self.assertEqual(response.status_code, 400)
+                    self.assertEqual(response.content, self.body)
+                    self.assertEqual(response.json(), self.payload)
+                    self.assertEqual(response.headers["content-type"], "application/json")
+
+    async def test_started_streams_emit_original_error(self) -> None:
+        """Forward a late executor error without adding task IDs or losing fields."""
+        error = build_upstream_error(400, self.body, "application/json")
+        for protocol in ("openai", "ollama"):
+            with self.subTest(protocol=protocol):
+                endpoint = Endpoint_openaix({"id": "test"})
+                endpoint._core = self.core
+                task = self.failed_task(error, stream=True)
+                first = {"message": {"content": "partial"}, "done": False}
+                generator = endpoint._openai_stream_response(task, {}, first_chunk=first) if protocol == "openai" else endpoint._stream_response(task, first_chunk=first)
+                chunks = [chunk async for chunk in generator]
+                encoded_error = chunks[1].decode().strip()
+                if protocol == "openai":
+                    encoded_error = encoded_error.removeprefix("data: ")
+                    self.assertEqual(chunks[-1], b"data: [DONE]\n\n")
+                self.assertEqual(json.loads(encoded_error), self.payload)
+
+    async def test_completed_empty_stream_terminates(self) -> None:
+        """Finish a completed stream after its initial sentinel has been consumed."""
+        endpoint = Endpoint_openaix({"id": "test"})
+        endpoint._core = self.core
+        for protocol in ("openai", "ollama"):
+            task = self.failed_task({}, stream=True)
+            task.status = STATUS_COMPLETED
+            response = await endpoint._openai_streaming_response(task, {}) if protocol == "openai" else await endpoint._streaming_response(task)
+            chunks = [chunk async for chunk in response.body_iterator]
+            self.assertEqual(chunks, [b"data: [DONE]\n\n"] if protocol == "openai" else [])
+
+    async def test_internal_errors_keep_existing_mapping(self) -> None:
+        """Keep transport and locally generated errors in their existing aidir envelopes."""
+        endpoint = Endpoint_openaix({"id": "test"})
+        endpoint._core = self.core
+        response = await endpoint._openai_sync_response(
+            self.failed_task({"code": "UPSTREAM_TIMEOUT", "message": "ReadTimeout"}), {},
+        )
+        self.assertEqual(response.status_code, 504)
+        self.assertEqual(json.loads(response.body)["error"]["type"], "upstream_timeout_error")
 
 
 class TestLocalServerManager(unittest.IsolatedAsyncioTestCase):

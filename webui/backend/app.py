@@ -375,6 +375,44 @@ def _task_summary_from_hash(task_hash: dict[str, str]) -> dict[str, Any]:
     return task
 
 
+async def _list_active_tasks(core: "Core") -> list[dict[str, Any]]:
+    """Return active Redis-backed tasks, preferring current-process task state."""
+    active_statuses = {"created", "queued", "running"}
+    namespace = core.config.get("instance", "aidir")
+    tasks: dict[str, dict[str, Any]] = {}
+    cursor = 0
+
+    while True:
+        cursor, keys = await core.redis.scan(cursor, match=f"{namespace}:task:*", count=200)
+        if keys:
+            pipeline = core.redis.pipeline(transaction=False)
+            for key in keys:
+                pipeline.hgetall(key)
+            hashes = await pipeline.execute()
+        else:
+            hashes = []
+
+        for task_hash in hashes:
+            if not task_hash or str(task_hash.get("status") or "").lower() not in active_statuses:
+                continue
+            task_id = str(task_hash.get("id") or "")
+            if task_id:
+                tasks[task_id] = _task_to_api_item(_task_from_hash(task_hash))
+
+        if cursor == 0:
+            break
+
+    for task in core.queue.list_tasks():
+        if task.status in active_statuses:
+            tasks[task.id] = _task_to_api_item(_task_from_hash(task.to_redis_hash()))
+
+    return sorted(
+        tasks.values(),
+        key=lambda task: task.get("last_operation_at") or task.get("created_at") or "",
+        reverse=True,
+    )
+
+
 def _normalize_filter_values(values: list[str] | str | None) -> list[str]:
     """Normalize comma-separated or repeated query values into a flat string list."""
     if values is None:
@@ -524,9 +562,8 @@ def create_app(
 
     @app.get("/api/tasks")
     async def get_tasks(session: dict = Depends(_require_session)):
-        tasks = core.queue.list_tasks()
         return {
-            "tasks": [_task_to_api_item(_task_from_hash(t.to_redis_hash())) for t in tasks]
+            "tasks": await _list_active_tasks(core)
         }
 
     @app.get("/api/tasks/viewer/meta")

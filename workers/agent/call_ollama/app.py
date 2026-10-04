@@ -6,7 +6,6 @@ Handles both streaming (stream=true) and non-streaming (stream=false) modes.
 from __future__ import annotations
 
 import asyncio
-import codecs
 import json
 from typing import Any, Awaitable, Callable
 
@@ -32,6 +31,7 @@ from core.worker import BaseWorker, WorkerResult
 from core.task import Task
 from core.task_types.task_agent import Task_agent
 from core import log
+from core.upstream_response import capture_response, consume_ndjson_response
 
 
 class CallOllamaWorker(BaseWorker):
@@ -374,7 +374,10 @@ class CallOllamaWorker(BaseWorker):
         await self._finalize_llm_call(task, history_entry, status="ok", http_status=resp.status_code, response=data, response_body=raw_response, response_content_type=self._response_content_type(resp, "application/json"))
         if save_call:
             save_llm_call(self.id, task.id, upstream_payload, data)
-        return WorkerResult(ok=True, data=data, usage=data.get("usage"))
+        return WorkerResult(
+            ok=True, data=data, usage=data.get("usage"),
+            upstream_response=capture_response("ollama", resp.status_code, self._response_content_type(resp, "application/json"), raw_response),
+        )
 
     async def _forward_stream(
         self,
@@ -503,77 +506,9 @@ class CallOllamaWorker(BaseWorker):
     @staticmethod
     async def _consume_stream_response(resp, emit_chunk, chunks: list[dict], response_spool, save_call: bool) -> dict | None:
         """Parse Ollama NDJSON stream while preserving raw bytes for logging."""
-        final_data: dict | None = None
-
-        aiter_raw = getattr(resp, "aiter_raw", None)
-        if callable(aiter_raw):
-            decoder = codecs.getincrementaldecoder("utf-8")()
-            text_buffer = ""
-            async for raw_chunk in aiter_raw():
-                if response_spool is not None:
-                    response_spool.write(raw_chunk)
-                decoded = decoder.decode(raw_chunk)
-                text_buffer += decoded
-                while "\n" in text_buffer:
-                    line, text_buffer = text_buffer.split("\n", 1)
-                    if not line.strip():
-                        continue
-                    try:
-                        chunk: dict = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-
-                    chunk = CallOllamaWorker._normalize_upstream_response_data(chunk)
-                    if emit_chunk:
-                        await emit_chunk(chunk)
-                    if save_call:
-                        chunks.append(chunk)
-
-                    if isinstance(chunk, dict):
-                        final_data = chunk
-                        if chunk.get("done"):
-                            break
-
-            tail = decoder.decode(b"", final=True)
-            if tail:
-                text_buffer += tail
-            if text_buffer.strip():
-                try:
-                    chunk = json.loads(text_buffer)
-                except json.JSONDecodeError:
-                    chunk = None
-                if isinstance(chunk, dict):
-                    chunk = CallOllamaWorker._normalize_upstream_response_data(chunk)
-                    if emit_chunk:
-                        await emit_chunk(chunk)
-                    if save_call:
-                        chunks.append(chunk)
-                    if isinstance(chunk, dict):
-                        final_data = chunk
-            return final_data
-
-        aiter_lines = getattr(resp, "aiter_lines", None)
-        if callable(aiter_lines):
-            async for line in aiter_lines():
-                if response_spool is not None:
-                    response_spool.write(line.encode("utf-8") + b"\n")
-                if not line.strip():
-                    continue
-                try:
-                    chunk: dict = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-
-                chunk = CallOllamaWorker._normalize_upstream_response_data(chunk)
-                if emit_chunk:
-                    await emit_chunk(chunk)
-                if save_call:
-                    chunks.append(chunk)
-
-                if isinstance(chunk, dict):
-                    final_data = chunk
-
-        return final_data
+        return await consume_ndjson_response(
+            resp, emit_chunk, chunks, response_spool, save_call, CallOllamaWorker._normalize_upstream_response_data,
+        )
 
 
 # Module-level export required by workers_loader

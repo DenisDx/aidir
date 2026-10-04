@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import codecs
 import json
 import time
 from datetime import datetime, timezone
@@ -15,6 +14,8 @@ from core.generation_options import OLLAMA_TO_OPENAI_OPTION_FIELDS
 from core.local_server_manager import LocalServerError
 from core.task import Task
 from core.task_types.task_agent import Task_agent
+from core.upstream_errors import build_upstream_error
+from core.upstream_response import UpstreamChunk, capture_response, iter_sse_events, sse_data
 from core.worker import WorkerResult
 from workers.agent.openaix.app import OpenAIxWorker
 
@@ -58,7 +59,7 @@ class CallLlamaCppWorker(OpenAIxWorker):
 
         try:
             async with httpx.AsyncClient(timeout=self._resolve_upstream_timeout(task), headers=headers) as client:
-                if task.stream and not payload.get("tools"):
+                if task.stream and not self._extract_injected_tool_names(task):
                     return await self._forward_stream(client, url, payload, emit_chunk, task=task, save_call=save_call, task_id=task.id)
                 return await self._run_with_internal_tools(client, url, payload, task, emit_chunk, save_call=save_call)
         except httpx.ConnectError as exc:
@@ -115,7 +116,9 @@ class CallLlamaCppWorker(OpenAIxWorker):
                 if isinstance(history_entry, dict):
                     history_entry["raw_response"] = response.text
                 await self._finalize_llm_call(task, history_entry, status="http_error", http_status=response.status_code, error_code="UPSTREAM_ERROR", response_body=raw_response, response_content_type=self._response_content_type(response, "application/octet-stream"))
-            return WorkerResult(ok=False, error={"code": "UPSTREAM_ERROR", "message": f"Upstream returned HTTP {response.status_code}", "body": response.text[:512]})
+            return WorkerResult(ok=False, error=build_upstream_error(
+                response.status_code, raw_response, self._response_content_type(response, "application/octet-stream"),
+            ))
         try:
             data = self._openai_response_to_ollama(response.json())
         except (ValueError, TypeError, KeyError) as exc:
@@ -130,7 +133,10 @@ class CallLlamaCppWorker(OpenAIxWorker):
             await self._finalize_llm_call(task, history_entry, status="ok", http_status=response.status_code, response=data, response_body=raw_response, response_content_type=self._response_content_type(response, "application/json"))
         if save_call:
             save_llm_call(self.id, task_id or (task.id if task else ""), {**payload, "stream": False}, data)
-        return WorkerResult(ok=True, data=data, usage=data.get("usage"))
+        return WorkerResult(
+            ok=True, data=data, usage=data.get("usage"),
+            upstream_response=capture_response("openai", response.status_code, self._response_content_type(response, "application/json"), raw_response),
+        )
 
     async def _forward_stream(self, client, url: str, payload: dict, emit_chunk, task=None, *, save_call: bool = False, task_id: str = "") -> WorkerResult:
         """Translate llama.cpp OpenAI SSE chunks into internal Ollama-compatible chunks."""
@@ -148,24 +154,54 @@ class CallLlamaCppWorker(OpenAIxWorker):
                     if isinstance(history_entry, dict):
                         history_entry["raw_response"] = raw_response.decode("utf-8", errors="replace")
                     await self._finalize_llm_call(task, history_entry, status="http_error", http_status=response.status_code, error_code="UPSTREAM_ERROR", response_body=raw_response, response_content_type=self._response_content_type(response, "application/octet-stream"))
-                return WorkerResult(ok=False, error={"code": "UPSTREAM_ERROR", "message": f"Upstream returned HTTP {response.status_code}"})
+                return WorkerResult(ok=False, error=build_upstream_error(
+                    response.status_code, raw_response, self._response_content_type(response, "application/octet-stream"),
+                ))
             audit_log = getattr(self._core, "audit_log", None)
             response_spool = audit_log.open_body_spool() if task is not None and audit_log is not None else None
             if task is not None:
                 task._audit_stream_spool = response_spool
-            async for line in self._iter_sse_lines(response, response_spool):
-                if not line.startswith("data:"):
+            content_type = self._response_content_type(response, "text/event-stream")
+            async for event in iter_sse_events(response, response_spool):
+                raw = sse_data(event)
+                if raw is None:
+                    if emit_chunk:
+                        await emit_chunk(UpstreamChunk({}, protocol="openai", raw=event, content_type=content_type, original=None))
                     continue
-                raw = line[5:].strip()
-                if raw == "[DONE]":
-                    break
+                if raw.strip() == b"[DONE]":
+                    if emit_chunk:
+                        await emit_chunk(UpstreamChunk({}, protocol="openai", raw=event, content_type=content_type, original=None))
+                    continue
                 try:
-                    chunk = self._openai_response_to_ollama(json.loads(raw), streaming=True)
-                except (ValueError, TypeError, KeyError):
-                    continue
+                    data = json.loads(raw)
+                    if not isinstance(data, dict):
+                        raise ValueError("Executor chat stream event must be a JSON object")
+                except (ValueError, UnicodeDecodeError) as exc:
+                    if task:
+                        await self._finalize_llm_call(
+                            task, history_entry, status="invalid_json", http_status=response.status_code,
+                            error_code="UPSTREAM_INVALID_JSON", response_spool=response_spool,
+                            response_content_type=content_type,
+                        )
+                    return WorkerResult(ok=False, error={"code": "UPSTREAM_INVALID_JSON", "message": str(exc)})
+                if isinstance(data, dict) and "error" in data:
+                    detail = data["error"]
+                    status_code = detail.get("code") if isinstance(detail, dict) else None
+                    if not isinstance(status_code, int) or not 400 <= status_code <= 599:
+                        status_code = 502
+                    if task:
+                        await self._finalize_llm_call(
+                            task, history_entry, status="http_error", http_status=status_code,
+                            error_code="UPSTREAM_ERROR", response_spool=response_spool,
+                            response_content_type=self._response_content_type(response, "text/event-stream"),
+                        )
+                    return WorkerResult(ok=False, error=build_upstream_error(
+                        status_code, raw, "application/json",
+                    ))
+                chunk = self._openai_response_to_ollama(data, streaming=True)
                 final_data = chunk
                 if emit_chunk:
-                    await emit_chunk(chunk)
+                    await emit_chunk(UpstreamChunk(chunk, protocol="openai", raw=event, content_type=content_type, original=data))
         if task:
             await self._finalize_llm_call(
                 task,
@@ -186,30 +222,6 @@ class CallLlamaCppWorker(OpenAIxWorker):
         return WorkerResult(ok=True, data=final_data, usage=(final_data or {}).get("usage"))
 
     @staticmethod
-    async def _iter_sse_lines(response, response_spool):
-        """Yield decoded SSE lines while retaining each raw transport byte sequence."""
-        aiter_raw = getattr(response, "aiter_raw", None)
-        if callable(aiter_raw):
-            buffer = ""
-            decoder = codecs.getincrementaldecoder("utf-8")()
-            async for raw_chunk in aiter_raw():
-                if response_spool is not None:
-                    response_spool.write(raw_chunk)
-                buffer += decoder.decode(raw_chunk)
-                while "\n" in buffer:
-                    line, buffer = buffer.split("\n", 1)
-                    yield line
-            buffer += decoder.decode(b"", final=True)
-            if buffer:
-                yield buffer
-            return
-
-        async for line in response.aiter_lines():
-            if response_spool is not None:
-                response_spool.write(line.encode("utf-8") + b"\n")
-            yield line
-
-    @staticmethod
     def _openai_response_to_ollama(data: dict, streaming: bool = False) -> dict:
         """Convert one OpenAI response or SSE delta into aidir's Ollama-compatible result shape."""
         choices = data.get("choices") if isinstance(data.get("choices"), list) else []
@@ -219,12 +231,18 @@ class CallLlamaCppWorker(OpenAIxWorker):
         finish_reason = choice.get("finish_reason")
         done = bool(finish_reason) and streaming
         result = {
+            **data,
             "model": data.get("model", ""),
             "created_at": datetime.now(timezone.utc).isoformat(),
-            "message": {"role": message.get("role", "assistant"), "content": message.get("content") or ""},
+            "message": {**message, "role": message.get("role", "assistant"), "content": message.get("content")},
             "done": done if streaming else True,
             "done_reason": finish_reason or ("stop" if not streaming else ""),
         }
+        if "thinking" not in result["message"]:
+            for field in ("reasoning_content", "reasoning"):
+                if field in message:
+                    result["message"]["thinking"] = message[field]
+                    break
         if isinstance(message.get("tool_calls"), list):
             result["message"]["tool_calls"] = message["tool_calls"]
         usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
@@ -237,7 +255,8 @@ class CallLlamaCppWorker(OpenAIxWorker):
     @staticmethod
     def _normalize_assistant_message_for_history(message: dict) -> dict:
         """Produce OpenAI-compatible assistant tool-call history for the next llama.cpp turn."""
-        out = {"role": "assistant", "content": message.get("content") or ""}
+        out = {**message, "role": "assistant", "content": message.get("content")}
+        out.pop("thinking", None)
         calls = message.get("tool_calls") if isinstance(message.get("tool_calls"), list) else []
         if calls:
             out["tool_calls"] = calls

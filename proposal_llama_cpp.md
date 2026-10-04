@@ -191,7 +191,17 @@ Candidate evaluation uses the model's configured local resource requirements. A 
 
 For a stopped but locally configurable provider (`exec_cmd` is non-empty), smart routing leaves the candidate eligible for lazy startup. The scheduler first resolves resource pressure and unloads conflicting idle models; only then does the selected worker start llama-server. This avoids starting a second VRAM-heavy server merely to probe it.
 
-## Error Contract
+## Response Contracts
+
+### Successful response transparency
+
+Direct OpenAI chat responses retain the original llama.cpp body and content type. SSE streams retain original event bytes, comments, event metadata, reasoning, all choices, usage-only events, and terminators. Original response transport is stored separately from normalized aidir task data, so endpoint conversion does not reconstruct native replies or discard unknown fields.
+
+For Ollama clients, conversion retains reasoning (`thinking` plus original reasoning fields), complete usage, finish reasons, and additional message/top-level fields. Fields with no direct Ollama equivalent remain extensions; a different protocol cannot be byte-identical.
+
+When aidir actually executes internal tools, intermediate turns remain hidden and reasoning fields are removed from the final answer, while usage and other final metadata are retained. Aidir-managed tool loops can synthesize the client stream from the final synchronous model response. Caller-owned tools use native streaming and do not trigger final-reasoning removal.
+
+### Failure responses
 
 Expected worker errors include:
 
@@ -202,7 +212,9 @@ Expected worker errors include:
 5. `UPSTREAM_ERROR`: llama.cpp returned a non-success HTTP response.
 6. `UPSTREAM_INVALID_JSON`: the non-streaming upstream response could not be decoded.
 
-Endpoint error serialization and task timeout semantics remain unchanged from other agent workers.
+`UPSTREAM_ERROR` remains an internal worker classification. The original executor HTTP status, complete body, and content type are retained in the serializable task error and forwarded to HTTP clients without a new envelope, truncation, or added `task_id`. This preserves numeric codes, error types, messages, and diagnostic fields such as `n_prompt_tokens` and `n_ctx`.
+
+Streaming requests rejected before their first output retain the original HTTP status. JSON errors inside an HTTP 200 SSE response are also treated as failures, using the upstream error's HTTP code when valid, otherwise 502. After output has started, the original error is emitted in the client's stream format; the HTTP status cannot change. Connection failures, locally generated errors, and task timeout semantics remain unchanged.
 
 ## Validation
 
@@ -214,7 +226,7 @@ Focused regression coverage is in:
 Run:
 
 ```bash
-./venv/bin/python -m unittest -v test_llama_cpp.py test_resource_reuse.py
+./venv/bin/python -m unittest -v test_llama_cpp.py test_response_transparency.py test_resource_reuse.py
 ```
 
 The active configuration can also be validated with the normal `core.config.Config` loader and `resolve_worker_configs` to ensure `call_llama_cpp` and `llama_local` resolve correctly.

@@ -96,9 +96,30 @@ class QueueManager:
         async for raw_key in self._redis.scan_iter(match=f"{self._ns}:task:*", count=200):
             key = raw_key.decode() if isinstance(raw_key, bytes) else str(raw_key)
             raw = await self._redis.hgetall(key)
+            task_id = str(raw.get("id") or key.rsplit(":", 1)[-1])
+            if raw.get("status") == STATUS_QUEUED and task_id not in self._tasks:
+                try:
+                    task = Task.from_redis_hash(raw)
+                    if task.type not in self._QUEUE_TASK_TYPES:
+                        raise ValueError(f"unsupported queued task type: {task.type!r}")
+                except Exception as exc:
+                    await self._redis.hset(
+                        f"{self._ns}:queue:quarantine",
+                        task_id,
+                        json.dumps({"task_type": raw.get("type") or "", "reason": str(exc)}),
+                    )
+                    quarantined += 1
+                    log("system", "warning", f"Quarantined orphaned persisted task {task_id}: {exc}")
+                    continue
+
+                await self._redis.zadd(self._q(task.type), {task.id: task.priority})
+                self._tasks[task.id] = task
+                recovered += 1
+                log("system", "warning", f"Restored orphaned queued task {task_id}")
+                continue
+
             if raw.get("status") != STATUS_RUNNING:
                 continue
-            task_id = str(raw.get("id") or key.rsplit(":", 1)[-1])
             now = datetime.now(timezone.utc).isoformat()
             error = {"code": "SERVICE_RESTARTED", "message": "Task interrupted by service restart"}
             pipe = self._redis.pipeline(transaction=True)
@@ -133,6 +154,7 @@ class QueueManager:
             task.started_at = now
             task.worker_id = worker_id
             task.error = None
+            task.upstream_response = None
         await self._redis.hset(self._tk(task_id), mapping={
             "status":     STATUS_RUNNING,
             "updated_at": now.isoformat(),
@@ -140,6 +162,7 @@ class QueueManager:
             "worker_id":  worker_id,
             "error":      "",
             "error_code": "",
+            "upstream_response": "",
         })
         if task:
             await self._notify_status_change(task)
@@ -156,6 +179,7 @@ class QueueManager:
             "updated_at":  now.isoformat(),
             "finished_at": task.finished_at.isoformat(),
             "result":      json.dumps(task.result) if task.result is not None else "",
+            "upstream_response": json.dumps(task.upstream_response) if task.upstream_response is not None else "",
             "error":       "",
             "error_code":  "",
         })

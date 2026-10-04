@@ -77,6 +77,12 @@ On **re-install / update** the script rebuilds images and restarts services with
 
 ## Configuration
 
+The proposed cross-project settings library, aiset, is described in
+[aiset/SPEC_.md](aiset/SPEC_.md). It is the complete working draft, not an available
+feature. The [aiset directory](aiset/) is maintained separately and excluded
+from this repository's Git tracking. See [DOCUMENTS.MD](DOCUMENTS.MD) for the
+project document index.
+
 Configuration is split into two files:
 
 ### `.env` — secrets and environment-specific values
@@ -230,6 +236,8 @@ are quarantined, while persisted running tasks are marked failed with
 
 Set a provider's `api` to `llama-cpp` to use `llama-server` through its OpenAI-compatible API. `call_llama_cpp` automatically converts incoming Ollama requests to `/v1/chat/completions`; OpenAI requests follow the same internal route.
 
+llama.cpp HTTP errors are returned with the original status, complete response body, and content type, without replacing their message, code, type, or extra diagnostic fields with an aidir error envelope. This also applies to streaming requests rejected before their first output. Once streaming has begun, the original JSON error is forwarded as an SSE or NDJSON error event; the already-sent HTTP status cannot change. Connection failures and timeouts still use aidir's own error handling.
+
 Use `exec_cmd` for a local server command. aidir starts it on demand, waits for `/health`, and records its PID in `logs/llama_cpp_servers.json`. Only such recorded processes are stopped when shared resources need VRAM. An already healthy server is treated as external and is never stopped. Leave `exec_cmd` empty for an externally managed or remote server.
 
 For a `llama-cpp` provider, resource `keep_alive` means restart-on-failure during its active window; it does not send API pings. Smart routes probe a running provider via `/v1/models`; an unavailable provider with `exec_cmd` remains eligible for lazy startup after the scheduler has freed resources.
@@ -310,6 +318,19 @@ Use the queue-state endpoint to inspect whether a provider/model resource can st
 | `/api/providers/{provider}/models/{model}/queue-state` | GET | Read-only queue state for a provider/model pair |
 | `/v1/providers/{provider}/models/{model}/queue-state` | GET | Read-only queue state for a provider/model pair |
 | `/health` | GET | Health check |
+
+#### Chat response transparency
+
+For direct chat calls with matching client and executor protocols (OpenAI/OpenAI or Ollama/Ollama), aidir returns the executor's original response body and content type. Streaming preserves the original SSE or NDJSON events, including reasoning, unknown fields, IDs, timestamps, multiple choices, usage details, and stream terminators. Reasoning is not substituted for an empty answer.
+
+Two exceptions apply:
+
+- **Internal multistep tool execution:** intermediate model/tool turns remain inside aidir. Only the final answer is returned, with reasoning fields removed after an internal tool actually executes. Usage statistics and other final-response fields remain available. Streaming may be synthesized from the final synchronous tool-loop response.
+- **Different protocols:** aidir converts the response envelope as closely as possible, preserving reasoning and compatible additional fields. Ollama `thinking` is exposed as OpenAI `reasoning_content`, and OpenAI reasoning is retained as Ollama `thinking` alongside its original fields. Native-only fields can remain as extensions; byte-for-byte identity is not possible across protocols.
+
+Caller-owned tool definitions do not trigger aidir's internal tool loop and retain native streaming.
+
+Completed, error-free OpenAI SSE chat responses are displayed in audit logs as one reconstructed final JSON completion with `body_format: "sse"` and `sse_chunk_count`. The audit assembler joins content, reasoning, tool-call arguments, choices, finish reasons, usage, and compatible fields from all chunks. Comments and `[DONE]` are not counted. A stream that cannot be unambiguously assembled, or is malformed, incomplete, failed, or error-bearing, remains one raw string for diagnosis. This audit-only normalization does not change client delivery; large SSE bodies also retain an original body-file link.
 
 MCP endpoint: `http://HOST:${MCP_ENDPOINT_PORT}`
 

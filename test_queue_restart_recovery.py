@@ -60,6 +60,13 @@ class _Redis:
         if member in members:
             members.remove(member)
 
+    async def zadd(self, key, mapping):
+        """Add task ids to the fake priority queue."""
+        members = self.zsets.setdefault(key, [])
+        for member in mapping:
+            if member not in members:
+                members.append(member)
+
     async def hset(self, key, field=None, value=None, mapping=None):
         """Write hash fields using Redis-compatible call forms."""
         target = self.hashes.setdefault(key, {})
@@ -108,6 +115,20 @@ class QueueRestartRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(quarantine["task_type"], "agent")
         self.assertEqual(redis.hashes[f"aidir:task:{running.id}"]["status"], STATUS_FAILED)
         self.assertEqual(json.loads(redis.hashes[f"aidir:task:{running.id}"]["error"])["code"], "SERVICE_RESTARTED")
+
+    async def test_recovery_restores_orphaned_queued_task_to_its_queue(self):
+        """Requeue a valid queued hash that has no sorted-set membership."""
+        redis = _Redis()
+        queued_agent = Task_agent(payload={"model": "queued"}, external=True)
+        queued_agent.status = STATUS_QUEUED
+        redis.hashes[f"aidir:task:{queued_agent.id}"] = queued_agent.to_redis_hash()
+
+        queue = QueueManager(redis)
+        result = await queue.recover_startup_tasks()
+
+        self.assertEqual(result, {"recovered": 1, "quarantined": 0, "restarted": 0})
+        self.assertEqual(redis.zsets["aidir:queue:agent"], [queued_agent.id])
+        self.assertEqual(queue.get_task(queued_agent.id).status, STATUS_QUEUED)
 
 
 if __name__ == "__main__":

@@ -373,6 +373,7 @@ class Scheduler:
             )
             if result.ok:
                 task.result = result.data
+                task.upstream_response = result.upstream_response
                 task.retry_attempt = 0
                 task.fallback_index = 0
                 task.next_retry_at = 0.0

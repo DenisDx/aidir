@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from typing import AsyncGenerator
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from core import log
 from core.error_logging import attach_request_id_middleware, get_or_create_request_id, log_exception
@@ -28,6 +28,8 @@ from core.generation_options import GENERATION_OPTION_FIELDS
 from core.request_limits import RequestBodyLimitMiddleware
 from core.smart_router import SmartRouteError, SmartRouter
 from core.task import STATUS_CANCELED, STATUS_COMPLETED, STATUS_FAILED
+from core.upstream_errors import upstream_error_payload, upstream_error_response
+from core.upstream_response import UpstreamChunk, original_chunk, original_payload, original_response
 
 
 class Endpoint_openaix(Endpoint_ollama):
@@ -142,7 +144,7 @@ class Endpoint_openaix(Endpoint_ollama):
 
         return app
 
-    async def _handle_chat(self, request: Request) -> StreamingResponse | JSONResponse:
+    async def _handle_chat(self, request: Request) -> Response:
         """Handle Ollama-compatible /api/chat and queue the openaix worker."""
         try:
             body, raw_body = await self._read_json_body(request)
@@ -216,10 +218,7 @@ class Endpoint_openaix(Endpoint_ollama):
             )
 
         if stream:
-            return StreamingResponse(
-                self._stream_response(task),
-                media_type="application/x-ndjson",
-            )
+            return await self._streaming_response(task)
         response = await self._sync_response(task)
         self._audit_client_response(task, response)
         log(
@@ -233,7 +232,7 @@ class Endpoint_openaix(Endpoint_ollama):
         )
         return response
 
-    async def _handle_openai_chat(self, request: Request) -> StreamingResponse | JSONResponse:
+    async def _handle_openai_chat(self, request: Request) -> Response:
         """Handle OpenAI chat completions request and map it to Task_agent flow."""
         try:
             body, raw_body = await self._read_json_body(request)
@@ -314,7 +313,7 @@ class Endpoint_openaix(Endpoint_ollama):
         self._audit_client_response(task, response)
         return response
 
-    async def _handle_embed(self, request: Request, *, protocol: str) -> JSONResponse:
+    async def _handle_embed(self, request: Request, *, protocol: str) -> Response:
         """Handle one non-streaming Ollama or OpenAI embedding request."""
         try:
             body, raw_body = await self._read_json_body(request)
@@ -746,7 +745,7 @@ class Endpoint_openaix(Endpoint_ollama):
         payload["stream"] = False
         return payload
 
-    async def _openai_embed_sync_response(self, task, request_body: dict) -> JSONResponse:
+    async def _openai_embed_sync_response(self, task, request_body: dict) -> Response:
         """Wait for an embedding task and return an OpenAI-compatible embedding response."""
         timeout_phase = await self._wait_for_task_terminal(task)
         if timeout_phase is not None:
@@ -764,6 +763,9 @@ class Endpoint_openaix(Endpoint_ollama):
             return JSONResponse(self._ollama_embed_to_openai(task.result or {}, task.id, request_body))
         if task.status == STATUS_FAILED:
             err = task.error or {}
+            upstream_response = upstream_error_response(err)
+            if upstream_response is not None:
+                return upstream_response
             if err.get("code") in {"TIMEOUT", "QUEUE_TIMEOUT"}:
                 return self._error_response(
                     protocol="openai",
@@ -830,7 +832,7 @@ class Endpoint_openaix(Endpoint_ollama):
             response["usage"] = {"prompt_tokens": int(prompt_tokens), "total_tokens": int(total_tokens)}
         return response
 
-    async def _openai_sync_response(self, task, request_body: dict) -> JSONResponse:
+    async def _openai_sync_response(self, task, request_body: dict) -> Response:
         """Wait for task completion and return OpenAI chat.completion JSON."""
         timeout_phase = await self._wait_for_task_terminal(task)
         if timeout_phase is not None:
@@ -847,6 +849,7 @@ class Endpoint_openaix(Endpoint_ollama):
         asyncio.create_task(self._core.delete_task(task.id))
 
         if task.status == STATUS_COMPLETED:
+            upstream = original_response(task.upstream_response, "openai")
             result = task.result or {}
             usage = result.get("usage") if isinstance(result, dict) else {}
             log(
@@ -859,9 +862,16 @@ class Endpoint_openaix(Endpoint_ollama):
                 ),
                 self.id,
             )
-            return JSONResponse(self._ollama_sync_to_openai(task.result or {}, task.id, request_body))
+            if upstream is not None:
+                return upstream
+            result = original_payload(task.upstream_response, "ollama", result)
+            return JSONResponse(self._ollama_sync_to_openai(result, task.id, request_body))
         if task.status == STATUS_FAILED:
             err = task.error or {}
+            upstream_response = upstream_error_response(err)
+            if upstream_response is not None:
+                log("http", "warning", f"{self.id} upstream error: task={task.id} status={upstream_response.status_code} message={err.get('message')}", self.id)
+                return upstream_response
             if err.get("code") in {"TIMEOUT", "QUEUE_TIMEOUT"}:
                 log(
                     "http",
@@ -927,14 +937,18 @@ class Endpoint_openaix(Endpoint_ollama):
         audit_log = getattr(self._core, "audit_log", None)
         audit_context = getattr(task, "_audit_client_context", None)
         spool = audit_log.open_body_spool() if audit_log is not None and isinstance(audit_context, dict) else None
+        passthrough = False
         try:
             if first_chunk is not None:
-                openai_chunk = self._ollama_chunk_to_openai(first_chunk, task.id, request_body)
-                encoded = f"data: {json.dumps(openai_chunk)}\n\n".encode()
-                yield encoded
-                if spool is not None:
-                    spool.write(encoded)
+                passthrough = original_chunk(first_chunk, "openai") is not None
+                encoded = self._encode_openai_chunk(first_chunk, task.id, request_body)
+                if encoded is not None:
+                    yield encoded
+                    if spool is not None:
+                        spool.write(encoded)
             while True:
+                if task.status == STATUS_COMPLETED and task._chunk_queue.empty():
+                    break
                 timeout_phase, remaining = self._task_timeout_phase(task)
                 if remaining is not None and remaining <= 0:
                     await self._terminate_task_on_timeout(task)
@@ -956,19 +970,26 @@ class Endpoint_openaix(Endpoint_ollama):
                     continue
 
                 if chunk is None:
+                    if task.status == STATUS_FAILED:
+                        err = upstream_error_payload(task.error or {})
+                        encoded = f"data: {json.dumps(err)}\n\n".encode()
+                        yield encoded
+                        if spool is not None:
+                            spool.write(encoded)
                     break
 
-                openai_chunk = self._ollama_chunk_to_openai(chunk, task.id, request_body)
-                encoded = f"data: {json.dumps(openai_chunk)}\n\n".encode()
+                passthrough = passthrough or original_chunk(chunk, "openai") is not None
+                encoded = self._encode_openai_chunk(chunk, task.id, request_body)
+                if encoded is not None:
+                    yield encoded
+                    if spool is not None:
+                        spool.write(encoded)
+
+            if not passthrough:
+                encoded = b"data: [DONE]\n\n"
                 yield encoded
                 if spool is not None:
                     spool.write(encoded)
-
-            # OpenAI streaming terminator.
-            encoded = b"data: [DONE]\n\n"
-            yield encoded
-            if spool is not None:
-                spool.write(encoded)
         finally:
             if spool is not None:
                 try:
@@ -987,7 +1008,7 @@ class Endpoint_openaix(Endpoint_ollama):
                     log("audit", "error", f"Failed to audit OpenAI stream response task={task.id}: {exc}", self.id)
             asyncio.create_task(self._core.delete_task(task.id))
 
-    async def _openai_streaming_response(self, task, request_body: dict) -> StreamingResponse | JSONResponse:
+    async def _openai_streaming_response(self, task, request_body: dict) -> Response:
         """Open SSE only after the first chunk, preserving HTTP errors before output starts."""
         while True:
             _, remaining = self._task_timeout_phase(task)
@@ -1009,7 +1030,9 @@ class Endpoint_openaix(Endpoint_ollama):
 
             if chunk is None:
                 if task.status != STATUS_COMPLETED:
-                    return await self._openai_sync_response(task, request_body)
+                    response = await self._openai_sync_response(task, request_body)
+                    self._audit_client_response(task, response)
+                    return response
                 return StreamingResponse(
                     self._openai_stream_response(task, request_body),
                     media_type="text/event-stream",
@@ -1017,8 +1040,18 @@ class Endpoint_openaix(Endpoint_ollama):
 
             return StreamingResponse(
                 self._openai_stream_response(task, request_body, first_chunk=chunk),
-                media_type="text/event-stream",
+                headers={"content-type": chunk.content_type if isinstance(chunk, UpstreamChunk) and chunk.protocol == "openai" else "text/event-stream"},
             )
+
+    def _encode_openai_chunk(self, chunk: dict, task_id: str, request_body: dict) -> bytes | None:
+        """Return an original OpenAI event or a converted event, omitting foreign controls."""
+        raw = original_chunk(chunk, "openai")
+        if raw is not None:
+            return raw
+        if isinstance(chunk, UpstreamChunk) and chunk.original is None:
+            return None
+        payload = self._ollama_chunk_to_openai(chunk, task_id, request_body)
+        return f"data: {json.dumps(payload)}\n\n".encode()
 
     def _collect_models(self) -> list[str]:
         """Collect unique externally visible model ids from configured providers."""
@@ -1636,11 +1669,15 @@ class Endpoint_openaix(Endpoint_ollama):
         """Map ollama usage-like counters to OpenAI usage when present."""
         prompt_tokens = data.get("prompt_eval_count")
         completion_tokens = data.get("eval_count")
+        usage = data.get("usage")
+        if isinstance(usage, dict) and ("prompt_tokens" in usage or "completion_tokens" in usage):
+            return dict(usage)
         if prompt_tokens is None and completion_tokens is None:
-            return None
+            return dict(usage) if isinstance(usage, dict) else None
         prompt_tokens = int(prompt_tokens or 0)
         completion_tokens = int(completion_tokens or 0)
         return {
+            **(usage if isinstance(usage, dict) else {}),
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "total_tokens": prompt_tokens + completion_tokens,
@@ -1668,9 +1705,11 @@ class Endpoint_openaix(Endpoint_ollama):
                 arguments = json.dumps(arguments if arguments is not None else {})
 
             tool_call = {
+                **raw_call,
                 "id": str(raw_call.get("id") or ""),
                 "type": str(raw_call.get("type") or "function"),
                 "function": {
+                    **function,
                     "name": name,
                     "arguments": arguments,
                 },
@@ -1687,23 +1726,28 @@ class Endpoint_openaix(Endpoint_ollama):
         content = msg.get("content", "")
         model = data.get("model") or request_body.get("model") or ""
         tool_calls = self._ollama_tool_calls_to_openai(msg.get("tool_calls"))
-        message = {"role": "assistant", "content": content}
+        message = {**msg, "role": msg.get("role", "assistant"), "content": content}
+        if "reasoning_content" not in message and "thinking" in message:
+            message["reasoning_content"] = message["thinking"]
         if tool_calls:
             message["tool_calls"] = tool_calls
 
         resp = {
-            "id": f"chatcmpl-{task_id}",
+            **{key: value for key, value in data.items() if key not in {"message", "done", "done_reason", "created_at", "choices"}},
+            "id": data.get("id") or f"chatcmpl-{task_id}",
             "object": "chat.completion",
-            "created": int(time.time()),
+            "created": data.get("created", int(time.time())),
             "model": model,
             "choices": [
                 {
                     "index": 0,
                     "message": message,
-                    "finish_reason": "tool_calls" if tool_calls else "stop",
+                    "finish_reason": data.get("done_reason") or ("tool_calls" if tool_calls else "stop"),
                 }
             ],
         }
+        if isinstance(data.get("choices"), list):
+            resp["choices"] = data["choices"]
 
         usage = self._usage_from_ollama(data)
         if usage is not None:
@@ -1712,23 +1756,25 @@ class Endpoint_openaix(Endpoint_ollama):
 
     def _ollama_chunk_to_openai(self, chunk: dict, task_id: str, request_body: dict) -> dict:
         """Convert one ollama stream chunk to OpenAI chat.completion.chunk shape."""
+        if isinstance(chunk, UpstreamChunk) and chunk.protocol == "ollama" and chunk.original is not None:
+            chunk = chunk.original
         msg = chunk.get("message") or {}
-        content = msg.get("content", "")
         done = bool(chunk.get("done", False))
         tool_calls = self._ollama_tool_calls_to_openai(msg.get("tool_calls"), streaming=True)
 
-        delta = {"content": content}
-        if not content:
-            delta = {}
+        delta = dict(msg)
+        if "reasoning_content" not in delta and "thinking" in delta:
+            delta["reasoning_content"] = delta["thinking"]
         if tool_calls:
             delta["tool_calls"] = tool_calls
 
-        finish_reason = "tool_calls" if done and tool_calls else "stop" if done else None
+        finish_reason = (chunk.get("done_reason") or ("tool_calls" if tool_calls else "stop")) if done else None
 
-        return {
-            "id": f"chatcmpl-{task_id}",
+        response = {
+            **{key: value for key, value in chunk.items() if key not in {"message", "done", "done_reason", "created_at", "choices"}},
+            "id": chunk.get("id") or f"chatcmpl-{task_id}",
             "object": "chat.completion.chunk",
-            "created": int(time.time()),
+            "created": chunk.get("created", int(time.time())),
             "model": chunk.get("model") or request_body.get("model") or "",
             "choices": [
                 {
@@ -1738,3 +1784,15 @@ class Endpoint_openaix(Endpoint_ollama):
                 }
             ],
         }
+        if isinstance(chunk.get("choices"), list):
+            choices = []
+            for choice in chunk["choices"]:
+                converted = dict(choice)
+                if "message" in converted:
+                    converted["delta"] = converted.pop("message")
+                choices.append(converted)
+            response["choices"] = choices
+        usage = self._usage_from_ollama(chunk)
+        if usage is not None:
+            response["usage"] = usage
+        return response

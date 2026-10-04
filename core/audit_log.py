@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import base64
 import binascii
+import copy
 import hashlib
 import logging
 import os
@@ -454,7 +455,10 @@ class AuditLog:
     ) -> dict[str, Any]:
         """Append an event while preserving a JSON, text, or file-backed body."""
         now = datetime.now().astimezone()
-        body_fields = self._body_fields(body, content_type, now.date().isoformat())
+        body_fields = self._body_fields(
+            body, content_type, now.date().isoformat(),
+            normalize_sse=self._can_normalize_sse(fields),
+        )
         return self.record_raw_event(event_type, **fields, **body_fields)
 
     def open_body_spool(self) -> AuditBodySpool:
@@ -478,7 +482,10 @@ class AuditLog:
         normalized_content_type = content_type.split(";", 1)[0].strip().lower()
         if body_size <= self._max_inline_body_bytes and not self._must_store_body_as_file(normalized_content_type):
             body = spool_path.read_bytes()
-            body_fields = self._body_fields(body, content_type, datetime.now().astimezone().date().isoformat())
+            body_fields = self._body_fields(
+                body, content_type, datetime.now().astimezone().date().isoformat(),
+                normalize_sse=self._can_normalize_sse(fields),
+            )
             event = self.record_raw_event(event_type, **fields, **body_fields)
             spool_path.unlink(missing_ok=True)
             return event
@@ -490,6 +497,14 @@ class AuditLog:
         with self._lock:
             destination.parent.mkdir(parents=True, exist_ok=True)
             os.replace(spool_path, destination)
+        decoded_fields: dict[str, Any] = {}
+        if normalized_content_type == "text/event-stream" and self._can_normalize_sse(fields):
+            try:
+                decoded = destination.read_bytes().decode("utf-8")
+            except UnicodeDecodeError:
+                decoded = None
+            if decoded is not None:
+                decoded_fields = self._sse_json_fields(decoded, now.date().isoformat())
         return self.record_raw_event(
             event_type,
             **fields,
@@ -503,6 +518,8 @@ class AuditLog:
             },
             body_bytes=body_size,
             body_sha256=body_sha256,
+            body_format=self._body_format_for_content_type(normalized_content_type),
+            **decoded_fields,
         )
 
     @staticmethod
@@ -724,7 +741,7 @@ class AuditLog:
             except OSError:
                 pass
 
-    def _body_fields(self, body: bytes, content_type: str, day: str) -> dict[str, Any]:
+    def _body_fields(self, body: bytes, content_type: str, day: str, *, normalize_sse: bool = True) -> dict[str, Any]:
         """Return audit fields preserving JSON, UTF-8 text, or binary data exactly."""
         fields = {
             "body_bytes": len(body),
@@ -741,16 +758,15 @@ class AuditLog:
             return fields | {"body_format": "binary"} | self._store_body_file(body, normalized_content_type, day)
 
         if normalized_content_type == "text/event-stream":
-            parsed_sse, sse_data = self._parse_single_json_sse(decoded)
-            if parsed_sse:
-                attachments = self._extract_data_uri_attachments(sse_data, day)
-                return fields | {
-                    "body_storage": "inline",
-                    "data": sse_data,
-                    "data_encoding": "json",
-                    "body_format": "sse_json_with_done",
-                    **({"attachments": attachments} if attachments else {}),
-                }
+            sse_fields = self._sse_json_fields(decoded, day) if normalize_sse else {}
+            if sse_fields:
+                return fields | {"body_storage": "inline", "body_format": "sse"} | sse_fields
+            return fields | {
+                "body_storage": "inline",
+                "data": decoded,
+                "data_encoding": "utf-8",
+                "body_format": "sse",
+            }
 
         try:
             data = json.loads(decoded)
@@ -785,43 +801,189 @@ class AuditLog:
         return "text"
 
     @staticmethod
-    def _parse_single_json_sse(body: str) -> tuple[bool, Any]:
-        """Return the JSON payload for one standard SSE event followed by [DONE]."""
-        payloads: list[str] = []
-        terminated = False
+    def _can_normalize_sse(fields: Mapping[str, Any]) -> bool:
+        """Allow structured SSE only for responses without a terminal failure."""
+        http = fields.get("http")
+        status_code = http.get("status_code") if isinstance(http, Mapping) else None
+        http_error = isinstance(status_code, int) and status_code >= 400
+        terminal_status = str(fields.get("terminal_status") or "").lower()
+        return terminal_status not in {
+            "failed", "cancelled", "timeout", "http_error", "invalid_json", "exception",
+        } and not fields.get("error_code") and not http_error
 
-        for event in re.split(r"\r?\n\r?\n", body):
-            if not event.strip():
-                continue
-            data_lines: list[str] = []
-            for line in event.splitlines():
+    def _sse_json_fields(self, body: str, day: str) -> dict[str, Any]:
+        """Return decoded JSON audit fields only when the entire SSE stream is valid."""
+        parsed, payloads = self._parse_json_sse(body)
+        if not parsed:
+            return {}
+        data = self._assemble_sse_response(payloads)
+        if data is None:
+            return {}
+        attachments = self._extract_data_uri_attachments(data, day)
+        return {
+            "data": data,
+            "data_encoding": "json",
+            "sse_chunk_count": len(payloads),
+            **({"attachments": attachments} if attachments else {}),
+        }
+
+    @staticmethod
+    def _merge_stream_value(current: Any, incoming: Any, *, concatenate: bool = False) -> Any:
+        """Combine a streamed value while preserving the final executor semantics."""
+        if incoming is None:
+            return current
+        if concatenate and isinstance(current, str) and isinstance(incoming, str):
+            return current + incoming
+        if isinstance(current, dict) and isinstance(incoming, dict):
+            merged = dict(current)
+            for key, value in incoming.items():
+                merged[key] = AuditLog._merge_stream_value(merged.get(key), value)
+            return merged
+        return copy.deepcopy(incoming)
+
+    @classmethod
+    def _assemble_sse_response(cls, payloads: list[Any]) -> dict[str, Any] | None:
+        """Assemble valid OpenAI chat-completion SSE chunks into one final JSON response."""
+        if len(payloads) == 1 and isinstance(payloads[0], dict):
+            payload = payloads[0]
+            if not isinstance(payload.get("choices"), list):
+                return payload
+
+        if not payloads or not all(isinstance(payload, dict) for payload in payloads):
+            return None
+
+        response: dict[str, Any] = {}
+        choices: dict[int, dict[str, Any]] = {}
+        saw_choice = False
+        for payload in payloads:
+            raw_choices = payload.get("choices")
+            if raw_choices is not None and not isinstance(raw_choices, list):
+                return None
+            if raw_choices is not None:
+                for raw_choice in raw_choices:
+                    if not isinstance(raw_choice, dict) or not isinstance(raw_choice.get("index"), int):
+                        return None
+                    delta = raw_choice.get("delta")
+                    if delta is not None and not isinstance(delta, dict):
+                        return None
+                    if delta is None and "message" in raw_choice:
+                        return None
+                    saw_choice = True
+                    index = raw_choice["index"]
+                    choice = choices.setdefault(index, {"index": index, "message": {}})
+                    message = choice["message"]
+                    for key, value in (delta or {}).items():
+                        if key in {"content", "reasoning", "reasoning_content"}:
+                            message[key] = cls._merge_stream_value(message.get(key, ""), value, concatenate=True)
+                        elif key == "tool_calls":
+                            if not isinstance(value, list):
+                                return None
+                            message[key] = cls._merge_tool_call_deltas(message.get(key), value)
+                            if message[key] is None:
+                                return None
+                        else:
+                            message[key] = cls._merge_stream_value(message.get(key), value)
+                    for key, value in raw_choice.items():
+                        if key not in {"index", "delta", "finish_reason"} and value is not None:
+                            choice[key] = cls._merge_stream_value(choice.get(key), value)
+                    if raw_choice.get("finish_reason") is not None:
+                        choice["finish_reason"] = raw_choice["finish_reason"]
+
+            for key, value in payload.items():
+                if key in {"choices", "usage"} or value is None:
+                    continue
+                response[key] = cls._merge_stream_value(response.get(key), value)
+            if isinstance(payload.get("usage"), dict):
+                response["usage"] = cls._merge_stream_value(response.get("usage", {}), payload["usage"])
+
+        if not saw_choice:
+            return None
+        response["object"] = "chat.completion"
+        response["choices"] = [choices[index] for index in sorted(choices)]
+        return response
+
+    @classmethod
+    def _merge_tool_call_deltas(cls, current: Any, incoming: list[Any]) -> list[dict[str, Any]] | None:
+        """Join OpenAI tool-call deltas by their stream index."""
+        calls = copy.deepcopy(current) if isinstance(current, list) else []
+        if not all(isinstance(call, dict) for call in calls):
+            return None
+        for raw_call in incoming:
+            if not isinstance(raw_call, dict) or not isinstance(raw_call.get("index"), int):
+                return None
+            index = raw_call["index"]
+            while len(calls) <= index:
+                calls.append({"index": len(calls), "function": {}})
+            call = calls[index]
+            for key, value in raw_call.items():
+                if key == "function":
+                    if not isinstance(value, dict):
+                        return None
+                    function = call.setdefault("function", {})
+                    if not isinstance(function, dict):
+                        return None
+                    for function_key, function_value in value.items():
+                        function[function_key] = cls._merge_stream_value(
+                            function.get(function_key, ""),
+                            function_value,
+                            concatenate=function_key == "arguments",
+                        )
+                elif key != "index":
+                    call[key] = cls._merge_stream_value(call.get(key), value)
+        return calls
+
+    @staticmethod
+    def _reject_json_constant(value: str) -> None:
+        """Reject non-standard JSON constants rather than recording invalid structured JSON."""
+        raise ValueError(f"Invalid JSON constant: {value}")
+
+    @classmethod
+    def _parse_json_sse(cls, body: str) -> tuple[bool, list[Any]]:
+        """Decode all complete SSE JSON payloads, rejecting malformed or error-bearing streams."""
+        payloads: list[Any] = []
+        terminated = False
+        data_lines: list[str] = []
+        event_type = ""
+        lines = re.split(r"\r\n|\r|\n", body.removeprefix("\ufeff"))
+        if lines[-1] == "":
+            lines.pop()
+        for line in lines:
+            if line:
                 if line.startswith(":"):
                     continue
-                if line.startswith("data:"):
-                    data_lines.append(line[5:].lstrip(" "))
-                    continue
-                if line.startswith(("event:", "id:", "retry:")):
-                    continue
-                return False, None
-
+                name, separator, value = line.partition(":")
+                if separator and value.startswith(" "):
+                    value = value[1:]
+                if name == "data":
+                    data_lines.append(value)
+                elif name == "event":
+                    event_type = value
+                continue
+            if event_type.lower() == "error":
+                return False, []
             if not data_lines:
+                event_type = ""
                 continue
             payload = "\n".join(data_lines)
+            data_lines = []
+            event_type = ""
             if payload == "[DONE]":
                 if terminated:
-                    return False, None
+                    return False, []
                 terminated = True
                 continue
             if terminated:
-                return False, None
-            payloads.append(payload)
-
-        if len(payloads) != 1 or not terminated:
-            return False, None
-        try:
-            return True, json.loads(payloads[0])
-        except json.JSONDecodeError:
-            return False, None
+                return False, []
+            try:
+                data = json.loads(payload, parse_constant=cls._reject_json_constant)
+            except ValueError:
+                return False, []
+            if isinstance(data, dict) and ("error" in data or data.get("type") == "error"):
+                return False, []
+            payloads.append(data)
+        if data_lines or event_type or not payloads:
+            return False, []
+        return True, payloads
 
     def _extract_data_uri_attachments(self, value: Any, day: str) -> list[dict[str, Any]]:
         """Store recognized media data URIs as attachments while preserving the source JSON value."""

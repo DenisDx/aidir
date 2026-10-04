@@ -93,6 +93,32 @@ def _summary(task_id: str, timestamp: str, model: str) -> dict[str, str]:
 class ViewerSearchTests(unittest.TestCase):
     """Verify the Viewer search contract against summary-only Redis hashes."""
 
+    def test_dashboard_lists_persisted_running_task_absent_from_memory(self):
+        """Show a running task even when it is owned by another process."""
+        task_id = "remote-running-task"
+        redis = _Redis({
+            f"aidir:task:{task_id}": {
+                **_summary(task_id, "2026-10-01T12:00:00+00:00", "remote-model"),
+                "status": "running",
+                "started_at": "2026-10-01T12:00:01+00:00",
+            },
+        })
+        core = _Core(redis)
+        core.queue.list_tasks.return_value = []
+
+        async def session(*args, **kwargs):
+            """Provide an authenticated Dashboard session."""
+            return {"permissions": ["all"], "login": "test"}
+
+        with patch("webui.backend.app._get_session", session):
+            response = TestClient(create_app(core)).get("/api/tasks")
+
+        self.assertEqual(response.status_code, 200)
+        tasks = response.json()["tasks"]
+        self.assertEqual([task["id"] for task in tasks], [task_id])
+        self.assertEqual(tasks[0]["status"], "running")
+        self.assertEqual(tasks[0]["model_id"], "remote-model")
+
     def test_search_uses_batched_summary_hashes_only(self):
         """Return top-k summary rows without decoding any heavy Redis task field."""
         hashes = {

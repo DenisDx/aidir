@@ -7,7 +7,6 @@ from __future__ import annotations
 import ast
 import asyncio
 import base64
-import codecs
 import json
 from typing import Awaitable, Callable
 
@@ -35,6 +34,7 @@ from core.task import Task, STATUS_COMPLETED, STATUS_FAILED, STATUS_CANCELED
 from core.task_types.task_agent import Task_agent
 from core.task_types.task_tool import Task_tool
 from core.worker import BaseWorker, WorkerResult
+from core.upstream_response import capture_response, consume_ndjson_response, original_payload, without_reasoning
 
 
 class OpenAIxWorker(BaseWorker):
@@ -199,7 +199,7 @@ class OpenAIxWorker(BaseWorker):
         try:
             async with httpx.AsyncClient(timeout=upstream_timeout, headers=request_headers) as client:
                 # Check if tools are present in payload (injected by context builder)
-                has_tools = bool(payload.get("tools"))
+                has_tools = bool(self._extract_injected_tool_names(task))
                 if task.stream and not has_tools:
                     return await self._forward_stream(client, url, payload, emit_chunk, task=task, save_call=save_call, task_id=task.id)
                 return await self._run_with_internal_tools(client, url, payload, task, emit_chunk, save_call=save_call)
@@ -941,6 +941,32 @@ class OpenAIxWorker(BaseWorker):
         max_turns = self._tools_max_turns
         turn = 0
         last_step_data: dict | None = None
+        last_step: WorkerResult | None = None
+        internal_tools_executed = False
+
+        def final_result(step: WorkerResult) -> WorkerResult:
+            """Restore original final content and remove reasoning only after internal tools."""
+            if not step.ok:
+                return step
+            data = dict(step.data or {})
+            upstream = step.upstream_response
+            if upstream is not None:
+                raw_payload = original_payload(upstream, upstream["protocol"], {})
+                message = raw_payload.get("message")
+                if not isinstance(message, dict):
+                    choices = raw_payload.get("choices")
+                    first_choice = choices[0] if isinstance(choices, list) and choices else {}
+                    message = first_choice.get("message") if isinstance(first_choice, dict) else None
+                if isinstance(message, dict):
+                    data["message"] = {**(data.get("message") or {}), **message}
+                if internal_tools_executed:
+                    upstream = capture_response(
+                        upstream["protocol"], upstream["status_code"], upstream["content_type"],
+                        json.dumps(without_reasoning(raw_payload), ensure_ascii=False),
+                    )
+            if internal_tools_executed:
+                data = without_reasoning(data)
+            return WorkerResult(ok=True, data=data, usage=step.usage, upstream_response=upstream)
 
         # Execute only tools that were actually injected by aidir for this request.
         available_tools = self._extract_injected_tool_names(parent_task)
@@ -960,6 +986,7 @@ class OpenAIxWorker(BaseWorker):
                 return step
 
             data = step.data or {}
+            last_step = step
             last_step_data = data if isinstance(data, dict) else None
             assistant_msg = data.get("message") if isinstance(data.get("message"), dict) else {}
             calls = self._extract_tool_calls(assistant_msg)
@@ -969,7 +996,7 @@ class OpenAIxWorker(BaseWorker):
                 # Thinking-mode models (e.g. qwen3) sometimes output the answer
                 # only in 'thinking' and leave 'content' empty.  Fall back to
                 # 'thinking' so the client receives a non-empty response.
-                if not content.strip() and thinking.strip():
+                if not internal_tools_executed and step.upstream_response is None and not content.strip() and thinking.strip():
                     log(
                         "worker",
                         "warning",
@@ -989,17 +1016,20 @@ class OpenAIxWorker(BaseWorker):
                     f"Task {parent_task.id} final response turn={turn} role={assistant_msg.get('role')} content={content_preview!r}",
                     "openaix",
                 )
+                step = final_result(WorkerResult(ok=True, data=data, usage=data.get("usage"), upstream_response=step.upstream_response))
+                data = step.data or {}
                 if parent_task.stream and emit_chunk:
                     await emit_chunk(data)
-                return WorkerResult(ok=True, data=data, usage=data.get("usage"))
+                return step
 
             # Separate tool calls into executable (local workers) and pass-through (external)
             executable_calls, external_calls = self._split_tool_calls(calls, available_tools)
 
             # If there are external tool calls, pass response to client unchanged
             if external_calls or not executable_calls:
+                step = final_result(step)
                 if parent_task.stream and emit_chunk:
-                    await emit_chunk(data)
+                    await emit_chunk(step.data or {})
                 return step
 
             # Continue internally: execute tool calls and append results
@@ -1010,6 +1040,7 @@ class OpenAIxWorker(BaseWorker):
                 "openaix",
             )
             messages.append(self._normalize_assistant_message_for_history(assistant_msg))
+            internal_tools_executed = True
             for call in executable_calls:
                 tool_result = await self._execute_internal_tool(call, parent_task)
                 if not tool_result.ok:
@@ -1068,17 +1099,19 @@ class OpenAIxWorker(BaseWorker):
             fb_msg = fd.get("message") if isinstance(fd.get("message"), dict) else {}
             fb_content = fb_msg.get("content") or ""
             fb_thinking = fb_msg.get("thinking") or ""
-            if not fb_content.strip() and fb_thinking.strip():
+            if not internal_tools_executed and fallback_step.upstream_response is None and not fb_content.strip() and fb_thinking.strip():
                 fd = dict(fd)
                 fd["message"] = dict(fb_msg)
                 fd["message"]["content"] = fb_thinking
-                fallback_step = WorkerResult(ok=True, data=fd, usage=fd.get("usage"))
+                fallback_step = WorkerResult(ok=True, data=fd, usage=fd.get("usage"), upstream_response=fallback_step.upstream_response)
+            fallback_step = final_result(fallback_step)
+            fd = fallback_step.data or {}
             if parent_task.stream and emit_chunk and isinstance(fd, dict):
                 await emit_chunk(fd)
             return fallback_step
 
-        if last_step_data is not None:
-            return WorkerResult(ok=True, data=last_step_data, usage=last_step_data.get("usage"))
+        if last_step_data is not None and last_step is not None:
+            return final_result(last_step)
 
         return WorkerResult(ok=False, error={"code": "TOOL_LOOP_LIMIT", "message": "Tool loop exceeded limit"})
 
@@ -1400,7 +1433,10 @@ class OpenAIxWorker(BaseWorker):
                                 )
                             if save_call:
                                 save_llm_call(self.id, effective_task_id, compat_payload, data)
-                            return WorkerResult(ok=True, data=data, usage=data.get("usage"))
+                            return WorkerResult(
+                                ok=True, data=data, usage=data.get("usage"),
+                                upstream_response=capture_response("ollama", compat_resp.status_code, self._response_content_type(compat_resp, "application/json"), compat_raw_response),
+                            )
 
                         body_preview = compat_resp.text[:512]
                         if task is not None:
@@ -1463,7 +1499,10 @@ class OpenAIxWorker(BaseWorker):
 
                         if save_call:
                             save_llm_call(self.id, effective_task_id, upstream_payload, data)
-                        return WorkerResult(ok=True, data=data, usage=data.get("usage"))
+                        return WorkerResult(
+                            ok=True, data=data, usage=data.get("usage"),
+                            upstream_response=capture_response("ollama", resp.status_code, self._response_content_type(resp, "application/json"), raw_response),
+                        )
             except httpx.ConnectError as exc:
                 if task is not None:
                     await self._finalize_llm_call(task, history_entry, status="connect_error", error_code="UPSTREAM_UNREACHABLE")
@@ -1780,73 +1819,9 @@ class OpenAIxWorker(BaseWorker):
     @staticmethod
     async def _consume_stream_response(resp, emit_chunk, chunks: list[dict], response_spool, save_call: bool) -> dict | None:
         """Parse Ollama NDJSON stream while preserving raw bytes for logging."""
-        final_data: dict | None = None
-
-        aiter_raw = getattr(resp, "aiter_raw", None)
-        if callable(aiter_raw):
-            decoder = codecs.getincrementaldecoder("utf-8")()
-            text_buffer = ""
-            async for raw_chunk in aiter_raw():
-                if response_spool is not None:
-                    response_spool.write(raw_chunk)
-                decoded = decoder.decode(raw_chunk)
-                text_buffer += decoded
-                while "\n" in text_buffer:
-                    line, text_buffer = text_buffer.split("\n", 1)
-                    if not line.strip():
-                        continue
-                    try:
-                        chunk = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    chunk = OpenAIxWorker._normalize_upstream_response_data(chunk)
-                    if emit_chunk:
-                        await emit_chunk(chunk)
-                    if save_call:
-                        chunks.append(chunk)
-                    if isinstance(chunk, dict):
-                        final_data = chunk
-                        if chunk.get("done"):
-                            break
-
-            tail = decoder.decode(b"", final=True)
-            if tail:
-                text_buffer += tail
-            if text_buffer.strip():
-                try:
-                    chunk = json.loads(text_buffer)
-                except json.JSONDecodeError:
-                    chunk = None
-                if isinstance(chunk, dict):
-                    chunk = OpenAIxWorker._normalize_upstream_response_data(chunk)
-                    if emit_chunk:
-                        await emit_chunk(chunk)
-                    if save_call:
-                        chunks.append(chunk)
-                    if isinstance(chunk, dict):
-                        final_data = chunk
-            return final_data
-
-        aiter_lines = getattr(resp, "aiter_lines", None)
-        if callable(aiter_lines):
-            async for line in aiter_lines():
-                if response_spool is not None:
-                    response_spool.write(line.encode("utf-8") + b"\n")
-                if not line.strip():
-                    continue
-                try:
-                    chunk = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                chunk = OpenAIxWorker._normalize_upstream_response_data(chunk)
-                if emit_chunk:
-                    await emit_chunk(chunk)
-                if save_call:
-                    chunks.append(chunk)
-                if isinstance(chunk, dict):
-                    final_data = chunk
-
-        return final_data
+        return await consume_ndjson_response(
+            resp, emit_chunk, chunks, response_spool, save_call, OpenAIxWorker._normalize_upstream_response_data,
+        )
 
 
 worker = OpenAIxWorker()

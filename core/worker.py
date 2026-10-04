@@ -14,6 +14,7 @@ from urllib.parse import urlparse
 from core import log
 from core.task import Task
 from core.task import STATUS_CANCELED, STATUS_COMPLETED, STATUS_FAILED
+from core.upstream_response import UpstreamResponse
 
 
 @dataclass
@@ -23,6 +24,7 @@ class WorkerResult:
     data: dict | None = None    # final response payload (non-streaming or summary)
     error: dict | None = None   # error dict if ok=False
     usage: dict | None = None   # token usage stats, if available
+    upstream_response: UpstreamResponse | None = None
 
 
 class BaseWorker:

@@ -152,7 +152,23 @@ Inline event bodies use an unambiguous representation:
 ```json
 {"body_storage":"inline","data":{"model":"example"},"data_encoding":"json"}
 {"body_storage":"inline","data":"data: text\n\n","data_encoding":"utf-8"}
+{"body_storage":"inline","data":{"object":"chat.completion","choices":[{"index":0,"message":{"content":"answer"}}]},"data_encoding":"json","body_format":"sse","sse_chunk_count":2}
 ```
+
+Completed error-free OpenAI chat SSE responses are validated and assembled as a
+whole before one reconstructed final JSON completion is stored as decoded `data`.
+The assembler joins content, reasoning, tool-call arguments, choices, finish
+reasons, usage, and compatible fields from all chunks. Comments, SSE metadata,
+and the optional OpenAI `[DONE]` marker are not JSON chunks. `body_format` is
+always `"sse"`, and `sse_chunk_count` counts only decoded source payloads. A
+stream that cannot be unambiguously assembled, or is malformed, incomplete,
+failed, cancelled, or error-bearing, retains its original text or file reference
+rather than a partial result.
+
+Normalization happens only when the completed body is classified; the live spool
+may remain raw text/bytes. This does not change the original stream delivered to
+the client. `body_bytes` and `body_sha256` describe those original bytes, not the
+decoded JSON representation.
 
 Binary HTTP bodies are stored as files under
 `logs/audit/files/YYYY-MM-DD/<file-id>`. Their JSONL event omits `data` and
@@ -170,6 +186,13 @@ uses a distinct file reference:
   }
 }
 ```
+
+Large finalized SSE bodies retain the original stream in `body_file` under the
+existing inline-byte threshold policy. Successful JSON normalization additionally
+stores decoded `data`, `data_encoding: "json"`, and `sse_chunk_count` in the audit
+record even for these file-backed SSE bodies. The authenticated body-file link
+still exposes the exact original bytes. Thus the threshold limits raw inline
+body storage, not the size of decoded SSE audit data.
 
 Recognized media encoded in a JSON `data:*;base64,...` value uses file-backed
 storage for the decoded media. The original JSON value remains inline in
@@ -237,9 +260,13 @@ Rules:
   stable `exchange_id`; retries receive separate exchange IDs.
 - `llm_request` stores the outgoing JSON value unchanged when valid JSON. A
   non-JSON outgoing body is stored as exact escaped text or a file reference.
-- `llm_response` stores valid complete JSON as JSON. It stores non-JSON and SSE
-  as exact escaped text or a file reference; binary and recognized media always
-  use `body_storage: "file"`.
+- `llm_response` and `client_response` store valid complete JSON as JSON.
+  Completed error-free OpenAI chat SSE stores one assembled final completion
+  with `body_format: "sse"` and `sse_chunk_count`; original delivery is
+  unchanged. SSE that cannot be assembled into a valid final response, and
+  invalid, incomplete, failed, cancelled, or error-bearing SSE and other
+  non-JSON bodies retain exact escaped text or a file reference. Binary and
+  recognized media always use `body_storage: "file"`.
 - Failed and cancelled streams still emit a terminal response event containing
   all bytes received or sent before termination plus the error reason.
 - Authorization headers, cookies, and secrets are metadata-only and redacted.

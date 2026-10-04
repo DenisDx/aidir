@@ -263,26 +263,30 @@ Typical fields:
 
 Special behavior:
 
-1. If final assistant `content` is empty and `thinking` is non-empty, worker may substitute `content = thinking`.
+1. When client and executor protocols match, direct chat responses preserve the original body and content type, including unknown fields and empty/null content. Reasoning is not copied into `content`.
+2. After aidir actually executes an internal tool, intermediate turns stay internal and reasoning fields are removed from the final answer. Merely declaring caller-owned tools does not trigger this rule.
+3. When protocols differ, response envelopes are converted with minimal loss: reasoning, detailed usage, original finish reasons, and compatible extra fields are preserved. `thinking` maps to OpenAI `reasoning_content`; OpenAI reasoning maps to Ollama `thinking` without discarding its original fields.
 
 ## 6.2 `POST /api/chat` stream response
 
 1. Content type: `application/x-ndjson`
 2. Body: newline-delimited JSON chunks from upstream
 3. Final chunk has `done: true`
+4. Matching Ollama streams retain original event bytes, line delimiters, content type, and additional fields.
+5. Aidir-managed tool loops may synthesize streaming from the final synchronous response, omitting reasoning only if an internal tool executed.
 
 ## 6.3 `POST /v1/chat/completions` non-stream response
 
-Mapped to OpenAI `chat.completion` shape:
+For an OpenAI executor such as llama.cpp, direct responses are returned unchanged, preserving all choices, identifiers, timestamps, reasoning, usage details, and vendor fields. The shape below describes conversion from an Ollama executor; existing compatible fields are retained rather than replaced:
 
-1. `id: "chatcmpl-<task_id>"`
+1. `id: original identifier, or "chatcmpl-<task_id>" when absent`
 2. `object: "chat.completion"`
-3. `created: unix_ts`
+3. `created: original timestamp, or current unix_ts when absent`
 4. `model: string`
 5. `choices[0].index: 0`
-6. `choices[0].message.role: "assistant"`
+6. `choices[0].message.role: original role, or "assistant" when absent`
 7. `choices[0].message.content: string`
-8. `choices[0].finish_reason: "stop"`
+8. `choices[0].finish_reason: original done_reason, or "tool_calls"/"stop" when absent`
 9. `usage` (optional):
    1. `prompt_tokens`
    2. `completion_tokens`
@@ -293,21 +297,25 @@ Usage is built from Ollama counters:
 1. `prompt_tokens <- prompt_eval_count`
 2. `completion_tokens <- eval_count`
 
+Existing OpenAI usage details are preserved. Unknown message fields and compatible top-level fields remain available as extensions.
+
 ## 6.4 `POST /v1/chat/completions` stream response
 
 1. Content type: `text/event-stream`
 2. Chunks format: `data: {json}\n\n`
 3. Final marker: `data: [DONE]\n\n`
 
-Chunk JSON shape:
+Matching OpenAI streams retain original SSE events, event metadata/comments, line delimiters, all choices and deltas, reasoning, usage-only chunks, and executor terminators. Aidir does not append a duplicate terminator. The shape below describes converted or synthesized streams:
 
-1. `id: "chatcmpl-<task_id>"`
+1. `id: original identifier, or "chatcmpl-<task_id>" when absent`
 2. `object: "chat.completion.chunk"`
-3. `created: unix_ts`
+3. `created: original timestamp, or current unix_ts when absent`
 4. `model: string`
 5. `choices[0].index: 0`
 6. `choices[0].delta.content: string` (when present)
-7. `choices[0].finish_reason: null|"stop"`
+7. `choices[0].delta.reasoning_content` (when the source provides reasoning)
+8. `choices[0].finish_reason: null or original done_reason, with "tool_calls"/"stop" as fallback`
+9. Additional compatible fields and detailed usage are preserved.
 
 ## 6.5 Models listing
 
@@ -376,6 +384,8 @@ Ollama-like:
 
 ## 7. Error format
 
+Executor errors retained by `call_llama_cpp` bypass the envelopes below: endpoints return the original HTTP status, complete body, and content type, preserving all upstream fields and adding no `task_id`. Streaming requests wait for their first output so an initial rejection can retain its HTTP status. If an error occurs after streaming starts, the original JSON error is emitted as an SSE (`/v1/*`) or NDJSON (`/api/*`) event; the HTTP status remains unchanged. This passthrough is independent of `errors_compatibility_mode`. Locally generated errors, including connection failures and timeouts, retain the behavior below.
+
 Endpoint has compatibility mode (`errors_compatibility_mode`, default `true`).
 
 When compatibility mode is enabled:
@@ -396,8 +406,8 @@ Compared to standard OpenAI Chat Completions API:
 1. This implementation supports only a subset of fields.
 2. Request extensions (`worker`, `envid`, `context_builder`, `log`) are non-standard.
 3. Internal tool execution loop is non-standard server-side behavior.
-4. Streaming chunks do not include full OpenAI delta semantics (for example role deltas).
-5. Non-stream OpenAI response is normalized to a single `choices[0]`.
+4. Matching-protocol direct responses and stream events are transparent; protocol conversion cannot provide byte-identical envelopes.
+5. Internal tool loops hide intermediate turns and omit final-stage reasoning after a tool executes. Their client stream may be synthesized from a final synchronous executor response.
 
 ## 9. Short list of OpenAIx extensions
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import errno
+import hashlib
 import os
 import tempfile
 import threading
@@ -100,7 +101,14 @@ class AuditLogTests(unittest.TestCase):
             )
             multi_json_sse_event = audit_log.record_body_event(
                 "client_response",
-                b'data: {"part":1}\n\ndata: {"part":2}\n\ndata: [DONE]\n\n',
+                (
+                    b'data: {"id":"completion-1","object":"chat.completion.chunk","model":"model",'
+                    b'"choices":[{"index":0,"delta":{"role":"assistant","content":"part "},"finish_reason":null}]}\n\n'
+                    b'data: {"id":"completion-1","object":"chat.completion.chunk","model":"model",'
+                    b'"choices":[{"index":0,"delta":{"content":"two","reasoning_content":"trace"},"finish_reason":"stop"}],'
+                    b'"usage":{"completion_tokens":2}}\n\n'
+                    b'data: [DONE]\n\n'
+                ),
                 content_type="text/event-stream",
             )
             binary_event = audit_log.record_body_event(
@@ -117,9 +125,17 @@ class AuditLogTests(unittest.TestCase):
             self.assertEqual(text_event["body_format"], "sse")
             self.assertEqual(single_json_sse_event["data"], {"ok": True})
             self.assertEqual(single_json_sse_event["data_encoding"], "json")
-            self.assertEqual(single_json_sse_event["body_format"], "sse_json_with_done")
-            self.assertEqual(multi_json_sse_event["data_encoding"], "utf-8")
+            self.assertEqual(single_json_sse_event["body_format"], "sse")
+            self.assertEqual(single_json_sse_event["sse_chunk_count"], 1)
+            self.assertEqual(multi_json_sse_event["data"]["object"], "chat.completion")
+            self.assertEqual(multi_json_sse_event["data"]["choices"][0]["message"], {
+                "role": "assistant", "content": "part two", "reasoning_content": "trace",
+            })
+            self.assertEqual(multi_json_sse_event["data"]["choices"][0]["finish_reason"], "stop")
+            self.assertEqual(multi_json_sse_event["data"]["usage"], {"completion_tokens": 2})
+            self.assertEqual(multi_json_sse_event["data_encoding"], "json")
             self.assertEqual(multi_json_sse_event["body_format"], "sse")
+            self.assertEqual(multi_json_sse_event["sse_chunk_count"], 2)
             self.assertEqual(binary_event["body_storage"], "file")
             body_path = Path(temporary_directory) / binary_event["body_file"]["relative_path"]
             self.assertEqual(body_path.read_bytes(), b"\x89PNG\r\n\x1a\n")
@@ -153,11 +169,201 @@ class AuditLogTests(unittest.TestCase):
             self.assertEqual(text_event["data"], "hello")
             self.assertEqual(sse_event["data"], {"ok": True})
             self.assertEqual(sse_event["data_encoding"], "json")
-            self.assertEqual(sse_event["body_format"], "sse_json_with_done")
+            self.assertEqual(sse_event["body_format"], "sse")
             self.assertEqual(binary_event["body_storage"], "file")
             self.assertEqual(large_event["body_storage"], "file")
             self.assertFalse(json_spool.exists())
             self.assertFalse(text_spool.exists())
+
+    def test_completed_sse_decodes_all_json_chunks_without_changing_body_metadata(self):
+        """Finalize complete SSE into ordered JSON values with exact original byte metadata."""
+        values = [
+            {"id": "completion-1", "object": "chat.completion.chunk", "created": 3, "model": "model", "vendor": {"a": 1}, "choices": [{"index": 0, "delta": {"role": "assistant", "reasoning_content": "tr"}, "finish_reason": None}]},
+            {"id": "completion-1", "object": "chat.completion.chunk", "model": "model", "choices": [{"index": 0, "delta": {"reasoning_content": "ace", "content": "answer"}, "finish_reason": "length"}]},
+            {"id": "completion-1", "object": "chat.completion.chunk", "choices": [], "usage": {"completion_tokens_details": {"reasoning_tokens": 7}}},
+        ]
+        body = b"\xef\xbb\xbf: keepalive\r\n\r\nevent: message\r\nid: event-1\r\nretry: 1000\r\n"
+        body += b"".join(b"data: " + line.encode() + b"\r\n" for line in json.dumps(values[0], indent=2).splitlines()) + b"\r\n"
+        body += b"".join(b"data: " + json.dumps(value).encode() + b"\r\n\r\n" for value in values[1:])
+        body += b"data: [DONE]\r\n\r\n: final comment\r\n\r\n"
+        with tempfile.TemporaryDirectory() as directory:
+            audit_log = AuditLog(directory)
+            spool = audit_log.open_body_spool()
+            for offset in range(0, len(body), 7):
+                spool.write(body[offset:offset + 7])
+            event = audit_log.finalize_body_spool(
+                "llm_response", spool, content_type="text/event-stream; charset=utf-8",
+                task_id="task-sse", terminal_status="ok",
+            )
+            self.assertEqual(event["data"], {
+                "id": "completion-1",
+                "object": "chat.completion",
+                "created": 3,
+                "model": "model",
+                "vendor": {"a": 1},
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "reasoning_content": "trace", "content": "answer"},
+                    "finish_reason": "length",
+                }],
+                "usage": {"completion_tokens_details": {"reasoning_tokens": 7}},
+            })
+            self.assertEqual(event["data_encoding"], "json")
+            self.assertEqual(event["body_format"], "sse")
+            self.assertEqual(event["sse_chunk_count"], 3)
+            self.assertEqual(event["body_bytes"], len(body))
+            self.assertEqual(event["body_sha256"], hashlib.sha256(body).hexdigest())
+            self.assertEqual(audit_log.read_event(event["event_id"]), event)
+            self.assertFalse(spool.exists())
+            journal = next(audit_log.directory.glob("raw_llm_responses-*.jsonl"))
+            self.assertEqual(json.loads(journal.read_text())["data"], event["data"])
+
+    def test_sse_assembly_supports_all_line_delimiters_without_done(self):
+        """Assemble OpenAI chunks without requiring the OpenAI-specific DONE marker."""
+        values = [
+            {"id": "completion-1", "choices": [{"index": 0, "delta": {"content": "hel"}, "finish_reason": None}]},
+            {"id": "completion-1", "choices": [{"index": 0, "delta": {"content": "lo"}, "finish_reason": "stop"}]},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            audit_log = AuditLog(directory)
+            for delimiter in ("\n", "\r\n", "\r"):
+                body = "".join(f"data: {json.dumps(value)}{delimiter}{delimiter}" for value in values).encode()
+                with self.subTest(delimiter=repr(delimiter)):
+                    event = audit_log.record_body_event("client_response", body, content_type="text/event-stream")
+                    self.assertEqual(event["data"]["choices"][0]["message"]["content"], "hello")
+                    self.assertEqual(event["data"]["choices"][0]["finish_reason"], "stop")
+                    self.assertEqual(event["sse_chunk_count"], len(values))
+                    self.assertEqual(event["body_format"], "sse")
+
+    def test_sse_assembly_preserves_choices_usage_and_tool_call_arguments(self):
+        """Reconstruct all standard OpenAI streaming fields rather than preserving chunk objects."""
+        chunks = [
+            {
+                "id": "completion-1", "object": "chat.completion.chunk", "created": 4, "model": "model",
+                "choices": [
+                    {"index": 1, "delta": {"role": "assistant", "content": "B"}, "finish_reason": None},
+                    {"index": 0, "delta": {"role": "assistant", "tool_calls": [{"index": 0, "id": "call-1", "type": "function", "function": {"name": "search", "arguments": '{"q":"'}}]}, "finish_reason": None},
+                ],
+            },
+            {
+                "id": "completion-1", "object": "chat.completion.chunk", "system_fingerprint": "fp",
+                "choices": [
+                    {"index": 0, "delta": {"tool_calls": [{"index": 0, "function": {"arguments": 'test"}'}}]}, "finish_reason": "tool_calls"},
+                    {"index": 1, "delta": {"content": " answer"}, "finish_reason": "stop", "logprobs": {"content": []}},
+                ],
+                "usage": {"prompt_tokens": 3, "completion_tokens_details": {"reasoning_tokens": 1}},
+            },
+        ]
+        body = b"".join(b"data: " + json.dumps(chunk).encode() + b"\n\n" for chunk in chunks) + b"data: [DONE]\n\n"
+        with tempfile.TemporaryDirectory() as directory:
+            event = AuditLog(directory).record_body_event("llm_response", body, content_type="text/event-stream")
+        self.assertEqual(event["data"], {
+            "id": "completion-1",
+            "object": "chat.completion",
+            "created": 4,
+            "model": "model",
+            "system_fingerprint": "fp",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "index": 0, "id": "call-1", "type": "function",
+                            "function": {"name": "search", "arguments": '{"q":"test"}'},
+                        }],
+                    },
+                    "finish_reason": "tool_calls",
+                },
+                {
+                    "index": 1,
+                    "message": {"role": "assistant", "content": "B answer"},
+                    "logprobs": {"content": []},
+                    "finish_reason": "stop",
+                },
+            ],
+            "usage": {"prompt_tokens": 3, "completion_tokens_details": {"reasoning_tokens": 1}},
+        })
+        self.assertEqual(event["sse_chunk_count"], 2)
+
+    def test_invalid_or_error_bearing_sse_remains_exact_text(self):
+        """Do not partially decode a stream that contains malformed JSON, errors, or incomplete events."""
+        prefix = 'data: {"ok":true}\n\n'
+        bodies = [
+            prefix + 'data: {broken}\n\n',
+            prefix + 'data: {"error":{"message":"failed"}}\n\n',
+            prefix + 'data: {"type":"error","message":"failed"}\n\n',
+            prefix + 'event: error\ndata: {"message":"failed"}\n\n',
+            prefix + 'data: {"value":NaN}\n\n',
+            prefix + 'data: {"value":Infinity}\n\n',
+            prefix + 'data: {"incomplete":true}',
+            prefix + 'data: {"incomplete":true}\n',
+            prefix + 'data: [DONE]\n\ndata: {"too_late":true}\n\n',
+            prefix + 'data: [DONE]\n\ndata: [DONE]\n\n',
+            '{"not":"SSE"}',
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            audit_log = AuditLog(directory)
+            for body in bodies:
+                with self.subTest(body=body):
+                    event = audit_log.record_body_event("llm_response", body.encode(), content_type="text/event-stream")
+                    self.assertEqual(event["data"], body)
+                    self.assertEqual(event["data_encoding"], "utf-8")
+                    self.assertEqual(event["body_format"], "sse")
+                    self.assertNotIn("sse_chunk_count", event)
+
+    def test_failed_and_cancelled_sse_stays_raw_even_with_valid_json_events(self):
+        """Keep interrupted or failed stream evidence raw rather than making it look successful."""
+        body = b'data: {"content":"partial"}\n\n'
+        with tempfile.TemporaryDirectory() as directory:
+            audit_log = AuditLog(directory)
+            for status in ("failed", "cancelled", "invalid_json", "http_error"):
+                with self.subTest(status=status):
+                    event = audit_log.record_body_event("llm_response", body, content_type="text/event-stream", terminal_status=status)
+                    self.assertEqual(event["data"], body.decode())
+                    self.assertEqual(event["data_encoding"], "utf-8")
+                    self.assertEqual(event["body_format"], "sse")
+            for fields in ({"terminal_status": "ok", "error_code": "UPSTREAM_ERROR"}, {"http": {"status_code": 400}}):
+                with self.subTest(fields=fields):
+                    event = audit_log.record_body_event("llm_response", body, content_type="text/event-stream", **fields)
+                    self.assertEqual(event["data"], body.decode())
+                    self.assertEqual(event["data_encoding"], "utf-8")
+            running = audit_log.record_body_event(
+                "client_response",
+                b'data: {"id":"completion-1","choices":[{"index":0,"delta":{"content":"complete"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+                content_type="text/event-stream",
+                terminal_status="running",
+            )
+            self.assertEqual(running["data"]["choices"][0]["message"]["content"], "complete")
+            self.assertEqual(running["data_encoding"], "json")
+
+    def test_large_completed_sse_keeps_raw_file_and_decoded_json(self):
+        """Expose decoded SSE data even above the inline threshold while retaining original bytes."""
+        values = [
+            {"id": "completion-1", "choices": [{"index": 0, "delta": {"content": "x" * 100}, "finish_reason": None}]},
+            {"id": "completion-1", "choices": [{"index": 0, "delta": {"content": "y" * 100}, "finish_reason": "stop"}]},
+        ]
+        body = b"".join(b"data: " + json.dumps(value).encode() + b"\n\n" for value in values) + b"data: [DONE]\n\n"
+        with tempfile.TemporaryDirectory() as directory:
+            audit_log = AuditLog(directory, max_inline_body_bytes=8)
+            spool = audit_log.open_body_spool()
+            spool.write(body)
+            event = audit_log.finalize_body_spool("client_response", spool, content_type="text/event-stream", terminal_status="completed")
+            self.assertEqual(event["data"]["choices"][0]["message"]["content"], "x" * 100 + "y" * 100)
+            self.assertEqual(event["data_encoding"], "json")
+            self.assertEqual(event["body_format"], "sse")
+            self.assertEqual(event["sse_chunk_count"], 2)
+            self.assertEqual(event["body_storage"], "file")
+            self.assertEqual((audit_log.directory / event["body_file"]["relative_path"]).read_bytes(), body)
+            self.assertEqual(audit_log.find_body_file(event["body_file"]["file_id"])["event_id"], event["event_id"])
+            self.assertFalse(spool.exists())
+            failed_spool = audit_log.open_body_spool()
+            failed_spool.write(body)
+            failed = audit_log.finalize_body_spool("llm_response", failed_spool, content_type="text/event-stream", terminal_status="cancelled")
+            self.assertNotIn("data", failed)
+            self.assertNotIn("sse_chunk_count", failed)
+            self.assertEqual(failed["body_format"], "sse")
+            self.assertEqual((audit_log.directory / failed["body_file"]["relative_path"]).read_bytes(), body)
 
     def test_terminal_snapshot_merges_late_client_response_reconciliation(self):
         """Combine append-only late stream references without mutating the terminal record."""

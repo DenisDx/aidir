@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import hashlib
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -16,6 +17,7 @@ from core.endpoints.endpoint_ollama import Endpoint_ollama
 from core.endpoints.endpoint_openaix import Endpoint_openaix
 from core.task import STATUS_COMPLETED
 from core.task_types.task_agent import Task_agent
+from core.upstream_response import UpstreamChunk
 from workers.agent.openaix.app import OpenAIxWorker
 
 
@@ -231,10 +233,65 @@ class EndpointAuditTests(unittest.TestCase):
             self.assertEqual(len(records), 1)
             event = records[0]
             self.assertEqual(event["body_storage"], "inline")
-            payload = delivered.split(b"data: ", 1)[1].split(b"\n\n", 1)[0]
-            self.assertEqual(event["data"], json.loads(payload))
-            self.assertEqual(event["body_format"], "sse_json_with_done")
+            self.assertEqual(event["data"]["object"], "chat.completion")
+            self.assertEqual(event["data"]["choices"][0]["message"], {"role": "assistant", "content": "hello"})
+            self.assertEqual(event["data"]["choices"][0]["finish_reason"], "stop")
+            self.assertEqual(event["body_format"], "sse")
+            self.assertEqual(event["sse_chunk_count"], 1)
             self.assertTrue(delivered.endswith(b"data: [DONE]\n\n"))
+
+    def test_native_sse_is_delivered_unchanged_then_audited_as_json(self) -> None:
+        """Keep client bytes exact while final audit data contains all decoded JSON chunks."""
+        payloads = [
+            {
+                "id": "executor-id", "object": "chat.completion.chunk", "model": "model",
+                "choices": [{"index": 0, "delta": {"role": "assistant", "reasoning_content": "trace", "vendor": 7}, "finish_reason": None}],
+            },
+            {
+                "id": "executor-id", "object": "chat.completion.chunk", "model": "model",
+                "choices": [{"index": 0, "delta": {"content": "answer"}, "finish_reason": "length"}],
+            },
+        ]
+        events = [
+            b": keepalive\r\n\r\n",
+            b"event: message\r\ndata: " + json.dumps(payloads[0]).encode() + b"\r\n\r\n",
+            b"data: " + json.dumps(payloads[1]).encode() + b"\r\n\r\n",
+            b"data: [DONE]\r\n\r\n",
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            core = _Core(AuditLog(directory))
+            endpoint = Endpoint_openaix({"id": "openaix"})
+            endpoint._core = core
+            task = Task_agent(payload={"model": "example"}, stream=True)
+            task.status = STATUS_COMPLETED
+            task._audit_client_context = {
+                "request_id": "native-sse",
+                "protocol": "openai",
+                "endpoint": "/v1/chat/completions",
+            }
+
+            async def consume_stream() -> bytes:
+                """Forward original executor frames through the ordinary stream queue."""
+                for raw in events:
+                    await task._chunk_queue.put(UpstreamChunk({}, protocol="openai", raw=raw, content_type="text/event-stream", original=None))
+                await task._chunk_queue.put(None)
+                return b"".join([chunk async for chunk in endpoint._openai_stream_response(task, {})])
+
+            delivered = asyncio.run(consume_stream())
+            self.assertEqual(delivered, b"".join(events))
+            journal = next(core.audit_log.directory.glob("raw_client_responses-*.jsonl"))
+            event = json.loads(journal.read_text())
+            self.assertEqual(event["data"]["id"], "executor-id")
+            self.assertEqual(event["data"]["object"], "chat.completion")
+            self.assertEqual(event["data"]["choices"][0]["message"], {
+                "role": "assistant", "reasoning_content": "trace", "vendor": 7, "content": "answer",
+            })
+            self.assertEqual(event["data"]["choices"][0]["finish_reason"], "length")
+            self.assertEqual(event["data_encoding"], "json")
+            self.assertEqual(event["body_format"], "sse")
+            self.assertEqual(event["sse_chunk_count"], len(payloads))
+            self.assertEqual(event["body_sha256"], hashlib.sha256(delivered).hexdigest())
+            self.assertEqual(event["body_bytes"], len(delivered))
 
 
 class UpstreamAuditCancellationTests(unittest.IsolatedAsyncioTestCase):

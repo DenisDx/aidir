@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from core.context import Context
+from core.upstream_response import UpstreamResponse
 
 # ── Status constants ─────────────────────────────────────────────────────────
 STATUS_CREATED   = "created"
@@ -55,6 +56,7 @@ class Task:
     started_at: datetime | None = None
     finished_at: datetime | None = None
     result: Any = None
+    upstream_response: UpstreamResponse | None = None
     error: dict | None = None
     llm_call_count: int = 0
     llm_call_history: list[dict[str, Any]] = field(default_factory=list)
@@ -127,6 +129,7 @@ class Task:
             "finished_at": self.finished_at.isoformat() if self.finished_at else "",
             "payload":     json.dumps(self.payload),
             "result":      json.dumps(self.result) if self.result is not None else "",
+            "upstream_response": json.dumps(self.upstream_response) if self.upstream_response is not None else "",
             "error":       json.dumps(self.error) if self.error else "",
             "llm_call_count": str(int(self.llm_call_count or 0)),
             "llm_call_history": json.dumps(self.llm_call_history or []),
@@ -193,6 +196,7 @@ class Task:
             started_at=parse_datetime("started_at"),
             finished_at=parse_datetime("finished_at"),
             result=parse_json("result", None),
+            upstream_response=json.loads(data["upstream_response"]) if data.get("upstream_response") else None,
             error=parse_json("error", None),
             llm_call_count=int(data.get("llm_call_count") or 0),
             llm_call_history=parse_json("llm_call_history", []),

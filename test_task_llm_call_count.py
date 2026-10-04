@@ -78,7 +78,10 @@ class _FakeCore:
         self.config.get.return_value = {}
         self.queue = _FakeTaskQueue(task)
         self.audit_log = audit_log
-        self.redis = MagicMock(get=AsyncMock(return_value=None))
+        self.redis = MagicMock(
+            get=AsyncMock(return_value=None),
+            scan=AsyncMock(return_value=(0, [])),
+        )
         self.workers = {}
         self.resources = None
         self.envid_registry = None
