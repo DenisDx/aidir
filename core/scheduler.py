@@ -21,6 +21,7 @@ from core import log
 from core.smart_router import SmartRouter, SmartRouteError
 
 if TYPE_CHECKING:
+    from core.hooks import HookManager
     from core.queue_manager import QueueManager
     from core.resources import Resources
     from core.worker import BaseWorker
@@ -41,12 +42,14 @@ class Scheduler:
         workers_cfg: dict | None = None,
         resources: "Resources | None" = None,
         full_config: dict | None = None,
+        hooks: "HookManager | None" = None,
     ) -> None:
         self._queue = queue
         self._workers = workers
         self._workers_cfg = workers_cfg or {}
         self._resources = resources
         self._full_config = full_config or {}
+        self._hooks = hooks
         self._running = False
         self._wake = asyncio.Event()
         self._active_runs: set[asyncio.Task] = set()
@@ -350,10 +353,14 @@ class Scheduler:
         """Execute one task; handle timeouts and exceptions."""
         log("worker", "info", f"Starting task {task.id}", worker.id)
         await self._queue.mark_running(task.id, worker.id)
+        if await self._apply_hook_control(task):
+            return
         consumer_id = f"{task.id}:{worker.id}"
         # Model id is used to track soft consumers (alive_time) after release
         model_id: str | None = (task.payload or {}).get("model") or None
         provider_id = self._resolve_task_provider_id(task, worker.id)
+        if provider_id:
+            task.route_provider_id = provider_id
 
         if self._resources and reserved_reqs and not resources_reserved:
             await self._resources.reserve_blind_for(
@@ -367,6 +374,10 @@ class Scheduler:
         failed_local_server_start = False
 
         try:
+            if self._hooks is not None and task.type == "agent":
+                await self._hooks.emit("before_llm_request", task, task.payload)
+            if await self._apply_hook_control(task):
+                return
             result: WorkerResult = await asyncio.wait_for(
                 worker.execute(task, emit_chunk=self._make_emitter(task)),
                 timeout=task.run_timeout or None,
@@ -374,13 +385,26 @@ class Scheduler:
             if result.ok:
                 task.result = result.data
                 task.upstream_response = result.upstream_response
+                if self._hooks is not None and task.type == "agent":
+                    await self._hooks.emit("llm_response_complete", task, result.data)
+                if await self._apply_hook_control(task):
+                    return
                 task.retry_attempt = 0
                 task.fallback_index = 0
                 task.next_retry_at = 0.0
+                if self._hooks is not None:
+                    await self._hooks.emit("before_consumer_delivery", task, result.data)
+                if await self._apply_hook_control(task):
+                    return
                 await self._queue.mark_completed(task)
                 log("worker", "info", f"Task {task.id} completed", worker.id)
             else:
                 err = result.error or {"code": "WORKER_ERROR", "message": "Worker returned error"}
+                task.error = err
+                if self._hooks is not None and task.type == "agent":
+                    await self._hooks.emit("llm_response_complete", task, err)
+                if await self._apply_hook_control(task):
+                    return
                 failed_local_server_start = (
                     self._provider_api(provider_id) == "llama-cpp"
                     and str(err.get("code") or "") in {
@@ -389,6 +413,10 @@ class Scheduler:
                         "UPSTREAM_UNREACHABLE",
                     }
                 )
+                if self._hooks is not None:
+                    await self._hooks.emit("before_consumer_delivery", task, err)
+                if await self._apply_hook_control(task):
+                    return
                 if not await self._handle_reject(task, worker.id, err):
                     await self._queue.mark_failed(task, err)
                     log("worker", "warn", f"Task {task.id} failed: {err}", worker.id)
@@ -421,6 +449,30 @@ class Scheduler:
                     provider_id=provider_id,
                     retain_model=not failed_local_server_start,
                 )
+
+    async def _apply_hook_control(self, task: Task) -> bool:
+        """Apply a hook-requested retry or cancellation before delivery."""
+        if self._hooks is None:
+            return False
+        reason = self._hooks.consume_cancel_request(task)
+        if reason:
+            task.error = {"code": "HOOK_CANCELED", "message": reason}
+            await self._queue.mark_canceled(task)
+            log("worker", "info", f"Task {task.id} canceled by hook: {reason}")
+            return True
+
+        retry_requested, provider_id = self._hooks.consume_retry_request(task)
+        if not retry_requested:
+            return False
+        if provider_id:
+            task.route_provider_id = provider_id
+        task.result = None
+        task.error = None
+        task.upstream_response = None
+        await self._queue.add_task(task, is_retry=True)
+        self.notify_new_task()
+        log("worker", "info", f"Task {task.id} requeued by hook")
+        return True
 
     async def _expire_queued_task_if_needed(self, task: Task) -> bool:
         """Fail queued tasks that exceeded queue timeout before their first run."""

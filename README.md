@@ -14,6 +14,7 @@ Client → Endpoint → [Middleware chain] → Worker → upstream AI → Client
 - **Ollama-compatible endpoint** — drop-in replacement; point any Ollama client at aidir instead of Ollama directly
 - **Priority task queue** backed by Redis
 - **Pluggable workers** — loaded dynamically from `workers/<id>/app.py`
+- **Opt-in lifecycle hooks** — simple Python experiments loaded from `hooks/`
 - **Streaming support** — server-sent chunks forwarded to clients in real time
 - **WebUI** — dashboard with live task queue, resource view, and log streaming
 - **Full isolation** — Python venv, Docker for Redis and nginx; no system-level dependencies modified
@@ -152,6 +153,17 @@ Key sections:
 - **`tasks`** — restart drain timeout plus queue/run lifecycle timeouts
 - **`logging`** — log levels per subsystem (0=EMERG … 7=DEBUG)
 - **`resources`** — hardware resources to track (VRAM etc.; enforced in future releases)
+
+### Hooks
+
+Hooks are administrator-controlled Python files for quickly trying lifecycle
+behavior without changing core code. They are discovered from `hooks/<id>.py`
+or `hooks/<id>/app.py` and are disabled unless the module sets `ENABLED = True`.
+
+The bundled `hooks/example.py` is a disabled no-op template. The optional
+`hooks/llama_cpp_empty_response_recovery.py` restarts an aidir-owned local
+llama.cpp provider and retries one empty OpenAI-compatible response. See
+[proposal_hooks.md](proposal_hooks.md) for the event API and safety rules.
 
 ### Resource sensor monitoring
 

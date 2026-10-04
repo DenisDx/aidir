@@ -34,6 +34,7 @@ Proposals may include both planned and completed work; consult each document.
 | [before_tools_worker.md](before_tools_worker.md) | Pre-tool-call context-processing hook. |
 | [proposal_aidir_smart_router.md](proposal_aidir_smart_router.md) | Resource-aware smart routing design. |
 | [proposal_http_api.md](proposal_http_api.md) | Token-authenticated HTTP API tool worker. |
+| [proposal_hooks.md](proposal_hooks.md) | Event-driven hook loading, lifecycle API, and llama.cpp empty-response recovery. |
 | [proposal_llama_cpp.md](proposal_llama_cpp.md) | llama.cpp provider and server-lifecycle integration. |
 | [proposal_ollama_embed.md](proposal_ollama_embed.md) | Transparent Ollama embedding support through OpenAIx. |
 | [proposal_opencode_go.md](proposal_opencode_go.md) | OpenCode Go provider and session integration. |

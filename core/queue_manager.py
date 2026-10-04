@@ -34,12 +34,14 @@ class QueueManager:
         redis_client: aioredis.Redis,
         instance: str = "aidir",
         status_change_callback: Callable[[Task], Awaitable[None]] | None = None,
+        task_created_callback: Callable[[Task], Awaitable[None]] | None = None,
         audit_log=None,
     ) -> None:
         self._redis = redis_client
         self._ns = instance                        # key namespace
         self._tasks: dict[str, Task] = {}          # task_id -> Task
         self._status_change_callback = status_change_callback
+        self._task_created_callback = task_created_callback
         self._audit_log = audit_log
 
     _QUEUE_TASK_TYPES = ("agent", "tool")
@@ -54,7 +56,7 @@ class QueueManager:
 
     # ── Public API ───────────────────────────────────────────────────────────
 
-    async def add_task(self, task: Task) -> None:
+    async def add_task(self, task: Task, *, is_retry: bool = False) -> None:
         """Enqueue task atomically: ZADD to queue + HSET state. status→queued."""
         task.status = STATUS_QUEUED
         task.updated_at = datetime.now(timezone.utc)
@@ -64,6 +66,8 @@ class QueueManager:
         await pipe.execute()
         self._tasks[task.id] = task
         await self._notify_status_change(task)
+        if not is_retry and self._task_created_callback is not None:
+            await self._task_created_callback(task)
 
     async def recover_startup_tasks(self) -> dict[str, int]:
         """Restore queued tasks and terminalize abandoned running tasks after restart."""

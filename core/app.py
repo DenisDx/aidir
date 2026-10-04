@@ -31,6 +31,7 @@ from core.error_logging import log_exception
 from core.envid import EnvidRegistry
 from core.logger import logger
 from core.local_server_manager import LocalServerManager
+from core.hooks import HookManager
 from core.queue_manager import QueueManager
 from core.resource_monitor import ResourceMonitor
 from core.resources import Resources
@@ -89,6 +90,7 @@ class Core:
         self.resources = Resources([])
         self.resource_monitor: ResourceMonitor | None = None
         self.llama_cpp_server_manager = LocalServerManager({}, _ROOT)
+        self.hooks = HookManager(_ROOT, self.llama_cpp_server_manager, self.config.raw())
         self.envid_registry: EnvidRegistry | None = None
         self.audit_log: AuditLog | None = None
         self._background_tasks: set[asyncio.Task] = set()
@@ -158,6 +160,7 @@ class Core:
             self.redis,
             instance,
             status_change_callback=self._on_task_status_change,
+            task_created_callback=self._on_task_created,
             audit_log=self.audit_log,
         )
         recovery = await self.queue.recover_startup_tasks()
@@ -183,6 +186,7 @@ class Core:
         self.resources.set_redis(self.redis, instance)
         self.resources.set_full_config(self.config.raw())
         self.llama_cpp_server_manager = LocalServerManager(self.config.raw(), _ROOT)
+        self.hooks = HookManager(_ROOT, self.llama_cpp_server_manager, self.config.raw())
         self.resources.set_local_server_manager(self.llama_cpp_server_manager)
         if self._manage_local_servers:
             stopped_providers = await self.llama_cpp_server_manager.stop_all()
@@ -214,7 +218,9 @@ class Core:
             workers_cfg=workers_cfg,
             resources=self.resources,
             full_config=self.config.raw(),
+            hooks=self.hooks,
         )
+        await self.hooks.load()
         self.resource_monitor = ResourceMonitor(self.resources)
         self._track_background_task(
             asyncio.create_task(self.resource_monitor.run(), name="resource-monitor")
@@ -490,6 +496,10 @@ class Core:
         TODO: check and notify parent tasks in chains.
         """
         await self.queue.mark_completed(task)
+
+    async def _on_task_created(self, task) -> None:
+        """Run hook handlers after a task is queued."""
+        await self.hooks.emit("task_created", task)
 
     async def delete_task(self, task_id: str) -> None:
         """
