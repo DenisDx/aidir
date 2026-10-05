@@ -39,8 +39,23 @@ class _Core:
             "limits": {"VRAM": 20},
             "units": {"VRAM": "MiB"},
             "availability": {"command": "nvidia-smi", "metric": "VRAM"},
+            "telemetry": {"sensors": ["gpu_temperature"]},
+            "monitoring": {
+                "sensors": [{
+                    "id": "gpu_temperature",
+                    "label": "GPU temperature",
+                    "unit": "C",
+                    "command": "nvidia-smi --query-gpu=temperature.gpu",
+                }]
+            },
         }])
         self.resources.get("gpu").record_observed_availability("command", {"VRAM": 12})
+        self.resources.get("gpu").set_sensor_state("gpu_temperature", {
+            "status": "ok",
+            "value": 44,
+            "updated_at": "2026-10-05T11:00:00+00:00",
+            "error": None,
+        })
         self.envid_registry = None
         self.audit_log = None
 
@@ -88,8 +103,8 @@ class TestPeerResources(unittest.TestCase):
         endpoint = Endpoint_openaix({"id": "openaix", **endpoint_config})
         return TestClient(endpoint.create_app(_Core(config)))
 
-    def test_resources_are_public_by_default_and_sanitized(self) -> None:
-        """Return the minimal resource response without executable or internal state."""
+    def test_resources_are_public_by_default_with_safe_telemetry(self) -> None:
+        """Return resource state with whitelist telemetry but no executable configuration."""
         with self._client({}, {"http": {"max_request_size": 1024}}) as client:
             response = client.get("/v1/resources/gpu")
 
@@ -97,7 +112,15 @@ class TestPeerResources(unittest.TestCase):
         payload = response.json()
         self.assertEqual(payload["id"], "gpu")
         self.assertEqual(payload["availability"]["available"], {"VRAM": 12.0})
-        self.assertEqual(payload["telemetry"], {})
+        self.assertEqual(payload["telemetry"]["sensors"], [{
+            "id": "gpu_temperature",
+            "label": "GPU temperature",
+            "unit": "C",
+            "status": "ok",
+            "value": 44,
+            "updated_at": "2026-10-05T11:00:00+00:00",
+            "error": None,
+        }])
         self.assertEqual(payload["units"], {"VRAM": "MiB"})
         self.assertNotIn("nvidia-smi", response.text)
         self.assertNotIn("consumers", payload)

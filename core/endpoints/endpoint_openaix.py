@@ -208,13 +208,24 @@ class Endpoint_openaix(Endpoint_ollama):
     @staticmethod
     def _peer_resource_payload(snapshot: dict) -> dict:
         """Build one minimal peer-safe resource response from a runtime snapshot."""
+        telemetry = snapshot.get("telemetry")
+        readings = telemetry.get("sensors") if isinstance(telemetry, dict) else None
         return {
             "id": str(snapshot.get("id") or ""),
             "type": str(snapshot.get("type") or ""),
             "limits": dict(snapshot.get("limits") or {}),
             "units": dict(snapshot.get("units") or {}),
             "availability": dict(snapshot.get("availability") or {}),
-            "telemetry": {},
+            "telemetry": {
+                "sensors": [
+                    {
+                        key: reading.get(key)
+                        for key in ("id", "label", "unit", "status", "value", "updated_at", "error")
+                    }
+                    for reading in readings
+                    if isinstance(reading, dict)
+                ]
+            } if isinstance(readings, list) else {},
         }
 
     async def _handle_chat(self, request: Request) -> Response:
