@@ -16,6 +16,7 @@ import hmac
 import json
 import secrets
 import shlex
+import shutil
 import subprocess
 import time
 from dataclasses import dataclass
@@ -305,6 +306,9 @@ async def _recent_task_routes(core: "Core") -> tuple[list[dict[str, Any]], dict[
 
 async def _cron_health(core: "Core") -> dict[str, Any]:
     """Return cron heartbeat freshness for the Dashboard health panel."""
+    embedded = bool(core.config.get("cron.embedded", False))
+    embedded_active = core.embedded_cron_enabled()
+    external_available = shutil.which("crontab") is not None
     max_age = int(core.config.get("webui.health.cron_max_age") or 180)
     key = f"{core.config.get('instance', 'aidir')}:cron:last_success_at"
     raw = await core.redis.get(key)
@@ -315,6 +319,9 @@ async def _cron_health(core: "Core") -> dict[str, Any]:
 
     age_seconds = max(0, int(time.time() - last_success)) if last_success else None
     return {
+        "mode": "embedded" if embedded else "external",
+        "embedded_active": embedded_active,
+        "external_available": external_available,
         "last_success_at": datetime.fromtimestamp(last_success, timezone.utc).isoformat() if last_success else None,
         "age_seconds": age_seconds,
         "max_age_seconds": max_age,
@@ -797,6 +804,10 @@ def create_app(
     @app.post("/api/cron/repair")
     async def repair_cron(session: dict = Depends(_require_session)):
         """Safely add or repair the unique aidir cron entry for the current user."""
+        if core.config.get("cron.embedded", False):
+            raise HTTPException(status_code=409, detail="Embedded cron is enabled")
+        if shutil.which("crontab") is None:
+            raise HTTPException(status_code=503, detail="System cron is not available")
         try:
             result = await asyncio.to_thread(_repair_user_crontab)
         except CronRepairError as exc:
@@ -805,6 +816,23 @@ def create_app(
 
         log("webui", "info", f"Cron repair {result['action']} by user {session['login']}", "control")
         return {"ok": True, **result}
+
+    @app.post("/api/cron/embedded/enable")
+    async def enable_embedded_cron(session: dict = Depends(_require_session)):
+        """Enable embedded cron in configuration while preserving other cron settings."""
+        cron_config = core.config.get("cron", {})
+        if not isinstance(cron_config, dict):
+            raise HTTPException(status_code=400, detail="cron configuration must be an object")
+        try:
+            core.config.update_key("cron", {**cron_config, "embedded": True})
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            log("webui", "error", f"Embedded cron enable failed for user {session['login']}: {exc}", "control")
+            raise HTTPException(status_code=500, detail=f"Failed to enable embedded cron: {exc}") from exc
+
+        log("webui", "info", f"Embedded cron enabled by user {session['login']}", "control")
+        return {"ok": True, "restart_required": not core.embedded_cron_enabled()}
 
     @app.post("/api/resources/{resource_id}/use")
     async def set_resource_use(

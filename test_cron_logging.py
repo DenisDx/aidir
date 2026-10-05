@@ -235,6 +235,44 @@ class TestCronLogging(unittest.TestCase):
         self.assertTrue(_MaintenanceCore.started)
         self.assertTrue(_MaintenanceCore.stopped)
 
+    def test_loop_workers_cycle_uses_live_core_without_restarting_it(self) -> None:
+        """Runs loop workers on the supplied Core without creating a second instance."""
+        class _LiveCore:
+            """Minimal live Core exposing one maintenance worker."""
+
+            def __init__(self) -> None:
+                """Initialize the worker loop state."""
+                self.loop_workers = [("worker", object())]
+                self.called_with = None
+
+            async def run_loop_workers_cycle(self, start_index: int) -> int:
+                """Record the selected worker and return the next index."""
+                self.called_with = start_index
+                return 0
+
+        class _Redis:
+            """Minimal Redis store for loop worker rotation."""
+
+            def __init__(self) -> None:
+                """Initialize an empty key store."""
+                self.data: dict[str, str] = {}
+
+            async def get(self, key: str):
+                """Return one stored value."""
+                return self.data.get(key)
+
+            async def set(self, key: str, value: str):
+                """Store one value."""
+                self.data[key] = value
+
+        live_core = _LiveCore()
+        redis = _Redis()
+
+        asyncio.run(cron.run_loop_workers_cycle(redis, core=live_core))
+
+        self.assertEqual(live_core.called_with, 0)
+        self.assertEqual(redis.data["aidir111:cron:loop_workers:start"], "0")
+
     def test_main_runs_remaining_jobs_when_one_fails(self) -> None:
         """Keeps running remaining cron jobs even if one of them raises an exception."""
 

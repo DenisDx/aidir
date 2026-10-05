@@ -94,6 +94,7 @@ class Core:
         self.envid_registry: EnvidRegistry | None = None
         self.audit_log: AuditLog | None = None
         self._background_tasks: set[asyncio.Task] = set()
+        self._embedded_cron_enabled = False
         self._restart_requested = False
         self._shutdown_started = False
         self._shutdown_lock = asyncio.Lock()
@@ -225,8 +226,25 @@ class Core:
         self._track_background_task(
             asyncio.create_task(self.resource_monitor.run(), name="resource-monitor")
         )
+        self._embedded_cron_enabled = bool(self.config.get("cron.embedded", False))
+        if self._embedded_cron_enabled:
+            self._track_background_task(
+                asyncio.create_task(self._run_embedded_cron(), name="embedded-cron")
+            )
+            log("core", "info", "Embedded cron enabled")
 
         log("core", "info", "Core started")
+
+    async def _run_embedded_cron(self) -> None:
+        """Run maintenance cycles every minute while the Core process is active."""
+        from core.cron import run_cycle
+
+        if self.redis is None:
+            raise RuntimeError("Embedded cron requires a Redis connection")
+
+        while True:
+            await run_cycle(self.redis, core=self)
+            await asyncio.sleep(60)
 
     async def stop(self) -> None:
         started_at = time.monotonic()
@@ -347,6 +365,10 @@ class Core:
             "active_tasks": active_tasks,
             "restart_wait_timeout": self.restart_wait_timeout_seconds(),
         }
+
+    def embedded_cron_enabled(self) -> bool:
+        """Return whether this Core process runs its maintenance cycle internally."""
+        return self._embedded_cron_enabled
 
     def get_effective_worker_config(self, worker_id: str, envid_id: str | None = None) -> dict:
         """Return worker config merged with envid-specific workers override when available."""

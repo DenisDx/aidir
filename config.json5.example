@@ -11,6 +11,10 @@
     "port": ${REDIS_PORT:-6379},
     "password": "${REDIS_PASSWORD:-}"
   },
+  // Run periodic maintenance inside the aidir process instead of system cron.
+  "cron": {
+    "embedded": false
+  },
   "logging": {
     // Default level for all subsystems. String or int (0-7, systemd-journald scale).
     "level": "${LOG_LEVEL:-error}",

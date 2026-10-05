@@ -291,11 +291,14 @@ async def cleanup_expired_tasks(redis: aioredis.Redis) -> None:
         log("system", "info", f"cleanup_expired_tasks: deleted {deleted} expired task(s)")
 
 
-async def run_loop_workers_cycle(redis: aioredis.Redis) -> None:
+async def run_loop_workers_cycle(redis: aioredis.Redis, core: Core | None = None) -> None:
     """Run loop() for all workers that expose it, rotating start position each cron cycle."""
-    core = Core(manage_local_servers=False, loop_workers_only=True)
+    owns_core = core is None
+    if core is None:
+        core = Core(manage_local_servers=False, loop_workers_only=True)
     try:
-        await core.start()
+        if owns_core:
+            await core.start()
 
         loop_workers = core.loop_workers
         if not loop_workers:
@@ -316,7 +319,8 @@ async def run_loop_workers_cycle(redis: aioredis.Redis) -> None:
         next_index = await core.run_loop_workers_cycle(start_index=start_index)
         await redis.set(key, str(next_index))
     finally:
-        await core.stop()
+        if owns_core:
+            await core.stop()
 
 
 async def keep_alive_ping(redis: aioredis.Redis) -> None:
@@ -420,9 +424,8 @@ async def refresh_external_mcp_tools(redis: aioredis.Redis) -> None:
     await worker.refresh_tools_if_due(reason="cron")
 
 
-async def main() -> None:
-    redis = await _connect_redis()
-
+async def run_cycle(redis: aioredis.Redis, core: Core | None = None) -> None:
+    """Run all maintenance jobs once using the supplied Redis connection and optional live Core."""
     async def _run_job(name: str, job_coro):
         """Run one cron job, logging failures without stopping the cycle."""
         try:
@@ -432,21 +435,32 @@ async def main() -> None:
             log("system", "error", f"cron job failed: {name}: {exc}")
             return False
 
+    loop_workers = (
+        run_loop_workers_cycle(redis, core=core)
+        if core is not None
+        else run_loop_workers_cycle(redis)
+    )
+    jobs_succeeded = [
+        await _run_job("run_loop_workers_cycle", loop_workers),
+        await _run_job("refresh_external_mcp_tools", refresh_external_mcp_tools(redis)),
+        await _run_job("wipe_logs", wipe_logs(redis)),
+        await _run_job("trim_logs_by_size", trim_logs_by_size(redis)),
+        await _run_job("retain_audit_logs", retain_audit_logs(redis)),
+        await _run_job("health_check", health_check(redis)),
+        await _run_job("cleanup_stale_tasks", cleanup_stale_tasks(redis)),
+        await _run_job("cleanup_expired_tasks", cleanup_expired_tasks(redis)),
+        await _run_job("keep_alive_ping", keep_alive_ping(redis)),
+    ]
+    if all(jobs_succeeded):
+        key = f"{config.get('instance', 'aidir')}:cron:last_success_at"
+        await redis.set(key, str(time.time()))
+
+
+async def main() -> None:
+    """Connect to Redis, run one maintenance cycle, then close the connection."""
+    redis = await _connect_redis()
     try:
-        jobs_succeeded = [
-            await _run_job("run_loop_workers_cycle", run_loop_workers_cycle(redis)),
-            await _run_job("refresh_external_mcp_tools", refresh_external_mcp_tools(redis)),
-            await _run_job("wipe_logs", wipe_logs(redis)),
-            await _run_job("trim_logs_by_size", trim_logs_by_size(redis)),
-            await _run_job("retain_audit_logs", retain_audit_logs(redis)),
-            await _run_job("health_check", health_check(redis)),
-            await _run_job("cleanup_stale_tasks", cleanup_stale_tasks(redis)),
-            await _run_job("cleanup_expired_tasks", cleanup_expired_tasks(redis)),
-            await _run_job("keep_alive_ping", keep_alive_ping(redis)),
-        ]
-        if all(jobs_succeeded):
-            key = f"{config.get('instance', 'aidir')}:cron:last_success_at"
-            await redis.set(key, str(time.time()))
+        await run_cycle(redis)
     finally:
         await redis.aclose()
 

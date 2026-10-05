@@ -14,6 +14,7 @@ let runtimeState = {
   active_tasks: 0,
   restart_wait_timeout: 120,
 };
+let cronHealth = null;
 
 const SERVER_UNAVAILABLE_STATUSES = new Set([502, 503, 504]);
 let loginServerUnavailable = false;
@@ -296,12 +297,34 @@ function renderSystemHealth(health) {
   if (!card || !indicator || !detail) return;
 
   const cron = health && health.cron;
+  cronHealth = cron || null;
+  const repairButton = $('repair-cron-btn');
+  const embeddedStatus = $('embedded-cron-status');
   const isHealthy = Boolean(cron && cron.healthy);
   card.classList.toggle('alert', !isHealthy);
   indicator.classList.toggle('alert', !isHealthy);
 
+  if (repairButton && embeddedStatus) {
+    if (cron && cron.mode === 'embedded') {
+      repairButton.hidden = true;
+      embeddedStatus.hidden = false;
+    } else {
+      repairButton.hidden = false;
+      embeddedStatus.hidden = true;
+      if (cron && !cron.external_available) {
+        repairButton.textContent = 'Enable cron.embedded';
+        repairButton.title = 'Enable the embedded cron scheduler after restart';
+      } else {
+        repairButton.textContent = 'Repair cron';
+        repairButton.title = 'Add or repair the aidir cron entry';
+      }
+    }
+  }
+
   if (!cron || !cron.last_success_at) {
-    detail.textContent = 'No successful cycle recorded';
+    detail.textContent = cron && cron.mode === 'embedded'
+      ? (cron.embedded_active ? 'Embedded scheduler is running' : 'Restart required to start embedded scheduler')
+      : 'No successful cycle recorded';
     return;
   }
 
@@ -332,6 +355,27 @@ async function requestRestart() {
 }
 
 async function repairCron() {
+  if (cronHealth && !cronHealth.external_available) {
+    const confirmed = window.confirm(
+      'Enable the embedded cron scheduler? The service must be restarted before it starts running.'
+    );
+    if (!confirmed) return;
+
+    const button = $('repair-cron-btn');
+    button.disabled = true;
+    const res = await apiPost('/api/cron/embedded/enable', {});
+    button.disabled = false;
+
+    if (!res.ok) {
+      window.alert(res.data.detail || 'Failed to enable embedded cron');
+      return;
+    }
+
+    window.alert('Embedded cron has been enabled. Restart the service to apply it.');
+    await loadTasks();
+    return;
+  }
+
   const confirmed = window.confirm(
     'Repair the aidir cron entry? Existing unrelated crontab entries will be preserved.'
   );

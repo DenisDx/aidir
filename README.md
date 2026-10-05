@@ -75,6 +75,13 @@ The script:
 
 On **re-install / update** the script rebuilds images and restarts services without touching existing data.
 
+### WSL without system cron
+
+When `crontab` is unavailable, set `cron.embedded` to `true` in `config.json5`.
+AIDIR will run periodic maintenance, including log retention and model keep-alive
+checks, inside its main process. The embedded scheduler runs only while AIDIR is
+running and starts after the next service restart.
+
 ---
 
 ## Configuration

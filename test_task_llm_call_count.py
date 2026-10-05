@@ -89,6 +89,10 @@ class _FakeCore:
     def get_runtime_status(self):
         return {}
 
+    def embedded_cron_enabled(self) -> bool:
+        """Return whether the fake Core uses embedded cron."""
+        return bool(self.config.get("cron.embedded", False))
+
 
 class TestTaskLlmCallCount(unittest.IsolatedAsyncioTestCase):
     """Validate task-level LLM call counting and API exposure."""
@@ -264,11 +268,26 @@ class TestTaskLlmCallCount(unittest.IsolatedAsyncioTestCase):
             healthy_response = client.get("/api/status")
             self.assertEqual(healthy_response.status_code, 200)
             self.assertTrue(healthy_response.json()["health"]["cron"]["healthy"])
+            self.assertEqual(healthy_response.json()["health"]["cron"]["mode"], "external")
 
             core.redis.get = AsyncMock(return_value=None)
             stale_response = client.get("/api/status")
             self.assertEqual(stale_response.status_code, 200)
             self.assertFalse(stale_response.json()["health"]["cron"]["healthy"])
+
+    def test_webui_enables_embedded_cron_without_existing_cron_section(self) -> None:
+        """Enable embedded cron through the dedicated endpoint."""
+        task = Task_agent(id="task-1", payload={"model": "qwen3.5:9b"}, stream=False)
+        core = _FakeCore(task)
+        core.config.get.side_effect = lambda key, default=None: default
+
+        with patch("webui.backend.app._get_session", return_value={"permissions": ["all"], "login": "tester"}):
+            client = TestClient(create_app(core=core))
+            response = client.post("/api/cron/embedded/enable")
+
+        self.assertEqual(response.status_code, 200)
+        core.config.update_key.assert_called_once_with("cron", {"embedded": True})
+        self.assertTrue(response.json()["restart_required"])
 
 
 if __name__ == "__main__":
