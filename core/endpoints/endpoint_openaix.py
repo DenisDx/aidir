@@ -45,6 +45,11 @@ class Endpoint_openaix(Endpoint_ollama):
         self._errors_compatibility_mode = bool(
             endpoint_cfg.get("errors_compatibility_mode", True)
         )
+        peer_resources_cfg = endpoint_cfg.get("peer_resources")
+        peer_resources_cfg = peer_resources_cfg if isinstance(peer_resources_cfg, dict) else {}
+        self._peer_resources_auth_mode = str(peer_resources_cfg.get("auth_mode") or "disabled").strip().lower()
+        if self._peer_resources_auth_mode not in {"disabled", "endpoint"}:
+            self._peer_resources_auth_mode = "disabled"
         self._model_resolution_warnings_emitted: set[str] = set()
 
     def create_app(self, core) -> FastAPI:
@@ -104,6 +109,22 @@ class Endpoint_openaix(Endpoint_ollama):
         async def openai_models():
             return self._openai_models_response()
 
+        @app.get("/v1/resources")
+        async def openai_resources(request: Request):
+            return self._peer_resources_response(request)
+
+        @app.get("/v1/resources/{resource_id}")
+        async def openai_resource(resource_id: str, request: Request):
+            return self._peer_resources_response(request, resource_id)
+
+        @app.get("/api/resources")
+        async def ollama_resources(request: Request):
+            return self._peer_resources_response(request)
+
+        @app.get("/api/resources/{resource_id}")
+        async def ollama_resource(resource_id: str, request: Request):
+            return self._peer_resources_response(request, resource_id)
+
         @app.get("/v1/providers/{provider_id}/models/{model_id:path}/queue-state")
         async def openai_model_queue_state(provider_id: str, model_id: str, priority: int = 5):
             return await self._model_queue_state_response(
@@ -143,6 +164,58 @@ class Endpoint_openaix(Endpoint_ollama):
             return {"status": "ok"}
 
         return app
+
+    def _peer_resources_response(self, request: Request, resource_id: str | None = None) -> JSONResponse:
+        """Return sanitized peer resource state after applying configured access policy."""
+        if self._peer_resources_auth_mode == "endpoint":
+            if not self._extract_bearer_token(request):
+                return self._error_response(
+                    protocol="openai",
+                    status_code=401,
+                    code="UNAUTHORIZED",
+                    message="Bearer authentication is required for peer resources",
+                )
+            auth_error = self._authorize_and_apply_envid(request, {})
+            if auth_error is not None:
+                return auth_error
+
+        resources = getattr(self._core, "resources", None)
+        if resources is None:
+            return self._error_response(
+                protocol="openai",
+                status_code=503,
+                code="RESOURCES_UNAVAILABLE",
+                message="Resources are not available",
+            )
+
+        if resource_id is not None:
+            resource = resources.get(resource_id)
+            if resource is None:
+                return self._error_response(
+                    protocol="openai",
+                    status_code=404,
+                    code="RESOURCE_NOT_FOUND",
+                    message=f"Unknown resource: {resource_id}",
+                )
+            return JSONResponse(self._peer_resource_payload(resource.snapshot()))
+
+        return JSONResponse({
+            "object": "list",
+            "protocol_version": 1,
+            "data": [self._peer_resource_payload(resource.snapshot()) for resource in resources.all()],
+        })
+
+    @staticmethod
+    def _peer_resource_payload(snapshot: dict) -> dict:
+        """Build one minimal peer-safe resource response from a runtime snapshot."""
+        return {
+            "id": str(snapshot.get("id") or ""),
+            "type": str(snapshot.get("type") or ""),
+            "limits": dict(snapshot.get("limits") or {}),
+            "units": dict(snapshot.get("units") or {}),
+            "availability": dict(snapshot.get("availability") or {}),
+            "telemetry": {},
+        }
 
     async def _handle_chat(self, request: Request) -> Response:
         """Handle Ollama-compatible /api/chat and queue the openaix worker."""

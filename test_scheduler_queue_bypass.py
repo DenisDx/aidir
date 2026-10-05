@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import asyncio
 import unittest
+from unittest.mock import AsyncMock
 
+from core.resource_monitor import ResourceMonitor
 from core.scheduler import Scheduler
 from core.task import STATUS_QUEUED
 from core.task_types.task_agent import Task_agent
@@ -169,6 +171,76 @@ class TestSchedulerQueueBypass(unittest.IsolatedAsyncioTestCase):
             await scheduler.wait_for_active_tasks(timeout=1)
             scheduler.stop()
             await scheduler_task
+
+    async def test_command_availability_is_refreshed_before_dispatch(self) -> None:
+        """Dispatch only when a fresh command availability observation fits the task."""
+        task = Task_agent(payload={"model": "observed"}, stream=False)
+        task.resource_requirements = {"gpu": {"VRAM": 6}}
+        queue = _Queue([task])
+        resources = Resources([{
+            "id": "gpu",
+            "type": "cuda",
+            "limits": {"VRAM": 10},
+            "availability": {
+                "command": "nvidia-smi",
+                "metric": "VRAM",
+            },
+        }])
+        monitor = ResourceMonitor(resources)
+        monitor._run_command = AsyncMock(return_value="6")  # type: ignore[method-assign]
+        started = asyncio.Event()
+        worker = _Worker(started)
+        scheduler = Scheduler(
+            queue=queue,
+            workers={worker.id: worker},
+            resources=resources,
+            resource_monitor=monitor,
+        )
+
+        scheduler_task = asyncio.create_task(scheduler.run())
+        try:
+            await asyncio.wait_for(started.wait(), timeout=1)
+        finally:
+            scheduler.stop()
+            await scheduler_task
+
+        self.assertEqual(worker.executed, [task.id])
+        self.assertEqual(monitor._run_command.await_count, 1)
+
+    async def test_failed_command_availability_defers_dispatch(self) -> None:
+        """Keep a task queued when its required command availability probe fails."""
+        task = Task_agent(payload={"model": "observed"}, stream=False)
+        task.resource_requirements = {"gpu": {"VRAM": 1}}
+        queue = _Queue([task])
+        resources = Resources([{
+            "id": "gpu",
+            "type": "cuda",
+            "limits": {"VRAM": 10},
+            "availability": {
+                "command": "nvidia-smi",
+                "metric": "VRAM",
+            },
+        }])
+        monitor = ResourceMonitor(resources)
+        monitor._run_command = AsyncMock(return_value="unavailable")  # type: ignore[method-assign]
+        worker = _Worker(asyncio.Event())
+        scheduler = Scheduler(
+            queue=queue,
+            workers={worker.id: worker},
+            resources=resources,
+            resource_monitor=monitor,
+        )
+
+        scheduler_task = asyncio.create_task(scheduler.run())
+        try:
+            await asyncio.sleep(0.05)
+        finally:
+            scheduler.stop()
+            await scheduler_task
+
+        self.assertEqual(worker.executed, [])
+        self.assertIn(task, queue._queued)
+        self.assertEqual(resources.snapshot()[0]["availability"]["status"], "error")
 
 
 if __name__ == "__main__":

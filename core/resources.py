@@ -5,6 +5,7 @@ Supports alive_time soft-tracking and force-unload via provider API.
 """
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import TYPE_CHECKING
 
@@ -33,10 +34,14 @@ class Resources:
                 keep_alive_period=int(it.get("keep_alive_period") or 0),
                 provider=it.get("provider"),
                 monitoring=it.get("monitoring"),
+                availability=it.get("availability"),
+                units=it.get("units"),
+                telemetry=it.get("telemetry"),
             )
         self._redis: "aioredis.Redis | None" = None
         self._ns: str = "aidir"
         self._full_config: dict = {}
+        self._admission_lock = asyncio.Lock()
 
     def set_redis(self, redis: "aioredis.Redis", ns: str = "aidir") -> None:
         """Inject Redis client for model activity persistence (needed by cron keep_alive)."""
@@ -269,6 +274,26 @@ class Resources:
             if res is None:
                 continue
             await res.reserve_blind(need, consumer_id=consumer_id, model_id=model_id, provider_id=provider_id)
+
+    async def reserve_if_available(
+        self,
+        requirements: dict[str, dict[str, int]] | None = None,
+        consumer_id: str = "",
+        model_id: str | None = None,
+        provider_id: str | None = None,
+    ) -> bool:
+        """Atomically check and reserve all requested resources for one consumer."""
+        reqs = requirements or {}
+        async with self._admission_lock:
+            if not self.check_available(reqs):
+                return False
+            await self.reserve_blind_for(
+                reqs,
+                consumer_id=consumer_id,
+                model_id=model_id,
+                provider_id=provider_id,
+            )
+            return True
 
     async def release(self, requirements: dict[str, dict[str, int]] | None = None) -> None:
         """Release previously reserved resources."""

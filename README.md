@@ -229,6 +229,81 @@ interrupting them. Reactions run once on crossing a threshold, then no more
 often than `cooldown` seconds (300 seconds by default); a normal reading re-arms
 the sensor.
 
+### Resource availability commands
+
+A resource can define `availability.command` to make scheduling use measured
+free capacity rather than only aidir's task reservations. The command runs at
+the resource monitoring interval and immediately before a task that requires
+the resource is dispatched.
+
+```json5
+{
+  id: "local_machine",
+  type: "cuda",
+  limits: { VRAM: 22000 },
+  units: { VRAM: "MiB" },
+  availability: {
+    command: "nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits",
+    metric: "VRAM",
+    unit: "MiB",
+    command_timeout: 5
+  },
+  monitoring: { poll_interval: 10 }
+}
+```
+
+The command must write one finite numeric free-capacity value to standard
+output. `metric` must exist in `limits`. When both `availability.unit` and
+`units.<metric>` are set, they must match; an omitted unit is treated as an
+empty string and leaves unit consistency to the administrator. A failed
+pre-dispatch availability command fails closed for that resource, but periodic
+monitoring continues and restores it automatically after a successful command.
+Commands are executed by the aidir service user and must be configured only by
+trusted administrators.
+
+### Peer resource availability
+
+For a resource without `availability.command`, aidir treats an `api: "openaix"`
+provider as a potential aidir peer. It probes the peer resource before
+dispatching a task and periodically every 10 seconds when no
+`monitoring.poll_interval` is configured. The peer is identified by its
+OpenAIx resource endpoint and incompatibility is cached only until restart;
+timeouts and transport failures are retried.
+
+```json5
+{
+  id: "remote_gpu",
+  type: "cuda",
+  limits: { VRAM: 22000 },
+  units: { VRAM: "MiB" },
+  provider: "remote_aidir",
+  availability: {
+    peer_resource_id: "gpu_0",
+    request_timeout_ms: 1500
+  }
+}
+```
+
+On the peer's OpenAIx endpoint, `peer_resources.auth_mode` controls access to
+`/v1/resources` and `/api/resources`. The default `disabled` mode permits
+read-only resource discovery on a trusted network. Set `endpoint` to require
+the normal bearer-token and environment authorization checks.
+
+### Safe resource telemetry
+
+Use `telemetry.sensors` to explicitly allow selected existing sensor readings in
+the local WebUI and peer resource responses. This whitelist exposes only a
+reading's ID, label, unit, value, status, timestamp, and error; it never
+exposes the sensor command or monitoring configuration.
+
+```json5
+{
+  telemetry: {
+    sensors: ["gpu_temperature"]
+  }
+}
+```
+
 ### Audit storage and task retention
 
 `logging.audit` stores task-correlated client and LLM request/response events in

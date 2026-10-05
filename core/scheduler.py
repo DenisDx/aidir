@@ -23,6 +23,7 @@ from core.smart_router import SmartRouter, SmartRouteError
 if TYPE_CHECKING:
     from core.hooks import HookManager
     from core.queue_manager import QueueManager
+    from core.resource_monitor import ResourceMonitor
     from core.resources import Resources
     from core.worker import BaseWorker
 
@@ -43,6 +44,7 @@ class Scheduler:
         resources: "Resources | None" = None,
         full_config: dict | None = None,
         hooks: "HookManager | None" = None,
+        resource_monitor: "ResourceMonitor | None" = None,
     ) -> None:
         self._queue = queue
         self._workers = workers
@@ -50,6 +52,7 @@ class Scheduler:
         self._resources = resources
         self._full_config = full_config or {}
         self._hooks = hooks
+        self._resource_monitor = resource_monitor
         self._running = False
         self._wake = asyncio.Event()
         self._active_runs: set[asyncio.Task] = set()
@@ -102,6 +105,12 @@ class Scheduler:
                     reqs = self._resolve_resource_requirements(task, worker.id)
                     requested_model_id = str(((task.payload or {}).get("model") or "")).strip()
                     requested_provider_id = self._resolve_task_provider_id(task, worker.id)
+                    if reqs and self._resource_monitor and not await self._resource_monitor.refresh_required_availability(reqs):
+                        task.next_retry_at = time.time() + 1
+                        deferred_tasks.append(task)
+                        log("system", "warn", f"Task {task.id} delayed: resource availability probe failed")
+                        task_id = await self._queue.pop_next(task_type)
+                        continue
                     if reqs and self._resources and not self._resources.check_available(reqs):
                         if requested_model_id and self._resources.check_available_for_reuse(
                             reqs, requested_model_id, requested_provider_id
@@ -135,12 +144,18 @@ class Scheduler:
                             continue
 
                     if self._resources and reqs:
-                        await self._resources.reserve_blind_for(
+                        reserved = await self._resources.reserve_if_available(
                             reqs,
                             consumer_id=f"{task.id}:{worker.id}",
                             model_id=(task.payload or {}).get("model") or None,
                             provider_id=requested_provider_id,
                         )
+                        if not reserved:
+                            task.next_retry_at = time.time() + 1
+                            deferred_tasks.append(task)
+                            log("system", "info", f"Task {task.id} delayed: resources changed during admission")
+                            task_id = await self._queue.pop_next(task_type)
+                            continue
                     bg_task = asyncio.create_task(
                         self._run_task(task, worker, reqs, resources_reserved=True),
                         name=f"task:{task.id}:{worker.id}",

@@ -26,6 +26,7 @@ Base URL (example): `http://127.0.0.1:21434`
 6. `GET /v1/models` - OpenAI-compatible models listing
 7. `GET /api/providers/{provider}/models/{model}/queue-state` and `GET /v1/providers/{provider}/models/{model}/queue-state` - read-only queue state for a provider/model pair
 8. `GET /health` - health check (`{"status":"ok"}`)
+9. `GET /api/resources`, `GET /v1/resources`, `GET /api/resources/{resource_id}`, and `GET /v1/resources/{resource_id}` - aidir peer resource availability extension
 
 ## 3. Authentication and envid behavior
 
@@ -37,6 +38,68 @@ If bearer token is provided:
 2. If request has no `envid`, endpoint may auto-assign `users.items[].autoassign_envid`.
 3. If `envid` is present (provided or auto-assigned), endpoint checks access against `users.items[].envids`.
 4. If `envid` does not exist in registry, returns `400 INVALID_ENVID`.
+
+### 3.1 Peer resource access
+
+The resource endpoints are an aidir peer extension. Their access mode is
+configured per OpenAIx endpoint:
+
+```json5
+"peer_resources": {
+  "auth_mode": "disabled" // "disabled" or "endpoint"
+}
+```
+
+`disabled` is the default and permits read-only resource requests without a
+bearer token. `endpoint` requires a valid bearer token and applies the ordinary
+environment authorization rules. Responses contain only resource ID, type,
+limits, units, availability state, and optional explicitly whitelisted telemetry
+readings; commands, credentials, consumers, sensor configuration, and internal
+reservations are never exposed.
+
+### 3.2 Peer resource response
+
+`GET /v1/resources` and `GET /api/resources` return:
+
+```json
+{
+  "object": "list",
+  "protocol_version": 1,
+  "data": [
+    {
+      "id": "gpu_0",
+      "type": "cuda",
+      "limits": {"VRAM": 22000},
+      "units": {"VRAM": "MiB"},
+      "availability": {
+        "source": "command",
+        "status": "ok",
+        "available": {"VRAM": 22173},
+        "observed_at": "2026-10-05T10:00:00+00:00",
+        "error": null
+      },
+      "telemetry": {
+        "sensors": [
+          {
+            "id": "gpu_temperature",
+            "label": "GPU temperature",
+            "unit": "C",
+            "status": "ok",
+            "value": 44,
+            "updated_at": "2026-10-05T10:00:00+00:00",
+            "error": null
+          }
+        ]
+      }
+    }
+  ]
+}
+```
+
+The single-resource variants return one item from `data`. A remote aidir
+provider is detected by this extension at runtime. Definitive incompatible or
+unauthorized responses are cached only until the local aidir process restarts;
+timeouts and transport failures are retried.
 
 ## 4. Request schema: `POST /api/chat`
 

@@ -31,6 +31,7 @@ from core.error_logging import log_exception
 from core.envid import EnvidRegistry
 from core.logger import logger
 from core.local_server_manager import LocalServerManager
+from core.peer_resources import PeerResourceClient
 from core.hooks import HookManager
 from core.queue_manager import QueueManager
 from core.resource_monitor import ResourceMonitor
@@ -213,6 +214,10 @@ class Core:
             )
 
         # ── Scheduler ─────────────────────────────────────────────────────
+        self.resource_monitor = ResourceMonitor(
+            self.resources,
+            peer_client=PeerResourceClient(self.config.raw()),
+        )
         self.scheduler = Scheduler(
             self.queue,
             self.workers,
@@ -220,9 +225,9 @@ class Core:
             resources=self.resources,
             full_config=self.config.raw(),
             hooks=self.hooks,
+            resource_monitor=self.resource_monitor,
         )
         await self.hooks.load()
-        self.resource_monitor = ResourceMonitor(self.resources)
         self._track_background_task(
             asyncio.create_task(self.resource_monitor.run(), name="resource-monitor")
         )

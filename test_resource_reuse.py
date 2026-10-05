@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import unittest
 
 from core.resource import Resource
@@ -125,6 +126,34 @@ class TestResourceReuse(unittest.IsolatedAsyncioTestCase):
         blocked = await resources.force_release("gpu")
 
         self.assertEqual(blocked, {"released": False, "active_consumers": ["active"], "unloaded_models": []})
+
+    async def test_atomic_admission_never_partially_reserves_resources(self) -> None:
+        """Reject a multi-resource request without reserving its otherwise available resource."""
+        resources = Resources([
+            {"id": "gpu_a", "type": "cuda", "limits": {"VRAM": 10}},
+            {"id": "gpu_b", "type": "cuda", "limits": {"VRAM": 4}},
+        ])
+
+        reserved = await resources.reserve_if_available(
+            {"gpu_a": {"VRAM": 5}, "gpu_b": {"VRAM": 5}},
+            consumer_id="task",
+        )
+
+        self.assertFalse(reserved)
+        self.assertEqual(resources.get("gpu_a").used["VRAM"], 0)
+        self.assertEqual(resources.get("gpu_b").used["VRAM"], 0)
+
+    async def test_atomic_admission_serializes_competing_reservations(self) -> None:
+        """Allow only one concurrent request when both need more than half of one resource."""
+        resources = Resources([{"id": "gpu", "type": "cuda", "limits": {"VRAM": 10}}])
+
+        first, second = await asyncio.gather(
+            resources.reserve_if_available({"gpu": {"VRAM": 6}}, consumer_id="first"),
+            resources.reserve_if_available({"gpu": {"VRAM": 6}}, consumer_id="second"),
+        )
+
+        self.assertCountEqual([first, second], [True, False])
+        self.assertEqual(resources.get("gpu").used["VRAM"], 6)
 
 
 if __name__ == "__main__":

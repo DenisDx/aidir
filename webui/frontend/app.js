@@ -502,7 +502,7 @@ function renderResources(resources) {
 
   if (!resources.length) {
     const tr = document.createElement('tr');
-    tr.innerHTML = '<td colspan="7" style="color:var(--muted)">No resources configured</td>';
+    tr.innerHTML = '<td colspan="8" style="color:var(--muted)">No resources configured</td>';
     body.appendChild(tr);
     return;
   }
@@ -547,12 +547,27 @@ function renderResources(resources) {
       return `<div style="margin-bottom:2px;color:${color}"><span>${escapeHtml(sensor.label || sensor.id || 'sensor')}</span> <strong>${escapeHtml(value)}</strong><span style="color:var(--muted)">${escapeHtml(detail)}</span></div>`;
     }).join('') || '<span style="color:var(--muted)">—</span>';
 
+    const availability = r.availability || {};
+    const availableValues = Object.entries(availability.available || {}).map(([metric, value]) => {
+      const unit = ((r.units || {})[metric] || '');
+      return `${metric}: ${value}${unit ? ` ${unit}` : ''}`;
+    }).join(' | ') || '—';
+    const availabilityStatus = availability.status || 'pending';
+    const availabilityColor = availabilityStatus === 'error' ? 'var(--yellow)' : availabilityStatus === 'ok' ? 'var(--ok)' : 'var(--muted)';
+    const availabilityError = availability.error ? `<div style="color:var(--yellow)">${escapeHtml(availability.error)}</div>` : '';
+    const telemetry = ((r.telemetry || {}).sensors || []).map(reading => {
+      const unit = reading.unit ? ` ${reading.unit}` : '';
+      const value = reading.value == null ? '—' : `${reading.value}${unit}`;
+      return `<div style="color:var(--muted)">telemetry: ${escapeHtml(reading.label || reading.id || 'sensor')} <strong>${escapeHtml(value)}</strong></div>`;
+    }).join('');
+
     const tr = document.createElement('tr');
     tr.innerHTML = `
       <td>${escapeHtml(r.id || '—')}</td>
       <td>${escapeHtml(r.type || '—')}</td>
       <td><input type="checkbox" data-resource-use ${r.use !== false ? 'checked' : ''} aria-label="Use resource ${escapeHtml(r.id || '')}"></td>
       <td>${escapeHtml(usageParts.join(' | ') || '—')}</td>
+      <td><div style="color:${availabilityColor}">${escapeHtml(availability.source || 'estimated')} / ${escapeHtml(availabilityStatus)}: <strong>${escapeHtml(availableValues)}</strong></div><div style="color:var(--muted)">${escapeHtml(fmtDateTime(availability.observed_at))}</div>${availabilityError}${telemetry}</td>
       <td>${consumers}${softConsumers}${startupErrors}</td>
       <td>${sensors}</td>
       <td><button class="btn-sm" data-resource-force-release>Force release</button></td>
