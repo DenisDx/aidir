@@ -80,6 +80,21 @@ class TestLlamaCppWorker(unittest.TestCase):
         self.assertEqual(result["message"]["content"], "hello")
         self.assertEqual(result["prompt_eval_count"], 4)
 
+    def test_assembles_stream_content_and_reasoning_for_task_result(self) -> None:
+        """Retain full streamed assistant output after the terminal empty delta."""
+        result = CallLlamaCppWorker._assemble_stream_result(
+            {
+                "choices": [{"delta": {}, "finish_reason": "length"}],
+                "message": {"role": "assistant", "content": None},
+                "done": True,
+            },
+            [],
+            ["///", "///"],
+        )
+
+        self.assertEqual(result["message"]["content"], None)
+        self.assertEqual(result["message"]["thinking"], "//////")
+
 
 class TestLlamaCppStreamingDiagnostics(unittest.IsolatedAsyncioTestCase):
     """Validate live persistence of exact llama.cpp SSE diagnostics."""

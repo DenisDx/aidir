@@ -156,7 +156,10 @@ class HookManagerTests(unittest.IsolatedAsyncioTestCase):
         hooks = _RecoveryHooks()
         module._hooks = hooks
         task = Task(type="agent", id="task-4", route_provider_id="llama")
-        response = {"choices": [{"message": {"content": "", "reasoning_content": "///"}}]}
+        response = {
+            "choices": [{"delta": {}, "finish_reason": "length"}],
+            "message": {"role": "assistant", "content": None, "thinking": "///"},
+        }
 
         with patch.object(module, "log") as logger:
             await module.on_llm_response_complete(task, response)

@@ -39,23 +39,23 @@ def register(hooks):
 
 def _is_openai_empty_response(response):
     """Return whether OpenAI content is empty and reasoning is slash-only."""
-    choices = response.get("choices")
-    if not isinstance(choices, list) or not choices:
-        return False
+    message = response.get("message")
+    if isinstance(message, dict):
+        messages = [message]
+    else:
+        choices = response.get("choices")
+        if not isinstance(choices, list) or not choices:
+            return False
+        messages = [choice.get("message") for choice in choices if isinstance(choice, dict)]
+        if len(messages) != len(choices) or not all(isinstance(item, dict) for item in messages):
+            return False
 
-    content: list[str] = []
-    reasoning: list[str] = []
-    for choice in choices:
-        if not isinstance(choice, dict):
-            return False
-        message = choice.get("message")
-        if not isinstance(message, dict):
-            return False
-        content.append(str(message.get("content") or ""))
-        reasoning.extend(
-            str(message.get(key) or "")
-            for key in ("reasoning", "reasoning_content", "thinking")
-        )
+    content = [str(message.get("content") or "") for message in messages]
+    reasoning = [
+        str(message.get(key) or "")
+        for message in messages
+        for key in ("reasoning", "reasoning_content", "thinking")
+    ]
 
     return not any(value.strip() for value in content) and all(
         not value.strip() or set(value.strip()) == {"/"} for value in reasoning

@@ -142,6 +142,8 @@ class CallLlamaCppWorker(OpenAIxWorker):
         """Translate llama.cpp OpenAI SSE chunks into internal Ollama-compatible chunks."""
         provider_id = self._resolve_task_provider_id(task) if task is not None else self._provider_id
         final_data: dict | None = None
+        content_parts: list[str] = []
+        thinking_parts: list[str] = []
         upstream_payload = {**payload, "stream": True}
         response_spool = None
         request = self._build_json_request(client, url, upstream_payload)
@@ -199,6 +201,11 @@ class CallLlamaCppWorker(OpenAIxWorker):
                         status_code, raw, "application/json",
                     ))
                 chunk = self._openai_response_to_ollama(data, streaming=True)
+                message = chunk.get("message") if isinstance(chunk.get("message"), dict) else {}
+                if message.get("content") is not None:
+                    content_parts.append(str(message["content"]))
+                if message.get("thinking") is not None:
+                    thinking_parts.append(str(message["thinking"]))
                 final_data = chunk
                 if emit_chunk:
                     await emit_chunk(UpstreamChunk(chunk, protocol="openai", raw=event, content_type=content_type, original=data))
@@ -219,7 +226,25 @@ class CallLlamaCppWorker(OpenAIxWorker):
                 upstream_payload,
                 {"final": final_data or {}},
             )
+        final_data = self._assemble_stream_result(final_data, content_parts, thinking_parts)
         return WorkerResult(ok=True, data=final_data, usage=(final_data or {}).get("usage"))
+
+    @staticmethod
+    def _assemble_stream_result(
+        final_data: dict | None,
+        content_parts: list[str],
+        thinking_parts: list[str],
+    ) -> dict | None:
+        """Return the final stream value with complete assistant content and reasoning."""
+        if not isinstance(final_data, dict):
+            return final_data
+        message = final_data.get("message") if isinstance(final_data.get("message"), dict) else {}
+        complete_message = {**message}
+        if content_parts:
+            complete_message["content"] = "".join(content_parts)
+        if thinking_parts:
+            complete_message["thinking"] = "".join(thinking_parts)
+        return {**final_data, "message": complete_message}
 
     @staticmethod
     def _openai_response_to_ollama(data: dict, streaming: bool = False) -> dict:

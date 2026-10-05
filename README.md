@@ -67,8 +67,9 @@ The script:
   - copies the selected template into `config.json5`
 2. Creates .env file and fills required field in the dialogue mode 
 3. Creates a Python virtual environment in `./venv/` and installs dependencies.
-4. Builds and starts Docker containers (Redis, nginx).
-  Also auto-fixes WebUI port conflicts: `NGINX_HTTP_PORT` is set and kept different from `WEBUI_PORT`.
+4. Builds Docker images, checks all aidir listener ports, then starts Docker containers (Redis, nginx).
+  On a fresh installation, an occupied default port is replaced with the next available port and saved in `.env`.
+  On an update, the installer proposes a replacement for an occupied configured port and asks for confirmation.
 5. Adds a cron entry for periodic maintenance (`core/cron.py`).
 6. Registers `core/app.py` as a `systemd` user service (`aidir.service`) and starts it.
 
@@ -287,7 +288,13 @@ Rules:
 
 - nginx always listens on container port `80`; Docker publishes it to host `${NGINX_HTTP_PORT}`.
 - HTML and WebSocket share the same public nginx port. WS uses `/ws/*`; it does not need a separate port.
-- `WEBUI_PORT` is the backend port behind nginx and must not equal `NGINX_HTTP_PORT`.
+- Before Docker or the core app starts, `install.sh` checks the Redis, nginx, WebUI, OpenAIx, and MCP listener ports.
+  It reserves each selected port during that check, so the aidir services cannot be assigned the same host port.
+- For a new `.env`, an occupied port is automatically changed to the next free TCP port. For an existing `.env`,
+  the installer shows the suggested replacement and waits for confirmation; non-interactive runs fail rather than
+  changing a configured port without consent.
+- On a re-install, aidir stops only the current instance's core service and Compose containers before checking ports,
+  so their existing listeners do not appear as external conflicts.
 - The nginx container renders its upstream from `WEBUI_HOST` and `WEBUI_PORT` at
   startup, runs `nginx -t` on the rendered configuration, then starts serving
   traffic. Change either value in `.env` and recreate the nginx container.

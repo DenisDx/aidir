@@ -165,6 +165,125 @@ set_env_var() {
   fi
 }
 
+# Tests whether a TCP port can be bound on a host; returns success when free.
+port_is_available() {
+  local host="$1"
+  local port="$2"
+
+  if [[ -n "${RESERVED_PORTS[$port]+x}" ]]; then
+    return 1
+  fi
+
+  python3 - "$host" "$port" <<'PY'
+import socket
+import sys
+
+host, raw_port = sys.argv[1:]
+port = int(raw_port)
+addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+sockets = []
+try:
+    for family, socktype, protocol, _, sockaddr in addresses:
+        sock = socket.socket(family, socktype, protocol)
+        sock.bind(sockaddr)
+        sockets.append(sock)
+except OSError:
+    sys.exit(1)
+finally:
+    for sock in sockets:
+        sock.close()
+PY
+}
+
+# Finds the next free TCP port after the requested port.
+find_next_available_port() {
+  local host="$1"
+  local requested_port="$2"
+  local candidate
+
+  for ((candidate = requested_port + 1; candidate <= 65535; candidate++)); do
+    if port_is_available "$host" "$candidate"; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+
+  for ((candidate = 1; candidate < requested_port; candidate++)); do
+    if port_is_available "$host" "$candidate"; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+# Persists a selected port and exposes it to the current installer process.
+set_listener_port() {
+  local key="$1"
+  local port="$2"
+
+  set_env_var "$ENV_FILE" "$key" "$port"
+  printf -v "$key" '%s' "$port"
+  export "$key"
+  RESERVED_PORTS["$port"]="$key"
+}
+
+# Resolves one listener's port, asking before changing a pre-existing setting.
+configure_listener_port() {
+  local label="$1"
+  local key="$2"
+  local host="$3"
+  local default_port="$4"
+  local current_port="${!key:-$default_port}"
+  local suggested_port
+  local reply
+
+  if ! [[ "$current_port" =~ ^[1-9][0-9]{0,4}$ ]] || ((current_port > 65535)); then
+    die "$key must be an integer from 1 to 65535; got '$current_port'"
+  fi
+
+  if port_is_available "$host" "$current_port"; then
+    RESERVED_PORTS["$current_port"]="$key"
+    return
+  fi
+
+  suggested_port="$(find_next_available_port "$host" "$current_port")" \
+    || die "No free TCP port is available for $label on $host"
+
+  if [[ "$ENV_CREATED" -eq 1 ]]; then
+    warn "$label port $host:$current_port is unavailable; using $suggested_port"
+    set_listener_port "$key" "$suggested_port"
+    return
+  fi
+
+  [[ -t 0 ]] || die "$label port $host:$current_port is unavailable. Re-run interactively to confirm the suggested port $suggested_port or update $ENV_FILE manually."
+  read -r -p "$label port $host:$current_port is unavailable. Use $suggested_port instead? [Y/n] " reply
+  if [[ "${reply,,}" == "n" || "${reply,,}" == "no" ]]; then
+    die "Installation cancelled. Set a free $key value in $ENV_FILE and re-run."
+  fi
+
+  warn "$label port changed from $current_port to $suggested_port"
+  set_listener_port "$key" "$suggested_port"
+}
+
+# Stops the current instance so its listeners do not mask external conflicts.
+stop_existing_aidir_service() {
+  local user_service="$HOME/.config/systemd/user/${SERVICE_NAME}.service"
+  local system_service="/etc/systemd/system/${SERVICE_NAME}.service"
+
+  if [[ -f "$user_service" ]] && grep -Fqx "WorkingDirectory=$SCRIPT_DIR" "$user_service"; then
+    info "Stopping existing user service before checking ports..."
+    systemctl --user stop "$SERVICE_NAME" || die "Failed to stop existing user service $SERVICE_NAME"
+  fi
+
+  if [[ -f "$system_service" ]] && grep -Fqx "WorkingDirectory=$SCRIPT_DIR" "$system_service"; then
+    [[ $EUID -eq 0 ]] || die "Existing system service $SERVICE_NAME must be stopped with sudo before changing its ports."
+    info "Stopping existing system service before checking ports..."
+    systemctl stop "$SERVICE_NAME" || die "Failed to stop existing system service $SERVICE_NAME"
+  fi
+}
+
 generate_password() {
   tr -dc 'A-Za-z0-9!@#%^*_' < /dev/urandom | head -c 20
 }
@@ -280,6 +399,7 @@ DOCKER_BUILT=0
 DOCKER_STARTED=0
 CRON_UPDATED=0
 CRON_STATE="not-configured"
+declare -A RESERVED_PORTS=()
 
 # ── Step 1: Prerequisites check ───────────────────────────────────────────────
 info "Checking prerequisites…"
@@ -383,21 +503,11 @@ set -a
 source "$ENV_FILE"
 set +a
 
-# Ensure nginx public port is configured and does not conflict with backend port.
+# Ensure nginx public port is configured before all listener ports are checked.
 if [[ -z "${NGINX_HTTP_PORT:-}" ]]; then
   NGINX_HTTP_PORT=8080
   set_env_var "$ENV_FILE" "NGINX_HTTP_PORT" "$NGINX_HTTP_PORT"
   info "NGINX_HTTP_PORT not set; defaulted to $NGINX_HTTP_PORT"
-fi
-
-if [[ "${NGINX_HTTP_PORT}" == "${WEBUI_PORT}" ]]; then
-  if [[ "${WEBUI_PORT}" != "8080" ]]; then
-    NGINX_HTTP_PORT=8080
-  else
-    NGINX_HTTP_PORT=8081
-  fi
-  set_env_var "$ENV_FILE" "NGINX_HTTP_PORT" "$NGINX_HTTP_PORT"
-  warn "WEBUI_PORT and NGINX_HTTP_PORT were equal; NGINX_HTTP_PORT changed to $NGINX_HTTP_PORT"
 fi
 
 # ── Step 3: venv + dependencies ───────────────────────────────────────────────
@@ -425,6 +535,16 @@ if ! $DOCKER_COMPOSE build; then
   $DOCKER_COMPOSE build --no-cache || die "Docker build failed on retry. Check Docker/containerd state and re-run."
 fi
 DOCKER_BUILT=1
+
+stop_existing_aidir_service
+$DOCKER_COMPOSE down --remove-orphans
+
+info "Checking local listener ports..."
+configure_listener_port "Redis" "REDIS_PORT" "${REDIS_HOST:-127.0.0.1}" "6379"
+configure_listener_port "nginx" "NGINX_HTTP_PORT" "0.0.0.0" "8080"
+configure_listener_port "WebUI backend" "WEBUI_PORT" "${WEBUI_HOST:-0.0.0.0}" "20082"
+configure_listener_port "OpenAIx endpoint" "OPENAIX_ENDPOINT_PORT" "${OPENAIX_ENDPOINT_HOST:-0.0.0.0}" "21434"
+configure_listener_port "MCP endpoint" "MCP_ENDPOINT_PORT" "${MCP_ENDPOINT_HOST:-0.0.0.0}" "20001"
 
 info "Starting Docker services (redis, nginx)…"
 $DOCKER_COMPOSE up -d --remove-orphans
