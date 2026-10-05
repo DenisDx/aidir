@@ -295,9 +295,11 @@ Rules:
   changing a configured port without consent.
 - On a re-install, aidir stops only the current instance's core service and Compose containers before checking ports,
   so their existing listeners do not appear as external conflicts.
-- The nginx container renders its upstream from `WEBUI_HOST` and `WEBUI_PORT` at
-  startup, runs `nginx -t` on the rendered configuration, then starts serving
-  traffic. Change either value in `.env` and recreate the nginx container.
+- The nginx container reaches the WebUI backend through Docker's
+  `host.docker.internal` host-gateway and renders the upstream port from
+  `WEBUI_PORT` at startup. It then runs `nginx -t` on the rendered
+  configuration before serving traffic. Change `WEBUI_PORT` in `.env` and
+  recreate the nginx container.
 
 #### Routes
 
