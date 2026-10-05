@@ -234,6 +234,20 @@ avoiding the current double-counting of work that is visible in the real
 measurement. Releasing a task does not increase an observed value locally; the
 next pre-dispatch probe or periodic poll supplies the new physical value.
 
+### Warm-model reuse and peer authority
+
+Low observed free capacity must not reject a request when the resource owner
+confirms that the exact required model is already warm and reusable. For
+example, a 19 GiB Qwen model on a 22 GiB GPU may leave only 3 GiB free, but a
+new request for that same warm model does not need another 19 GiB allocation.
+
+For a peer aidir resource, the remote model queue-state response is
+authoritative for this decision. Before forwarding every task, the local
+scheduler asks the peer whether the resolved provider/model can run now. It
+does not reserve or reject peer VRAM from the local free-memory snapshot. The
+remote aidir evaluates its own warm-model state, queue, and resource admission;
+only a negative or failed remote queue-state response defers the task locally.
+
 Admission of all resources for one task must be atomic with respect to other
 local admissions. If one resource fails its refresh or capacity check, no
 reservation may be left on the others.

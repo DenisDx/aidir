@@ -155,6 +155,21 @@ class TestResourceReuse(unittest.IsolatedAsyncioTestCase):
         self.assertCountEqual([first, second], [True, False])
         self.assertEqual(resources.get("gpu").used["VRAM"], 6)
 
+    async def test_command_observation_allows_reuse_of_a_warm_model(self) -> None:
+        """Allow a matching warm model despite low currently free observed memory."""
+        resource = Resource(
+            "gpu",
+            "cuda",
+            {"VRAM": 22},
+            alive_time=300,
+            availability={"command": "nvidia-smi", "metric": "VRAM"},
+        )
+        await resource.release({"VRAM": 19}, consumer_id="previous", model_id="qwen")
+        resource.record_observed_availability("command", {"VRAM": 3})
+
+        self.assertFalse(resource.is_available({"VRAM": 19}))
+        self.assertTrue(resource.is_available_for_reuse({"VRAM": 19}, "qwen"))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

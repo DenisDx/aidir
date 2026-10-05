@@ -1382,13 +1382,22 @@ class Endpoint_openaix(Endpoint_ollama):
         resource_ready_after_unload = bool(
             self._core.resources and self._core.resources.check_available_after_unload(resolved)
         )
+        resource_reusable = bool(
+            self._core.resources
+            and callable(getattr(self._core.resources, "check_available_for_reuse", None))
+            and self._core.resources.check_available_for_reuse(
+                resolved,
+                model_id=model_id,
+                provider_id=provider_id,
+            )
+        )
         blocked_by_same_or_higher = queue_state["queued_count_total"] - queue_state["queued_count_below_priority"]
 
         payload = {
             "provider": provider_id,
             "model": model_id,
             "priority": priority,
-            "can_run_now": resource_ready_after_unload and blocked_by_same_or_higher == 0,
+            "can_run_now": (resource_ready_after_unload or resource_reusable) and blocked_by_same_or_higher == 0,
             "queued_count_below_priority": queue_state["queued_count_below_priority"],
             "queued_count_total": queue_state["queued_count_total"],
             "priority_counts": queue_state["priority_counts"],

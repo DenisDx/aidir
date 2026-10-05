@@ -112,6 +112,20 @@ class Resources:
                 return False
         return True
 
+    def local_admission_requirements(
+        self,
+        requirements: dict[str, dict[str, int]] | None = None,
+    ) -> dict[str, dict[str, int]]:
+        """Return requirements that must be reserved locally rather than by a peer aidir."""
+        return {
+            resource_id: dict(metrics)
+            for resource_id, metrics in (requirements or {}).items()
+            if (
+                (resource := self._items.get(resource_id)) is None
+                or resource.availability_snapshot().get("source") != "peer"
+            )
+        }
+
     async def force_unload_for(
         self,
         requirements: dict[str, dict[str, int]] | None = None,

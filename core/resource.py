@@ -254,12 +254,13 @@ class Resource:
         """Return True when the same warm model can be reused without unloading it."""
         if not self.use:
             return False
-        if self.has_command_availability():
-            return self.is_available(required)
         req = required or {}
         match = self._matching_soft_consumer(model_id, req, provider_id)
         if match is None:
             return False
+
+        if self._availability_state.get("source") in {"command", "peer"}:
+            return self._availability_state.get("status") == "ok"
 
         soft = self._compute_soft_used()
         matched_resources = match.get("resources") or {}

@@ -111,23 +111,34 @@ class Scheduler:
                         log("system", "warn", f"Task {task.id} delayed: resource availability probe failed")
                         task_id = await self._queue.pop_next(task_type)
                         continue
-                    if reqs and self._resources and not self._resources.check_available(reqs):
+                    if not await self._remote_route_can_run(
+                        task,
+                        requested_provider_id,
+                        requested_model_id,
+                    ):
+                        task.next_retry_at = time.time() + 1
+                        deferred_tasks.append(task)
+                        log("system", "info", f"Task {task.id} delayed: remote aidir cannot run the model now")
+                        task_id = await self._queue.pop_next(task_type)
+                        continue
+                    local_reqs = self._resources.local_admission_requirements(reqs) if self._resources else reqs
+                    if local_reqs and self._resources and not self._resources.check_available(local_reqs):
                         if requested_model_id and self._resources.check_available_for_reuse(
-                            reqs, requested_model_id, requested_provider_id
+                            local_reqs, requested_model_id, requested_provider_id
                         ):
                             log("system", "info", f"Task {task.id} reusing warm model {requested_model_id}")
-                        elif self._resources.check_available_after_unload(reqs):
+                        elif self._resources.check_available_after_unload(local_reqs):
                             # Soft consumers (alive-time models) block the resource; force-unload them.
                             log("system", "info",
                                 f"Task {task.id} needs force-unload of idle models to free resources")
                             await self._resources.force_unload_for(
-                                reqs,
+                                local_reqs,
                                 self._full_config,
                                 keep_model_id=requested_model_id or None,
                                 keep_provider_id=requested_provider_id or None,
                             )
                             # Re-check actual soft reservations; a failed unload must keep its VRAM occupied.
-                            if not self._resources.check_available(reqs):
+                            if not self._resources.check_available(local_reqs):
                                 task.next_retry_at = time.time() + 5
                                 deferred_tasks.append(task)
                                 log("system", "warn",
@@ -143,9 +154,9 @@ class Scheduler:
                             task_id = await self._queue.pop_next(task_type)
                             continue
 
-                    if self._resources and reqs:
+                    if self._resources and local_reqs:
                         reserved = await self._resources.reserve_if_available(
-                            reqs,
+                            local_reqs,
                             consumer_id=f"{task.id}:{worker.id}",
                             model_id=(task.payload or {}).get("model") or None,
                             provider_id=requested_provider_id,
@@ -157,7 +168,7 @@ class Scheduler:
                             task_id = await self._queue.pop_next(task_type)
                             continue
                     bg_task = asyncio.create_task(
-                        self._run_task(task, worker, reqs, resources_reserved=True),
+                        self._run_task(task, worker, local_reqs, resources_reserved=True),
                         name=f"task:{task.id}:{worker.id}",
                     )
                     self._active_runs.add(bg_task)
@@ -617,6 +628,29 @@ class Scheduler:
                 return provider_id
         worker_cfg = self._workers_cfg.get(worker_id, {}) or {}
         return str(worker_cfg.get("provider") or "").strip()
+
+    async def _remote_route_can_run(
+        self,
+        task: Task,
+        provider_id: str,
+        model_id: str,
+    ) -> bool:
+        """Ask a remote aidir whether its resolved model can run before forwarding work."""
+        if not provider_id or self._provider_api(provider_id) != "openaix":
+            return True
+        if not model_id:
+            return False
+        incoming_bearer_token = ""
+        if isinstance(task.config, dict):
+            incoming_bearer_token = str(task.config.get("incoming_bearer_token") or "").strip()
+        queue_state = await self._probe_remote_model_queue_state(
+            provider_id,
+            model_id,
+            priority=task.priority,
+            timeout_ms=1500,
+            incoming_bearer_token=incoming_bearer_token,
+        )
+        return isinstance(queue_state, dict) and bool(queue_state.get("can_run_now"))
 
     def _make_smart_router(self, worker_id: str) -> SmartRouter:
         """Build a shared smart router for scheduler-time route refresh."""
