@@ -520,7 +520,7 @@ function renderResources(resources) {
         .map(([k, v]) => `${k}:${v}`)
         .join(', ');
       return `<div style="margin-bottom:2px"><span style="font-family:monospace">${escapeHtml(c.id)}</span> <span style="color:var(--muted)">${escapeHtml(details)}</span></div>`;
-    }).join('') || '<span style="color:var(--muted)">—</span>';
+    }).join('');
 
     const softConsumers = (r.soft_consumers || []).map(c => {
       const details = Object.entries(c.resources || {})
@@ -545,7 +545,7 @@ function renderResources(resources) {
       const color = sensor.status === 'alert' ? 'var(--red)' : sensor.status === 'error' ? 'var(--yellow)' : 'var(--muted)';
       const detail = sensor.error ? `: ${sensor.error}` : threshold;
       return `<div style="margin-bottom:2px;color:${color}"><span>${escapeHtml(sensor.label || sensor.id || 'sensor')}</span> <strong>${escapeHtml(value)}</strong><span style="color:var(--muted)">${escapeHtml(detail)}</span></div>`;
-    }).join('') || '<span style="color:var(--muted)">—</span>';
+    }).join('');
 
     const availability = r.availability || {};
     const availableValues = Object.entries(availability.available || {}).map(([metric, value]) => {
@@ -562,6 +562,8 @@ function renderResources(resources) {
       const error = reading.error ? `: ${reading.error}` : '';
       return `<div style="margin-bottom:2px;color:${color}"><span>${escapeHtml(reading.label || reading.id || 'sensor')}</span> <strong>${escapeHtml(value)}</strong><span style="color:var(--muted)">${escapeHtml(error)}</span></div>`;
     }).join('');
+    const consumersCell = consumers + softConsumers + startupErrors || '<span style="color:var(--muted)">—</span>';
+    const sensorsCell = sensors + telemetry || '<span style="color:var(--muted)">—</span>';
 
     const tr = document.createElement('tr');
     tr.innerHTML = `
@@ -570,8 +572,8 @@ function renderResources(resources) {
       <td><input type="checkbox" data-resource-use ${r.use !== false ? 'checked' : ''} aria-label="Use resource ${escapeHtml(r.id || '')}"></td>
       <td>${escapeHtml(usageParts.join(' | ') || '—')}</td>
       <td><div style="color:${availabilityColor}">${escapeHtml(availability.source || 'estimated')} / ${escapeHtml(availabilityStatus)}: <strong>${escapeHtml(availableValues)}</strong></div><div style="color:var(--muted)">${escapeHtml(fmtDateTime(availability.observed_at))}</div>${availabilityError}</td>
-      <td>${consumers}${softConsumers}${startupErrors}</td>
-      <td>${sensors}${telemetry}</td>
+      <td>${consumersCell}</td>
+      <td>${sensorsCell}</td>
       <td><button class="btn-sm" data-resource-force-release>Force release</button></td>
     `;
     const useCheckbox = tr.querySelector('[data-resource-use]');
