@@ -1,6 +1,7 @@
-"""Regression tests for bounded, summary-only Task Viewer search."""
+"""Regression tests for bounded Task Viewer search."""
 from __future__ import annotations
 
+import json
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -119,8 +120,8 @@ class ViewerSearchTests(unittest.TestCase):
         self.assertEqual(tasks[0]["status"], "running")
         self.assertEqual(tasks[0]["model_id"], "remote-model")
 
-    def test_search_uses_batched_summary_hashes_only(self):
-        """Return top-k summary rows without decoding any heavy Redis task field."""
+    def test_search_uses_batched_hashes_and_bounded_results(self):
+        """Return top-k rows without requiring valid heavy Redis task fields."""
         hashes = {
             "aidir:task:old": _summary("old", "2026-10-01T10:00:00+00:00", "old-model"),
             "aidir:task:middle": _summary("middle", "2026-10-01T11:00:00+00:00", "middle-model"),
@@ -144,6 +145,76 @@ class ViewerSearchTests(unittest.TestCase):
         self.assertEqual(body["tasks"][0]["model_id"], "new-model")
         self.assertEqual(redis.scan_calls, 1)
         self.assertEqual(redis.executed_batches, [list(hashes)])
+
+    def test_search_decodes_endpoint_request_previews(self):
+        """Decode bounded previews for Ollama, OpenAI parts, embeddings, and MCP."""
+        timestamp = "2026-10-01T12:00:00+00:00"
+        cases = {
+            "ollama": (
+                {
+                    "model": "ollama-model",
+                    "messages": [{"role": "user", "content": "Ollama question"}],
+                },
+                "Ollama question",
+            ),
+            "openai": (
+                {
+                    "model": "openai-model",
+                    "messages": [{
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url", "image_url": {"url": "data:image/png;base64,secret"}},
+                            {"type": "text", "text": "OpenAI text part"},
+                        ],
+                    }],
+                },
+                "OpenAI text part",
+            ),
+            "embedding": (
+                {
+                    "model": "embedding-model",
+                    "input": ["First embedding input", "Second embedding input"],
+                },
+                "First embedding input",
+            ),
+            "mcp": (
+                {
+                    "tool": "echo",
+                    "arguments": {"value": "MCP argument"},
+                },
+                'echo {"value":"MCP argument"}',
+            ),
+            "bounded": (
+                {
+                    "model": "bounded-model",
+                    "messages": [{"role": "user", "content": "x" * 1200}],
+                },
+                f'{"x" * 999}…',
+            ),
+        }
+        hashes = {}
+        for task_id, (payload, _) in cases.items():
+            task_hash = _summary(task_id, timestamp, str(payload.get("model") or ""))
+            task_hash["payload"] = json.dumps(payload)
+            if task_id == "mcp":
+                task_hash["type"] = "tool"
+            hashes[f"aidir:task:{task_id}"] = task_hash
+
+        redis = _Redis(hashes)
+        core = _Core(redis)
+
+        async def session(*args, **kwargs):
+            """Provide an authenticated Viewer session."""
+            return {"permissions": ["all"], "login": "test"}
+
+        with patch("webui.backend.app._get_session", session):
+            response = TestClient(create_app(core)).get("/api/tasks/viewer/search")
+
+        self.assertEqual(response.status_code, 200)
+        tasks = {task["id"]: task for task in response.json()["tasks"]}
+        for task_id, (_, expected_preview) in cases.items():
+            self.assertEqual(tasks[task_id]["first_message_preview"], expected_preview)
+        self.assertNotIn("data:image", tasks["openai"]["first_message_preview"])
 
     def test_search_prefers_live_status_over_stale_redis_status(self):
         """Expose an active task's live status while its Redis hash is stale."""

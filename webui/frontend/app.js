@@ -666,14 +666,43 @@ function fmtTaskDuration(startedAt, finishedAt = null) {
   return `${minutes}:${String(seconds).padStart(2, '0')}`;
 }
 
+// Extract text while ignoring image and other media-only content fields.
+function requestPreviewText(value) {
+  if (typeof value === 'string') return value;
+  if (Array.isArray(value)) {
+    return value.map(requestPreviewText).filter(Boolean).join(' ');
+  }
+  if (value && typeof value === 'object') {
+    for (const key of ['text', 'input_text']) {
+      const text = requestPreviewText(value[key]);
+      if (text) return text;
+    }
+  }
+  return '';
+}
+
+// Return a bounded request preview for task list columns.
 function firstMessagePreview(task, maxLength = 40) {
+  const persistedPreview = task && typeof task.first_message_preview === 'string'
+    ? task.first_message_preview
+    : '';
   const payload = task && typeof task.payload === 'object' ? task.payload : null;
   const messages = Array.isArray(payload && payload.messages) ? payload.messages : [];
   const firstMessage = messages.length > 0 && messages[0] && typeof messages[0] === 'object' ? messages[0] : null;
-  const rawContent = firstMessage ? firstMessage.content : '';
-  const content = Array.isArray(rawContent)
-    ? rawContent.filter(part => part != null).map(part => String(part)).join(' ')
-    : (rawContent == null ? '' : String(rawContent));
+  let content = persistedPreview || requestPreviewText(firstMessage ? firstMessage.content : '');
+  if (!content && payload && payload.input !== undefined) {
+    const input = Array.isArray(payload.input) ? payload.input[0] : payload.input;
+    content = requestPreviewText(input);
+  }
+  if (!content && payload && payload.tool) {
+    const argumentsText = payload.arguments && Object.keys(payload.arguments).length
+      ? ` ${JSON.stringify(payload.arguments)}`
+      : '';
+    content = `${payload.tool}${argumentsText}`;
+  }
+  if (!content && payload) {
+    content = requestPreviewText(payload.prompt);
+  }
   const normalized = content.replace(/\s+/g, ' ').trim();
   if (!normalized) return '—';
   if (normalized.length <= maxLength) return normalized;

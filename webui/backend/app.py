@@ -355,6 +355,61 @@ def _task_from_hash(task_hash: dict[str, str]) -> dict[str, Any]:
     return task
 
 
+def _preview_text(value: Any) -> str:
+    """Extract text from chat or embedding content without exposing media fields."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return " ".join(filter(None, (_preview_text(item) for item in value)))
+    if isinstance(value, dict):
+        for key in ("text", "input_text"):
+            if key in value:
+                text = _preview_text(value[key])
+                if text:
+                    return text
+    return ""
+
+
+def _clip_request_preview(value: str, max_length: int = 1000) -> str:
+    """Normalize and bound one request preview."""
+    normalized = " ".join(str(value or "").split())
+    if len(normalized) <= max_length:
+        return normalized
+    return f"{normalized[:max_length - 1]}…"
+
+
+def _first_request_preview(task_type: str, raw_payload: Any) -> str:
+    """Decode a bounded first-input preview for agent, embedding, or tool tasks."""
+    payload = _parse_json_field(raw_payload) if isinstance(raw_payload, str) else raw_payload
+    if not isinstance(payload, dict):
+        return ""
+
+    if task_type == "tool":
+        tool_name = str(payload.get("tool") or "").strip()
+        arguments = payload.get("arguments")
+        if arguments not in (None, {}, []):
+            arguments_text = json.dumps(arguments, ensure_ascii=False, separators=(",", ":"))
+            return _clip_request_preview(f"{tool_name} {arguments_text}".strip())
+        return _clip_request_preview(tool_name)
+
+    messages = payload.get("messages")
+    if isinstance(messages, list) and messages:
+        first_message = messages[0]
+        if isinstance(first_message, dict):
+            preview = _preview_text(first_message.get("content"))
+            if preview:
+                return _clip_request_preview(preview)
+
+    input_value = payload.get("input")
+    if isinstance(input_value, list) and input_value:
+        input_value = input_value[0]
+    preview = _preview_text(input_value)
+    if preview:
+        return _clip_request_preview(preview)
+
+    return _clip_request_preview(_preview_text(payload.get("prompt")))
+
+
 def _task_summary_from_hash(task_hash: dict[str, str]) -> dict[str, Any]:
     """Return search-safe task metadata without decoding raw task bodies or histories."""
     status = str(task_hash.get("status") or "")
@@ -611,7 +666,7 @@ def create_app(
         _, task_routes = await _recent_task_routes(core) if routes else ([], {})
 
         ns = core.config.get("instance", "aidir")
-        items: list[tuple[str, int, dict[str, Any]]] = []
+        items: list[tuple[str, int, dict[str, Any], Any]] = []
         matching_count = 0
         sequence = 0
         cursor = 0
@@ -659,7 +714,7 @@ def create_app(
                 matching_count += 1
                 sequence += 1
                 sort_key = task.get("last_operation_at") or task.get("created_at") or ""
-                candidate = (sort_key, sequence, task)
+                candidate = (sort_key, sequence, task, raw.get("payload"))
                 if len(items) < limit:
                     heapq.heappush(items, candidate)
                 elif candidate[:2] > items[0][:2]:
@@ -669,8 +724,15 @@ def create_app(
                 break
 
         items.sort(reverse=True)
+        tasks = []
+        for _, _, task, raw_payload in items:
+            task["first_message_preview"] = _first_request_preview(
+                str(task.get("type") or ""),
+                raw_payload,
+            )
+            tasks.append(task)
         return {
-            "tasks": [item[2] for item in items],
+            "tasks": tasks,
             "count": matching_count,
         }
 
@@ -692,13 +754,18 @@ def create_app(
         """Return compact task metadata and lazy audit-event manifest."""
         live_task = core.queue.get_task(task_id) if core.queue else None
         if live_task is not None:
-            task = _task_summary_from_hash(live_task.to_redis_hash())
+            raw = live_task.to_redis_hash()
+            task = _task_summary_from_hash(raw)
         else:
             ns = core.config.get("instance", "aidir")
             raw = await core.redis.hgetall(f"{ns}:task:{task_id}")
             if not raw:
                 raise HTTPException(status_code=404, detail="Task not found")
             task = _task_summary_from_hash(raw)
+        task["first_message_preview"] = _first_request_preview(
+            str(task.get("type") or ""),
+            raw.get("payload"),
+        )
         audit_log = getattr(core, "audit_log", None)
         events = audit_log.list_task_events(task_id) if audit_log is not None else []
         terminal_audit = audit_log.task_terminal_snapshot(task_id) if audit_log is not None else None
