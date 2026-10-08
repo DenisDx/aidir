@@ -28,6 +28,27 @@ class TestResourceReuse(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot["soft_used"].get("VRAM", 0), 0)
         self.assertEqual([item["model_id"] for item in snapshot["soft_consumers"]], [])
 
+    async def test_atomic_reservation_reuses_matching_warm_model(self) -> None:
+        """Reserves a matching warm model when ordinary capacity is unavailable."""
+        resources = Resources([{"id": "gpu", "type": "cuda", "limits": {"VRAM": 10}, "alive_time": 300}])
+        requirements = {"gpu": {"VRAM": 8}}
+        await resources.release_for(
+            requirements,
+            consumer_id="previous",
+            model_id="model-a",
+            provider_id="llama_local",
+        )
+
+        reserved = await resources.reserve_if_available_or_reuse(
+            requirements,
+            consumer_id="next",
+            model_id="model-a",
+            provider_id="llama_local",
+        )
+
+        self.assertTrue(reserved)
+        self.assertEqual(resources.get("gpu").snapshot()["used"]["VRAM"], 8)
+
     async def test_resource_reuse_still_respects_other_soft_consumers(self) -> None:
         """Refuses same-model reuse when other warm models still exceed the resource limit."""
         resource = Resource("gpu", "cuda", {"VRAM": 10}, alive_time=300)

@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import hmac
 import json
+import os
 import time
 import uuid
 from datetime import datetime, timezone
@@ -25,6 +27,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from core.endpoint import BaseEndpoint
 from core.error_logging import attach_request_id_middleware, get_or_create_request_id, log_exception
+from core.opencode_session import OpenCodeSessionError, OpenCodeSessionStore
 from core.request_limits import RequestBodyLimitMiddleware
 from core.smart_router import SmartRouteError, SmartRouter
 from core.task_types.task_agent import Task_agent
@@ -69,6 +72,7 @@ class Endpoint_ollama(BaseEndpoint):
             audit_log=getattr(core, "audit_log", None),
         )
         attach_request_id_middleware(app)
+        self._attach_ingress_logging(app)
 
         @app.exception_handler(Exception)
         async def unhandled_exception_handler(request: Request, exc: Exception):
@@ -143,6 +147,7 @@ class Endpoint_ollama(BaseEndpoint):
                 stream,
                 incoming_bearer_token=incoming_bearer_token,
                 route_trace=route_trace,
+                request=request,
             )
         except SmartRouteError as exc:
             self._audit_pre_task_rejection(
@@ -356,6 +361,7 @@ class Endpoint_ollama(BaseEndpoint):
         *,
         incoming_bearer_token: str = "",
         route_trace: dict | None = None,
+        request: Request | None = None,
     ) -> Task_agent:
         """Create Task_agent and resolve smart routes before queueing when needed."""
         worker_id = self._resolve_worker_id(payload)
@@ -375,7 +381,93 @@ class Endpoint_ollama(BaseEndpoint):
         if isinstance(route_trace, dict):
             task.config = dict(task.config or {})
             task.config["route_trace"] = dict(route_trace)
+        if request is not None:
+            await self._attach_opencode_session_metadata(task, request)
         return task
+
+    async def _attach_opencode_session_metadata(self, task: Task_agent, request: Request) -> None:
+        """Store only protected OpenCode Go session metadata before task persistence."""
+        provider_id = str(task.route_provider_id or "").strip()
+        if self._provider_api(provider_id) != "opencode-go":
+            return
+        if self._core is None or self._core.redis is None:
+            raise SmartRouteError(
+                code="OPENCODE_SESSION_STORE_UNAVAILABLE",
+                status_code=503,
+                message="Redis is unavailable",
+            )
+
+        provider_cfg = self._provider_cfg(provider_id)
+        session_cfg = provider_cfg.get("opencode_session")
+        session_cfg = session_cfg if isinstance(session_cfg, dict) else {}
+        try:
+            ttl_seconds = max(1, int(session_cfg.get("ttl_seconds", 86400)))
+            anonymous_ttl_seconds = max(1, int(session_cfg.get("anonymous_ttl_seconds", 3600)))
+        except (TypeError, ValueError) as exc:
+            raise SmartRouteError(
+                code="OPENCODE_GO_INVALID_CONFIG",
+                status_code=500,
+                message="OpenCode Go session TTL values must be positive integers",
+            ) from exc
+        if anonymous_ttl_seconds > ttl_seconds:
+            raise SmartRouteError(
+                code="OPENCODE_GO_INVALID_CONFIG",
+                status_code=500,
+                message="OpenCode Go anonymous session TTL cannot exceed the normal TTL",
+            )
+
+        try:
+            store = OpenCodeSessionStore.from_environment(
+                self._core.redis,
+                str(self._core.config.get("instance", "aidir")),
+            )
+        except OpenCodeSessionError as exc:
+            raise SmartRouteError(
+                code="OPENCODE_GO_INVALID_CONFIG",
+                status_code=500,
+                message=str(exc),
+            ) from exc
+
+        raw_session = str(request.headers.get("x-opencode-session") or "").strip()
+        task.config = dict(task.config or {})
+        if raw_session:
+            try:
+                reference = await store.store_caller_session(
+                    task.id,
+                    raw_session,
+                    max(1, task.queue_timeout + task.run_timeout),
+                )
+            except OpenCodeSessionError as exc:
+                raise SmartRouteError(
+                    code="OPENCODE_SESSION_STORE_UNAVAILABLE",
+                    status_code=503,
+                    message=str(exc),
+                ) from exc
+            task.config["opencode_session"] = {"caller_reference": reference}
+            return
+
+        token = self._extract_bearer_token(request)
+        envid = str((task.payload or {}).get("envid") or "").strip()
+        if token:
+            identity_source, identity_value, effective_ttl = "authenticated", token, ttl_seconds
+        elif envid:
+            identity_source, identity_value, effective_ttl = "envid", envid, ttl_seconds
+        else:
+            host = request.client.host if request.client is not None else ""
+            agent = str(request.headers.get("user-agent") or "").split("/", 1)[0].strip().lower()
+            identity_source, identity_value, effective_ttl = "anonymous", f"{host}|{agent}", anonymous_ttl_seconds
+
+        secret = os.environ.get("AIDIR_OPENCODE_SESSION_HMAC_SECRET", "")
+        digest = hmac.new(
+            secret.encode("utf-8"),
+            f"v1:{identity_source}:{identity_value}".encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        task.config["opencode_session"] = {
+            "identity_digest": digest,
+            "identity_source": identity_source,
+            "ttl_seconds": effective_ttl,
+        }
 
     def _create_task_for_payload(
         self,
@@ -418,6 +510,12 @@ class Endpoint_ollama(BaseEndpoint):
         provider_api = self._provider_api(provider_id)
         if provider_api == "llama-cpp":
             routed_worker_id = self._resolve_worker_id_by_name("call_llama_cpp")
+            return routed_worker_id or worker_id
+        if provider_api == "openai":
+            routed_worker_id = self._resolve_worker_id_by_name("call_openai")
+            return routed_worker_id or worker_id
+        if provider_api == "opencode-go":
+            routed_worker_id = self._resolve_worker_id_by_name("call_opencode_go")
             return routed_worker_id or worker_id
         if provider_api != "openaix":
             return worker_id
@@ -468,6 +566,18 @@ class Endpoint_ollama(BaseEndpoint):
                 return False
             return bool(self._core.resources.check_available_after_unload(requirements))
 
+        def check_resource_available_for_reuse(
+            requirements: dict,
+            model_id: str,
+            provider_id: str,
+        ) -> bool:
+            if self._core is None or self._core.resources is None:
+                return False
+            checker = getattr(self._core.resources, "check_available_for_reuse", None)
+            if not callable(checker):
+                return False
+            return bool(checker(requirements, model_id, provider_id))
+
         return SmartRouter(
             endpoint_id=self.id,
             default_worker_id=worker_id,
@@ -477,8 +587,10 @@ class Endpoint_ollama(BaseEndpoint):
             get_local_queue_state=get_local_queue_state,
             check_resource_available=check_resource_available,
             check_resource_available_after_unload=check_resource_available_after_unload,
+            check_resource_available_for_reuse=check_resource_available_for_reuse,
             probe_remote_model_queue_state=self._probe_remote_model_queue_state,
             probe_ollama_model_availability=self._probe_ollama_model_availability,
+            probe_openai_model_availability=self._probe_openai_model_availability,
             resolve_probe_timeout_ms=self._resolve_probe_timeout_ms,
             resolve_worker_id_for_route=self._resolve_worker_id_for_route,
             is_candidate_allowed=is_candidate_allowed,
@@ -828,6 +940,33 @@ class Endpoint_ollama(BaseEndpoint):
             if normalized_model_id in candidate_names:
                 return True
         return False
+
+    async def _probe_openai_model_availability(
+        self,
+        provider_id: str,
+        model_id: str,
+        *,
+        timeout_ms: int,
+        incoming_bearer_token: str = "",
+    ) -> bool:
+        """Confirm an OpenAI-compatible provider lists the requested model without a session."""
+        provider_cfg = self._provider_cfg(provider_id)
+        base_url = str(provider_cfg.get("baseUrl") or "").rstrip("/")
+        if base_url.endswith("/v1"):
+            base_url = base_url[:-3]
+        if not base_url:
+            return False
+        headers = self._resolve_probe_headers(provider_id, incoming_bearer_token)
+        try:
+            async with httpx.AsyncClient(timeout=max(0.001, timeout_ms / 1000.0), headers=headers) as client:
+                response = await client.get(f"{base_url}/v1/models")
+            if not 200 <= response.status_code < 300:
+                return False
+            payload = response.json()
+        except (httpx.HTTPError, ValueError):
+            return False
+        items = payload.get("data") if isinstance(payload, dict) else None
+        return any(isinstance(item, dict) and str(item.get("id") or "") == model_id for item in items or [])
 
     def _find_provider_model_cfg(self, provider_id: str, model_id: str) -> dict | None:
         """Return provider model config matched by id, name, or alias."""

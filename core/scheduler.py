@@ -155,7 +155,7 @@ class Scheduler:
                             continue
 
                     if self._resources and local_reqs:
-                        reserved = await self._resources.reserve_if_available(
+                        reserved = await self._resources.reserve_if_available_or_reuse(
                             local_reqs,
                             consumer_id=f"{task.id}:{worker.id}",
                             model_id=(task.payload or {}).get("model") or None,
@@ -431,6 +431,8 @@ class Scheduler:
                     await self._hooks.emit("llm_response_complete", task, err)
                 if await self._apply_hook_control(task):
                     return
+                if await self._fallback_smart_route_after_execution_failure(task, worker.id, err):
+                    return
                 failed_local_server_start = (
                     self._provider_api(provider_id) == "llama-cpp"
                     and str(err.get("code") or "") in {
@@ -475,6 +477,85 @@ class Scheduler:
                     provider_id=provider_id,
                     retain_model=not failed_local_server_start,
                 )
+
+    async def _fallback_smart_route_after_execution_failure(
+        self,
+        task: Task,
+        worker_id: str,
+        error: dict,
+    ) -> bool:
+        """Requeue a failed smart route on the next eligible concrete candidate."""
+        if str((error or {}).get("code") or "").upper() != "UPSTREAM_ERROR":
+            return False
+
+        route_cfg = (task.config or {}).get("route") if isinstance(task.config, dict) else None
+        if not isinstance(route_cfg, dict) or str(route_cfg.get("selection") or "") != "smart_route":
+            return False
+
+        requested_provider = str(route_cfg.get("requested_provider") or "").strip()
+        requested_model = str(
+            route_cfg.get("requested_alias")
+            or route_cfg.get("requested_model")
+            or ""
+        ).strip()
+        failed_provider = str(route_cfg.get("resolved_provider") or "").strip()
+        failed_model = str(route_cfg.get("resolved_model") or "").strip()
+        if (
+            not requested_provider
+            or not requested_model
+            or not failed_provider
+            or not failed_model
+            or self._provider_api(requested_provider) != "smart"
+        ):
+            return False
+
+        request_payload = dict(task.payload or {})
+        request_payload["model"] = requested_model
+        incoming_bearer_token = str((task.config or {}).get("incoming_bearer_token") or "").strip()
+        base_route = {
+            "requested_model": requested_model,
+            "requested_alias": str(route_cfg.get("requested_alias") or requested_model).strip(),
+            "resolved_provider": requested_provider,
+            "resolved_model": requested_model,
+        }
+
+        try:
+            resolution = await self._make_smart_router(worker_id).resolve_route(
+                base_route,
+                request_payload=request_payload,
+                request_priority=task.priority,
+                incoming_bearer_token=incoming_bearer_token,
+                excluded_candidates={(failed_provider, failed_model)},
+            )
+        except SmartRouteError:
+            return False
+
+        next_route = dict(resolution.route or {})
+        next_provider = str(next_route.get("resolved_provider") or "").strip()
+        next_model = str(next_route.get("resolved_model") or "").strip()
+        if not next_provider or not next_model or (next_provider, next_model) == (failed_provider, failed_model):
+            return False
+
+        task.config = dict(task.config or {})
+        task.config["route"] = next_route
+        task.payload = dict(task.payload or {})
+        task.payload["model"] = next_model
+        task.resource_requirements = {}
+        task.route_provider_id = next_provider
+        task.model_id = next_model
+        task.worker_id = str(next_route.get("resolved_worker") or worker_id)
+        task.next_retry_at = 0.0
+        await self._queue.add_task(task)
+        log(
+            "worker",
+            "info",
+            (
+                f"Task {task.id} smart execution fallback: "
+                f"{failed_provider}/{failed_model} -> {next_provider}/{next_model}"
+            ),
+            worker_id,
+        )
+        return True
 
     async def _apply_hook_control(self, task: Task) -> bool:
         """Apply a hook-requested retry or cancellation before delivery."""
@@ -668,6 +749,16 @@ class Scheduler:
                 return False
             return bool(self._resources.check_available_after_unload(requirements))
 
+        def check_resource_available_for_reuse(
+            requirements: dict,
+            model_id: str,
+            provider_id: str,
+        ) -> bool:
+            if self._resources is None:
+                return False
+            checker = getattr(self._resources, "check_available_for_reuse", None)
+            return bool(checker(requirements, model_id, provider_id)) if callable(checker) else False
+
         return SmartRouter(
             endpoint_id="scheduler",
             default_worker_id=worker_id,
@@ -677,6 +768,7 @@ class Scheduler:
             get_local_queue_state=get_local_queue_state,
             check_resource_available=check_resource_available,
             check_resource_available_after_unload=check_resource_available_after_unload,
+            check_resource_available_for_reuse=check_resource_available_for_reuse,
             probe_remote_model_queue_state=self._probe_remote_model_queue_state,
             probe_ollama_model_availability=self._probe_ollama_model_availability,
             resolve_probe_timeout_ms=self._resolve_probe_timeout_ms,

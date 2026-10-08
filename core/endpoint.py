@@ -19,6 +19,18 @@ class BaseEndpoint(ABC):
     id: str = ""
     api: str = ""
 
+    def _attach_ingress_logging(self, app: Any) -> None:
+        """Log every incoming HTTP request before endpoint processing."""
+        @app.middleware("http")
+        async def ingress_logging_middleware(request, call_next):
+            log(
+                "http",
+                "info",
+                f"Incoming request method={request.method} path={request.url.path}",
+                self.id or None,
+            )
+            return await call_next(request)
+
     def _warn_deprecated_request_timeout(self, endpoint_cfg: dict) -> None:
         """Warn when deprecated endpoint-level request_timeout is still configured."""
         if not isinstance(endpoint_cfg, dict) or "request_timeout" not in endpoint_cfg:

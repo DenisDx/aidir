@@ -52,6 +52,7 @@ class Endpoint_mcp(BaseEndpoint):
             audit_log=getattr(core, "audit_log", None),
         )
         attach_request_id_middleware(app)
+        self._attach_ingress_logging(app)
 
         @app.exception_handler(Exception)
         async def unhandled_exception_handler(request: Request, exc: Exception):

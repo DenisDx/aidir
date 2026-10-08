@@ -309,6 +309,31 @@ class Resources:
             )
             return True
 
+    async def reserve_if_available_or_reuse(
+        self,
+        requirements: dict[str, dict[str, int]] | None = None,
+        consumer_id: str = "",
+        model_id: str | None = None,
+        provider_id: str | None = None,
+    ) -> bool:
+        """Atomically reserve resources for a new or matching warm model."""
+        reqs = requirements or {}
+        async with self._admission_lock:
+            reusable = bool(model_id) and self.check_available_for_reuse(
+                reqs,
+                str(model_id),
+                str(provider_id or ""),
+            )
+            if not reusable and not self.check_available(reqs):
+                return False
+            await self.reserve_blind_for(
+                reqs,
+                consumer_id=consumer_id,
+                model_id=model_id,
+                provider_id=provider_id,
+            )
+            return True
+
     async def release(self, requirements: dict[str, dict[str, int]] | None = None) -> None:
         """Release previously reserved resources."""
         await self.release_for(requirements, consumer_id="")

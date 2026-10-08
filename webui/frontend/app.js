@@ -8,6 +8,7 @@ let logTimer = null;
 let logWsGeneration = 0;
 let logLiveUiBound = false;
 let refreshTimer = null;
+let tasksLoadInFlight = false;
 let runtimeState = {
   restart_requested: false,
   accepting_new_tasks: true,
@@ -397,8 +398,13 @@ async function repairCron() {
 }
 
 // ── Tasks ──────────────────────────────────────────────────────────────────
+// Refresh dashboard tasks without overlapping Redis scans.
 async function loadTasks() {
-  const [data, status] = await Promise.all([
+  if (tasksLoadInFlight) return;
+  tasksLoadInFlight = true;
+
+  try {
+    const [data, status] = await Promise.all([
     apiGet('/api/tasks'),
     apiGet('/api/status'),
   ]);
@@ -459,6 +465,9 @@ async function loadTasks() {
   if (status) {
     $('stat-workers').textContent = Object.keys(status.workers).length;
     renderResources(status.resources || []);
+  }
+  } finally {
+    tasksLoadInFlight = false;
   }
 }
 

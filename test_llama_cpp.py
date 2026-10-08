@@ -159,7 +159,7 @@ class TestLlamaCppStreamingDiagnostics(unittest.IsolatedAsyncioTestCase):
             """Capture endpoint-bound stream chunks."""
             emitted.append(chunk)
 
-        with patch("workers.agent.call_llama_cpp.app.save_llm_call"):
+        with patch("workers.agent.call_openai.app.save_llm_call"):
             result = await worker._forward_stream(
                 _Client(),
                 "http://127.0.0.1:8888/v1/chat/completions",

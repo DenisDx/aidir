@@ -1,22 +1,25 @@
-# Proposal: Universal Remote OpenAI Worker and OpenCode Go Sessions
+# Proposal: Remote OpenAI and Dedicated OpenCode Go Workers
 
 ## Decision
 
-Implement the third option: add one universal `call_openai` agent worker for
-remote servers that implement the OpenAI Chat Completions protocol. OpenCode Go
-is configured as a normal `api: "openai"` provider of that worker, not as a
-separate worker and not as an endpoint hook.
+Implement two remote agent workers:
 
-The provider-only `force_x_opencode_session` feature makes the worker add
-OpenCode Go's required `x-opencode-session` request header. It is enabled by
-default for the OpenCode Go configuration example, and disabled by default for
-ordinary OpenAI-compatible providers. This avoids leaking a vendor-specific
-header to every remote provider while keeping OpenCode Go configuration
-explicit and minimal.
+1. `call_openai` serves ordinary `api: "openai"` providers that implement
+   OpenAI Chat Completions.
+2. `call_opencode_go` serves only `api: "opencode-go"` providers. It implements
+   OpenCode Go's documented Chat Completions endpoint, provider authentication,
+   coding-agent User-Agent, and stable `x-opencode-session` behavior.
 
-`call_llama_cpp` remains separate because it owns a local llama.cpp process and
-therefore has materially different lifecycle, health, and resource behavior.
-The existing `call_ollama` remains separate because it speaks the incompatible
+OpenCode Go is deliberately not configured as a generic OpenAI provider. Its
+provider-specific requirements stay isolated in `call_opencode_go`, so a
+vendor header, generated session binding, and required User-Agent can never
+leak to a normal OpenAI-compatible server.
+
+`call_openai` owns the shared OpenAI Chat Completions request conversion,
+response conversion, streaming, authentication, timeout, cancellation, retry,
+and observability behavior. `call_llama_cpp` subclasses it and adds only the
+local llama.cpp process lifecycle before invoking that shared transport.
+`call_ollama` remains separate because it speaks the incompatible
 Ollama `/api/chat` protocol. The existing `openaix` worker is also not a
 candidate for reuse: despite its name, it converts public OpenAIx requests to
 outbound Ollama requests.
@@ -33,9 +36,9 @@ outbound Ollama requests.
 4. Redis is already the authoritative cross-process store for tasks. It is the
    correct store for a session binding that must survive a queue delay, retry,
    and service restart.
-5. No current outbound worker speaks OpenAI Chat Completions. Adding an
-   OpenCode-only worker would duplicate the future generic remote OpenAI
-   transport and response conversion.
+5. Existing llama.cpp OpenAI conversion and SSE handling can move into
+   `call_openai` without changing their behavior. This makes `call_openai` the
+   reusable transport base while llama.cpp retains only its local-server logic.
 
 ## Scope
 
@@ -46,7 +49,7 @@ Initial scope is the OpenAI Chat Completions protocol only:
 - OpenAI bearer authentication or an explicitly configured static header;
 - configured OpenAI-compatible models, including OpenCode Go models;
 - direct routes and `api: "smart"` routes;
-- optional OpenCode session injection.
+- mandatory OpenCode Go session injection for `api: "opencode-go"` providers.
 
 The worker must not infer Anthropic, Responses API, Ollama, or custom protocols
 from model names or upstream errors. Those are separate adapters and require
@@ -61,14 +64,12 @@ resource requirements retain their current meaning.
 "models": {
   "providers": {
     "opencode_go": {
-      "api": "openai",
-      "baseUrl": "${OPENCODE_GO_BASE_URL}",
+      "api": "opencode-go",
+      "baseUrl": "${OPENCODE_GO_BASE_URL:-https://opencode.ai/zen/go}",
       "auth": {
         "type": "bearer",
         "token": "${OPENCODE_GO_API_KEY}"
       },
-      // OpenCode Go-specific extension; true is the intended default here.
-      "force_x_opencode_session": true,
       "opencode_session": {
         "ttl_seconds": 86400,
         "anonymous_ttl_seconds": 3600
@@ -96,6 +97,11 @@ resource requirements retain their current meaning.
     "call_openai": {
       "enabled": true,
       "request_timeout": ${REQUEST_TIMEOUT:-100}
+    },
+    "call_opencode_go": {
+      "enabled": true,
+      "request_timeout": ${REQUEST_TIMEOUT:-100},
+      "user_agent": "aidir/1.0"
     }
   }
 }
@@ -103,35 +109,37 @@ resource requirements retain their current meaning.
 
 Rules:
 
-1. `api: "openai"` means OpenAI Chat Completions over HTTP; `baseUrl` is
-   required and cannot include a request path.
-2. `force_x_opencode_session` is a boolean provider option. It defaults to
-   `false` when omitted. OpenCode Go configurations must set it to `true`;
-   the shipped OpenCode example documents `true` as its default.
-3. When the flag is `true`, `opencode_session.ttl_seconds` defaults to `86400`
+1. `api: "openai"` means OpenAI Chat Completions over HTTP. `api:
+   "opencode-go"` means OpenCode Go Chat Completions over HTTP. `baseUrl` is
+   required and cannot include an endpoint suffix such as
+   `/v1/chat/completions`.
+2. An `opencode-go` provider always enables managed session behavior; it has
+   no `force_x_opencode_session` switch. The shipped OpenCode Go example uses
+   `https://opencode.ai/zen/go` as its base URL.
+3. For an `opencode-go` provider, `opencode_session.ttl_seconds` defaults to `86400`
    and `anonymous_ttl_seconds` defaults to `3600`. Both must be positive
    integers, and the anonymous TTL cannot exceed the normal TTL.
 4. A provider's configured authentication takes priority. Forwarding a
    caller's bearer token remains only the existing explicit fallback behavior;
    it is never used as an OpenCode session value.
-5. The implementation should use repository-standard snake_case JSON keys.
-   The proposal's option corresponds to the requested
-   `force-x-opencode-session` behavior, not a second hyphenated alias.
+5. `call_opencode_go` sends its configured non-empty `user_agent` and must
+   reject an absent or generic HTTP-library User-Agent value.
 
 ## Request and Routing Flow
 
 1. The endpoint authenticates and normalizes the inbound OpenAIx or Ollama
    request as it does today.
 2. Before queueing, it resolves smart routes to a concrete provider and model.
-   When the resolved provider has `api: "openai"`, it selects `call_openai`.
+   A resolved `api: "openai"` provider selects `call_openai`; a resolved
+   `api: "opencode-go"` provider selects `call_opencode_go`.
 3. The endpoint captures only the information needed for session selection:
    a caller-supplied non-empty `x-opencode-session`, or a non-secret identity
    fingerprint. It places this protected internal metadata in task config; it
    must not add the raw header to the public payload.
 4. `call_openai` converts the normalized internal messages, tools, generation
    options, and stream flag to the OpenAI Chat Completions request shape.
-5. If session forcing is enabled, it resolves the session described below and
-   adds exactly one `x-opencode-session` upstream header.
+5. For an OpenCode Go task, `call_opencode_go` resolves the session described
+   below and adds exactly one `x-opencode-session` upstream header.
 6. The worker translates the upstream JSON or SSE response to aidir's existing
    internal result/chunk format. The public endpoint retains responsibility for
    rendering Ollama or OpenAIx responses.
@@ -141,11 +149,13 @@ HTTP timeout, audit, task cancellation, retry, and error conventions.
 
 ## OpenCode Session Contract
 
-When `force_x_opencode_session` is `true`, the worker sends exactly one
+For every `api: "opencode-go"` inference request, `call_opencode_go` sends exactly one
 `x-opencode-session` header on every inference request:
 
 1. If the client supplied a non-empty header, forward it unchanged. Do not
-   store it, rewrite it, expose it in a response, or include it in logs.
+   place it in task metadata, rewrite it, expose it in a response, or include
+   it in logs. Store it only in a separate, encrypted, single-task Redis value
+   that expires after the task's permitted queue and request lifetime.
 2. Otherwise, look up a server-managed session binding for the resolved
    provider, upstream model, and client identity.
 3. If absent, atomically create an opaque UUID value and store it in Redis
@@ -189,16 +199,16 @@ generate an unpersisted session.
 
 ## Smart Routing and Health
 
-`api: "openai"` models become normal concrete candidates of `api: "smart"`
-models. The route is resolved before session allocation, so each binding is
-keyed to the actual selected provider/model and a health probe never creates a
-session.
+`api: "openai"` and `api: "opencode-go"` models become normal concrete
+candidates of `api: "smart"` models. The route is resolved before session
+allocation, so each binding is keyed to the actual selected provider/model and
+a health probe never creates a session.
 
-The smart router should treat a configured remote OpenAI provider as a remote
-candidate, rather than its current special case for `api: "openaix"`. Initial
-availability probing uses a bounded, session-free configured health URL (with
-`/v1/models` as the default only where supported). A failed probe makes a
-candidate ineligible; it does not send `x-opencode-session`.
+The smart router should treat configured remote OpenAI and OpenCode Go providers
+as remote candidates, rather than its current special case for `api:
+"openaix"`. Initial availability probing uses a bounded, session-free
+`GET {baseUrl}/v1/models`. A failed probe makes a candidate ineligible; it does
+not send `x-opencode-session`.
 
 ## Error Handling and Observability
 
@@ -209,6 +219,11 @@ Errors must be explicit and follow existing endpoint compatibility envelopes:
 - `OPENAI_UPSTREAM_TIMEOUT`
 - `OPENAI_UPSTREAM_ERROR`
 - `OPENAI_UPSTREAM_INVALID_RESPONSE`
+- `OPENCODE_GO_INVALID_CONFIG`
+- `OPENCODE_GO_UPSTREAM_UNREACHABLE`
+- `OPENCODE_GO_UPSTREAM_TIMEOUT`
+- `OPENCODE_GO_UPSTREAM_ERROR`
+- `OPENCODE_GO_UPSTREAM_INVALID_RESPONSE`
 - `OPENCODE_SESSION_STORE_UNAVAILABLE`
 
 Logs and metrics may include provider ID, model ID, protocol, stream mode,
@@ -218,18 +233,22 @@ and prompt content.
 
 ## Implementation Plan
 
-1. Add configuration validation and the documented `call_openai` worker entry.
-2. Add `api: "openai"` worker resolution in both endpoint route selection and
-   smart-route resolution; preserve the dedicated llama.cpp mapping.
+1. Add configuration validation and the documented `call_openai` and
+   `call_opencode_go` worker entries.
+2. Add `api: "openai"` and `api: "opencode-go"` worker resolution in both
+   endpoint route selection and smart-route resolution; preserve the dedicated
+   llama.cpp mapping.
 3. Capture and sanitize the incoming OpenCode session/identity context before
    task persistence.
 4. Implement a small Redis-backed session-binding component with atomic
    creation, TTL refresh, redaction, and failure reporting.
 5. Implement `call_openai` using existing worker logging, LLM-call history,
    timeout, cancellation, retry, and streaming conventions.
-6. Extend smart-route probing to remote `api: "openai"` providers without
-   allocating a session.
-7. Add the provider example and user-facing configuration documentation after
+6. Implement `call_opencode_go` with the same response conversion plus its
+   mandatory User-Agent and session policy.
+7. Extend smart-route probing to remote `api: "openai"` and
+   `api: "opencode-go"` providers without allocating a session.
+8. Add the provider example and user-facing configuration documentation after
    the code and tests establish the final field semantics.
 
 ## Validation
@@ -237,27 +256,135 @@ and prompt content.
 Focused tests must prove:
 
 1. a direct and a smart route to `api: "openai"` select `call_openai`;
-2. llama.cpp and Ollama retain their current workers;
-3. sync and streaming OpenAI responses preserve the existing public OpenAIx and
-   Ollama response contracts;
-4. configured provider authentication is applied and secrets are redacted;
-5. a supplied `x-opencode-session` is forwarded unchanged and never persisted;
-6. one authenticated client/model reuses its managed session within TTL;
-7. different authenticated clients receive different sessions;
-8. anonymous identity is digested before task persistence and is scoped to the
-   short anonymous TTL;
-9. concurrent first requests create and use one binding;
-10. Redis failure is visible as a task error, not a transient random session;
-11. session-free health probes do not create Redis session bindings;
-12. headers and session values never appear in task results, audit payloads, or
+2. a direct and a smart route to `api: "opencode-go"` select
+    `call_opencode_go`;
+3. llama.cpp and Ollama retain their current workers;
+4. sync and streaming OpenAI responses preserve the existing public OpenAIx and
+    Ollama response contracts;
+5. configured provider authentication is applied and secrets are redacted;
+6. an OpenCode Go request has a configured coding-agent User-Agent and a
+    supplied `x-opencode-session` is forwarded unchanged and never persisted;
+7. one authenticated client/model reuses its managed session within TTL;
+8. different authenticated clients receive different sessions;
+9. anonymous identity is digested before task persistence and is scoped to the
+    short anonymous TTL;
+10. concurrent first requests create and use one binding;
+11. Redis failure is visible as a task error, not a transient random session;
+12. session-free health probes do not create Redis session bindings;
+13. headers and session values never appear in task results, audit payloads, or
     ordinary logs.
 
-## Open Question Requiring Confirmation
+## Confirmed OpenCode Go Contract
 
-The target OpenCode Go deployment must provide a verified OpenAI Chat
-Completions endpoint and model-listing or health endpoint. Before implementation,
-capture redacted fixtures for one non-streaming and one streaming request,
-including the exact response to a valid `x-opencode-session`. If it instead
-requires a different upstream protocol, retain this universal OpenAI worker and
-add a separate named protocol adapter rather than changing behavior based on
-provider branding.
+The official OpenCode Go documentation confirms the following contract:
+
+1. Chat Completions-capable models use
+   `POST https://opencode.ai/zen/go/v1/chat/completions`.
+2. Model discovery uses
+   `GET https://opencode.ai/zen/go/v1/models`.
+3. Requests authenticate with the OpenCode Go API key as a bearer token.
+4. Clients must identify themselves with a non-generic coding-agent
+   `User-Agent` and send a stable session ID using `x-opencode-session` for
+   each conversation.
+
+OpenCode Go also exposes Responses and Anthropic Messages paths for models that
+require them. They are out of this initial scope: an `opencode-go` provider may
+configure only models documented as Chat Completions-compatible. A future named
+adapter may add the other protocols without changing the `call_openai` contract.
+
+The session-digest secret is initially loaded from `.env` as
+`AIDIR_OPENCODE_SESSION_HMAC_SECRET`. It is required whenever an
+`opencode-go` provider creates a managed session. Rotation is an operational
+restart that creates new managed bindings; prior bindings expire by their
+existing TTL.
+
+The default session-free health check for both remote provider types is
+`GET {baseUrl}/v1/models`. AIDIR already exposes `GET /v1/models` from its
+OpenAIx endpoint and must retain that behavior.
+
+## Execution Phases and Plan
+
+### Phase 0: Resolve external contracts
+
+Implement the confirmed contract and capture redacted synchronous and streaming
+fixtures against a reachable OpenCode Go deployment. **Exit criterion:** the
+configuration fields, request URL, health URL, and expected synchronous and
+SSE response shapes are verified against OpenCode Go.
+
+### Phase 1: Establish configuration and routing
+
+Add validated `api: "openai"` and `api: "opencode-go"` provider configuration
+and worker registration. Extend direct and smart routing to resolve
+`call_openai` and `call_opencode_go` while preserving the existing llama.cpp
+and Ollama mappings. Add route-selection and invalid-configuration tests.
+**Exit criterion:** direct and smart routes select the dedicated worker for
+each valid provider type.
+
+### Phase 2: Implement secure session binding
+
+Capture the permitted inbound session context before queue persistence and add
+the Redis binding component for `call_opencode_go`, with atomic creation, TTL
+handling, redaction, and explicit storage errors. Add identity-isolation,
+concurrency, expiry, and Redis-failure tests. **Exit criterion:** all managed
+and caller-supplied OpenCode Go session paths satisfy the session contract
+without persisting secret values.
+
+### Phase 3: Implement transport and compatibility
+
+Implement synchronous and streaming Chat Completions transport for
+`call_openai` and `call_opencode_go`. The Go worker must add the documented
+User-Agent and session header; both workers must use established response
+conversion, authentication, cancellation, timeout, retry, and error mapping.
+Use the verified OpenCode fixtures and add generic OpenAI-compatible fixtures.
+**Exit criterion:** both public OpenAIx and Ollama response contracts remain
+compatible for synchronous and streaming requests.
+
+### Phase 4: Integrate health, documentation, and release validation
+
+Add session-free health probing for smart routes, document the provider
+configuration, and execute the focused validation suite listed above.
+Perform a redaction review of task records, audit payloads, logs, and metrics.
+**Exit criterion:** health probes never allocate sessions, all focused tests
+pass, and the released example config works against the verified OpenCode Go
+deployment.
+
+## Implementation Status and Remaining Release Work
+
+The following implementation work is complete:
+
+- `call_openai` is the shared OpenAI Chat Completions transport; `call_llama_cpp`
+  extends it only with local server lifecycle behavior.
+- Direct provider routing recognizes `api: "openai"` and `api: "opencode-go"`;
+  the OpenCode Go provider and two Chat Completions model aliases are configured.
+- `call_opencode_go` applies the dedicated User-Agent and session-header policy.
+- The endpoint persists only encrypted caller-session references or HMAC
+  identity digests; managed bindings use atomic Redis creation and successful
+  response TTL refresh.
+- Caller-session records are deleted on task completion, with TTL as a fallback.
+- Smart routing probes `GET {baseUrl}/v1/models` for OpenAI and OpenCode Go
+  candidates without allocating a session.
+- Existing focused OpenAI, llama.cpp, queue-state, queue-timeout, and response
+  compatibility tests pass after the transport refactor.
+
+The following work is required before release:
+
+1. Add configuration validation at startup for provider base URL, OpenCode Go
+   Chat Completions-only models, configured authentication, session TTLs,
+   `AIDIR_OPENCODE_SESSION_HMAC_SECRET`, and a non-generic User-Agent.
+2. Add focused tests for direct and smart worker selection, `/v1/models`
+   success/failure behavior, supplied and managed sessions, identity isolation,
+   expiry, concurrent Redis creation, cleanup, Redis failure, and redaction.
+3. Add a regression proving that a health probe never creates a session
+   binding or caller-session record.
+4. Perform an explicit audit/log/task serialization review for Authorization,
+   `x-opencode-session`, identity input values, and encrypted session records.
+5. Normalize all generic and OpenCode-specific upstream failures to the
+   documented `OPENAI_*` and `OPENCODE_GO_*` error codes.
+6. Document the provider configuration, required environment variable names,
+   aliases, protocol limitation, and base URL semantics in `README.md` and
+   each localized `README_*.md`.
+7. Capture redacted synchronous and streaming OpenCode Go fixtures, then run a
+   live smoke test for `/v1/models`, synchronous Chat Completions, and SSE.
+
+Items 1-7 are release gates. Responses API and Anthropic Messages support are
+explicitly out of scope and are not release blockers for this proposal.

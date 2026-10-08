@@ -62,6 +62,7 @@ class Endpoint_openaix(Endpoint_ollama):
             audit_log=getattr(core, "audit_log", None),
         )
         attach_request_id_middleware(app)
+        self._attach_ingress_logging(app)
 
         @app.exception_handler(Exception)
         async def unhandled_exception_handler(request: Request, exc: Exception):
@@ -271,6 +272,7 @@ class Endpoint_openaix(Endpoint_ollama):
                 stream,
                 incoming_bearer_token=incoming_bearer_token,
                 route_trace=route_trace,
+                request=request,
             )
         except SmartRouteError as exc:
             self._audit_pre_task_rejection(request, protocol="ollama", status_code=exc.status_code, error_code=exc.code, reason=str(exc))
@@ -360,6 +362,7 @@ class Endpoint_openaix(Endpoint_ollama):
                 stream,
                 incoming_bearer_token=incoming_bearer_token,
                 route_trace=route_trace,
+                request=request,
             )
         except SmartRouteError as exc:
             self._audit_pre_task_rejection(request, protocol="openai", status_code=exc.status_code, error_code=exc.code, reason=str(exc))
@@ -458,6 +461,7 @@ class Endpoint_openaix(Endpoint_ollama):
                 request_kind="embed",
                 incoming_bearer_token=incoming_bearer_token,
                 route_trace=route_trace,
+                request=request,
             )
         except SmartRouteError as exc:
             self._audit_pre_task_rejection(request, protocol=protocol, status_code=exc.status_code, error_code=exc.code, reason=str(exc))
@@ -566,6 +570,7 @@ class Endpoint_openaix(Endpoint_ollama):
         request_kind: str = "chat",
         incoming_bearer_token: str = "",
         route_trace: dict | None = None,
+        request: Request | None = None,
     ):
         """Create Task_agent and resolve smart routes before queueing when needed."""
         payload = self._apply_generation_defaults(payload)
@@ -593,6 +598,8 @@ class Endpoint_openaix(Endpoint_ollama):
         if isinstance(route_trace, dict):
             task.config = dict(task.config or {})
             task.config["route_trace"] = dict(route_trace)
+        if request is not None:
+            await self._attach_opencode_session_metadata(task, request)
         return task
 
     def _create_task_for_payload(

@@ -42,6 +42,8 @@ class SmartRouter:
         probe_remote_model_queue_state: Callable[..., Awaitable[dict | None]],
         probe_ollama_model_availability: Callable[..., Awaitable[bool]] | None,
         resolve_probe_timeout_ms: Callable[[dict], int],
+        check_resource_available_for_reuse: Callable[[dict, str, str], bool] | None = None,
+        probe_openai_model_availability: Callable[..., Awaitable[bool]] | None = None,
         resolve_worker_id_for_route: Callable[[str, dict | None], str] | None = None,
         is_candidate_allowed: Callable[[str, str], bool] | None = None,
         on_selection: Callable[[dict], None] | None = None,
@@ -55,8 +57,10 @@ class SmartRouter:
         self._get_local_queue_state = get_local_queue_state
         self._check_resource_available = check_resource_available
         self._check_resource_available_after_unload = check_resource_available_after_unload
+        self._check_resource_available_for_reuse = check_resource_available_for_reuse
         self._probe_remote_model_queue_state = probe_remote_model_queue_state
         self._probe_ollama_model_availability = probe_ollama_model_availability
+        self._probe_openai_model_availability = probe_openai_model_availability
         self._resolve_probe_timeout_ms = resolve_probe_timeout_ms
         self._resolve_worker_id_for_route = resolve_worker_id_for_route
         self._is_candidate_allowed = is_candidate_allowed
@@ -70,8 +74,9 @@ class SmartRouter:
         request_payload: dict | None,
         request_priority: int | None = None,
         incoming_bearer_token: str = "",
+        excluded_candidates: set[tuple[str, str]] | None = None,
     ) -> SmartRouteResolution:
-        """Resolve one smart alias route into a concrete provider/model/worker selection."""
+        """Resolve one smart alias route while skipping excluded concrete candidates."""
         requested_provider = str(route.get("resolved_provider") or "").strip()
         requested_model = str(route.get("resolved_model") or "").strip()
         smart_model_cfg = self._find_provider_model_cfg(requested_provider, requested_model)
@@ -101,8 +106,27 @@ class SmartRouter:
         effective_priority = self.resolve_request_priority(request_payload) if request_priority is None else self._normalize_priority(request_priority)
         busy_candidates: list[dict] = []
         candidate_probes: list[dict] = []
+        excluded = {
+            (str(provider_id).strip(), str(model_id).strip())
+            for provider_id, model_id in (excluded_candidates or set())
+        }
 
         for index, item in enumerate(items):
+            if isinstance(item, dict):
+                candidate_key = (
+                    str(item.get("provider") or "").strip(),
+                    str(item.get("model") or "").strip(),
+                )
+                if candidate_key in excluded:
+                    candidate_probes.append(
+                        self.candidate_probe_record(
+                            index,
+                            item,
+                            probe_ok=False,
+                            reason="excluded_after_execution_failure",
+                        )
+                    )
+                    continue
             candidate = await self.evaluate_candidate(
                 item,
                 request_priority=effective_priority,
@@ -198,6 +222,34 @@ class SmartRouter:
         except Exception:
             fallback_prio = int(index)
         timeout_ms = self._resolve_probe_timeout_ms(item)
+        provider_api = self._provider_api(provider_id)
+
+        if provider_api in {"openai", "opencode-go"} and self._probe_openai_model_availability is not None:
+            probe_ok = bool(
+                await self._probe_openai_model_availability(
+                    provider_id,
+                    model_id,
+                    timeout_ms=timeout_ms,
+                    incoming_bearer_token=incoming_bearer_token,
+                )
+            )
+            if not probe_ok:
+                return {
+                    "provider": provider_id, "model": model_id, "index": index,
+                    "fallback_prio": fallback_prio, "can_run_now": False,
+                    "queue_state": None, "probe_ok": False,
+                    "probe_source": f"{provider_api}_models",
+                    "probe_latency_ms": int((time.perf_counter() - started_at) * 1000),
+                    "probe_error": "probe_failed", "routing_eligible": False,
+                }
+            return {
+                "provider": provider_id, "model": model_id, "index": index,
+                "fallback_prio": fallback_prio, "can_run_now": True,
+                "queue_state": None, "probe_ok": True,
+                "probe_source": f"{provider_api}_models",
+                "probe_latency_ms": int((time.perf_counter() - started_at) * 1000),
+                "routing_eligible": True,
+            }
 
         if requirements is not None and self._get_local_queue_state is not None and self._check_resource_available is not None:
             queue_state = await self._get_local_queue_state(requirements, request_priority)
@@ -206,8 +258,10 @@ class SmartRouter:
                 resource_ready_after_unload = bool(
                     self._check_resource_available_after_unload(requirements)
                 ) if self._check_resource_available_after_unload is not None else resource_ready
+                resource_reusable = bool(
+                    self._check_resource_available_for_reuse(requirements, model_id, provider_id)
+                ) if self._check_resource_available_for_reuse is not None else False
                 blocked_by_same_or_higher = int(queue_state.get("queued_count_total") or 0) - int(queue_state.get("queued_count_below_priority") or 0)
-                provider_api = self._provider_api(provider_id)
                 if provider_api in {"ollama", "llama-cpp"} and self._probe_ollama_model_availability is not None:
                     probe_ok = bool(
                         await self._probe_ollama_model_availability(
@@ -236,13 +290,14 @@ class SmartRouter:
                     "model": model_id,
                     "index": index,
                     "fallback_prio": fallback_prio,
-                    "can_run_now": resource_ready_after_unload and blocked_by_same_or_higher == 0,
+                    "can_run_now": (resource_ready_after_unload or resource_reusable) and blocked_by_same_or_higher == 0,
                     "queue_state": queue_state,
                     "probe_ok": True,
                     "probe_source": "local" if provider_api not in {"ollama", "llama-cpp"} else f"{provider_api}_http",
                     "probe_latency_ms": int((time.perf_counter() - started_at) * 1000),
                     "resource_ready": resource_ready,
                     "resource_ready_after_unload": resource_ready_after_unload,
+                    "resource_reusable": resource_reusable,
                     "routing_eligible": True,
                 }
 

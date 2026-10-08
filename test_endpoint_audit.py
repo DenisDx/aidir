@@ -7,6 +7,7 @@ import hashlib
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 from fastapi.responses import JSONResponse
@@ -57,6 +58,32 @@ class _Core:
 
 class EndpointAuditTests(unittest.TestCase):
     """Verify the endpoint writes request and response audit events after task creation."""
+
+    def test_every_endpoint_logs_ingress_before_route_matching(self) -> None:
+        """Log an incoming request even when no endpoint route matches it."""
+        endpoints = (
+            Endpoint_ollama({"id": "ollama", "worker": "call_ollama"}),
+            Endpoint_openaix({"id": "openaix", "worker": "openaix"}),
+            Endpoint_mcp({"id": "mcp", "tools": {"echo": "echo_worker"}}),
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            core = _Core(AuditLog(temporary_directory))
+            with patch("core.endpoint.log") as logger:
+                for endpoint in endpoints:
+                    with self.subTest(endpoint=endpoint.id), TestClient(endpoint.create_app(core)) as client:
+                        response = client.get("/ingress-test")
+                        self.assertEqual(response.status_code, 404)
+
+            expected_messages = {
+                endpoint.id: f"Incoming request method=GET path=/ingress-test"
+                for endpoint in endpoints
+            }
+            actual_messages = {
+                call.args[3]: call.args[2]
+                for call in logger.call_args_list
+                if call.args[:2] == ("http", "info")
+            }
+        self.assertEqual(actual_messages, expected_messages)
 
     def test_sync_chat_records_correlated_request_and_response(self) -> None:
         """Write matching client audit records containing the visible JSON payloads."""
