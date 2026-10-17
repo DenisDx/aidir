@@ -13,7 +13,7 @@ from urllib.parse import quote
 
 import httpx
 
-from core.config import Config
+from core.config import Config, config
 
 
 OVERSHOOT_RATIO = 1.08
@@ -63,8 +63,8 @@ def print_run_instructions(script_name: str) -> None:
 
 
 def load_runtime_config() -> Config:
-    """Load config.json5 from the repository root."""
-    return Config(Path(__file__).with_name("config.json5"))
+    """The configuration of this repository, as the running system sees it."""
+    return config
 
 
 def resolve_openaix_base_url(config: Config) -> str:
@@ -192,9 +192,9 @@ def main() -> int:
         return 1
 
     print_run_instructions(Path(__file__).name)
-    config = load_runtime_config()
-    base_url = resolve_openaix_base_url(config)
-    headers = resolve_auth_headers(config)
+    runtime_config = load_runtime_config()
+    base_url = resolve_openaix_base_url(runtime_config)
+    headers = resolve_auth_headers(runtime_config)
     payload, approx_chars, approx_tokens = build_payload(args.model, args.context_tokens)
 
     print(f"Endpoint: {base_url}")

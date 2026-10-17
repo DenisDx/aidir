@@ -111,9 +111,57 @@ python -m unittest -v \
   test_response_transparency \
   test_viewer_search \
   test_webui_live_logs
+
+# Settings subsystem (descriptors and the aiset host adapter)
+python -m unittest -v \
+  test_config_descriptor \
+  test_settings_backend \
+  test_settings_parity \
+  test_frontend_boot_order
 ```
 
-A focused test run is not a replacement for the full suite before a release.
+`test_frontend_boot_order` runs the real front-end sources in Node against a
+minimal DOM, in the order `index.html` loads them, and reports the page before
+and after sign-in. HTTP tests cannot cover this: their requests are already
+authenticated, so an editor that initialises before the login still looks
+correct. The suite covers a boot helper that was called but not defined, an
+editor initialised before authentication, and the document list read from a
+response envelope `apiGet` never produces. It is skipped when `node` is absent.
+
+`test_settings_parity` compares the running backend against an independent
+reference reader over the same `config.json5` and the same `.env`: every leaf,
+every value, and every merged worker entry. It is the automated half of the dual
+run described in `plan_aiset_integration.md`.
+
+### 4.1 Settings descriptor gate
+
+The descriptors are a contract, not documentation: aiset treats an undeclared
+key as a hard error and then refuses to load the whole document. Run these
+before every change that touches `config.json5`, `config.json5.example`, a
+worker `config.json5`, or any `descriptor.json5`.
+
+```bash
+# 1. Descriptor grammar: no unknown property, no malformed node
+for f in config.types.json5 config.descriptor.json5 \
+         workers/agent/call_ollama/descriptor.json5 \
+         workers/agent/openaix/descriptor.json5 \
+         workers/context/context_builder/descriptor.json5 \
+         workers/tool/http_api/descriptor.json5 \
+         workers/tool/web_fetch/descriptor.json5 \
+         workers/tool/web_search/descriptor.json5; do
+  aiset/.venv/bin/aiset validate-descriptor "$f" --strict \
+      --typedef config.types.json5 --format text
+done
+
+# 2. Both shipped root configurations and every worker file must load clean
+python -m unittest -v test_config_descriptor
+```
+
+Expected: every descriptor prints `valid: True`, and the test run ends with
+`OK`. A failure names the exact configuration path that the descriptor does not
+cover; add the missing declaration to the descriptor, do not relax the test.
+
+## 5. Smoke test after startup or deployment
 
 ## 5. Smoke test after startup or deployment
 
@@ -220,9 +268,47 @@ viewer, logs, and WebSocket live updates.
 | Queue | Priority ordering, queued/running/completed transitions, timeout and cancellation behavior |
 | Routing | Direct provider/model route and smart route; expected fallback after an unavailable provider |
 | Resources | Admission, reuse of already loaded resources, queue-state endpoint, and release after completion |
-| WebUI | Login, status, tasks, viewer search, logs, config display, and live log updates |
+| WebUI | Login, status, tasks, viewer search, logs, and live log updates |
+| Settings (aiset) | See the manual steps in section 7.1 |
 | Recovery | Core restart with Redis retained; Docker service restart; no orphaned running tasks or leaked locks |
 | Observability | Expected status codes and useful error messages; no request bodies, credentials, or tokens in logs |
+
+### 7.1 Manual acceptance: the generated settings editor
+
+The editor is always active; restart aidir, sign in, and open **Settings**.
+
+What is already covered without a browser, and therefore needs no manual step:
+that the three assets are served and loaded in dependency order, that every asset
+the page names sits under a prefix nginx forwards, that every element the editor
+mounts into exists, that every one of the seven documents returns a populated tree
+snapshot, that a node carries its description, its comments, its `apply` policy and
+its `secret` flag, and that a declared but unwritten setting is reported as absent
+(`test_settings_backend.py`). The steps below are the ones a browser can answer and
+a script cannot.
+
+Open the page through nginx (`http://localhost:${NGINX_HTTP_PORT}`, port `8080` by
+default), not straight at the WebUI backend: the failure that produced the asset
+error of 2026-10-17 was visible only through the proxy, which answers a script
+request outside the forwarded prefixes with the SPA page and status `200`. To
+confirm the delivery path by hand:
+
+```bash
+curl -sI "http://localhost:${NGINX_HTTP_PORT:-8080}/api/settings/assets/aiset-tree.js" | head -2
+# expect: HTTP 200 and Content-Type: application/javascript, not text/html
+```
+
+| Step | Expected |
+|---|---|
+| Open **Settings** | The document selector lists `main` and one entry per worker-local configuration; the tree renders with descriptions |
+| Expand `logging` | Every node shows its type, its description, the file comments and the `apply` policy (`live`, `reload`, `restart`) |
+| Change `logging.level` and press **Apply** | One atomic write; `config.json5` keeps its comments, quoting and every `${VAR}` placeholder; the status line reports the application state |
+| Open the `.env` button on a node that holds `${VAR}` | The variable name and the inline fallback are editable separately, and the placeholder is not lost |
+| Change a value in `redis.password` or `webui.auth.users[].password` | The value is stored as a placeholder; without the secret permission the whole subtree is denied, not blanked |
+| Edit a worker document (`worker:tool:web_search`) | The same editor, the same rules, writing that worker's own `config.json5` |
+| Press **Reload settings** | Every document is re-read; the effective values in the rest of the WebUI follow |
+| Set a port (for example `webui.port`) and read the state | The node reports `restart_required`; the value is not live |
+| Introduce a deliberate error (for example a port above 65535) and press **Apply** | The batch is refused with a path and a rule; the file is byte-for-byte unchanged |
+| Press **Restart aidir** | The restart proceeds after the confirmation dialog |
 
 Record the date, commit, configuration variant, commands, result, and relevant
 log excerpts for failed checks. A test is passing only when its expected

@@ -1,0 +1,761 @@
+// config.types.json5 - reusable shapes of the aidir configuration.
+//
+// WHAT THIS FILE IS
+//   A declaration-only descriptor. Every node in `root.children` below carries
+//   `typedef: "<name>"`, which publishes it as a reusable shape. Other
+//   descriptors reference a shape by writing `type: "<name>"` at a node, and
+//   aiset replaces that node with the declaration from this file, so two places
+//   that describe the same thing can never drift apart.
+//
+// HOW IT IS WIRED
+//   config.descriptor.json5 and every worker descriptor.json5 import this file
+//   through the `typedef_sources` argument of `aiset.service.Service.register`.
+//   That wiring lives in core/settings/runtime.py and in core/settings/documents.py;
+//   nothing here is loaded implicitly.
+//
+// HOW TO CHECK IT
+//   aiset/.venv/bin/aiset validate-descriptor config.types.json5 --strict
+//   aiset/.venv/bin/aiset validate-descriptor config.descriptor.json5 --strict \
+//       --typedef config.types.json5
+//
+// WHY IT IS A SEPARATE FILE
+//   Templates have to be declared as named children of some descriptor root.
+//   Declaring them inside config.descriptor.json5 would add fifteen phantom
+//   fields to the top level of the real configuration. A separate file keeps
+//   the contract of config.json5 free of anything that is not a setting, and
+//   lets the worker descriptors reuse exactly the same shapes.
+//
+// A template must declare a primitive `type` of its own and must never be
+// referenced by name from inside itself.
+
+{
+  descriptor_version: "1.0",
+  project: "aidir-types",
+  config_version: "1.0",
+
+  root: {
+    type: "object",
+    description: "Declaration-only root of the aidir reusable configuration shapes",
+    children: {
+
+      // ── Primitives reused everywhere ─────────────────────────────────
+
+      log_level: {
+        typedef: "log_level",
+        type: "union",
+        description: "Logging threshold: a level name or the systemd-journald number 0-7",
+        children_options: [
+          {
+            type: "string",
+            enum: [
+              "emerg", "alert", "crit", "critical", "error",
+              "warn", "warning", "notice", "info", "debug", "notset",
+            ],
+            description: "Named logging threshold",
+          },
+          {
+            type: "int",
+            minimum: 0,
+            maximum: 7,
+            description: "Numeric logging threshold on the systemd-journald scale",
+          },
+        ],
+      },
+
+      // A named tool of a worker.
+      //
+      // Two spellings exist in aidir:
+      //   "search": { "worker": "web_search" }   - a reference to a tool worker
+      //   "mytool": { "description": ..., "inputSchema": ... }  - an internal
+      //                                               tool declaration
+      // Both are accepted here. The schema of an internal declaration is free-form
+      // JSON and is declared `any`; the descriptive fields around it are declared,
+      // so a typo in a field name is still an error.
+      worker_tool: {
+        typedef: "worker_tool",
+        type: "union",
+        description: "One tool made available to a worker: a reference to a tool worker, or an internal tool declaration",
+        children_options: [
+          {
+            type: "string",
+            min_length: 1,
+            description: "Short form: the id of the worker that implements this tool",
+          },
+          {
+            type: "object",
+            description: "Long form: the implementing worker, or a full internal tool declaration",
+            children: {
+              worker: {
+                type: "string",
+                min_length: 1,
+                description: "Worker id that implements this tool",
+              },
+              name: {
+                type: "string",
+                min_length: 1,
+                description: "Tool name shown to the model; defaults to the key",
+              },
+              description: {
+                type: "string",
+                description: "What the tool does; this text is shown to the model",
+              },
+              enabled: {
+                type: "bool",
+                description: "Whether the tool is offered to the model",
+              },
+              inputSchema: {
+                type: "any",
+                description: "JSON schema of the tool arguments; any JSON value is accepted",
+                ui: {
+                  widget: "textarea",
+                  rows: 4,
+                  help: "Free-form JSON, stored and edited as written.",
+                },
+              },
+              parameters: {
+                type: "any",
+                description: "OpenAI-style JSON schema of the tool arguments, used when inputSchema is absent",
+                ui: {
+                  widget: "textarea",
+                  rows: 4,
+                  help: "Free-form JSON, stored and edited as written.",
+                },
+              },
+            },
+          },
+        ],
+      },
+
+      // The logging block a worker carries.
+      worker_logging: {
+        typedef: "worker_logging",
+        type: "object",
+        description: "Log level overrides of one worker",
+        children: {
+          level: {
+            type: "log_level",
+            description: "Threshold for this worker's own log file",
+          },
+          alllevel: {
+            type: "log_level",
+            description: "Threshold for this worker's records inside all.log",
+          },
+          save_llm_request: {
+            type: "bool",
+            description: "Persist the full LLM request of this worker for debugging",
+          },
+        },
+      },
+
+      // A remote service the http_api worker can call.
+      http_operation: {
+        typedef: "http_operation",
+        type: "object",
+        description: "One remote operation an http_api connector can call",
+        children: {
+          method: {
+            type: "string",
+            enum: ["GET", "POST", "PUT", "PATCH", "DELETE"],
+            description: "HTTP method of the call",
+          },
+          path: {
+            type: "string",
+            min_length: 1,
+            description: "Request path appended to the connector base URL",
+            ui: { placeholder: "/gettopics" },
+          },
+          query: {
+            type: "object",
+            description: "Query parameters; a {name} placeholder is filled from the call arguments",
+            key_pattern: "^[A-Za-z0-9_]+$",
+            additional_children: {
+              type: "string",
+              description: "One query parameter template",
+              ui: { placeholder: "{group_name}" },
+            },
+          },
+          allowed_params: {
+            type: "array",
+            description: "Argument names this operation accepts; any other argument is refused",
+            children: { type: "string", min_length: 1, description: "One accepted argument name" },
+          },
+          mode: {
+            type: "string",
+            enum: ["item", "list"],
+            description: "item returns one object, list returns a collection",
+          },
+          pagination: {
+            type: "object",
+            description: "Cursor pagination of a list operation",
+            children: {
+              type: { type: "string", enum: ["cursor"], description: "Pagination strategy" },
+              request_param: {
+                type: "string",
+                min_length: 1,
+                description: "Query parameter that carries the cursor",
+              },
+              response_field: {
+                type: "string",
+                min_length: 1,
+                description: "Response field that carries the next cursor",
+              },
+            },
+          },
+          result_path: {
+            type: "string",
+            description: "Dot path inside the response that holds the result",
+          },
+        },
+      },
+
+      http_connector: {
+        typedef: "http_connector",
+        type: "object",
+        description: "One remote service the http_api worker can call",
+        children: {
+          enabled: { type: "bool", description: "Whether this connector may be used" },
+          base_url: {
+            type: "string",
+            min_length: 1,
+            description: "Base URL of the remote service",
+            env: { allowed: true, convert: "string" },
+            ui: { placeholder: "https://groups.io/api/v1" },
+          },
+          auth: {
+            type: "object",
+            description: "Credentials presented to the remote service",
+            children: {
+              type: {
+                type: "string",
+                enum: ["bearer", "basic", "none"],
+                description: "Authentication scheme",
+              },
+              key: {
+                type: "string",
+                secret: true,
+                description: "API key; keep the placeholder and put the value in .env",
+                env: { allowed: true, convert: "string" },
+              },
+              token: {
+                type: "string",
+                secret: true,
+                description: "Bearer token; keep the placeholder and put the value in .env",
+                env: { allowed: true, convert: "string" },
+              },
+            },
+          },
+          defaults: {
+            type: "object",
+            description: "Argument values used when a call does not supply them",
+            key_pattern: "^[A-Za-z0-9_]+$",
+            additional_children: { type: "string", description: "One default argument value" },
+          },
+          operations: {
+            type: "object",
+            description: "Callable operations keyed by operation name",
+            key_pattern: "^[A-Za-z0-9_]+$",
+            additional_children: {
+              type: "http_operation",
+              description: "One callable operation",
+            },
+          },
+        },
+      },
+
+      // A remote MCP server.
+      mcp_server: {
+        typedef: "mcp_server",
+        type: "object",
+        description: "One remote MCP server",
+        children: {
+          type: {
+            type: "string",
+            enum: ["http", "sse", "stdio"],
+            description: "Transport used to reach the server",
+          },
+          url: {
+            type: "string",
+            min_length: 1,
+            description: "URL of the MCP server",
+            env: { allowed: true, convert: "string" },
+            ui: { placeholder: "http://127.0.0.1:30081/mcp" },
+          },
+          enabled: { type: "bool", description: "Whether this server is contacted" },
+          auth: {
+            type: "object",
+            nullable: true,
+            description: "Credentials for this server; overrides the worker default",
+            children: {
+              type: {
+                type: "string",
+                enum: ["bearer", "basic", "none"],
+                description: "Authentication scheme",
+              },
+              token: {
+                type: "string",
+                secret: true,
+                description: "Bearer token; keep the placeholder and put the value in .env",
+                env: { allowed: true, convert: "string" },
+              },
+            },
+          },
+        },
+      },
+
+      // One outbound search or fetch provider.
+      search_provider: {
+        typedef: "search_provider",
+        type: "object",
+        description: "One outbound search or fetch provider",
+        children: {
+          id: {
+            type: "string",
+            min_length: 1,
+            description: "Provider entry id, unique inside the worker",
+          },
+          type: {
+            type: "string",
+            enum: ["brave", "searxng", "duckduckgo", "tavily"],
+            description: "Provider implementation",
+          },
+          enabled: { type: "bool", description: "Whether this provider may be used" },
+          apiKey: {
+            type: "string",
+            secret: true,
+            description: "Provider API key; keep the placeholder and put the value in .env",
+            env: { allowed: true, convert: "string" },
+          },
+          host: {
+            type: "string",
+            min_length: 1,
+            description: "Host of a self-hosted provider such as SearXNG",
+            env: { allowed: true, convert: "string" },
+            ui: { placeholder: "127.0.0.1" },
+          },
+          port: {
+            type: "int",
+            minimum: 1,
+            maximum: 65535,
+            description: "Port of a self-hosted provider",
+            env: { allowed: true, convert: "int" },
+            ui: { placeholder: "18080" },
+          },
+          engines: {
+            type: "array",
+            description: "SearXNG engines to query",
+            children: { type: "string", min_length: 1, description: "One engine name" },
+          },
+          categories: {
+            type: "array",
+            description: "SearXNG result categories to request",
+            children: { type: "string", min_length: 1, description: "One category" },
+          },
+          language: { type: "string", description: "SearXNG result language, for example all" },
+          safesearch: {
+            type: "int",
+            minimum: 0,
+            maximum: 2,
+            description: "SearXNG safe-search level",
+          },
+          empty_is_error: {
+            type: "bool",
+            description: "Treat an empty result as a failure and try the next provider",
+          },
+        },
+      },
+
+      // One upstream candidate of a first_available model.
+      provider_ref: {
+        typedef: "provider_ref",
+        type: "object",
+        description: "One upstream candidate of a first_available model",
+        children: {
+          provider: {
+            type: "string",
+            min_length: 1,
+            description: "Provider id from models.providers that serves this candidate",
+          },
+          model: {
+            type: "string",
+            min_length: 1,
+            description: "Model id as that provider knows it",
+          },
+          request_timeout_ms: {
+            type: "int",
+            minimum: 1,
+            maximum: 3600000,
+            description: "Milliseconds allowed for one request to this candidate",
+          },
+          fallback_prio: {
+            type: "int",
+            minimum: 0,
+            maximum: 1000,
+            description: "Preference order; lower values are tried first",
+          },
+        },
+      },
+
+      // One workspace entry of an environment context.
+      env_context_workspace: {
+        typedef: "env_context_workspace",
+        type: "object",
+        description: "One workspace reachable from the tasks of an environment",
+        children: {
+          type: {
+            type: "string",
+            enum: ["mcp", "file", "http"],
+            description: "How the workspace is reached",
+          },
+          endid: {
+            type: "string",
+            description: "Environment id presented to the MCP server of this workspace",
+          },
+          host: {
+            type: "string",
+            min_length: 1,
+            description: "Host and port of the workspace service",
+            ui: { placeholder: "127.0.0.1:30081" },
+          },
+          location: {
+            type: "string",
+            min_length: 1,
+            description: "Root path exposed to the tasks",
+            ui: { placeholder: "/root/workspace/" },
+          },
+          token: {
+            type: "string",
+            secret: true,
+            description: "Credential used to reach the workspace; keep the placeholder",
+            env: { allowed: true, convert: "string" },
+          },
+        },
+      },
+
+      // ── Free-form JSON regions ────────────────────────────────────────
+      // A region whose shape aidir owns and the shared library does not need to
+      // know - a tool declaration, a JSON schema, an extension map - is declared
+      // `type: "any"`. The library accepts every JSON value there, including
+      // null, and does not look inside: no type rule, no constraint, no null
+      // rule, no recursion into the members.
+      //
+      // What still applies to an opaque value:
+      //   - the operational limits (depth, collection size, string length, file
+      //     size) are checked structurally on the whole value;
+      //   - a `${VAR}` placeholder inside it stays literal, because resolving a
+      //     member would require knowing the shape of the member;
+      //   - in the Settings editor it is one text node edited as source, never a
+      //     list of fields;
+      //   - an empty value, an object, an array and a scalar are all valid, so a
+      //     new field can be added to a declaration without touching this file.
+      //
+      // Anything that IS known must still be declared: a worker setting with a
+      // fixed shape belongs in `worker_item`, not here.
+
+      // ── Worker families ──────────────────────────────────────────────
+      // workers.items.<id> is a union of these shapes. Each one is the contract
+      // of a family of workers, so a key that only another family reads is an
+      // error, and the Settings editor shows the form of the family the worker
+      // belongs to. A new worker joins the family whose shape it matches; a
+      // genuinely new family gets a new shape here and one more entry in the
+      // union in config.descriptor.json5.
+      //
+      // The common switches are repeated in every family on purpose: the grammar
+      // has no inheritance, and a phantom shared base would be a shape of its
+      // own in the tree. Every family therefore declares `enabled`, and the
+      // families that log name `logging`.
+
+      // Agents that may call internal tools: openaix.
+      worker_agent: {
+        typedef: "worker_agent",
+        type: "object",
+        description: "Worker that calls a language model and may use internal tools",
+        children: {
+          enabled: { type: "bool", description: "Whether this worker is loaded and may receive tasks" },
+          api: {
+            type: "string",
+            min_length: 1,
+            description: "Protocol override; normally taken from the provider of this worker",
+          },
+          provider: {
+            type: "string",
+            min_length: 1,
+            description: "Provider id from models.providers this worker uses",
+          },
+          request_timeout: {
+            type: "int",
+            minimum: 1,
+            maximum: 86400,
+            description: "Seconds allowed for one request to the model",
+            env: { allowed: true, convert: "int" },
+          },
+          user_agent: { type: "string", description: "User-Agent header sent to the provider" },
+          tools_max_turns: {
+            type: "int",
+            minimum: 1,
+            maximum: 1000,
+            description: "Tool turns of this worker; falls back to workers.tools_max_turns",
+          },
+          tools: {
+            type: "object",
+            description: "Tools available to this worker, keyed by tool name",
+            key_pattern: "^[A-Za-z0-9._-]+$",
+            additional_children: { type: "worker_tool", description: "One available tool" },
+          },
+          generation_defaults: {
+            type: "object",
+            nullable: true,
+            description: "Default sampling parameters for the requests of this worker",
+            key_pattern: "^[A-Za-z0-9_]+$",
+            additional_children: {
+              type: "number",
+              description: "One default sampling parameter, for example repeat_penalty or num_predict",
+            },
+          },
+          logging: {
+            type: "worker_logging",
+            description: "Log level overrides of this worker",
+          },
+        },
+      },
+
+      // Workers that only forward a request: call_ollama, call_openai, call_llama_cpp.
+      worker_llm: {
+        typedef: "worker_llm",
+        type: "object",
+        description: "Worker that forwards a model request to a provider",
+        children: {
+          enabled: { type: "bool", description: "Whether this worker is loaded and may receive tasks" },
+          provider: {
+            type: "string",
+            min_length: 1,
+            description: "Provider id from models.providers this worker uses",
+          },
+          request_timeout: {
+            type: "int",
+            minimum: 1,
+            maximum: 86400,
+            description: "Seconds allowed for one request to the provider",
+            env: { allowed: true, convert: "int" },
+          },
+          user_agent: { type: "string", description: "User-Agent header sent to the provider" },
+          tools: {
+            type: "object",
+            description: "Tools available to this worker, keyed by tool name",
+            key_pattern: "^[A-Za-z0-9._-]+$",
+            additional_children: { type: "worker_tool", description: "One available tool" },
+          },
+          logging: {
+            type: "worker_logging",
+            description: "Log level overrides of this worker",
+          },
+        },
+      },
+
+      // Tool workers that reach the network: web_search, web_fetch.
+      worker_search: {
+        typedef: "worker_search",
+        type: "object",
+        description: "Tool worker that queries outbound search or fetch providers",
+        children: {
+          enabled: { type: "bool", description: "Whether this worker is loaded and may receive tasks" },
+          provider: {
+            type: "string",
+            min_length: 1,
+            description: "Default provider entry id of this worker",
+          },
+          provider_cooldown_seconds: {
+            type: "int",
+            minimum: 0,
+            maximum: 86400,
+            description: "Seconds a failing provider is skipped before it is tried again",
+          },
+          request_timeout: {
+            type: "int",
+            minimum: 1,
+            maximum: 86400,
+            description: "Seconds allowed for one outbound request",
+            env: { allowed: true, convert: "int" },
+          },
+          timeoutSeconds: {
+            type: "int",
+            minimum: 1,
+            maximum: 86400,
+            description: "Legacy outbound timeout in seconds, used when request_timeout is absent",
+          },
+          providers: {
+            type: "array",
+            description: "Ordered fallback chain; the first available provider wins",
+            children: { type: "search_provider", description: "One provider of the chain" },
+          },
+        },
+      },
+
+      // The http_api tool worker.
+      worker_http_api: {
+        typedef: "worker_http_api",
+        type: "object",
+        description: "Tool worker that calls authenticated remote HTTP services",
+        children: {
+          enabled: { type: "bool", description: "Whether this worker is loaded and may receive tasks" },
+          request_timeout: {
+            type: "int",
+            minimum: 1,
+            maximum: 86400,
+            description: "Seconds allowed for one remote request",
+            env: { allowed: true, convert: "int" },
+          },
+          user_agent: { type: "string", description: "User-Agent header sent to the remote service" },
+          max_response_chars: {
+            type: "int",
+            minimum: 1,
+            maximum: 100000000,
+            description: "Largest response body returned to the model, in characters",
+          },
+          connectors: {
+            type: "object",
+            description: "Remote services this worker may call, keyed by connector id",
+            key_pattern: "^[A-Za-z0-9._-]+$",
+            additional_children: { type: "http_connector", description: "One connector" },
+          },
+        },
+      },
+
+      // The external_mcp tool worker.
+      worker_mcp_client: {
+        typedef: "worker_mcp_client",
+        type: "object",
+        description: "Tool worker that exposes remote MCP servers as tools",
+        children: {
+          enabled: { type: "bool", description: "Whether this worker is loaded and may receive tasks" },
+          tools_ttl: {
+            type: "int",
+            minimum: 1,
+            maximum: 86400,
+            description: "Seconds a remote tool listing is cached before it is fetched again",
+          },
+          auth: {
+            type: "object",
+            description: "Default credentials for every remote MCP server of this worker",
+            children: {
+              type: { type: "string", enum: ["bearer", "basic", "none"], description: "Authentication scheme" },
+              token: {
+                type: "string",
+                secret: true,
+                description: "Bearer token; keep the placeholder and put the value in .env",
+                env: { allowed: true, convert: "string" },
+              },
+            },
+          },
+          servers: {
+            type: "object",
+            description: "Remote MCP servers keyed by server id",
+            key_pattern: "^[A-Za-z0-9._-]+$",
+            additional_children: { type: "mcp_server", description: "One MCP server" },
+          },
+          logging: {
+            type: "worker_logging",
+            description: "Log level overrides of this worker",
+          },
+        },
+      },
+
+      // Context workers: context_builder, context_add_internal_tools,
+      // context_render_openclaw_style.
+      worker_context: {
+        typedef: "worker_context",
+        type: "object",
+        description: "Worker that prepares the context handed to an agent",
+        children: {
+          enabled: { type: "bool", description: "Whether this worker is loaded and may receive tasks" },
+          tools: {
+            type: "object",
+            description: "Internal tools injected into the context, keyed by tool name",
+            key_pattern: "^[A-Za-z0-9._-]+$",
+            additional_children: {
+              type: "any",
+              description: "One internal tool declaration; any JSON value is accepted",
+              ui: { widget: "textarea", rows: 3 },
+            },
+          },
+        },
+      },
+
+      // reject_agent: reacts when another worker refuses a task.
+      worker_reject: {
+        typedef: "worker_reject",
+        type: "object",
+        description: "Worker that reacts to a refusal of another worker",
+        children: {
+          enabled: { type: "bool", description: "Whether this worker is loaded and may receive tasks" },
+          fallbacks: {
+            type: "array",
+            description: "Workers tried in order when the task is rejected",
+            children: { type: "string", min_length: 1, description: "One fallback worker id" },
+          },
+          retry_count: {
+            type: "int",
+            minimum: 0,
+            maximum: 100,
+            description: "How often the primary worker is retried",
+          },
+          retry_period: {
+            type: "int",
+            minimum: 0,
+            maximum: 3600,
+            description: "Seconds between two retries",
+          },
+          on_reject: {
+            type: "object",
+            description: "Reaction per rejection reason",
+            key_pattern: "^[A-Za-z0-9._-]+$",
+            additional_children: {
+              type: "object",
+              description: "One reaction",
+              children: {
+                action: {
+                  type: "string",
+                  enum: ["fallback-retry", "retry", "cancel", "fail"],
+                  description: "What happens with the task",
+                },
+                retry_count: {
+                  type: "int",
+                  minimum: 0,
+                  maximum: 100,
+                  description: "How often to retry",
+                },
+                retry_period: {
+                  type: "int",
+                  minimum: 0,
+                  maximum: 3600,
+                  description: "Seconds between two retries",
+                },
+              },
+            },
+          },
+        },
+      },
+
+      // Workers with only the common switches: echo_agent, selftest.
+      worker_plain: {
+        typedef: "worker_plain",
+        type: "object",
+        description: "Worker with only the common switches",
+        children: {
+          enabled: { type: "bool", description: "Whether this worker is loaded and may receive tasks" },
+          includeWorkers: {
+            type: "bool",
+            description: "Include worker state in the result of this worker",
+          },
+          includeResources: {
+            type: "bool",
+            description: "Include resource state in the result of this worker",
+          },
+          logging: {
+            type: "worker_logging",
+            description: "Log level overrides of this worker",
+          },
+        },
+      },
+    },
+  },
+}

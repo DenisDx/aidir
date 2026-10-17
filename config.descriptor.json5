@@ -1,0 +1,1327 @@
+// config.descriptor.json5 - the schema of the aidir main configuration file.
+//
+// WHAT THIS FILE IS
+//   An *aiset descriptor*: not configuration, but the contract that describes
+//   ./config.json5. aiset compiles it at process start and uses it for every
+//   read, every validation and every write of that file. The editor in the
+//   WebUI **Settings** tab is generated from it, so every description below is
+//   also the help text a user reads while editing.
+//
+// HOW TO USE IT
+//   Grammar check (must print nothing and exit 0):
+//     aiset/.venv/bin/aiset validate-descriptor config.descriptor.json5 --strict \
+//         --typedef config.types.json5
+//   Contract check against the shipped files (the real gate, a unit test):
+//     venv/bin/python -m unittest -v test_config_descriptor.py
+//
+// RULES THAT MUST NOT BE BROKEN
+//   1. COVERAGE. Every key that can appear in config.json5 or in
+//      config.json5.example must be declared here. An undeclared key is a hard
+//      validation error: the whole document becomes unreadable and every write
+//      to it is refused. test_config_descriptor.py fails when a configuration
+//      key appears without a matching declaration here.
+//   2. ENVIRONMENT. A node that may hold `${VAR}` or `${VAR:-default}` needs
+//      `env: { allowed: true }`, plus `convert` when the value is not a string.
+//      Without it the document does not load.
+//   3. APPLY. Every node says how the running system picks the change up:
+//        live    - the next read already sees it (log levels)
+//        reload  - a SIGHUP or the Reload action re-reads the configuration
+//        restart - a process restart is required (bind addresses, ports, workers)
+//      Leaving `apply` unset means "restart", which is almost always wrong.
+//   4. SECRETS. Every key holding a credential is `secret: true`. A session
+//      without the secret permission receives the whole enclosing subtree as
+//      denied, never as redacted values. Keep credentials in .env and store only
+//      the placeholder here.
+//   5. READ ONLY. `version` and derived identifiers are not editable.
+//   6. SHARED SHAPES. A repeated shape is named `type: "<name>"` and declared
+//      in config.types.json5; do not inline it a second time.
+//
+// This file is edited together with the code that reads the values it declares.
+// Renaming or re-meaning a node here without changing its reader is a regression.
+
+{
+  descriptor_version: "1.0",
+  project: "aidir",
+  config_version: "1.0",
+
+  root: {
+    type: "object",
+    description: "Main aidir configuration: one complete instance of the system",
+    apply: "restart",
+    children: {
+
+      // ── Identity ───────────────────────────────────────────────────────
+      version: {
+        type: "string",
+        const: "1.0",
+        read_only: true,
+        apply: "restart",
+        description: "Configuration format version. Fixed; any other value stops startup",
+        ui: { help: "Do not change. aidir refuses to start with a different version." },
+      },
+
+      title: {
+        type: "string",
+        apply: "reload",
+        description: "Human-readable instance title shown in the WebUI",
+        env: { allowed: true, convert: "string" },
+        ui: { placeholder: "aidir 111" },
+      },
+
+      instance: {
+        type: "string",
+        min_length: 1,
+        max_length: 128,
+        pattern: "^[A-Za-z0-9._-]+$",
+        apply: "reload",
+        description: "Instance id that tells several aidir installations on one machine apart",
+        env: { allowed: true, convert: "string" },
+        ui: {
+          placeholder: "aidir111",
+          help: "Used in logs, in Redis key prefixes and in generated file names.",
+        },
+      },
+
+      root: {
+        type: "string",
+        min_length: 1,
+        apply: "restart",
+        description: "Absolute filesystem path of the aidir installation",
+        env: { allowed: true, convert: "string" },
+        ui: {
+          placeholder: "/home/user/aidir",
+          help: "Used for logs, audit storage and worker discovery. A wrong path breaks logging.",
+        },
+      },
+
+      // ── Redis ──────────────────────────────────────────────────────────
+      redis: {
+        type: "object",
+        apply: "restart",
+        description: "Redis connection used for queues, WebUI sessions and resource state",
+        children: {
+          host: {
+            type: "string",
+            min_length: 1,
+            apply: "restart",
+            description: "Redis hostname or IP address",
+            env: { allowed: true, convert: "string" },
+            ui: { placeholder: "127.0.0.1" },
+          },
+          port: {
+            type: "int",
+            minimum: 1,
+            maximum: 65535,
+            apply: "restart",
+            description: "Redis TCP port",
+            env: { allowed: true, convert: "int" },
+            ui: { placeholder: "6379" },
+          },
+          password: {
+            type: "string",
+            secret: true,
+            apply: "restart",
+            description: "Redis password; keep the placeholder and put the value in .env",
+            env: { allowed: true, convert: "string" },
+            ui: {
+              placeholder: "${REDIS_PASSWORD:-}",
+              help: "Leave the placeholder here; the value belongs in .env.",
+            },
+          },
+        },
+      },
+
+      // ── Inbound request limits ─────────────────────────────────────────
+      http: {
+        type: "object",
+        apply: "restart",
+        description: "Limits applied to every inbound HTTP request of every endpoint",
+        children: {
+          max_request_size: {
+            type: "int",
+            minimum: 1024,
+            maximum: 1073741824,
+            apply: "restart",
+            description: "Largest accepted request body in bytes; 100 MiB by default",
+            env: { allowed: true, convert: "int" },
+            ui: {
+              placeholder: "104857600",
+              help: "Applies to the OpenAIx, Ollama and MCP endpoints alike.",
+            },
+          },
+        },
+      },
+
+      // ── Embedded maintenance ───────────────────────────────────────────
+      cron: {
+        type: "object",
+        apply: "reload",
+        description: "Periodic maintenance aidir can run inside its own process",
+        children: {
+          embedded: {
+            type: "bool",
+            apply: "reload",
+            description: "Run the maintenance cycle in-process instead of relying on the system crontab",
+            env: { allowed: true, convert: "bool" },
+            ui: { help: "Switching this on writes the configuration immediately." },
+          },
+        },
+      },
+
+      // ── Logging ────────────────────────────────────────────────────────
+      logging: {
+        type: "object",
+        apply: "live",
+        description: "Log levels, rotation, retention and the audit journal",
+        children: {
+          level: {
+            type: "log_level",
+            apply: "live",
+            description: "Default level for every subsystem; a level name or the journald number 0-7",
+            env: { allowed: true, convert: "string" },
+            ui: { placeholder: '"${LOG_LEVEL:-error}"' },
+          },
+          timezone: {
+            type: "string",
+            min_length: 1,
+            apply: "live",
+            description: "Timestamp timezone: local, UTC, or an IANA name such as Europe/Moscow",
+            env: { allowed: true, convert: "string" },
+            ui: { placeholder: '"${LOG_TIMEZONE:-local}"' },
+          },
+          wipe_period: {
+            type: "int",
+            minimum: 0,
+            maximum: 31536000,
+            apply: "live",
+            description: "Seconds between two log wipe runs; 0 disables wiping",
+            env: { allowed: true, convert: "int" },
+            ui: { placeholder: "10000" },
+          },
+          wipe_max_age: {
+            type: "int",
+            minimum: 0,
+            maximum: 315360000,
+            apply: "live",
+            description: "Delete log files older than this many seconds; 0 keeps them forever",
+            env: { allowed: true, convert: "int" },
+            ui: {
+              placeholder: "1000000",
+              help: "Usually smaller than wipe_period so that old files go first.",
+            },
+          },
+          trim_period: {
+            type: "int",
+            minimum: 0,
+            maximum: 31536000,
+            apply: "live",
+            description: "Seconds between size checks on individual log files; 0 disables trimming",
+            env: { allowed: true, convert: "int" },
+            ui: { placeholder: "60" },
+          },
+          max_log_size: {
+            type: "int",
+            minimum: 0,
+            maximum: 1073741824,
+            apply: "live",
+            description: "Size limit in bytes for one log file; 0 means unlimited",
+            env: { allowed: true, convert: "int" },
+            ui: { placeholder: "1048576" },
+          },
+
+          // Both maps are keyed by the subsystem name the logger passes in, so
+          // they are open: any subsystem may add its own key.
+          levels: {
+            type: "object",
+            apply: "live",
+            description: "Threshold per subsystem for the individual per-subsystem log files",
+            key_pattern: "^[A-Za-z0-9._-]+$",
+            additional_children: {
+              type: "log_level",
+              apply: "live",
+              description: "Threshold of one subsystem log file",
+              env: { allowed: true, convert: "string" },
+            },
+          },
+
+          alllevels: {
+            type: "object",
+            apply: "live",
+            description: "Threshold per subsystem for the records written to the combined all.log",
+            key_pattern: "^[A-Za-z0-9._-]+$",
+            additional_children: {
+              type: "log_level",
+              apply: "live",
+              description: "Threshold of one subsystem inside all.log",
+              env: { allowed: true, convert: "string" },
+            },
+          },
+
+          audit: {
+            type: "object",
+            apply: "reload",
+            description: "Audit journal: a separate durable record of control and request events",
+            children: {
+              directory: {
+                type: "string",
+                min_length: 1,
+                apply: "reload",
+                description: "Directory holding the audit journal, relative to the project root",
+                ui: { placeholder: "logs/audit" },
+              },
+              retention_days: {
+                type: "int",
+                minimum: 1,
+                maximum: 3650,
+                apply: "reload",
+                description: "Delete journal segments older than this many days",
+              },
+              retention_period: {
+                type: "int",
+                minimum: 60,
+                maximum: 31536000,
+                apply: "reload",
+                description: "Seconds a closed journal segment is kept before deletion",
+              },
+              max_total_bytes: {
+                type: "int",
+                minimum: 0,
+                maximum: 1099511627776,
+                apply: "reload",
+                description: "Soft limit for the whole journal in bytes; 0 means unlimited",
+              },
+              emergency_max_total_bytes: {
+                type: "int",
+                minimum: 0,
+                maximum: 1099511627776,
+                apply: "reload",
+                description: "Hard limit for the whole journal; the oldest segments go above it",
+              },
+              max_spool_age_seconds: {
+                type: "int",
+                minimum: 0,
+                maximum: 31536000,
+                apply: "reload",
+                description: "Discard spooled records older than this many seconds; 0 keeps them",
+              },
+              max_inline_body_bytes: {
+                type: "int",
+                minimum: 0,
+                maximum: 1073741824,
+                apply: "reload",
+                description: "Largest request or response body stored inline; 0 stores none",
+              },
+              secret_metadata_keys: {
+                type: "array",
+                apply: "reload",
+                description: "Extra metadata key names whose values are redacted in the journal",
+                children: { type: "string", min_length: 1, description: "One metadata key name" },
+              },
+              writer_queue_size: {
+                type: "int",
+                minimum: 1,
+                maximum: 1048576,
+                apply: "reload",
+                description: "Capacity of the background journal writer queue",
+              },
+              overflow_policy: {
+                type: "string",
+                enum: ["best_effort", "durable"],
+                apply: "reload",
+                description: "What to do when the writer queue is full: drop records or block the caller",
+                ui: {
+                  help: "best_effort never blocks a request and may lose records; durable waits for the writer.",
+                },
+              },
+            },
+          },
+        },
+      },
+
+      // ── Resources (VRAM pools) ─────────────────────────────────────────
+      resources: {
+        type: "array",
+        apply: "restart",
+        description: "Physical or remote resource pools the scheduler places models on",
+        children: {
+          type: "object",
+          description: "One resource pool",
+          children: {
+            id: {
+              type: "string",
+              min_length: 1,
+              max_length: 64,
+              pattern: "^[A-Za-z0-9._-]+$",
+              read_only: true,
+              apply: "restart",
+              description: "Resource id referenced by model entries and by providers",
+            },
+            type: {
+              type: "string",
+              enum: ["cuda", "aidir", "rocm", "metal", "cpu"],
+              apply: "restart",
+              description: "Resource kind: a local accelerator family or a remote aidir instance",
+            },
+            arch: {
+              type: "string",
+              apply: "restart",
+              description: "Accelerator architecture, used to pick the availability command",
+            },
+            limits: {
+              type: "object",
+              apply: "restart",
+              description: "Hard capacity limits of this resource, keyed by metric name",
+              key_pattern: "^[A-Za-z0-9._-]+$",
+              additional_children: {
+                type: "number",
+                minimum: 0,
+                apply: "restart",
+                description: "Capacity limit of one metric, expressed in the unit from units",
+              },
+            },
+            units: {
+              type: "object",
+              apply: "restart",
+              description: "Unit of every metric named in limits",
+              key_pattern: "^[A-Za-z0-9._-]+$",
+              additional_children: {
+                type: "string",
+                min_length: 1,
+                apply: "restart",
+                description: "Unit name, for example MiB, GiB or C",
+              },
+            },
+            availability: {
+              type: "object",
+              nullable: true,
+              apply: "live",
+              description: "How the free capacity of this resource is discovered",
+              children: {
+                command: {
+                  type: "string",
+                  min_length: 1,
+                  apply: "live",
+                  description: "Shell command that prints the free amount of one metric",
+                  ui: {
+                    widget: "textarea",
+                    rows: 2,
+                    placeholder: "nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits",
+                  },
+                },
+                metric: {
+                  type: "string",
+                  min_length: 1,
+                  apply: "live",
+                  description: "Metric key the command reports, for example VRAM",
+                },
+                unit: {
+                  type: "string",
+                  min_length: 1,
+                  apply: "live",
+                  description: "Unit the command prints, for example MiB",
+                },
+                command_timeout: {
+                  type: "int",
+                  minimum: 1,
+                  maximum: 600,
+                  apply: "live",
+                  description: "Seconds before the availability command is killed",
+                },
+                peer_resource_id: {
+                  type: "string",
+                  min_length: 1,
+                  apply: "live",
+                  description: "Local resource id whose availability answers for this remote resource",
+                },
+                request_timeout_ms: {
+                  type: "int",
+                  minimum: 1,
+                  maximum: 600000,
+                  apply: "live",
+                  description: "Milliseconds allowed for one peer availability request",
+                },
+              },
+            },
+            telemetry: {
+              type: "object",
+              apply: "live",
+              description: "Sensors collected from this resource",
+              children: {
+                sensors: {
+                  type: "array",
+                  apply: "live",
+                  description: "Ids of the monitoring sensors that apply to this resource",
+                  children: { type: "string", min_length: 1, description: "One sensor id" },
+                },
+              },
+            },
+            alive_time: {
+              type: "int",
+              minimum: 0,
+              maximum: 604800,
+              apply: "reload",
+              description: "Seconds a model stays in memory after its last task; the scheduler may force-unload inside this window",
+              ui: { help: "The Ollama default is 300 seconds." },
+            },
+            keep_alive: {
+              type: "int",
+              minimum: 0,
+              maximum: 604800,
+              apply: "reload",
+              description: "Keep a model loaded this many seconds after its last use; 0 disables keep-alive",
+            },
+            keep_alive_period: {
+              type: "int",
+              minimum: 0,
+              maximum: 86400,
+              apply: "reload",
+              description: "Seconds between keep-alive pings; keep it below the upstream auto-unload delay",
+            },
+            provider: {
+              type: "string",
+              min_length: 1,
+              apply: "reload",
+              description: "Provider id from models.providers used for force-unload and keep-alive calls",
+            },
+            monitoring: {
+              type: "object",
+              apply: "reload",
+              description: "Sensor pollers and their alert thresholds for this resource",
+              children: {
+                poll_interval: {
+                  type: "int",
+                  minimum: 1,
+                  maximum: 3600,
+                  apply: "reload",
+                  description: "Seconds between two sensor polls",
+                },
+                command_timeout: {
+                  type: "int",
+                  minimum: 1,
+                  maximum: 600,
+                  apply: "reload",
+                  description: "Seconds before one sensor command is killed",
+                },
+                sensors: {
+                  type: "array",
+                  apply: "reload",
+                  description: "Sensors polled for this resource",
+                  children: {
+                    type: "object",
+                    description: "One polled sensor",
+                    children: {
+                      id: {
+                        type: "string",
+                        min_length: 1,
+                        apply: "reload",
+                        description: "Sensor id referenced by telemetry.sensors",
+                      },
+                      label: {
+                        type: "string",
+                        apply: "reload",
+                        description: "Display name of the sensor",
+                      },
+                      unit: {
+                        type: "string",
+                        min_length: 1,
+                        apply: "reload",
+                        description: "Unit the sensor command prints, for example MiB or C",
+                      },
+                      command: {
+                        type: "string",
+                        min_length: 1,
+                        apply: "reload",
+                        description: "Shell command that prints one sensor reading",
+                        ui: { widget: "textarea", rows: 2 },
+                      },
+                      threshold: {
+                        type: "object",
+                        nullable: true,
+                        apply: "reload",
+                        description: "Alert boundary of the sensor and the reactions it triggers",
+                        children: {
+                          value: {
+                            type: "number",
+                            apply: "reload",
+                            description: "Boundary the reading is compared with",
+                          },
+                          operator: {
+                            type: "string",
+                            enum: ["above", "below"],
+                            apply: "reload",
+                            description: "How the reading is compared with the boundary",
+                            ui: {
+                              help: "above fires when the reading rises past value, below when it drops under it.",
+                            },
+                          },
+                          reactions: {
+                            type: "array",
+                            apply: "reload",
+                            description: "Actions to run when the boundary is crossed",
+                            children: { type: "string", min_length: 1, description: "One reaction name" },
+                          },
+                          cooldown: {
+                            type: "int",
+                            minimum: 0,
+                            maximum: 86400,
+                            apply: "reload",
+                            description: "Seconds before the same reaction may fire again; 0 disables the cooldown",
+                          },
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+
+      // ── Endpoints ──────────────────────────────────────────────────────
+      endpoints: {
+        type: "array",
+        apply: "restart",
+        description: "Network listeners published by aidir",
+        children: {
+          type: "object",
+          description: "One published listener",
+          children: {
+            id: {
+              type: "string",
+              min_length: 1,
+              max_length: 64,
+              pattern: "^[A-Za-z0-9._-]+$",
+              read_only: true,
+              apply: "restart",
+              description: "Endpoint id used in logs, in the WebUI and by the audit journal",
+            },
+            api: {
+              type: "string",
+              enum: ["openaix", "ollama", "mcp"],
+              apply: "restart",
+              description: "Protocol this endpoint speaks",
+            },
+            port: {
+              type: "int",
+              minimum: 1,
+              maximum: 65535,
+              apply: "restart",
+              description: "TCP port the endpoint listens on",
+              env: { allowed: true, convert: "int" },
+              ui: { placeholder: "21434" },
+            },
+            bindAddress: {
+              type: "string",
+              min_length: 1,
+              apply: "restart",
+              description: "Bind address; 0.0.0.0 publishes the endpoint on every interface",
+              env: { allowed: true, convert: "string" },
+              ui: { placeholder: "0.0.0.0" },
+            },
+            worker: {
+              type: "string",
+              min_length: 1,
+              apply: "reload",
+              description: "Worker id that serves agent tasks here; falls back to workers.default",
+            },
+            logging: {
+              type: "object",
+              apply: "live",
+              description: "Log levels of this endpoint; they override logging.levels and logging.alllevels",
+              children: {
+                level: {
+                  type: "log_level",
+                  apply: "live",
+                  description: "Threshold for this endpoint's own log file",
+                  env: { allowed: true, convert: "string" },
+                },
+                alllevel: {
+                  type: "log_level",
+                  apply: "live",
+                  description: "Threshold for this endpoint's records inside all.log",
+                  env: { allowed: true, convert: "string" },
+                },
+              },
+            },
+            middlewares: {
+              type: "array",
+              apply: "restart",
+              description: "Middleware ids applied to requests of this endpoint, in order",
+              children: { type: "string", min_length: 1, description: "One middleware id" },
+            },
+            tools: {
+              type: "object",
+              apply: "reload",
+              description: "Deprecated. Declare tools in workers.items.<worker_id>.tools instead",
+              key_pattern: "^[A-Za-z0-9._-]+$",
+              additional_children: {
+                type: "worker_tool",
+                apply: "reload",
+                description: "Legacy tool entry: the worker that implements the tool",
+              },
+            },
+          },
+        },
+      },
+
+      // ── Workers ────────────────────────────────────────────────────────
+      workers: {
+        type: "object",
+        apply: "restart",
+        description: "Worker registry: everything aidir can execute",
+        children: {
+          tools_max_turns: {
+            type: "int",
+            minimum: 1,
+            maximum: 1000,
+            apply: "reload",
+            description: "Default number of internal tool turns for agent workers that support tools",
+            env: { allowed: true, convert: "int" },
+            ui: { placeholder: "50" },
+          },
+          default: {
+            type: "string",
+            min_length: 1,
+            apply: "restart",
+            description: "Worker used when no worker is named explicitly",
+          },
+          items: {
+            type: "object",
+            apply: "restart",
+            description: "Per-worker settings keyed by worker id. A worker-local config.json5 overrides this",
+            key_pattern: "^[A-Za-z0-9._-]+$",
+            // One entry per worker family. The resolver picks the alternative
+            // that declares a member (and validation accepts any alternative),
+            // so a ${VAR} below a worker is resolved and a key that only
+            // another family reads is an error.
+            additional_children: {
+              type: "union",
+              apply: "restart",
+              description: "Settings of one worker; the accepted shape depends on the family of the worker",
+              children_options: [
+                { type: "worker_agent", description: "Agent that may call internal tools (openaix)" },
+                { type: "worker_llm", description: "Worker that forwards a model request" },
+                { type: "worker_search", description: "Search or fetch tool worker" },
+                { type: "worker_http_api", description: "Authenticated HTTP tool worker" },
+                { type: "worker_mcp_client", description: "Worker that exposes MCP servers as tools" },
+                { type: "worker_context", description: "Context preparation worker" },
+                { type: "worker_reject", description: "Worker that reacts to a refusal" },
+                { type: "worker_plain", description: "Worker with only the common switches" },
+              ],
+            },
+          },
+        },
+      },
+
+      // ── Middleware ─────────────────────────────────────────────────────
+      middleware: {
+        type: "object",
+        apply: "restart",
+        description: "Request middleware registry",
+        children: {
+          items: {
+            type: "object",
+            apply: "restart",
+            description: "Per-middleware settings keyed by middleware id",
+            key_pattern: "^[A-Za-z0-9._-]+$",
+            additional_children: {
+              type: "object",
+              nullable: true,
+              apply: "live",
+              description: "Settings of one middleware",
+              children: {
+                // Only the log levels are read from here today (core/logger.py).
+                // Declare a new middleware setting here in the same change that
+                // makes the middleware read it; an undeclared key stops the
+                // whole configuration from loading.
+                logging: {
+                  type: "worker_logging",
+                  apply: "live",
+                  description: "Log level overrides of this middleware",
+                },
+              },
+            },
+          },
+        },
+      },
+
+      // ── Models and providers ───────────────────────────────────────────
+      models: {
+        type: "object",
+        apply: "restart",
+        description: "Model catalogue and the providers that serve it",
+        children: {
+          providers: {
+            type: "object",
+            apply: "restart",
+            description: "Provider definitions keyed by provider id; workers and resources refer to these ids",
+            key_pattern: "^[A-Za-z0-9._-]+$",
+            additional_children: {
+              type: "object",
+              apply: "restart",
+              description: "One provider: how to reach it, how to authenticate, which models it offers",
+              children: {
+                api: {
+                  type: "string",
+                  enum: ["ollama", "openaix", "openai", "opencode-go", "llama-cpp", "smart"],
+                  apply: "restart",
+                  description: "Protocol dialect spoken by this provider",
+                },
+                baseUrl: {
+                  type: "string",
+                  min_length: 1,
+                  apply: "restart",
+                  description: "Base URL of the provider; for OpenCode Go it excludes the /v1 suffix",
+                  env: { allowed: true, convert: "string" },
+                  ui: { placeholder: "http://127.0.0.1:11434" },
+                },
+                host: {
+                  type: "string",
+                  min_length: 1,
+                  apply: "restart",
+                  description: "Host of a provider reached without a URL, used by the llama.cpp launcher",
+                },
+                port: {
+                  type: "int",
+                  minimum: 1,
+                  maximum: 65535,
+                  apply: "restart",
+                  description: "Port of a provider reached without a URL",
+                },
+                exec_cmd: {
+                  type: "string",
+                  apply: "restart",
+                  description: "Command that starts a local llama.cpp server; aidir manages its lifetime. An empty value means aidir does not start a server",
+                  ui: {
+                    widget: "textarea",
+                    rows: 3,
+                    help: "Empty is valid: the provider is then expected to be running already.",
+                  },
+                },
+                startup_timeout: {
+                  type: "int",
+                  minimum: 1,
+                  maximum: 3600,
+                  apply: "restart",
+                  description: "Seconds allowed for a managed llama.cpp server to become ready",
+                },
+                auth: {
+                  type: "object",
+                  apply: "restart",
+                  description: "Credentials presented to this provider",
+                  children: {
+                    type: {
+                      type: "string",
+                      enum: ["bearer", "basic", "none"],
+                      apply: "restart",
+                      description: "Authentication scheme sent with every request",
+                    },
+                    token: {
+                      type: "string",
+                      secret: true,
+                      apply: "restart",
+                      description: "Bearer token; keep the placeholder and put the value in .env",
+                      env: { allowed: true, convert: "string" },
+                    },
+                    key: {
+                      type: "string",
+                      secret: true,
+                      apply: "restart",
+                      description: "API key; keep the placeholder and put the value in .env",
+                      env: { allowed: true, convert: "string" },
+                    },
+                  },
+                },
+                opencode_session: {
+                  type: "object",
+                  apply: "restart",
+                  description: "Session lifetime of the OpenCode Go provider",
+                  children: {
+                    ttl_seconds: {
+                      type: "int",
+                      minimum: 1,
+                      maximum: 604800,
+                      apply: "restart",
+                      description: "Lifetime of an authenticated OpenCode session in seconds",
+                    },
+                    anonymous_ttl_seconds: {
+                      type: "int",
+                      minimum: 1,
+                      maximum: 604800,
+                      apply: "restart",
+                      description: "Lifetime of an anonymous OpenCode session in seconds",
+                    },
+                  },
+                },
+                models: {
+                  type: "array",
+                  apply: "reload",
+                  description: "Models offered by this provider; runtime discovery may append to this list",
+                  children: {
+                    type: "object",
+                    description: "One model offered by this provider",
+                    children: {
+                      id: {
+                        type: "string",
+                        min_length: 1,
+                        apply: "reload",
+                        description: "Model id as the provider knows it",
+                      },
+                      alias: {
+                        type: "string",
+                        min_length: 1,
+                        apply: "reload",
+                        description: "Name shown to clients and used for routing",
+                      },
+                      name: {
+                        type: "string",
+                        apply: "reload",
+                        description: "Display name of the model",
+                      },
+                      type: {
+                        type: "string",
+                        enum: ["first_available", "direct"],
+                        apply: "reload",
+                        description: "Model kind; first_available spreads requests over its items",
+                      },
+                      embedding: {
+                        type: "bool",
+                        apply: "reload",
+                        description: "The model produces embeddings rather than chat completions",
+                      },
+                      reasoning: {
+                        type: "bool",
+                        apply: "reload",
+                        description: "The model emits reasoning content before the answer",
+                      },
+                      contextWindow: {
+                        type: "int",
+                        minimum: 1,
+                        maximum: 100000000,
+                        apply: "reload",
+                        description: "Context window in tokens",
+                      },
+                      default_tool_injection: {
+                        type: "bool",
+                        apply: "reload",
+                        description: "Inject the standard tools into the requests for this model by default",
+                      },
+                      upstream_retry_count: {
+                        type: "int",
+                        minimum: 0,
+                        maximum: 20,
+                        apply: "reload",
+                        description: "Retries against the upstream provider before failing over",
+                      },
+                      input: {
+                        type: "array",
+                        apply: "reload",
+                        description: "Input modalities this model accepts",
+                        children: {
+                          type: "string",
+                          enum: ["text", "image", "audio"],
+                          description: "One input modality",
+                        },
+                      },
+                      resources: {
+                        type: "object",
+                        apply: "reload",
+                        description: "VRAM this model needs on each resource",
+                        key_pattern: "^[A-Za-z0-9._-]+$",
+                        additional_children: {
+                          type: "object",
+                          apply: "reload",
+                          description: "VRAM requirement on one resource",
+                          children: {
+                            VRAM: {
+                              type: "number",
+                              minimum: 0,
+                              apply: "reload",
+                              description: "VRAM in the unit declared by resources.<id>.units.VRAM",
+                            },
+                          },
+                        },
+                      },
+                      items: {
+                        type: "array",
+                        apply: "reload",
+                        description: "Upstream candidates of a first_available model, in preference order",
+                        children: {
+                          type: "provider_ref",
+                          apply: "reload",
+                          description: "One upstream candidate",
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+
+      // ── WebUI ──────────────────────────────────────────────────────────
+      webui: {
+        type: "object",
+        apply: "restart",
+        description: "Web interface listener, authentication and backend request timeouts",
+        children: {
+          port: {
+            type: "int",
+            minimum: 1,
+            maximum: 65535,
+            apply: "restart",
+            description: "TCP port of the WebUI",
+            env: { allowed: true, convert: "int" },
+            ui: { placeholder: "20082" },
+          },
+          bind: {
+            type: "string",
+            min_length: 1,
+            apply: "restart",
+            description: "Bind address of the WebUI; 0.0.0.0 publishes it on every interface",
+            env: { allowed: true, convert: "string" },
+            ui: { placeholder: "127.0.0.1" },
+          },
+          auth: {
+            type: "object",
+            apply: "restart",
+            description: "WebUI accounts and session policy",
+            children: {
+              mode: {
+                type: "string",
+                enum: ["login", "open"],
+                apply: "restart",
+                description: "login requires credentials; open removes the login screen",
+                ui: { help: "open is only safe behind a reverse proxy that authenticates every request." },
+              },
+              session_ttl: {
+                type: "int",
+                minimum: 60,
+                maximum: 604800,
+                apply: "restart",
+                description: "Session lifetime in seconds",
+              },
+              users: {
+                type: "array",
+                apply: "restart",
+                description: "Accounts allowed to sign in",
+                children: {
+                  type: "object",
+                  description: "One WebUI account",
+                  children: {
+                    login: {
+                      type: "string",
+                      min_length: 1,
+                      apply: "restart",
+                      description: "Account name",
+                      env: { allowed: true, convert: "string" },
+                    },
+                    password: {
+                      type: "string",
+                      secret: true,
+                      apply: "restart",
+                      description: "Account password; keep the placeholder and put the value in .env",
+                      env: { allowed: true, convert: "string" },
+                    },
+                    permissions: {
+                      type: "array",
+                      apply: "restart",
+                      description: "Permission groups of this account; all grants every capability",
+                      children: { type: "string", min_length: 1, description: "One permission group" },
+                    },
+                  },
+                },
+              },
+            },
+          },
+          request_timeouts: {
+            type: "object",
+            apply: "reload",
+            description: "Seconds the WebUI backend waits for an upstream endpoint",
+            children: {
+              ollama_chat: {
+                type: "int",
+                minimum: 1,
+                maximum: 3600,
+                apply: "reload",
+                description: "Timeout of the Ollama chat probe on the LLM test page",
+                env: { allowed: true, convert: "int" },
+                ui: { placeholder: "120" },
+              },
+              mcp_proxy: {
+                type: "int",
+                minimum: 1,
+                maximum: 3600,
+                apply: "reload",
+                description: "Timeout of the MCP proxy",
+                env: { allowed: true, convert: "int" },
+                ui: { placeholder: "60" },
+              },
+              model_list: {
+                type: "int",
+                minimum: 1,
+                maximum: 3600,
+                apply: "reload",
+                description: "Timeout of the model list request",
+                env: { allowed: true, convert: "int" },
+                ui: { placeholder: "20" },
+              },
+              agent_test: {
+                type: "int",
+                minimum: 1,
+                maximum: 3600,
+                apply: "reload",
+                description: "Timeout of the agent test request",
+                env: { allowed: true, convert: "int" },
+                ui: { placeholder: "45" },
+              },
+            },
+          },
+        },
+      },
+
+      // ── API users ──────────────────────────────────────────────────────
+      users: {
+        type: "object",
+        apply: "reload",
+        description: "Accounts allowed to call the OpenAI-compatible endpoints. These are not WebUI accounts",
+        children: {
+          items: {
+            type: "array",
+            apply: "reload",
+            description: "API accounts",
+            children: {
+              type: "object",
+              description: "One API account",
+              children: {
+                login: {
+                  type: "string",
+                  min_length: 1,
+                  apply: "reload",
+                  description: "Account name reported to the client",
+                },
+                token: {
+                  type: "string",
+                  secret: true,
+                  apply: "reload",
+                  description: "Bearer token of this account; keep the placeholder and put the value in .env",
+                  env: { allowed: true, convert: "string" },
+                },
+                envids: {
+                  type: "array",
+                  apply: "reload",
+                  description: "Environment ids this account may use",
+                  children: { type: "string", min_length: 1, description: "One environment id" },
+                },
+                autoassign_envid: {
+                  type: "string",
+                  apply: "reload",
+                  description: "Environment id used when a request names none",
+                },
+              },
+            },
+          },
+        },
+      },
+
+      // ── Task timeouts ──────────────────────────────────────────────────
+      tasks: {
+        type: "object",
+        apply: "reload",
+        description: "Lifecycle timeouts of scheduled tasks",
+        children: {
+          restart_wait_timeout: {
+            type: "int",
+            minimum: 0,
+            maximum: 86400,
+            apply: "reload",
+            description: "Seconds a graceful restart waits for running tasks before cancelling them",
+            env: { allowed: true, convert: "int" },
+            ui: { placeholder: "120" },
+          },
+          queue_timeout: {
+            type: "int",
+            minimum: 1,
+            maximum: 604800,
+            apply: "reload",
+            description: "Seconds a task may stay queued before it fails",
+            env: { allowed: true, convert: "int" },
+            ui: { placeholder: "300" },
+          },
+          run_timeout: {
+            type: "int",
+            minimum: 1,
+            maximum: 604800,
+            apply: "reload",
+            description: "Seconds a task may run before it is cancelled",
+            env: { allowed: true, convert: "int" },
+            ui: { placeholder: "300" },
+          },
+          external_task_live: {
+            type: "int",
+            minimum: 1,
+            maximum: 31536000,
+            apply: "reload",
+            description: "Seconds a task owned by another instance stays visible and reclaimable",
+            env: { allowed: true, convert: "int" },
+            ui: { placeholder: "2500000" },
+          },
+        },
+      },
+
+      // ── Environment ids ────────────────────────────────────────────────
+      envids: {
+        type: "object",
+        apply: "reload",
+        description: "Named execution environments: workspace context and per-environment worker overrides",
+        children: {
+          check_period_minutes: {
+            type: "int",
+            minimum: 1,
+            maximum: 10080,
+            apply: "reload",
+            description: "Minutes between liveness checks of stored environment ids",
+            env: { allowed: true, convert: "int" },
+            ui: { placeholder: "600" },
+          },
+          store_duration_minutes: {
+            type: "int",
+            minimum: 1,
+            maximum: 525600,
+            apply: "reload",
+            description: "Minutes an environment context is kept after its last use",
+            env: { allowed: true, convert: "int" },
+            ui: { placeholder: "60000" },
+          },
+          default_context_building: {
+            type: "object",
+            apply: "reload",
+            description: "Size limits applied while building an environment context",
+            children: {
+              bootstrapMaxChars: {
+                type: "int",
+                minimum: 0,
+                maximum: 100000000,
+                apply: "reload",
+                description: "Largest single bootstrap document in characters",
+                env: { allowed: true, convert: "int" },
+                ui: { placeholder: "32000" },
+              },
+              bootstrapTotalMaxChars: {
+                type: "int",
+                minimum: 0,
+                maximum: 100000000,
+                apply: "reload",
+                description: "Largest bootstrap set in characters across all documents",
+                env: { allowed: true, convert: "int" },
+                ui: { placeholder: "150000" },
+              },
+            },
+          },
+          items: {
+            type: "object",
+            apply: "reload",
+            description: "Environment definitions keyed by environment id",
+            key_pattern: "^[A-Za-z0-9._-]+$",
+            additional_children: {
+              type: "object",
+              apply: "reload",
+              description: "One environment definition",
+              children: {
+                description: {
+                  type: "string",
+                  apply: "reload",
+                  description: "What this environment is for",
+                },
+                parent: {
+                  type: "string",
+                  min_length: 1,
+                  apply: "reload",
+                  description: "Environment id used as a template; this environment inherits it and overrides single fields",
+                },
+                context: {
+                  type: "object",
+                  apply: "reload",
+                  description: "Workspace context of the environment",
+                  children: {
+                    items: {
+                      type: "object",
+                      nullable: true,
+                      apply: "reload",
+                      description: "Workspace entries keyed by their own name",
+                      key_pattern: "^[A-Za-z0-9._-]+$",
+                      additional_children: {
+                        type: "env_context_workspace",
+                        apply: "reload",
+                        description: "One workspace entry",
+                      },
+                    },
+                    files: {
+                      type: "array",
+                      nullable: true,
+                      apply: "reload",
+                      description: "Files injected into the context of every task of this environment",
+                      children: {
+                        type: "object",
+                        description: "One injected file",
+                        children: {
+                          name: {
+                            type: "string",
+                            min_length: 1,
+                            apply: "reload",
+                            description: "Name the file is presented under",
+                          },
+                          location: {
+                            type: "string",
+                            min_length: 1,
+                            apply: "reload",
+                            description: "Path of the file to inject",
+                          },
+                          token: {
+                            type: "string",
+                            secret: true,
+                            apply: "reload",
+                            description: "Credential used to fetch the file; keep the placeholder",
+                            env: { allowed: true, convert: "string" },
+                          },
+                        },
+                      },
+                    },
+                  },
+                },
+                workers: {
+                  type: "object",
+                  nullable: true,
+                  apply: "reload",
+                  description: "Worker overrides applied only inside this environment",
+                  key_pattern: "^[A-Za-z0-9._-]+$",
+                  additional_children: {
+                    type: "object",
+                    apply: "reload",
+                    description: "Overrides of one worker; anything not repeated here keeps the global value",
+                    children: {
+                      servers: {
+                        type: "object",
+                        apply: "reload",
+                        description: "MCP server overrides keyed by server id",
+                        key_pattern: "^[A-Za-z0-9._-]+$",
+                        additional_children: {
+                          type: "mcp_server",
+                          apply: "reload",
+                          description: "One MCP server override",
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+  },
+}

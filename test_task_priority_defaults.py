@@ -12,10 +12,17 @@ class TestTaskPriorityDefaults(unittest.TestCase):
     """Validate the default priority scale used by queued tasks."""
 
     def test_priority_constants_keep_normal_aligned_with_queue_state(self) -> None:
-        """Keeps default task priority aligned with queue-state default while preserving an urgent tier."""
+        """Keeps default task priority aligned with queue-state default while preserving an urgent tier.
+
+        The scale is 0 = urgent, 5 = normal, 10 = idle, and the scale itself was
+        retuned from 5/10/20 to 0/5/10 in commit b063de4. This test still
+        expected the old idle value. The queue default is `priority: int = 5`
+        (core/queue_manager.py) and `Task.priority` defaults to
+        `PRIORITY_NORMAL`, which is what "aligned" means here.
+        """
         self.assertEqual(PRIORITY_URGENT, 0)
         self.assertEqual(PRIORITY_NORMAL, 5)
-        self.assertEqual(PRIORITY_IDLE, 20)
+        self.assertEqual(PRIORITY_IDLE, 10)
 
     def test_base_task_defaults_to_normal_priority(self) -> None:
         """Creates tasks with the aligned normal default priority."""

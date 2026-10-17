@@ -1,0 +1,39 @@
+// workers/tool/http_api/descriptor.json5 - schema of this worker's own config.json5.
+//
+// WHAT THIS FILE IS
+//   An *aiset descriptor* for the worker-local configuration file that sits next
+//   to it. `config.json5` in this directory holds only the settings that belong
+//   to this worker alone; the full set for this worker also exists in the root
+//   configuration under workers.items.http_api, and the root entry wins on every
+//   key present in both (core/workers_loader.py, core/config_merger.py).
+//
+// HOW IT IS WIRED
+//   The file is registered as its own aiset document with id "worker:tool:http_api"
+//   by core/settings/documents.py, which also passes config.types.json5 as
+//   `typedef_sources`. That is why this descriptor only names a shape instead of
+//   repeating it: `worker_item`, `http_connector` and `http_operation` are
+//   declared once in config.types.json5.
+//
+// HOW TO CHECK IT
+//   aiset/.venv/bin/aiset validate-descriptor workers/tool/http_api/descriptor.json5 \
+//       --strict --typedef config.types.json5
+//   venv/bin/python -m unittest -v test_config_descriptor.py
+//
+// The Settings tab of the WebUI edits this file through the same editor as the
+// root configuration, with the same descriptions and the same apply policy.
+
+{
+  descriptor_version: "1.0",
+  project: "aidir-worker-http_api",
+  config_version: "1.0",
+
+  root: {
+    // Same shape as workers.items.http_api in config.descriptor.json5.
+    type: "worker_http_api",
+    apply: "restart",
+    description: "Settings of the http_api worker that apply to every instance of aidir",
+    ui: {
+      help: "A key present in the root configuration (workers.items.http_api) overrides the value here.",
+    },
+  },
+}

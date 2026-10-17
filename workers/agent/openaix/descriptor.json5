@@ -1,0 +1,39 @@
+// workers/agent/openaix/descriptor.json5 - schema of this worker's own config.json5.
+//
+// WHAT THIS FILE IS
+//   An *aiset descriptor* for the worker-local configuration file that sits next
+//   to it. `config.json5` in this directory holds only the settings that belong
+//   to this worker alone; the full set for this worker also exists in the root
+//   configuration under workers.items.openaix, and the root entry wins on every
+//   key present in both (core/workers_loader.py, core/config_merger.py).
+//
+// HOW IT IS WIRED
+//   The file is registered as its own aiset document with id "worker:agent:openaix"
+//   by core/settings/documents.py, which also passes config.types.json5 as
+//   `typedef_sources`. That is why this descriptor only names a shape instead of
+//   repeating it: `worker_agent` is declared once in config.types.json5.
+//
+// HOW TO CHECK IT
+//   aiset/.venv/bin/aiset validate-descriptor workers/agent/openaix/descriptor.json5 \
+//       --strict --typedef config.types.json5
+//   venv/bin/python -m unittest -v test_config_descriptor.py
+//
+// The Settings tab of the WebUI edits this file through the same editor as the
+// root configuration, with the same descriptions and the same apply policy.
+
+{
+  descriptor_version: "1.0",
+  project: "aidir-worker-openaix",
+  config_version: "1.0",
+
+  root: {
+    // Same shape as workers.items.openaix in config.descriptor.json5, so a key
+    // edited here and the same key edited in the root can never disagree.
+    type: "worker_agent",
+    apply: "restart",
+    description: "Settings of the openaix agent worker that apply to every instance of aidir",
+    ui: {
+      help: "A key present in the root configuration (workers.items.openaix) overrides the value here.",
+    },
+  },
+}

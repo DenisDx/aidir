@@ -17,6 +17,17 @@ docker/volumes/
 .runtime/
 logs/
 
+# aiset settings sidecars: lock, backup chain and preserved rejected copies
+config.json5.lock
+*.json5.lock
+*.json5.back
+*.json5.back.back
+*.json5.back.back.back
+*.json5.back.back.back.back
+*.json5.back.back.back.back.back
+*.json5.conflicted.*.back
+*.json5.*.tmp
+
 memory/
 AGENTS.md
 SPEC.md

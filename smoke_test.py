@@ -1,15 +1,12 @@
-import os
 import time
-import json
 import redis
-from core.config import Config
+from core.config import config
 from core.queue_manager import QueueManager
 from core.task import Task
 
 def test():
     try:
         # 1) Loads config and connects to Redis
-        config = Config()
         redis_host = config.get("redis.host", "127.0.0.1")
         redis_port = config.get("redis.port", 6379)
         redis_pass = config.get("redis.password")
@@ -19,7 +16,11 @@ def test():
         print("1) Redis connection: PASS")
 
         # 2) Creates QueueManager
-        qm = QueueManager(config)
+        # QueueManager takes the Redis client and the instance namespace, exactly
+        # as core/app.py builds it. It was previously handed the configuration
+        # object in the client position, so every later Redis call went through
+        # the wrong object.
+        qm = QueueManager(r, config.get("instance", "aidir"))
         print("2) QueueManager creation: PASS")
 
         # 3) Create Task and run transitions

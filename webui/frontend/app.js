@@ -33,104 +33,6 @@ let taskViewerModalJsonText = '';
 let taskViewerModalJsonMode = 'tree';
 let taskViewerModalBackAction = null;
 
-const TEXT_PICKERS = [
-  {
-    id: 'cfg-logging-level',
-    rootId: 'cfg-logging-level-picker',
-    inputId: 'cfg-logging-level',
-    toggleId: 'cfg-logging-level-toggle',
-    menuId: 'cfg-logging-level-menu',
-    options: [
-      { label: '"emerg"', value: '"emerg"' },
-      { label: '"alert"', value: '"alert"' },
-      { label: '"crit"', value: '"crit"' },
-      { label: '"error"', value: '"error"' },
-      { label: '"warn"', value: '"warn"' },
-      { label: '"notice"', value: '"notice"' },
-      { label: '"info"', value: '"info"' },
-      { label: '"debug"', value: '"debug"' },
-      { label: '"${LOG_LEVEL:-info}"', value: '"${LOG_LEVEL:-info}"' },
-    ],
-  },
-  {
-    id: 'cfg-logging-levels-workers',
-    rootId: 'cfg-logging-levels-workers-picker',
-    inputId: 'cfg-logging-levels-workers',
-    toggleId: 'cfg-logging-levels-workers-toggle',
-    menuId: 'cfg-logging-levels-workers-menu',
-    options: [],
-  },
-  {
-    id: 'cfg-logging-levels-http',
-    rootId: 'cfg-logging-levels-http-picker',
-    inputId: 'cfg-logging-levels-http',
-    toggleId: 'cfg-logging-levels-http-toggle',
-    menuId: 'cfg-logging-levels-http-menu',
-    options: [],
-  },
-  {
-    id: 'cfg-logging-levels-webui',
-    rootId: 'cfg-logging-levels-webui-picker',
-    inputId: 'cfg-logging-levels-webui',
-    toggleId: 'cfg-logging-levels-webui-toggle',
-    menuId: 'cfg-logging-levels-webui-menu',
-    options: [],
-  },
-  {
-    id: 'cfg-logging-levels-core',
-    rootId: 'cfg-logging-levels-core-picker',
-    inputId: 'cfg-logging-levels-core',
-    toggleId: 'cfg-logging-levels-core-toggle',
-    menuId: 'cfg-logging-levels-core-menu',
-    options: [],
-  },
-  {
-    id: 'cfg-logging-levels-endpoint',
-    rootId: 'cfg-logging-levels-endpoint-picker',
-    inputId: 'cfg-logging-levels-endpoint',
-    toggleId: 'cfg-logging-levels-endpoint-toggle',
-    menuId: 'cfg-logging-levels-endpoint-menu',
-    options: [],
-  },
-  {
-    id: 'cfg-logging-levels-middleware',
-    rootId: 'cfg-logging-levels-middleware-picker',
-    inputId: 'cfg-logging-levels-middleware',
-    toggleId: 'cfg-logging-levels-middleware-toggle',
-    menuId: 'cfg-logging-levels-middleware-menu',
-    options: [],
-  },
-];
-
-const LEVEL_LIST_OPTIONS = [
-  { label: 'NOT DEFINED', value: 'NOT DEFINED' },
-  { label: '"emerg"', value: '"emerg"' },
-  { label: '"alert"', value: '"alert"' },
-  { label: '"crit"', value: '"crit"' },
-  { label: '"error"', value: '"error"' },
-  { label: '"warn"', value: '"warn"' },
-  { label: '"notice"', value: '"notice"' },
-  { label: '"info"', value: '"info"' },
-  { label: '"debug"', value: '"debug"' },
-  { label: '"${LOG_LEVEL:-info}"', value: '"${LOG_LEVEL:-info}"' },
-];
-
-const GUI_LEVEL_FIELDS = [
-  { inputId: 'cfg-logging-level', key: 'logging.level', allowNotDefined: false },
-  { inputId: 'cfg-logging-levels-workers', key: 'logging.levels.workers', allowNotDefined: true },
-  { inputId: 'cfg-logging-levels-http', key: 'logging.levels.http', allowNotDefined: true },
-  { inputId: 'cfg-logging-levels-webui', key: 'logging.levels.webui', allowNotDefined: true },
-  { inputId: 'cfg-logging-levels-core', key: 'logging.levels.core', allowNotDefined: true },
-  { inputId: 'cfg-logging-levels-endpoint', key: 'logging.levels.endpoint', allowNotDefined: true },
-  { inputId: 'cfg-logging-levels-middleware', key: 'logging.levels.middleware', allowNotDefined: true },
-];
-
-for (const picker of TEXT_PICKERS) {
-  if (picker.id.startsWith('cfg-logging-levels-')) {
-    picker.options = LEVEL_LIST_OPTIONS;
-  }
-}
-
 // ── DOM helpers ────────────────────────────────────────────────────────────
 const $ = id => document.getElementById(id);
 
@@ -145,7 +47,7 @@ function showPage(name) {
   $(`page-${name}`).classList.add('active');
   $(`nav-${name}`).classList.add('active');
 
-  if (name === 'settings') loadConfig();
+  if (name === 'settings') initSettingsBackend();
   if (name === 'task-viewer') ensureTaskViewerMeta();
   if (name === 'llm')      loadWorkersModels();
   if (name === 'mcp')      loadMcpEndpoints();
@@ -229,12 +131,26 @@ function doLogout() {
   token = '';
   stopLiveLogs();
   clearInterval(refreshTimer);
+  resetSettingsEditor();
   showScreen('login');
+}
+
+function resetSettingsEditor() {
+  // The next sign-in may be a different account, so the editor and its document
+  // list are thrown away rather than reused.
+  if (settingsEditor) settingsEditor.destroy();
+  settingsEditor = null;
+  settingsEditorDocument = '';
+  settingsDocuments = [];
+  settingsReady = false;
+  $('cfg-document').innerHTML = '';
+  $('settings-tree').innerHTML = '';
 }
 
 function onLoggedIn() {
   showScreen('app');
   showPage('dashboard');
+  initSettingsBackend();
   loadTasks();
   ensureTaskViewerMeta();
   startLiveLogs();
@@ -1237,41 +1153,130 @@ function appendLog(line) {
 }
 
 // ── Settings ───────────────────────────────────────────────────────────────
+//
+// `#settings-tree` is the generated aiset tree editor. The whole document is
+// described by config.descriptor.json5, so this file only wires it up: pick a
+// document, mount the editor, and offer the two process actions the editor
+// cannot perform itself (reload, restart). Every field, its description and its
+// validation rule come from the descriptor, never from here.
+let settingsEditor = null;
+let settingsEditorDocument = '';
+let settingsDocuments = [];
+// The editor talks to an authenticated API, so it is initialised only after the
+// user is signed in. Before that, /api/settings-info answers 401 and the
+// document selector would stay empty with nothing to retry it.
+let settingsReady = false;
+
 function setCfgStatus(elId, text, ok) {
   const el = $(elId);
   el.textContent = text;
   el.style.color = ok ? 'var(--ok)' : 'var(--err)';
 }
 
-function getTextPicker(pickerId) {
-  return TEXT_PICKERS.find(picker => picker.id === pickerId) || null;
-}
-
-function closeTextPicker(picker) {
-  $(picker.menuId).classList.remove('is-open');
-  $(picker.toggleId).classList.remove('is-open');
-  $(picker.toggleId).setAttribute('aria-expanded', 'false');
-}
-
-function closeAllTextPickers(exceptId = '') {
-  TEXT_PICKERS.forEach(picker => {
-    if (picker.id !== exceptId) closeTextPicker(picker);
+function bindSettingsUi() {
+  $('cfg-document').addEventListener('change', () => mountSettingsEditor($('cfg-document').value));
+  $('cfg-show-absent').addEventListener('change', () => {
+    if (settingsEditor) settingsEditor.setShowAbsent($('cfg-show-absent').checked);
   });
+  $('cfg-values-as-text').addEventListener('change', () => {
+    if (settingsEditor) settingsEditor.setValuesAsText($('cfg-values-as-text').checked);
+  });
+  $('cfg-reload-btn').addEventListener('click', reloadSettings);
+  $('cfg-restart-btn').addEventListener('click', restartAidir);
 }
 
-function openTextPicker(picker) {
-  closeAllTextPickers(picker.id);
-  syncTextPickerSelection(picker);
-  $(picker.menuId).classList.add('is-open');
-  $(picker.toggleId).classList.add('is-open');
-  $(picker.toggleId).setAttribute('aria-expanded', 'true');
+/**
+ * List the configuration documents and mount the editor on the first one.
+ *
+ * The document list comes from the backend rather than from a hardcoded array,
+ * so a worker that gains its own config.json5 appears without a frontend change.
+ */
+// Names the script URLs that failed, because the usual cause is not a restart:
+// a reverse proxy that forwards the API but not the asset path answers a
+// script request with the SPA page, and the browser reports that only as a
+// missing global.
+function missingAssetsMessage() {
+  const urls = Array.from(document.querySelectorAll('script[src*="assets/aiset"]'))
+    .map(node => node.getAttribute('src'));
+  return 'The settings editor assets did not load, so the settings cannot be ' +
+    'edited here. Requested: ' + (urls.length ? urls.join(', ') : 'no asset URL found') +
+    '. Check that those URLs answer with JavaScript and not with an HTML page.';
 }
 
-function toggleTextPicker(picker) {
-  if ($(picker.menuId).classList.contains('is-open')) {
-    closeTextPicker(picker);
-  } else {
-    openTextPicker(picker);
+async function initSettingsBackend() {
+  if (settingsReady) return;
+  const res = await apiGet('/api/settings-info');
+  if (!res || !res.ok) {
+    // apiGet resolves the parsed body and yields null on any failure, so the
+    // reason is read from the body rather than from a response envelope.
+    const reason = res ? (res.detail || res.error || ('HTTP ' + res.status)) : 'no response';
+    $('cfg-aiset-status').textContent = 'The settings service could not be read: ' + reason;
+    $('cfg-aiset-status').style.color = 'var(--err)';
+    return;
+  }
+  settingsDocuments = Array.isArray(res.documents) ? res.documents : [];
+
+  const select = $('cfg-document');
+  select.innerHTML = '';
+  settingsDocuments.forEach(id => {
+    const option = document.createElement('option');
+    option.value = id;
+    option.textContent = id === 'main' ? 'Main configuration (config.json5)' : id;
+    select.appendChild(option);
+  });
+
+  if (!window.aiset || typeof window.aiset.mountTree !== 'function') {
+    // Not marked ready, so opening the page again retries.
+    $('cfg-aiset-status').textContent = missingAssetsMessage();
+    $('cfg-aiset-status').style.color = 'var(--err)';
+    return;
+  }
+  settingsReady = true;
+  await mountSettingsEditor(settingsDocuments[0] || 'main');
+}
+
+function mountSettingsEditor(documentId) {
+  if (!documentId) return Promise.resolve();
+  if (settingsEditor) {
+    settingsEditor.destroy();
+    settingsEditor = null;
+  }
+  settingsEditorDocument = documentId;
+  settingsEditor = window.aiset.mountTree('#settings-tree', {
+    document: documentId,
+    apiBase: '/api/settings',
+    view: 'source',
+    showAbsent: $('cfg-show-absent').checked,
+    valuesAsText: $('cfg-values-as-text').checked,
+  });
+
+  settingsEditor.on('status', event => {
+    const node = $('cfg-aiset-status');
+    node.textContent = event.message || '';
+    node.style.color = event.state === 'error' ? 'var(--err)' : 'var(--muted)';
+  });
+  settingsEditor.on('applied', () => setCfgStatus('cfg-aiset-lifecycle-status', 'Saved.', true));
+
+  return settingsEditor.ready;
+}
+
+async function reloadSettings() {
+  setCfgStatus('cfg-aiset-lifecycle-status', 'Reloading…', true);
+  const res = await apiPost('/api/settings/reload', {});
+  if (!res.ok) {
+    setCfgStatus('cfg-aiset-lifecycle-status', (res.data && res.data.detail) || 'Reload failed', false);
+    return;
+  }
+  setCfgStatus('cfg-aiset-lifecycle-status', 'Settings reloaded.', true);
+  if (settingsEditor) await settingsEditor.reload(false);
+}
+
+async function restartAidir() {
+  if (!window.confirm('Restart aidir? Running tasks wait for the graceful timeout first.')) return;
+  setCfgStatus('cfg-aiset-lifecycle-status', 'Restart requested…', true);
+  const res = await apiPost('/api/restart', {});
+  if (!res.ok) {
+    setCfgStatus('cfg-aiset-lifecycle-status', (res.data && res.data.detail) || 'Restart failed', false);
   }
 }
 
@@ -1295,192 +1300,12 @@ function bindTaskViewerUi() {
   });
 }
 
-function renderTextPickerOptions(picker) {
-  const menu = $(picker.menuId);
-  menu.innerHTML = picker.options.map(opt => (
-    `<button class="field-picker-option" type="button" data-picker-id="${picker.id}" data-value="${opt.value.replaceAll('&', '&amp;').replaceAll('"', '&quot;').replaceAll('<', '&lt;')}">${opt.label.replaceAll('&', '&amp;').replaceAll('<', '&lt;')}</button>`
-  )).join('');
-}
-
-function syncTextPickerSelection(picker) {
-  const currentValue = $(picker.inputId).value;
-  document.querySelectorAll(`#${picker.menuId} .field-picker-option`).forEach(option => {
-    const isSelected = option.dataset.value === currentValue;
-    option.classList.toggle('is-selected', isSelected);
-    option.setAttribute('aria-selected', isSelected ? 'true' : 'false');
-  });
-}
-
-function getPickerOptions(picker) {
-  return Array.from(document.querySelectorAll(`#${picker.menuId} .field-picker-option`));
-}
-
-function focusTextPickerOption(picker, index) {
-  const options = getPickerOptions(picker);
-  if (!options.length) return;
-  const normalized = ((index % options.length) + options.length) % options.length;
-  options[normalized].focus();
-}
-
-function selectTextPickerValue(picker, value) {
-  $(picker.inputId).value = value;
-  syncTextPickerSelection(picker);
-  closeTextPicker(picker);
-  $(picker.inputId).focus();
-}
-
-function bindTextPicker(picker) {
-  renderTextPickerOptions(picker);
-  syncTextPickerSelection(picker);
-
-  $(picker.toggleId).addEventListener('click', () => toggleTextPicker(picker));
-
-  $(picker.inputId).addEventListener('input', () => {
-    syncTextPickerSelection(picker);
-  });
-
-  $(picker.inputId).addEventListener('keydown', event => {
-    if (event.key === 'ArrowDown') {
-      event.preventDefault();
-      openTextPicker(picker);
-      const options = getPickerOptions(picker);
-      const selectedIndex = options.findIndex(option => option.classList.contains('is-selected'));
-      focusTextPickerOption(picker, selectedIndex >= 0 ? selectedIndex : 0);
-    } else if (event.key === 'ArrowUp') {
-      event.preventDefault();
-      openTextPicker(picker);
-      const options = getPickerOptions(picker);
-      const selectedIndex = options.findIndex(option => option.classList.contains('is-selected'));
-      focusTextPickerOption(picker, selectedIndex >= 0 ? selectedIndex : options.length - 1);
-    } else if (event.key === 'Escape') {
-      closeTextPicker(picker);
-    }
-  });
-
-  getPickerOptions(picker).forEach((option, index) => {
-    option.addEventListener('click', () => {
-      selectTextPickerValue(picker, option.dataset.value || '');
-    });
-
-    option.addEventListener('keydown', event => {
-      if (event.key === 'ArrowDown') {
-        event.preventDefault();
-        focusTextPickerOption(picker, index + 1);
-      } else if (event.key === 'ArrowUp') {
-        event.preventDefault();
-        focusTextPickerOption(picker, index - 1);
-      } else if (event.key === 'Enter' || event.key === ' ') {
-        event.preventDefault();
-        selectTextPickerValue(picker, option.dataset.value || '');
-      } else if (event.key === 'Escape') {
-        event.preventDefault();
-        closeTextPicker(picker);
-        $(picker.inputId).focus();
-      }
-    });
-  });
-}
-
-function bindSettingsUi() {
-  $('cfg-mode-gui').addEventListener('change', () => {
-    $('cfg-raw-pane').style.display = 'none';
-    $('cfg-gui-pane').style.display = 'block';
-    closeAllTextPickers();
-  });
-
-  $('cfg-mode-raw').addEventListener('change', () => {
-    $('cfg-raw-pane').style.display = 'block';
-    $('cfg-gui-pane').style.display = 'none';
-    closeAllTextPickers();
-  });
-
-  $('config-save-raw-btn').addEventListener('click', saveRawConfig);
-  $('config-save-gui-btn').addEventListener('click', saveGuiConfig);
-
-  document.addEventListener('click', event => {
-    TEXT_PICKERS.forEach(picker => {
-      if (!$(picker.rootId).contains(event.target)) closeTextPicker(picker);
-    });
-  });
-
-  document.addEventListener('keydown', event => {
-    if (event.key === 'Escape') closeAllTextPickers();
-  });
-
-  TEXT_PICKERS.forEach(bindTextPicker);
-}
-
-async function loadConfig() {
-  const keys = GUI_LEVEL_FIELDS.map(field => field.key).join(',');
-  const [data, raw, fields] = await Promise.all([
-    apiGet('/api/config'),
-    apiGet('/api/config/raw'),
-    apiGet(`/api/config/fields?keys=${encodeURIComponent(keys)}`),
-  ]);
-
-  if (data) {
-    $('config-pre').textContent = JSON.stringify(data, null, 2);
-  }
-
-  if (raw && typeof raw.text === 'string') {
-    $('config-editor').value = raw.text;
-  }
-
-  if (fields && fields.fields) {
-    GUI_LEVEL_FIELDS.forEach(field => {
-      const val = fields.fields[field.key];
-      if (typeof val === 'string') {
-        $(field.inputId).value = val;
-      } else if (field.allowNotDefined) {
-        $(field.inputId).value = 'NOT DEFINED';
-      } else {
-        $(field.inputId).value = '';
-      }
-
-      const picker = getTextPicker(field.inputId);
-      if (picker) syncTextPickerSelection(picker);
-    });
-  }
-}
-
-async function saveRawConfig() {
-  setCfgStatus('config-save-raw-status', '', true);
-  const res = await apiPost('/api/config/raw', {
-    config_text: $('config-editor').value,
-  });
-  if (!res.ok) {
-    setCfgStatus('config-save-raw-status', res.data.detail || 'Save failed', false);
-    return;
-  }
-  setCfgStatus('config-save-raw-status', 'Saved', true);
-  await loadConfig();
-}
-
-async function saveGuiConfig() {
-  setCfgStatus('config-save-gui-status', '', true);
-
-  const changes = [];
-  for (const field of GUI_LEVEL_FIELDS) {
-    const valueText = $(field.inputId).value.trim();
-    if (field.allowNotDefined && (valueText === 'NOT DEFINED' || valueText === '')) {
-      changes.push({ key: field.key, remove: true });
-    } else {
-      changes.push({ key: field.key, value_text: valueText });
-    }
-  }
-
-  const res = await apiPost('/api/config/fields', { changes });
-  if (!res.ok) {
-    setCfgStatus('config-save-gui-status', res.data.detail || 'Save failed', false);
-    return;
-  }
-  setCfgStatus('config-save-gui-status', 'Saved', true);
-  await loadConfig();
-}
-
 // ── Boot ───────────────────────────────────────────────────────────────────
 bindSettingsUi();
 bindTaskViewerUi();
+// initSettingsBackend() is deliberately absent here: it needs an authenticated
+// session and is called from onLoggedIn() and from the first visit to the
+// settings page instead.
 
 // ── TEST LLM ───────────────────────────────────────────────────────────────
 

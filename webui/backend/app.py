@@ -548,6 +548,74 @@ async def _require_session(
     return session
 
 
+def _cookie_value(header: str, name: str) -> str:
+    """Read one cookie value from a Cookie header."""
+    for part in header.split(";"):
+        key, _, value = part.strip().partition("=")
+        if key == name:
+            return value
+    return ""
+
+
+def _session_token(scope: dict) -> str:
+    """Session token of one ASGI scope: the cookie first, then a Bearer header."""
+    token = ""
+    for name, value in scope.get("headers", []):
+        key = name.decode("latin1").lower()
+        text = value.decode("latin1")
+        if key == "cookie":
+            token = _cookie_value(text, "aidir_token") or token
+        elif key == "authorization" and text.startswith("Bearer "):
+            token = text[7:]
+    return token
+
+
+class SettingsPrincipalResolver:
+    """Turns the WebUI session of one ASGI scope into an aiset Principal.
+
+    The library calls this from its own ASGI adapter, which is exactly why it
+    exists: the session lookup is asynchronous, and aiset only needs a finished
+    `Principal`. This class decides *who* the session is; aiset decides what that
+    session may do, and a session without a valid token yields a principal with
+    no permissions, which the library refuses.
+    """
+
+    def __init__(self, core: "Core") -> None:
+        self._core = core
+
+    async def resolve(self, scope: dict):
+        """Read the session of one scope and map it to a principal."""
+        from core.settings.wsgi import ANONYMOUS, principal_for
+
+        token = _session_token(scope)
+        if not token:
+            return ANONYMOUS
+        session = await _get_session(self._core, token)
+        if session is None:
+            return ANONYMOUS
+        return principal_for(session.get("permissions"), session.get("login", ""))
+
+
+def mount_settings_api(app: FastAPI, core: "Core") -> None:
+    """Mount the settings API under /api/settings.
+
+    Two mounts of the same library application are installed: the API under its
+    own prefix, and the same application again under /assets, because the
+    library serves its editor assets at the application root rather than below
+    the API prefix. A browser asking for /assets/aiset.css therefore reaches the
+    library, and any other /assets path is refused by it rather than by the
+    frontend static mount.
+    """
+    from core.settings.runtime import get_runtime
+    from core.settings.wsgi import ASSET_BASE, SETTINGS_BASE, build_asgi_app
+
+    runtime = get_runtime()
+    settings_app = build_asgi_app(runtime.service, SettingsPrincipalResolver(core).resolve)
+    app.mount(SETTINGS_BASE, settings_app, name="settings")
+    app.mount(ASSET_BASE, settings_app, name="settings-assets")
+    log("webui", "info", f"settings API mounted at {SETTINGS_BASE}", "settings")
+
+
 # ── App factory ───────────────────────────────────────────────────────────────
 
 def create_app(
@@ -886,11 +954,18 @@ def create_app(
 
     @app.post("/api/cron/embedded/enable")
     async def enable_embedded_cron(session: dict = Depends(_require_session)):
-        """Enable embedded cron in configuration while preserving other cron settings."""
+        """Enable embedded cron in configuration while preserving other cron settings.
+
+        With the aiset backend this is a single atomic `set` operation on the
+        cron object, so the file keeps its comments and the write is validated
+        against config.descriptor.json5 before it reaches the disk.
+        """
         cron_config = core.config.get("cron", {})
         if not isinstance(cron_config, dict):
             raise HTTPException(status_code=400, detail="cron configuration must be an object")
         try:
+            # One atomic operation with either backend: the legacy loader
+            # rewrites the file, the aiset facade stages a validated `set`.
             core.config.update_key("cron", {**cron_config, "embedded": True})
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1054,73 +1129,14 @@ def create_app(
         except WebSocketDisconnect:
             pass
 
-    # ── Config read/write ─────────────────────────────────────────────────────
-
-    @app.get("/api/config")
-    async def get_config(session: dict = Depends(_require_session)):
-        """Return current config (without secrets substituted back)."""
-        return core.config.raw()
-
-    @app.get("/api/config/raw")
-    async def get_config_raw(session: dict = Depends(_require_session)):
-        """Return raw config text for direct editing mode."""
-        return {"text": core.config.raw_text()}
-
-    @app.post("/api/config/raw")
-    async def save_config_raw(request: Request, session: dict = Depends(_require_session)):
-        """Validate and save full config text from UI, then reload config cache."""
-        body = await request.json()
-        config_text = body.get("config_text", "")
-        if not isinstance(config_text, str) or not config_text.strip():
-            raise HTTPException(status_code=400, detail="config_text must be a non-empty string")
-
-        try:
-            core.config.save_config_text(config_text)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
-        except Exception as exc:
-            raise HTTPException(status_code=500, detail=f"Failed to save config: {exc}")
-
-        return {"ok": True, "config": core.config.raw()}
-
-    @app.post("/api/config/fields")
-    async def update_config_fields(request: Request, session: dict = Depends(_require_session)):
-        """Update config fields one by one using Config.update_key and reload cache."""
-        body = await request.json()
-        changes = body.get("changes", [])
-        if not isinstance(changes, list) or not changes:
-            raise HTTPException(status_code=400, detail="changes must be a non-empty list")
-
-        try:
-            for change in changes:
-                key = change.get("key")
-                if not isinstance(key, str) or not key.strip():
-                    raise ValueError("Each change must include non-empty key")
-                if bool(change.get("remove")):
-                    core.config.delete_key(key)
-                elif "value_text" in change:
-                    core.config.update_key_text(key, change.get("value_text", ""))
-                else:
-                    core.config.update_key(key, change.get("value"))
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
-        except Exception as exc:
-            raise HTTPException(status_code=500, detail=f"Failed to update config fields: {exc}")
-
-        return {"ok": True, "config": core.config.raw()}
-
-    @app.get("/api/config/fields")
-    async def get_config_fields(keys: str, session: dict = Depends(_require_session)):
-        """Return raw text values for requested comma-separated config keys."""
-        items = [k.strip() for k in keys.split(",") if k.strip()]
-        if not items:
-            raise HTTPException(status_code=400, detail="keys query parameter is required")
-
-        out: dict[str, str | None] = {}
-        for key in items:
-            out[key] = core.config.get_key_text_or_none(key)
-
-        return {"fields": out}
+    # ── Settings ─────────────────────────────────────────────────────────────
+    # Reading and writing the configuration is the aiset service, mounted at
+    # /api/settings. The routes below are only the host actions the service
+    # cannot perform itself: describing which subsystem is active, and the two
+    # process-level actions it reports back. There is deliberately no whole-file
+    # read endpoint any more: it returned every substituted credential to any
+    # authenticated session, and the editor shows a secret only when the session
+    # holds the secret permission.
 
     # ── Test: workers / models info ───────────────────────────────────────────
 
@@ -1482,8 +1498,54 @@ def create_app(
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc))
 
+    # ── Settings host routes ────────────────────────────────────────────
+    # These live outside /api/settings, which the aiset WSGI application owns.
+
+    @app.get("/api/settings-info")
+    async def settings_info(session: dict = Depends(_require_session)):
+        """List the configuration documents and the current revision.
+
+        The frontend builds its document selector from this, so a worker that
+        gains its own configuration file appears without a frontend change.
+        """
+        from core.settings.runtime import get_runtime
+        from core.settings.wsgi import ASSET_BASE
+
+        runtime = get_runtime()
+        return {
+            "ok": True,
+            "documents": runtime.document_ids(),
+            "assets": ASSET_BASE,
+            "revision": runtime.load("main").revision,
+        }
+
+    @app.post("/api/settings/reload")
+    async def settings_reload(session: dict = Depends(_require_session)):
+        """Re-read every configuration document and apply it to the process.
+
+        This is the host action behind the `reload_required` application state:
+        the editor asks the server how a change is picked up, and the user
+        triggers the actual re-read here.
+        """
+        from core.settings.runtime import SettingsError, get_runtime
+
+        try:
+            runtime = get_runtime()
+            runtime.refresh()
+            core.reload_config()
+        except SettingsError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except Exception as exc:
+            log("webui", "error", f"Settings reload failed for user {session['login']}: {exc}", "control")
+            raise HTTPException(status_code=500, detail=f"Failed to reload settings: {exc}") from exc
+
+        log("webui", "info", f"Settings reloaded by user {session['login']}", "control")
+        return {"ok": True, "revision": runtime.load("main").revision}
+
     # ── Static files ──────────────────────────────────────────────────────────
     # Served last so API routes take priority
+
+    mount_settings_api(app, core)
 
     if _FRONTEND_DIR.exists():
         app.mount("/", StaticFiles(directory=str(_FRONTEND_DIR), html=True), name="frontend")

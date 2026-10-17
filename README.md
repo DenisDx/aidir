@@ -86,11 +86,12 @@ running and starts after the next service restart.
 
 ## Configuration
 
-The proposed cross-project settings library, aiset, is described in
-[aiset/SPEC_.md](aiset/SPEC_.md). It is the complete working draft, not an available
-feature. The [aiset directory](aiset/) is maintained separately and excluded
-from this repository's Git tracking. See [DOCUMENTS.MD](DOCUMENTS.MD) for the
-project document index.
+The shared cross-project settings library, aiset, lives in the
+[aiset directory](aiset/) and is maintained separately from this repository's
+Git tracking. Its complete draft is in [aiset/SPEC_.md](aiset/SPEC_.md) and the
+integration plan for this project is in
+[plan_aiset_integration.md](plan_aiset_integration.md). See
+[DOCUMENTS.MD](DOCUMENTS.MD) for the project document index.
 
 Configuration is split into two files:
 
@@ -161,6 +162,68 @@ Key sections:
 - **`tasks`** — restart drain timeout plus queue/run lifecycle timeouts
 - **`logging`** — log levels per subsystem (0=EMERG … 7=DEBUG)
 - **`resources`** — hardware resources to track (VRAM etc.; enforced in future releases)
+
+#### Settings schema and the generated editor
+
+Every configuration file has a **descriptor**: a schema that names every key,
+its type, its constraints, whether it holds a secret, how the running system
+picks a change up, and the text a user reads while editing it.
+
+| File | Describes |
+|---|---|
+| `config.descriptor.json5` | `config.json5` |
+| `config.types.json5` | reusable shapes shared by all descriptors |
+| `workers/<type>/<id>/descriptor.json5` | that worker's `config.json5` |
+
+A worker may keep its own `config.json5` next to `app.py`. Its keys are merged
+under `workers.items.<id>`, and the root entry wins on every key present in
+both.
+
+The configuration subsystem is built on the [aiset](aiset/) library, and it is
+the only implementation:
+
+- every read is schema-validated, and every write is one atomic,
+  revision-checked operation committed under a lock;
+- an undeclared key is a hard error, so a configuration file that no longer
+  matches its descriptor stops startup with a precise diagnostic instead of being
+  silently accepted;
+- comments, quoting and `${VAR}` placeholders survive every write; everything
+  else in the file is preserved byte for byte;
+- credentials keep their placeholder in the file and are shown only to a session
+  whose account holds the secret permission;
+- `config.json5.lock`, `config.json5.back…` and `config.json5.conflicted.*.back`
+  appear next to the file (write lock, backup chain, preserved rejected copies),
+  and a rejected external edit is restored instead of being served;
+- the **Settings** tab of the WebUI is a generated editor built from the
+  descriptor, with a document selector for the root configuration and for every
+  worker-local configuration;
+- the editor's JS and CSS are served by the library, not copied into
+  `webui/frontend/`. The page requests them from `/api/settings/assets/`, so they
+  travel the same route nginx already forwards to the WebUI backend;
+- the previous raw whole-file editor and the seven-field logging form are gone.
+  Each node can still be edited as raw source, and a change is staged until
+  **Apply** commits the whole batch.
+
+There is no endpoint that returns the whole resolved configuration any more:
+it included every substituted credential. Use the tree snapshot, which honours
+the secret permission.
+
+Validate the descriptors and the shipped files at any time:
+
+```bash
+# descriptor grammar (must print nothing and exit 0)
+aiset/.venv/bin/aiset validate-descriptor config.descriptor.json5 --strict \
+    --typedef config.types.json5
+
+# both shipped configuration files against their descriptor
+venv/bin/python -m unittest -v test_config_descriptor.py
+
+# the host adapter
+venv/bin/python -m unittest -v test_settings_backend.py
+```
+
+The migration plan and the reasoning behind the change are in
+[plan_aiset_integration.md](plan_aiset_integration.md).
 
 ### Hooks
 
@@ -370,6 +433,12 @@ Rules:
 
 - nginx always listens on container port `80`; Docker publishes it to host `${NGINX_HTTP_PORT}`.
 - HTML and WebSocket share the same public nginx port. WS uses `/ws/*`; it does not need a separate port.
+- nginx forwards three prefixes to the WebUI backend and serves everything else from `webui/frontend`:
+  `/api/`, `/ws/` and `/assets/`. A path that names a file extension and is not found returns `404`
+  rather than the SPA page, so a missing script cannot arrive as `text/html` with status `200`.
+- The settings editor assets come from the installed `aiset` package, not from this repository. The page
+  therefore requests them under the API prefix (`/api/settings/assets/aiset.js`), which nginx already
+  forwards; requesting them at `/assets/` works as well, but depends on the proxy rule above.
 - Before Docker or the core app starts, `install.sh` checks the Redis, nginx, WebUI, OpenAIx, and MCP listener ports.
   It reserves each selected port during that check, so the aidir services cannot be assigned the same host port.
 - For a new `.env`, an occupied port is automatically changed to the next free TCP port. For an existing `.env`,

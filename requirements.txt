@@ -2,6 +2,9 @@ fastapi==0.115.12
 uvicorn[standard]==0.34.2
 redis[asyncio]==5.3.0
 httpx==0.28.1
-json5==0.10.0
-python-dotenv==1.1.0
 cryptography==46.0.3
+# json5 is not used by the service: aiset has its own JSON5 parser. It is here
+# for test_settings_parity.py, whose reference reader must parse the
+# configuration with a parser the service does not use, or the parity check
+# would only prove that one parser agrees with itself.
+json5==0.10.0

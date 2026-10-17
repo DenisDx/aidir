@@ -10,39 +10,29 @@ import importlib
 import sys
 from pathlib import Path
 
-import json5
-
-from core.config import _substitute
 from core.worker import BaseWorker
 from core import log
 
 _ROOT = Path(__file__).parent.parent
 
 
-def _deep_merge(base: dict, override: dict) -> dict:
-    """Recursively merge dictionaries with override priority."""
-    out = dict(base)
-    for key, value in override.items():
-        if isinstance(value, dict) and isinstance(out.get(key), dict):
-            out[key] = _deep_merge(out[key], value)
-        else:
-            out[key] = value
-    return out
-
-
 def _read_worker_local_config(worker_dir: Path, worker_id: str) -> dict:
-    """Read workers/<type>/<id>/config.json5 as JSON5 (with env placeholders)."""
-    cfg_file = worker_dir / "config.json5"
-    if not cfg_file.exists():
+    """Resolved settings of a worker's own config.json5, or {} when it has none.
+
+    The file is a settings document in its own right, with its own descriptor, so
+    its values come from the settings runtime rather than from a second JSON5
+    parse here. A worker without a local file keeps being configured from the
+    root entry alone.
+    """
+    from core.settings.documents import worker_document_id
+    from core.settings.runtime import get_runtime
+
+    if not (worker_dir / "descriptor.json5").is_file():
         return {}
 
-    try:
-        raw = cfg_file.read_text(encoding="utf-8")
-        parsed = json5.loads(_substitute(raw))
-        return parsed if isinstance(parsed, dict) else {}
-    except Exception as exc:
-        log("system", "warn", f"Worker {worker_id}: invalid config.json5 ignored: {exc}")
-        return {}
+    document_id = worker_document_id(worker_dir.parent.name, worker_id)
+    effective = get_runtime().effective(document_id)
+    return dict(effective) if isinstance(effective, dict) else {}
 
 
 def _iter_worker_dirs(workers_dir: Path):
@@ -71,9 +61,21 @@ def resolve_worker_configs(config: dict) -> dict[str, dict]:
         root_cfg = items_cfg.get(worker_id, {})
         if not isinstance(root_cfg, dict):
             root_cfg = {}
-        workers_cfg[worker_id] = _deep_merge(local_cfg, root_cfg)
+        workers_cfg[worker_id] = _merge_worker_entry(local_cfg, root_cfg)
 
     return workers_cfg
+
+
+def _merge_worker_entry(local_cfg: dict, root_cfg: dict) -> dict:
+    """Combine a worker-local entry with its root entry; the root entry wins.
+
+    `aiset.merge(prefer="base")` states that rule directly, so the library owns
+    it and the host keeps no second implementation. test_settings_backend.py
+    asserts the result is identical to the merge order this replaced.
+    """
+    from core.settings.documents import merge_worker_entry
+
+    return merge_worker_entry(root_cfg, local_cfg)
 
 
 def load_workers(config: dict, workers_cfg: dict[str, dict] | None = None) -> dict[str, BaseWorker]:
