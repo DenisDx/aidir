@@ -8,6 +8,7 @@ Proposals may include both planned and completed work; consult each document.
 | Document | Responsibility |
 |---|---|
 | [README.md](README.md) | User-facing installation, configuration, operation, and troubleshooting. |
+| [TEST.md](TEST.md) | Smoke, automated, regression, and manual acceptance test procedures. |
 | [SPEC.md](SPEC.md) | Original project specification; read-only for agents. |
 | [AGENTS.md](AGENTS.md) | Agent workflow and maintenance rules; read-only for agents. |
 | [TODO.md](TODO.md) | Existing task notes and configuration reminders. |
