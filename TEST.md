@@ -117,8 +117,15 @@ python -m unittest -v \
   test_config_descriptor \
   test_settings_backend \
   test_settings_parity \
-  test_frontend_boot_order
+  test_frontend_boot_order \
+  test_settings_styles
 ```
+
+`test_settings_styles.py` checks the design contract against the library's own
+published inventory (`aiset.classes()`): every class is painted by the host or the
+library, every `--aiset-*` variable the library reads is set by the host, the host
+reintroduces no literal palette, the host sheet loads last, no rule escapes the
+editor, and no host control carries an inline style. It needs `node`.
 
 `test_frontend_boot_order` runs the real front-end sources in Node against a
 minimal DOM, in the order `index.html` loads them, and reports the page before
@@ -300,6 +307,9 @@ curl -sI "http://localhost:${NGINX_HTTP_PORT:-8080}/api/settings/assets/aiset-tr
 | Step | Expected |
 |---|---|
 | Open **Settings** | The document selector lists `main` and one entry per worker-local configuration; the tree renders with descriptions |
+| Look at the tree | Every level is indented under its parent with a guide line, so what is inside what is visible; names do not touch the controls |
+| Look at the badges | Each badge is a pill with a border and a colour by meaning (type, `reload`, `live`, `secret`, `dirty`); they are separated, not one run of text |
+| Look at the toolbar | **Apply** is the primary control and stands out; Reload, Revert all, Expand all and Collapse all are quiet; hovering a row highlights it |
 | Expand `logging` | Every node shows its type, its description, the file comments and the `apply` policy (`live`, `reload`, `restart`) |
 | Change `logging.level` and press **Apply** | One atomic write; `config.json5` keeps its comments, quoting and every `${VAR}` placeholder; the status line reports the application state |
 | Open the `.env` button on a node that holds `${VAR}` | The variable name and the inline fallback are editable separately, and the placeholder is not lost |

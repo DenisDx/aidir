@@ -200,6 +200,13 @@ the only implementation:
 - the editor's JS and CSS are served by the library, not copied into
   `webui/frontend/`. The page requests them from `/api/settings/assets/`, so they
   travel the same route nginx already forwards to the WebUI backend;
+- the design of the editor belongs to this project, in
+  `webui/frontend/settings.css`: the library ships markup and light-theme
+  defaults, and a generated interface cannot guess the design of the host. The
+  stylesheet loads after `aiset.css` and must stay there, since equal specificity
+  is decided by order. `test_settings_styles.py` fails if a class the editor emits
+  is left undesigned, if the order is reversed, or if a library rule outranks the
+  theme;
 - the previous raw whole-file editor and the seven-field logging form are gone.
   Each node can still be edited as raw source, and a change is staged until
   **Apply** commits the whole batch.

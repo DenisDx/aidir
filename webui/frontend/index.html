@@ -1066,38 +1066,37 @@
 
     <!--
       Generated settings editor (aiset).
-      The assets are the library's own files, served read-only at /assets by the
-      backend. Load order matters: aiset.js first, then aiset-tree.js, then
-      app.js, which mounts the editor into #settings-tree.
+      The assets are the library's own files, served read-only by the backend.
+      Load order matters: aiset.js first, then aiset-tree.js, then app.js, which
+      mounts the editor into #settings-tree.
     -->
     <link rel="stylesheet" href="/api/settings/assets/aiset.css">
+    <!-- Host design for the generated editor. Must come after aiset.css: the
+         library ships only light-theme defaults, and equal-specificity rules
+         are decided by order. -->
+    <link rel="stylesheet" href="settings.css">
     <div class="card" id="cfg-aiset-card">
       <div class="card-title">Configuration editor</div>
-      <div id="cfg-aiset-status"
-        style="font-size:12px;color:var(--muted);margin-bottom:10px;">Loading the settings editor…</div>
-      <div class="cfg-row" style="margin-bottom:10px;">
+      <div id="cfg-aiset-status">Loading the settings editor…</div>
+      <div class="cfg-row">
         <label for="cfg-document">Document</label>
-        <select id="cfg-document"
-          style="background:#0a0c12;color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 8px;font-size:13px;min-width:320px;"></select>
+        <select id="cfg-document"></select>
       </div>
-      <div class="cfg-row" style="margin-bottom:10px;gap:16px;flex-wrap:wrap;">
-        <label style="display:flex;align-items:center;gap:6px;">
+      <div class="cfg-row">
+        <label class="cfg-check">
           <input type="checkbox" id="cfg-show-absent">
           Show settings that are not in the file
         </label>
-        <label style="display:flex;align-items:center;gap:6px;">
+        <label class="cfg-check">
           <input type="checkbox" id="cfg-values-as-text">
           Show objects and arrays as text
         </label>
       </div>
       <div id="settings-tree"></div>
-      <div id="cfg-aiset-lifecycle"
-        style="display:flex;gap:10px;align-items:center;margin-top:12px;">
-        <button id="cfg-reload-btn" type="button"
-          style="padding:8px 12px;border-radius:6px;border:none;background:var(--accent);color:#fff;cursor:pointer;">Reload settings</button>
-        <button id="cfg-restart-btn" type="button"
-          style="padding:8px 12px;border-radius:6px;border:1px solid var(--border);background:transparent;color:var(--text);cursor:pointer;">Restart aidir</button>
-        <span id="cfg-aiset-lifecycle-status" style="font-size:12px;color:var(--muted);"></span>
+      <div id="cfg-aiset-lifecycle">
+        <button id="cfg-reload-btn" type="button">Reload settings</button>
+        <button id="cfg-restart-btn" type="button">Restart aidir</button>
+        <span id="cfg-aiset-lifecycle-status"></span>
       </div>
     </div>
 

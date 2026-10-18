@@ -1,0 +1,245 @@
+/* Host design for the generated settings editor (webui/frontend/index.html).
+ *
+ * The library owns the markup, the structure and a light-theme default palette.
+ * Since aiset 97748c8 the palette is entirely expressed through custom
+ * properties on `:root`, and the structural rules - row layout, the indent of
+ * `.aiset-tree-children`, the guide line, the focus ring - moved into
+ * `aiset.css`. What is left for the host is the palette and the few controls the
+ * library names but does not paint.
+ *
+ * So this file is mostly a variable block. That is deliberate: overriding forty
+ * selectors is a specificity contest that only load order can settle, overriding
+ * fourteen variables cannot be lost at all.
+ *
+ * Load order still matters for the handful of real rules below, so keep this file
+ * after aiset.css. Do not edit or copy aiset.css: it is served from the installed
+ * package and your copy rots at the next upgrade.
+ */
+
+/* ── Palette ────────────────────────────────────────────────────────────
+   The project palette (index.html `:root`) mapped onto the library's contract.
+   These are the names aiset.css actually reads. */
+:root {
+  --aiset-surface:        #1a1d27;  /* panels, pills, inputs   */
+  --aiset-surface-strong: #1f2331;  /* hover, focused inputs   */
+  --aiset-input-bg:       #1a1d27;
+  --aiset-border:         #2a2d3a;
+  --aiset-text:           #d0d4e8;
+  --aiset-text-soft:      #a8adc8;
+  --aiset-muted:          #6b7090;
+  --aiset-accent:         #5b8af7;
+  --aiset-ok:             #4caf86;
+  --aiset-pending:        #f0a500;
+  --aiset-warn:           #f0a500;
+  --aiset-err:            #e05555;
+
+  /* Type marks are a choice, not a fact, so the library keeps them separate. */
+  --aiset-type-int:    #4caf86;
+  --aiset-type-string: #5b8af7;
+  --aiset-type-bool:   #b48ef0;
+  --aiset-type-other:  #6b7090;
+
+  /* Structural tunables. The defaults are sane, but a host that says nothing
+     about its own metrics accepts someone else's by accident. */
+  --aiset-indent: 14px;
+  --aiset-guide:  1px;
+  --aiset-row-gap: 8px;
+  --aiset-row-pad: 3px 6px;
+
+  /* Badge borders, so no rule below hard-codes a colour. */
+  --cfg-border-accent: #33406b;
+  --cfg-border-ok:     #2c5a46;
+  --cfg-border-warn:   #5a4720;
+  --cfg-border-err:    #6b3030;
+
+  /* Native widgets are drawn by the browser, so the document decides them. */
+  color-scheme: dark;
+}
+
+/* ── Page chrome ────────────────────────────────────────────────────────
+   The controls of the page itself carry no inline styles: an inline
+   declaration outranks a stylesheet rule of equal specificity, so a theme can
+   never reach it. Scoped to the card, because index.html already has a
+   `.cfg-row` of its own for the log page. */
+#cfg-aiset-status { font-size: 12px; color: var(--muted); margin-bottom: 10px; }
+
+#cfg-aiset-card .cfg-row {
+  display: flex; align-items: center; gap: 10px;
+  margin-bottom: 12px; flex-wrap: wrap;
+}
+#cfg-aiset-card .cfg-row > label {
+  color: var(--muted); font-size: 12px; min-width: 0; text-align: left;
+}
+
+#cfg-document {
+  background: var(--bg); color: var(--text);
+  border: 1px solid var(--border); border-radius: 6px;
+  padding: 6px 8px; font: inherit; font-size: 13px; min-width: 320px;
+}
+#cfg-document:focus { outline: none; border-color: var(--accent); }
+
+.cfg-check {
+  display: flex; align-items: center; gap: 6px;
+  color: var(--text); font-size: 12px; cursor: pointer; user-select: none;
+}
+.cfg-check:hover { color: var(--accent); }
+.cfg-check input[type="checkbox"] {
+  accent-color: var(--accent); width: 14px; height: 14px; margin: 0; cursor: pointer;
+}
+
+#cfg-aiset-lifecycle {
+  display: flex; gap: 10px; align-items: center;
+  margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border);
+}
+#cfg-aiset-lifecycle button { padding: 7px 12px; border-radius: 6px; font: inherit; font-size: 13px; cursor: pointer; }
+#cfg-reload-btn  { background: var(--accent); border: none; color: #fff; }
+#cfg-reload-btn:hover { opacity: .88; }
+#cfg-restart-btn { background: transparent; border: 1px solid var(--border); color: var(--text); }
+#cfg-restart-btn:hover { border-color: var(--accent); color: var(--accent); }
+#cfg-aiset-lifecycle-status { font-size: 12px; color: var(--muted); }
+
+/* ── Row: readability ─────────────────────────────────────────────────────
+   Layout comes from the library. These two rules are decoration, and they are
+   the ones a host actually wants to have opinions about. */
+.aiset-tree-editor .aiset-tree { display: flex; flex-direction: column; gap: 2px; }
+.aiset-tree-editor .aiset-tree-row { border-radius: 5px; }
+.aiset-tree-editor .aiset-tree-row:hover { background: var(--aiset-surface); }
+
+/* A short key must not touch its input. */
+.aiset-tree-editor .aiset-tree-name { min-width: 190px; word-break: break-word; }
+.aiset-tree-editor .aiset-tree-name:hover { text-decoration-color: var(--aiset-muted); }
+
+/* ── Toolbar shell ─────────────────────────────────────────────────────
+   The library names these elements but paints none of them: no flex, no gap,
+   no spacing. Without this the buttons are bare inline text. */
+.aiset-tree-editor .aiset-tree-toolbar {
+  display: flex; align-items: center; gap: 8px;
+  padding: 10px 0 12px; flex-wrap: wrap;
+}
+
+/* ── Badges ───────────────────────────────────────────────────────────────
+   The library paints the badge but **not** `aiset-tree-badges`, the wrapper they
+   sit in, and it is `required` in the library's own inventory. Without this rule
+   the badges of one node run together as a single line of text, which is how
+   they looked before any host stylesheet existed. */
+.aiset-tree-editor .aiset-tree-badges {
+  display: inline-flex; align-items: center; gap: 4px; flex-wrap: wrap;
+}
+.aiset-tree-editor .aiset-tree-badge {
+  display: inline-flex; align-items: center; white-space: nowrap;
+  font-size: 10.5px; line-height: 1.5; padding: 1px 7px;
+  border: 1px solid var(--aiset-border); border-radius: 10px;
+  color: var(--aiset-muted); background: var(--aiset-surface);
+}
+
+/* The kinds the library does not paint: apply policy, access rules, and the
+   states of a staged edit. `new` and `deleted` it already paints. */
+.aiset-tree-editor .aiset-tree-badge.type    { color: var(--aiset-accent); border-color: var(--cfg-border-accent); }
+.aiset-tree-editor .aiset-tree-badge.apply   { color: var(--aiset-muted); }
+.aiset-tree-editor .aiset-tree-badge.req     { color: var(--aiset-accent); border-color: var(--cfg-border-accent); }
+.aiset-tree-editor .aiset-tree-badge.lock,
+.aiset-tree-editor .aiset-tree-badge.secret  { color: var(--aiset-err); border-color: var(--cfg-border-err); }
+.aiset-tree-editor .aiset-tree-badge.absent,
+.aiset-tree-editor .aiset-tree-badge.default,
+.aiset-tree-editor .aiset-tree-badge.unsupported { color: var(--aiset-warn); border-color: var(--cfg-border-warn); }
+.aiset-tree-editor .aiset-tree-badge.dirty   { color: var(--aiset-pending); border-color: var(--aiset-pending); }
+.aiset-tree-editor .aiset-tree-badge.origin,
+.aiset-tree-editor .aiset-tree-badge.env     { color: var(--aiset-ok); border-color: var(--cfg-border-ok); }
+
+/* ── Status, issues, staged list ───────────────────────────────────────
+   Also unpainted by the library, and `required` in its own inventory. */
+.aiset-tree-editor .aiset-tree-status { padding: 8px 0 2px; font-size: 12px; color: var(--aiset-muted); }
+.aiset-tree-editor .aiset-tree-status[data-state="ok"]      { color: var(--aiset-ok); }
+.aiset-tree-editor .aiset-tree-status[data-state="pending"] { color: var(--aiset-pending); }
+.aiset-tree-editor .aiset-tree-status[data-state="error"]   { color: var(--aiset-err); }
+.aiset-tree-editor .aiset-tree-issues { color: var(--aiset-err); font-size: 12px; margin: 6px 0; padding-left: 18px; }
+.aiset-tree-editor .aiset-tree-pending h4 { margin: 10px 0 4px; font-size: 12px; color: var(--aiset-pending); }
+.aiset-tree-editor .aiset-tree-staged { list-style: none; margin: 0; padding: 0; }
+.aiset-tree-editor .aiset-tree-staged-row { display: flex; gap: 8px; align-items: center; font-size: 12px; padding: 2px 0; }
+.aiset-tree-editor .aiset-tree-staged-path { font-family: var(--mono); color: var(--aiset-pending); }
+.aiset-tree-editor .aiset-tree-staged-source,
+.aiset-tree-editor .aiset-tree-staged-op { font-family: var(--mono); color: var(--aiset-muted); }
+
+/* ── Toolbar ──────────────────────────────────────────────────────────────
+   The library now names these buttons `aiset-tree-button` plus the role class
+   `apply`, `reload`, `revert`, and still paints none of them: the toolbar is
+   host design. This is the whole reason the role classes are worth having. */
+.aiset-tree-editor .aiset-tree-button {
+  background: var(--aiset-surface); color: var(--aiset-text);
+  border: 1px solid var(--aiset-border); border-radius: 6px;
+  padding: 5px 12px; font: inherit; font-size: 13px; cursor: pointer;
+}
+.aiset-tree-editor .aiset-tree-button:hover:not(:disabled) {
+  border-color: var(--aiset-accent); color: var(--aiset-accent);
+}
+.aiset-tree-editor .aiset-tree-button:disabled { opacity: .45; cursor: default; }
+
+/* Apply commits the batch: the one primary control on the page. */
+.aiset-tree-editor .aiset-tree-apply {
+  background: var(--aiset-accent); border-color: var(--aiset-accent);
+  color: #fff; font-weight: 600;
+}
+.aiset-tree-editor .aiset-tree-apply:hover:not(:disabled) { color: #fff; opacity: .88; }
+
+/* Reload and Revert do not edit; keep them quiet. */
+.aiset-tree-editor .aiset-tree-reload,
+.aiset-tree-editor .aiset-tree-revert,
+.aiset-tree-editor .aiset-tree-view,
+.aiset-tree-editor .aiset-tree-lifecycle {
+  background: transparent; color: var(--aiset-muted);
+}
+
+.aiset-tree-editor .aiset-tree-chooser {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding-left: 10px; margin-left: 4px;
+  border-left: 1px solid var(--aiset-border);
+  color: var(--muted); font-size: 12px;
+}
+
+/* ── Helpers ──────────────────────────────────────────────────────────────
+   Helper dialogs and the raw editor are host-styled dialogs; the library
+   positions them but does not paint them. */
+.aiset-tree-editor .aiset-tree-raw,
+.aiset-tree-editor .aiset-form {
+  background: var(--aiset-surface); border-color: var(--aiset-accent);
+}
+.aiset-tree-editor .aiset-tree-raw { border-radius: 6px; }
+.aiset-tree-editor .aiset-tree-raw-text,
+.aiset-tree-editor .aiset-form-control {
+  background: var(--bg); border-radius: 5px;
+}
+.aiset-tree-editor .aiset-tree-raw-actions button,
+.aiset-tree-editor .aiset-form-actions button {
+  background: var(--bg); color: var(--aiset-text);
+  border: 1px solid var(--aiset-border); border-radius: 5px;
+  padding: 4px 12px; font: inherit; cursor: pointer;
+}
+.aiset-tree-editor .aiset-tree-raw-actions button:hover:not(:disabled),
+.aiset-tree-editor .aiset-form-actions button:hover:not(:disabled) {
+  border-color: var(--aiset-accent); color: var(--aiset-accent);
+}
+
+/* ── Values the library leaves unpainted ────────────────────────────────── */
+.aiset-tree-editor .aiset-tree-value-readonly { color: var(--aiset-muted); }
+.aiset-tree-editor .aiset-tree-secret { color: var(--aiset-err); font-size: 12px; }
+.aiset-tree-editor .aiset-tree-shape { cursor: pointer; }
+.aiset-tree-editor .aiset-tree-union { gap: 8px; flex-wrap: wrap; }
+/* An absent value keeps its placeholder visible instead of looking like one. */
+.aiset-tree-editor .aiset-tree-value input::placeholder,
+.aiset-tree-editor .aiset-tree-value textarea::placeholder {
+  color: var(--aiset-muted); opacity: .75; font-style: italic;
+}
+
+/* ── Per-node controls ────────────────────────────────────────────────────
+   The library positions and sizes these but leaves the state colours out. */
+.aiset-tree-editor .aiset-tree-action.pill:hover:not(:disabled) {
+  background: var(--aiset-surface-strong);
+}
+.aiset-tree-editor .aiset-tree-action.add:hover:not(:disabled),
+.aiset-tree-editor .aiset-tree-action.up:hover:not(:disabled),
+.aiset-tree-editor .aiset-tree-action.down:hover:not(:disabled) {
+  color: var(--aiset-ok); border-color: var(--aiset-ok);
+}
+.aiset-tree-editor .aiset-tree-action.remove:hover:not(:disabled) {
+  color: var(--aiset-err); border-color: var(--aiset-err);
+}
