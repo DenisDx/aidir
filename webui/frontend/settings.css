@@ -118,13 +118,10 @@
 }
 
 /* ── Badges ───────────────────────────────────────────────────────────────
-   The library paints the badge but **not** `aiset-tree-badges`, the wrapper they
-   sit in, and it is `required` in the library's own inventory. Without this rule
-   the badges of one node run together as a single line of text, which is how
-   they looked before any host stylesheet existed. */
-.aiset-tree-editor .aiset-tree-badges {
-  display: inline-flex; align-items: center; gap: 4px; flex-wrap: wrap;
-}
+   The library paints the badge, the `aiset-tree-badges` wrapper and the `new` and
+   `deleted` kinds. What is left here is this host's vocabulary: the apply
+   policy, the access rules, and the states the library has no name for. */
+.aiset-tree-editor .aiset-tree-badges { gap: 5px; }
 .aiset-tree-editor .aiset-tree-badge {
   display: inline-flex; align-items: center; white-space: nowrap;
   font-size: 10.5px; line-height: 1.5; padding: 1px 7px;
@@ -152,10 +149,11 @@
 .aiset-tree-editor .aiset-tree-status[data-state="ok"]      { color: var(--aiset-ok); }
 .aiset-tree-editor .aiset-tree-status[data-state="pending"] { color: var(--aiset-pending); }
 .aiset-tree-editor .aiset-tree-status[data-state="error"]   { color: var(--aiset-err); }
-.aiset-tree-editor .aiset-tree-issues { color: var(--aiset-err); font-size: 12px; margin: 6px 0; padding-left: 18px; }
+/* The library sets its box; only the colour is the host's. */
+.aiset-tree-editor .aiset-tree-issues { color: var(--aiset-err); }
 .aiset-tree-editor .aiset-tree-pending h4 { margin: 10px 0 4px; font-size: 12px; color: var(--aiset-pending); }
 .aiset-tree-editor .aiset-tree-staged { list-style: none; margin: 0; padding: 0; }
-.aiset-tree-editor .aiset-tree-staged-row { display: flex; gap: 8px; align-items: center; font-size: 12px; padding: 2px 0; }
+.aiset-tree-editor .aiset-tree-staged-row { font-size: 12px; padding: 2px 0; }
 .aiset-tree-editor .aiset-tree-staged-path { font-family: var(--mono); color: var(--aiset-pending); }
 .aiset-tree-editor .aiset-tree-staged-source,
 .aiset-tree-editor .aiset-tree-staged-op { font-family: var(--mono); color: var(--aiset-muted); }

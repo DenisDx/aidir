@@ -1,8 +1,11 @@
+import gc
+import unittest
+import warnings
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import json
 
-from core.logger import logger
+from core.logger import CoreLogger, logger
 from core.cron import _trim_log_file
 
 logs = Path('logs')
@@ -39,3 +42,33 @@ print('TRIM_TEST', 'PASS' if trim_ok else 'FAIL', 'removed=', removed, 'size=', 
 
 for p in (log_path, jsonl_path, trim_path):
     p.unlink(missing_ok=True)
+
+
+class LoggerResourceTests(unittest.TestCase):
+    """The logger must close what it opens."""
+
+    def test_log_append_closes_the_file_explicitly(self):
+        """Regression: writing through a temporary leaves the close to the collector.
+
+        `path.open("a").write(line)` is finalised rather than closed, so every
+        line raises a ResourceWarning - noise that hides the ones that matter -
+        and it is measurably slower than an explicit block.
+
+        The level matters: `log()` drops anything above the configured threshold
+        before it opens a file, so a run that logs at `info` under an `error`
+        threshold writes nothing and would pass against the old code. Logging at
+        `error` guarantees the write happens.
+        """
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", ResourceWarning)
+            local = CoreLogger()
+            for i in range(5):
+                local.log("system", "error", f"close check {i}")
+            gc.collect()
+
+        unclosed = [w for w in caught if issubclass(w.category, ResourceWarning)]
+        self.assertEqual(
+            unclosed, [],
+            "the logger left files to the collector: "
+            + "; ".join(str(w.message)[:80] for w in unclosed),
+        )
