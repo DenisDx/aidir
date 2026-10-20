@@ -153,7 +153,25 @@ class Core:
             await self.redis.ping()
             log("core", "info", "Redis connected")
         except Exception as exc:
+            host = redis_cfg.get("host", "127.0.0.1")
+            port = redis_cfg.get("port", 6379)
             log("system", "error", f"Redis connection failed: {exc}")
+            # A raw traceback here hides the only thing that matters: the port
+            # aidir was told to use. It is usually a stopped container, or a
+            # container that still publishes the previous port after the port
+            # was changed in .env.
+            print(
+                f"\naidir: Redis is not usable at {host}:{port} "
+                f"({exc.__class__.__name__}: {exc}).\n"
+                f"  Start it:       docker compose -f {_ROOT / 'docker-compose.yml'} up -d\n"
+                f"  Container state: docker compose ps\n"
+                f"  Port on the host: ss -ltnp | grep ':{port}'\n"
+                f"  .env REDIS_PORT and the container's published port must be the same;\n"
+                f"  a container created before the port changed keeps the old one, so\n"
+                f"  force a recreate: docker compose up -d --force-recreate redis\n"
+                f"  If REDIS_PASSWORD is set, verify it matches the container.\n",
+                file=sys.stderr,
+            )
             raise
 
         # ── Queue ──────────────────────────────────────────────────────────

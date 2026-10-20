@@ -119,6 +119,13 @@ git commit -m "aiset: <what changed>"
 `git status` in aidir shows `modified: aiset (new commits)` whenever the library
 moved without the pointer being committed. That is the pin working, not noise.
 
+A fresh clone or `git submodule update` leaves aiset **detached** at the pinned
+commit. That is the correct read-only state for a consumer, and it is why `git
+pull` there fails with `You are not currently on a branch`: a detached HEAD has
+no branch to merge into. Run `git switch main` first, as above. If you commit
+while detached, the commit belongs to no branch; switch to `main` before working,
+or create a branch with `git switch -c <name>`.
+
 Configuration is split into two files:
 
 ### `.env` — secrets and environment-specific values
