@@ -160,6 +160,18 @@ ensure_aiset_checkout() {
   local aiset_dir="$SCRIPT_DIR/aiset"
 
   if [[ -f "$aiset_dir/src/aiset/service.py" ]]; then
+    # The directory can be a manual clone from before aiset became a submodule.
+    # `git submodule status` marks an unregistered one with a leading '-'. The
+    # runtime works either way, but an unregistered clone is invisible to git and
+    # will never be updated by `git submodule update`, so register it here.
+    if command -v git &>/dev/null \
+      && git -C "$SCRIPT_DIR" rev-parse --is-inside-work-tree &>/dev/null \
+      && [[ -f "$SCRIPT_DIR/.gitmodules" ]] \
+      && git -C "$SCRIPT_DIR" submodule status 2>/dev/null | grep -q "^-"; then
+      info "aiset is present but not registered as a submodule; registering it…"
+      git -C "$SCRIPT_DIR" submodule init \
+        || warn "Could not register the aiset submodule; run: git -C \"$SCRIPT_DIR\" submodule init"
+    fi
     info "aiset library present"
     return 0
   fi
