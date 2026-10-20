@@ -645,6 +645,65 @@ curl http://127.0.0.1:20001/mcp \
 
 ## Diagnostic commands
 
+### Doctor
+
+One command checks the configuration documents and the host, and repairs what can
+be repaired mechanically. It runs even when aidir refuses to start because of an
+invalid configuration, which is the case it exists for.
+
+```bash
+# Report only: configuration, aiset checkout, .env, directories, the store lock,
+# venv, Docker, Redis, nginx, ports, Ollama, systemd
+./doctor.sh
+
+# Only the configuration documents; touches no container, port or network, so it
+# is safe while aidir keeps running
+./doctor.sh --config-only
+
+# Safe repairs: clamp an out-of-range number, create missing directories
+./doctor.sh --fix
+
+# Also recreate containers and drop keys the descriptor does not declare
+# (lossy: shown in the report before it is applied)
+./doctor.sh --fix-all
+
+# Machine-readable, for monitoring
+./doctor.sh --json
+
+# Every option, with its explanation, exit codes and fix classes
+./doctor.sh --help
+```
+
+`doctor.sh` runs the doctor through `venv/bin/python core/app.py doctor` and
+forwards every argument; it works from any directory. The long form is
+`venv/bin/python core/app.py doctor`.
+
+Exit codes: `0` healthy or warnings only, `1` failures remain, `2` repaired but
+issues remain. The file is written only when the repairs make it fully valid; a
+partial repair of an invalid file is reported, not stored.
+
+`--root` allows the privileged repairs (start the Docker daemon, restart the
+unit) and prompts for a password once; without it the exact `sudo` command is
+printed. `--dry-run` shows the plan and writes nothing. `./doctor.sh --help`
+lists every option.
+
+The doctor is safe to run while aidir is running:
+
+- configuration reads and the repair write go through the same store lock and
+  revision check as any other write, so a concurrent write is reported as
+  `skipped` instead of being overwritten;
+- ports already held by the running process are recognised as its own, not as a
+  conflict;
+- a repaired configuration is **not** applied by the running process: reload it
+  (`systemctl --user reload aidir`, SIGHUP) or restart. The report says so;
+- reinstalling the virtual environment is refused while the service runs, because
+  replacing packages under a live process is unsafe;
+- `--fix-all` may recreate Redis or nginx; the running process notices and
+  reconnects, and the report says that before the change.
+
+The service logs a one-line `doctor:` summary at every start, before the listeners
+bind, and prints the two-line hint that points at `--help` and `doctor`.
+
 ### Service management
 
 ```bash

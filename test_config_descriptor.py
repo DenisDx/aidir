@@ -304,6 +304,38 @@ class LegacyFieldTests(unittest.TestCase):
         self.assertEqual(int(value), 100)
 
 
+class InvalidDocumentReportTests(unittest.TestCase):
+    """A drifted config must report every stale key in one go."""
+
+    def test_the_failure_lists_every_undeclared_field(self):
+        import tempfile
+
+        from core.settings.runtime import format_load_failure
+
+        text = ROOT_CONFIG.read_text(encoding="utf-8")
+        marker = '      "port": ${OPENAIX_ENDPOINT_PORT:-21434},\n'
+        self.assertIn(marker, text, "the endpoint block moved; update this fixture")
+        drifted = text.replace(
+            marker,
+            marker
+            + '      "context_builder_worker": "context_builder",\n'
+            + '      "retired_endpoint_option": 1,\n',
+            1,
+        )
+        with tempfile.TemporaryDirectory(prefix="aidir-drift-") as tmp:
+            path = Path(tmp) / "config.json5"
+            path.write_text(drifted, encoding="utf-8")
+            service = _build_service("main", ROOT_DESCRIPTOR, path)
+            result = service.load("main", principal=Principal.demo())
+
+        self.assertTrue(result.invalid_on_disk)
+        message = format_load_failure("main", result)
+        self.assertIn("/endpoints/0/context_builder_worker", message)
+        self.assertIn("/endpoints/0/retired_endpoint_option", message)
+        # One line per problem, so a reader can delete them in a single pass.
+        self.assertGreaterEqual(len(message.splitlines()), 3)
+
+
 class CoverageTests(unittest.TestCase):
     """No leaf of a configuration file may be invisible to its descriptor."""
 

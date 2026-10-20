@@ -119,8 +119,15 @@ python -m unittest -v \
   test_settings_parity \
   test_frontend_boot_order \
   test_settings_styles \
-  test_aiset_path
+  test_aiset_path \
+  test_doctor
 ```
+
+`test_doctor.py` covers the host diagnostic: a drifted configuration key is
+reported with its fix class and removed only through `--fix-all`, a dry run writes
+nothing, a missing directory is created by `--fix`, and an unreachable Redis is
+reported within the socket timeout. `core/app.py --help` and the startup hint are
+also asserted.
 
 `test_settings_styles.py` checks the design contract against the library's own
 published inventory (`aiset.classes()`): every class is painted by the host or the
@@ -280,6 +287,19 @@ viewer, logs, and WebSocket live updates.
 | Settings (aiset) | See the manual steps in section 7.1 |
 | Recovery | Core restart with Redis retained; Docker service restart; no orphaned running tasks or leaked locks |
 | Observability | Expected status codes and useful error messages; no request bodies, credentials, or tokens in logs |
+
+### 7.0 Manual acceptance: startup hint and the doctor
+
+| Step | Expected |
+|---|---|
+| Start aidir and read the journal | One `doctor:` line before the listeners bind, then the two-line hint naming `--help` and `doctor` |
+| Run `./doctor.sh --help` | Usage with the `doctor` command, exit 0, even when the configuration is broken |
+| Run `./doctor.sh` | One line per check; Redis, nginx and the configuration are all reported |
+| Add an undeclared key to `config.json5`, run `./doctor.sh` | The key is reported as `drop_unknown`; nothing is written |
+| Run `./doctor.sh --fix-all` | The key is removed, the report says how many repairs were applied, and the file still keeps its comments |
+| Run `./doctor.sh --dry-run --fix-all` | The plan is printed and the file is unchanged |
+| Keep aidir running, run `doctor` | Ports are reported as owned by the running instance, not as conflicts; the JSON has `"aidir_running": true` |
+| Keep aidir running, repair a key with `doctor --fix-all` | The repair is written and the report says to reload aidir (`systemctl --user reload aidir`) |
 
 ### 7.1 Manual acceptance: the generated settings editor
 

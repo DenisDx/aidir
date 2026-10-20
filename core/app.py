@@ -22,6 +22,21 @@ _ROOT = Path(__file__).parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+# `--help` and `doctor` must be dispatched before the imports below. `core.config`
+# builds the process-wide configuration at import and raises when a document is
+# invalid, which is exactly the case an operator runs the doctor for.
+if __name__ == "__main__":
+    _argv = sys.argv[1:]
+    if _argv[:1] in (["-h"], ["--help"]):
+        from core.doctor import usage
+
+        print(usage())
+        raise SystemExit(0)
+    if _argv[:1] == ["doctor"]:
+        from core.doctor import main as doctor_main
+
+        raise SystemExit(doctor_main(_argv[1:]))
+
 import redis.asyncio as aioredis
 import uvicorn
 
@@ -744,6 +759,22 @@ def _build_webui_server(core: Core, restart_callback=None) -> uvicorn.Server:
 
 async def main() -> None:
     log("core", "info", "=== APPLICATION STARTUP BEGIN ===")
+    # Cheap checks before anything binds a port, so a warning is visible even when
+    # a listener fails. This never blocks startup and never raises.
+    try:
+        from core.doctor import startup_report
+
+        summary = startup_report()
+        log("core", "info", summary)
+        print(
+            "aidir: help    venv/bin/python core/app.py --help\n"
+            "aidir: doctor  venv/bin/python core/app.py doctor   "
+            "(configuration, Redis, containers)",
+            file=sys.stderr,
+            flush=True,
+        )
+    except Exception:  # the doctor must never break a start
+        pass
     _enable_signal_stack_dump()
     core = Core()
     await core.start()

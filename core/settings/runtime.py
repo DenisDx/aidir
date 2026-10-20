@@ -97,6 +97,23 @@ def build_resolver(env_file: Path = ENV_FILE) -> Resolver:
     return Resolver(overrides={}, dotenv=read_dotenv(env_file), environ=os.environ)
 
 
+def format_load_failure(document_id: str, result) -> str:
+    """One line per error, with its path, for a document invalid on disk.
+
+    A configuration that drifted from the descriptor usually carries several
+    stale keys. Reporting only the first turns a single correction into a
+    restart per key, so every error path is listed at once.
+    """
+    problems = [
+        f"  {issue.path or '/'} [{issue.rule}] {issue.message}"
+        for issue in result.issues
+        if getattr(issue, "severity", "error") == "error"
+    ]
+    if not problems:
+        return f"{document_id}: {result.reason}"
+    return f"{document_id}: {result.reason}\n" + "\n".join(problems)
+
+
 class SettingsRuntime:
     """Owns the aiset Service and the mapping from document id to file."""
 
@@ -107,7 +124,7 @@ class SettingsRuntime:
             audit=self._audit,
         )
         self._effective: dict[str, dict[str, Any]] = {}
-        self._resolver = build_resolver()
+        self._resolver = build_resolver(self.root / ".env")
         self._callbacks_bound = False
 
     # ── construction ────────────────────────────────────────────────
@@ -187,10 +204,16 @@ class SettingsRuntime:
         return self._resolver
 
     def load(self, document_id: str):
-        """Load one document and raise when it is invalid on disk."""
+        """Load one document and raise when it is invalid on disk.
+
+        The failure lists every error with its path, not only the first one.
+        A configuration that drifted from the descriptor typically carries
+        several stale keys, and reporting them one per restart turns a
+        five-minute fix into five restarts.
+        """
         result = self.service.load(document_id, principal=CORE_PRINCIPAL)
         if result.invalid_on_disk:
-            raise SettingsError(f"{document_id}: {result.reason}")
+            raise SettingsError(format_load_failure(document_id, result))
         return result
 
     def refresh(self) -> None:
