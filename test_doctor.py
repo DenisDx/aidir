@@ -206,6 +206,71 @@ class ConcurrencyTests(unittest.TestCase):
         self.assertIn("systemctl reload aidir", details)
 
 
+class VerdictTests(unittest.TestCase):
+    """The last line must say plainly whether everything is fine."""
+
+    def test_green_verdict_when_every_check_passes(self):
+        report = doctor.Report(checks=[doctor.CheckResult("config", "ok", "valid")])
+        text = doctor._render(report)
+        self.assertIn("RESULT: all checks passed", text)
+        self.assertNotIn("\033[", text)
+
+    def test_red_verdict_when_a_check_fails(self):
+        report = doctor.Report(checks=[doctor.CheckResult("redis", "fail", "down")])
+        text = doctor._render(report)
+        self.assertIn("RESULT: 1 problem(s) remain", text)
+        self.assertEqual(report.exit_code, 1)
+
+    def test_warnings_are_named_in_the_verdict(self):
+        report = doctor.Report(checks=[
+            doctor.CheckResult("systemd", "warn", "inactive"),
+            doctor.CheckResult("config", "ok", "valid"),
+        ])
+        text = doctor._render(report)
+        self.assertIn("all checks passed, 1 warning(s)", text)
+        self.assertEqual(report.exit_code, 0)
+
+    def test_colour_is_used_only_when_asked(self):
+        report = doctor.Report(checks=[doctor.CheckResult("redis", "fail", "down")])
+        self.assertIn("\033[31m", doctor._render(report, color=True))
+        self.assertNotIn("\033[", doctor._render(report, color=False))
+
+    def test_a_recommendation_is_rendered(self):
+        result = doctor.CheckResult("redis", "fail", "down")
+        result.recommendation = "restart Docker"
+        text = doctor._render(doctor.Report(checks=[result]))
+        self.assertIn("recommendations:", text)
+        self.assertIn("restart Docker", text)
+
+    def test_a_failed_repair_is_listed_not_hidden(self):
+        report = doctor.Report(
+            checks=[doctor.CheckResult("redis", "fail", "down")],
+            failed=["redis: docker compose up -d redis -> exit status 1"],
+        )
+        text = doctor._render(report)
+        self.assertIn("failed repairs:", text)
+        self.assertIn("exit status 1", text)
+
+    def test_an_unreachable_redis_reports_the_failed_repair_and_advice(self):
+        """The 110 shape: unreachable, the repair cannot run, nothing is hidden."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(Path(tmp), env={"REDIS_HOST": "127.0.0.1",
+                                             "REDIS_PORT": str(free_port())})
+            report = doctor.run(root=root, only=["redis"], fix_all=True)
+            text = doctor._render(report)
+        self.assertIn("RESULT: 1 problem(s) remain", text)
+        self.assertTrue(report.failed or report.checks[0].fixes)
+        self.assertIsNotNone(report.checks[0].recommendation)
+
+    def test_json_carries_the_failed_repairs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(Path(tmp), env={"REDIS_HOST": "127.0.0.1",
+                                             "REDIS_PORT": str(free_port())})
+            payload = doctor.run(root=root, only=["redis"], fix_all=True).to_dict()
+        self.assertIn("failed", payload)
+        self.assertEqual(payload["exit_code"], 1)
+
+
 class WrapperTests(unittest.TestCase):
     """doctor.sh forwards its arguments to `core/app.py doctor`."""
 

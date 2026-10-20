@@ -678,6 +678,20 @@ invalid configuration, which is the case it exists for.
 forwards every argument; it works from any directory. The long form is
 `venv/bin/python core/app.py doctor`.
 
+Every run ends with one explicit verdict:
+
+```
+RESULT: all checks passed                  green
+RESULT: all checks passed, 2 warning(s)    amber
+RESULT: 1 problem(s) remain                red
+```
+
+Colour is used only when stdout is a terminal; `--no-color` or `NO_COLOR=1`
+disables it. After the checks the report lists the repairs it applied, the
+repairs that **failed** with the command's own error, the repairs it skipped, and
+a recommendation for everything still wrong (for example, restart Docker when it
+cannot program a port, or reload aidir after a configuration repair).
+
 Exit codes: `0` healthy or warnings only, `1` failures remain, `2` repaired but
 issues remain. The file is written only when the repairs make it fully valid; a
 partial repair of an invalid file is reported, not stored.

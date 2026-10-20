@@ -59,6 +59,12 @@ exit codes:
   1  failures remain
   2  repairs were applied, but issues remain
 
+the report ends with one verdict line:
+  RESULT: all checks passed                  (green)
+  RESULT: all checks passed, N warning(s)    (amber)
+  RESULT: N problem(s) remain                (red)
+Colour is used only on a terminal; --no-color or NO_COLOR=1 disables it.
+
 examples:
   ./doctor.sh
   ./doctor.sh --config-only
@@ -87,9 +93,10 @@ class CheckResult:
     details: list[str] = field(default_factory=list)
     issues: list[dict[str, Any]] = field(default_factory=list)
     fixes: list[dict[str, Any]] = field(default_factory=list)
+    recommendation: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        out = {
             "id": self.id,
             "status": self.status,
             "message": self.message,
@@ -97,6 +104,9 @@ class CheckResult:
             "issues": self.issues,
             "fixes": self.fixes,
         }
+        if self.recommendation:
+            out["recommendation"] = self.recommendation
+        return out
 
 
 @dataclass
@@ -128,6 +138,7 @@ class Report:
 
     checks: list[CheckResult]
     applied: list[str] = field(default_factory=list)
+    failed: list[str] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)
     aidir_running: bool = False
 
@@ -144,6 +155,7 @@ class Report:
             "checks": [check.to_dict() for check in self.checks],
             "aidir_running": self.aidir_running,
             "applied": self.applied,
+            "failed": self.failed,
             "skipped": self.skipped,
             "exit_code": self.exit_code,
         }
@@ -178,6 +190,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                         help="run only the listed checks, comma separated")
     parser.add_argument("--json", action="store_true", help="machine-readable report")
     parser.add_argument("--dry-run", action="store_true", help="print the plan, apply nothing")
+    parser.add_argument("--no-color", action="store_true",
+                        help="never colour the report (also honours NO_COLOR)")
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     only = [part.strip() for part in (args.only or "").split(",") if part.strip()]
@@ -196,7 +210,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.json:
         print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
     else:
-        print(_render(report))
+        color = (not args.no_color and not os.environ.get("NO_COLOR")
+                 and sys.stdout.isatty())
+        print(_render(report, color=color))
     return report.exit_code
 
 
@@ -268,33 +284,72 @@ def run(
             result = CheckResult(name, "fail", f"{exc.__class__.__name__}: {exc}")
         results.append(result)
         for item in result.fixes:
-            if item.get("applied"):
-                report.applied.append(f"{name}: {item['action']}")
-        if context.dry_run:
-            report.skipped.extend(
-                f"{name}: {item.get('document', '')} {item.get('path', '')} "
-                f"{item['action']} ({item['class']})".replace("  ", " ")
-                for item in result.fixes if not item.get("applied")
+            where = " ".join(
+                part for part in (item.get("document"), item.get("path")) if part
             )
+            label = f"{name}: {where + ' ' if where else ''}{item['action']}"
+            if item.get("applied"):
+                report.applied.append(label)
+            elif item.get("attempted"):
+                report.failed.append(
+                    f"{label} -> {item.get('error', 'failed')}"
+                )
+            else:
+                report.skipped.append(f"{label} ({item['class']})")
     return report
 
 
-def _render(report: Report) -> str:
-    """One line per check, details indented, fixes and skips at the end."""
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+RED = "\033[31m"
+BOLD = "\033[1m"
+RESET = "\033[0m"
+
+_STATUS_COLOUR = {"ok": GREEN, "warn": YELLOW, "fail": RED}
+
+
+def _paint(text: str, colour: str, enabled: bool) -> str:
+    """Wrap text in one ANSI colour when the output is a terminal."""
+    return f"{colour}{text}{RESET}" if enabled else text
+
+
+def _render(report: Report, *, color: bool = False) -> str:
+    """Checks, repairs, recommendations, then one explicit verdict."""
     lines: list[str] = []
     width = max((len(check.id) for check in report.checks), default=0)
     for check in report.checks:
-        lines.append(f"{check.id:<{width}}  {check.status:<4}  {check.message}")
+        status = _paint(f"{check.status:<4}", _STATUS_COLOUR.get(check.status, ""), color)
+        lines.append(f"{check.id:<{width}}  {status}  {check.message}")
         for detail in check.details:
             lines.append(f"{'':<{width}}        {detail}")
     if report.applied:
-        lines.append("")
-        lines.append("applied:")
-        lines.extend(f"  {item}" for item in report.applied)
+        lines += ["", "applied:"]
+        lines += [f"  {item}" for item in report.applied]
+    if report.failed:
+        lines += ["", _paint("failed repairs:", RED, color)]
+        lines += [f"  {item}" for item in report.failed]
     if report.skipped:
-        lines.append("")
-        lines.append("skipped:")
-        lines.extend(f"  {item}" for item in report.skipped)
+        lines += ["", "skipped:"]
+        lines += [f"  {item}" for item in report.skipped]
+
+    advice = [c for c in report.checks if c.recommendation and c.status != "ok"]
+    if advice:
+        lines += ["", "recommendations:"]
+        lines += [f"  {check.id}: {check.recommendation}" for check in advice]
+
+    failures = [c for c in report.checks if c.status == "fail"]
+    warnings = [c for c in report.checks if c.status == "warn"]
+    if failures:
+        verdict = (f"RESULT: {len(failures)} problem(s) remain"
+                   + (f", {len(warnings)} warning(s)" if warnings else ""))
+        colour = RED
+    elif warnings:
+        verdict = f"RESULT: all checks passed, {len(warnings)} warning(s)"
+        colour = YELLOW
+    else:
+        verdict = "RESULT: all checks passed"
+        colour = GREEN
+    lines += ["", _paint(verdict, BOLD + colour, color)]
     return "\n".join(lines)
 
 
@@ -313,6 +368,7 @@ def _check_aiset(context: Context) -> CheckResult:
         message = str(exc) or exc.__class__.__name__
         result = CheckResult("aiset", "fail", message.splitlines()[0],
                              details=[line for line in message.splitlines()[1:] if line.strip()])
+        result.recommendation = "git submodule update --init --recursive"
         if (context.root / ".gitmodules").is_file() and shutil.which("git"):
             result.fixes.append({"action": "git submodule update --init --recursive",
                                  "class": SAFE})
@@ -395,14 +451,22 @@ def _check_config(context: Context) -> CheckResult:
         details.insert(0, context.config_error.splitlines()[0])
 
     if not runtime.service.documents:
-        return CheckResult("config", "fail", "no configuration documents are registered",
-                           details=details)
+        result = CheckResult("config", "fail",
+                             "no configuration documents are registered", details=details)
+        result.recommendation = "run ./install.sh; it creates config.json5 and .env"
+        return result
     errors = [item for item in issues if item["severity"] == "error"]
     if failed:
         status = "fail"
         message = f"{len(errors)} issue(s)"
         if fixes:
             message += f", {len(fixes)} repaired"
+        recommendation = ("--fix clamps a range violation; --fix-all also drops unknown keys; "
+                          "values that need a decision must be edited by hand")
+        result = CheckResult("config", status, message, details=details,
+                             issues=issues, fixes=fixes)
+        result.recommendation = recommendation
+        return result
     elif fixes and context.dry_run:
         status = "ok"
         message = f"{len(fixes)} repair(s) planned"
@@ -420,12 +484,16 @@ def _check_env_file(context: Context) -> CheckResult:
     """`.env` must exist and parse. install.sh owns every write to it."""
     path = context.root / ".env"
     if not path.is_file():
-        return CheckResult("env-file", "fail", ".env is missing",
-                           details=["run ./install.sh; it owns .env"])
+        result = CheckResult("env-file", "fail", ".env is missing",
+                             details=["install.sh owns .env"])
+        result.recommendation = "run ./install.sh"
+        return result
     try:
         values = _read_env(path)
     except OSError as exc:
-        return CheckResult("env-file", "fail", f".env cannot be read: {exc.strerror}")
+        result = CheckResult("env-file", "fail", f".env cannot be read: {exc.strerror}")
+        result.recommendation = "check the file permissions, or re-create it with ./install.sh"
+        return result
     return CheckResult("env-file", "ok", f"{len(values)} variable(s)")
 
 
@@ -438,11 +506,16 @@ def _check_env_root(context: Context) -> CheckResult:
     value = _read_env(path).get("AIDIR_ROOT", "")
     actual = str(context.root)
     if not value:
-        return CheckResult("env-root", "fail", "AIDIR_ROOT is empty",
-                           details=[f"install.sh should set it to {actual}"])
+        result = CheckResult("env-root", "fail", "AIDIR_ROOT is empty",
+                             details=[f"install.sh should set it to {actual}"])
+        result.recommendation = "run ./install.sh"
+        return result
     if Path(value).resolve() != context.root:
-        return CheckResult("env-root", "warn", f"AIDIR_ROOT={value}, this checkout is {actual}",
-                           details=["install.sh owns .env; re-run it to correct the value"])
+        result = CheckResult("env-root", "warn",
+                             f"AIDIR_ROOT={value}, this checkout is {actual}",
+                             details=["install.sh owns .env"])
+        result.recommendation = "run ./install.sh to write the correct AIDIR_ROOT"
+        return result
     return CheckResult("env-root", "ok", actual)
 
 
@@ -466,6 +539,8 @@ def _check_dirs(context: Context) -> CheckResult:
                              details=details)
         if missing:
             result.fixes.append({"action": "create the missing directories", "class": SAFE})
+        if unwritable:
+            result.recommendation = ("make them writable: chmod u+w logs logs/audit")
         return result
     return CheckResult("dirs", "ok", "present; logs writable")
 
@@ -491,8 +566,11 @@ def _check_store_lock(context: Context) -> CheckResult:
         except OSError:
             continue
     if held:
-        return CheckResult("store-lock", "warn", "held by a running writer",
-                           details=held + ["the kernel releases a flock when the holder exits"])
+        result = CheckResult("store-lock", "warn", "held by a running writer",
+                             details=held + ["the kernel releases a flock when the holder exits"])
+        result.recommendation = ("another process is writing; wait, or check for a stuck aidir "
+                                 "process before removing anything")
+        return result
     return CheckResult("store-lock", "ok", "not held")
 
 
@@ -512,13 +590,16 @@ def _check_venv(context: Context) -> CheckResult:
             importlib.import_module(name)
     except ImportError as exc:
         if _aidir_running(context):
-            return CheckResult(
+            result = CheckResult(
                 "venv", "fail", f"dependency missing: {exc.name}",
-                details=["aidir is running; stop it before reinstalling dependencies",
-                         "then run ./install.sh, or pip install -r requirements.txt"],
+                details=["aidir is running; stop it before reinstalling dependencies"],
             )
+            result.recommendation = ("stop aidir, then run ./install.sh or "
+                                     "venv/bin/pip install -r requirements.txt")
+            return result
         result = CheckResult("venv", "fail", f"dependency missing: {exc.name}",
-                             details=["run ./install.sh, or pip install -r requirements.txt"])
+                             details=["install it from requirements.txt"])
+        result.recommendation = "run ./install.sh, or venv/bin/pip install -r requirements.txt"
         result.fixes.append({"action": "pip install -r requirements.txt", "class": SAFE,
                              "run": lambda: _run([str(pip), "install", "-q", "-r",
                                                   str(context.root / "requirements.txt")],
@@ -536,8 +617,9 @@ def _check_docker(context: Context) -> CheckResult:
     code, _out = _run(["docker", "info"], timeout=10)
     if code == 0:
         return CheckResult("docker", "ok", "daemon reachable")
-    result = CheckResult("docker", "fail", "the Docker daemon is not reachable",
-                         details=["start it: sudo systemctl start docker"])
+    result = CheckResult("docker", "fail", "the Docker daemon is not reachable")
+    result.recommendation = ("start it: sudo systemctl start docker, or start Docker Desktop; "
+                             "on WSL, 'wsl --shutdown' resets a wedged engine")
     if context.privileges:
         result.fixes.append({"action": "systemctl start docker", "class": PRIVILEGED})
         _apply_fix(context, result.fixes[-1],
@@ -555,8 +637,11 @@ def _check_compose(context: Context) -> CheckResult:
     code, out = _compose(context, ["config", "-q"], timeout=20)
     if code == 0:
         return CheckResult("compose", "ok", "compose file parses")
-    return CheckResult("compose", "fail", "the compose file does not parse",
-                       details=[line for line in out.splitlines() if line.strip()][-3:])
+    result = CheckResult("compose", "fail", "the compose file does not parse",
+                         details=[line for line in out.splitlines() if line.strip()][-3:])
+    result.recommendation = ("check the values .env supplies to docker-compose.yml, "
+                             "then run: docker compose config")
+    return result
 
 
 @_register("redis")
@@ -565,30 +650,67 @@ def _check_redis(context: Context) -> CheckResult:
     host, port, password = _redis_settings(context)
     reachable, error = _redis_ping(host, port, password)
     published = _compose_published_port(context, "redis", 6379)
+    container = _compose_container(context, "redis")
     details: list[str] = []
     if published is not None and published != port:
         details.append(f"the container publishes {published}, the configuration says {port}")
     if reachable:
-        return CheckResult("redis", "ok", f"{host}:{port} answers",
-                           details=details) if not details else CheckResult(
-            "redis", "warn", f"{host}:{port} answers, published port differs",
-            details=details)
+        if not details:
+            return CheckResult("redis", "ok", f"{host}:{port} answers")
+        result = CheckResult("redis", "warn",
+                             f"{host}:{port} answers, published port differs", details=details)
+        result.recommendation = (
+            "recreate the container so it publishes the configured port: "
+            "docker compose up -d --force-recreate redis"
+        )
+        return result
+
     details.insert(0, error or "no response")
+    if container:
+        details.append("the container exists but does not answer")
+    else:
+        details.append("the container is not running")
     if _aidir_running(context):
         details.append("aidir is running; it will reconnect after the container is back")
     result = CheckResult("redis", "fail", f"cannot reach {host}:{port}", details=details)
-    action = "docker compose up -d redis"
-    if published is not None and published != port:
+
+    if context.fix_all:
+        # A container that exists but does not answer is usually stuck; recreating
+        # it is the only repair that works, and it is why this class is `visible`.
         action = "docker compose up -d --force-recreate redis"
-    allowed = context.fix_all or (context.fix and published in (None, port))
-    if allowed:
-        result.fixes.append({"action": action, "class": VISIBLE if "force" in action else SAFE})
+        result.fixes.append({"action": action, "class": VISIBLE})
         _apply_fix(context, result.fixes[-1],
-                   command=_compose_command(context, action.split()[2:]))
-        if result.fixes[-1].get("applied") and not context.dry_run:
-            reachable, error = _redis_ping(host, port, password)
-            if reachable:
-                return CheckResult("redis", "ok", f"{host}:{port} answers after the repair")
+                   command=_compose_command(context, ["up", "-d", "--force-recreate", "redis"]))
+    elif context.fix and not container:
+        action = "docker compose up -d redis"
+        result.fixes.append({"action": action, "class": SAFE})
+        _apply_fix(context, result.fixes[-1],
+                   command=_compose_command(context, ["up", "-d", "redis"]))
+
+    if result.fixes and result.fixes[-1].get("applied") and not context.dry_run:
+        reachable, error = _redis_ping(host, port, password)
+        if reachable:
+            return CheckResult("redis", "ok", f"{host}:{port} answers after the repair")
+        result.details.append("still unreachable after the repair")
+
+    if result.fixes and result.fixes[-1].get("attempted") and not result.fixes[-1].get("applied"):
+        output = str(result.fixes[-1].get("error", ""))
+        if "connectivity" in output or "iptables" in output or "proxy" in output:
+            result.recommendation = (
+                "Docker could not program the port. Restart it: "
+                "sudo systemctl restart docker; on WSL also run 'wsl --shutdown' "
+                "from Windows, then start Docker again"
+            )
+        else:
+            result.recommendation = (
+                "inspect it: docker compose logs --tail 50 redis; then "
+                "docker compose up -d --force-recreate redis"
+            )
+    elif not result.fixes:
+        result.recommendation = (
+            "run ./doctor.sh --fix-all to recreate the container, then "
+            "docker compose logs --tail 50 redis if it still does not answer"
+        )
     return result
 
 
@@ -657,7 +779,9 @@ def _check_logs(context: Context) -> CheckResult:
         probe.write_text("", encoding="utf-8")
         probe.unlink(missing_ok=True)
     except OSError as exc:
-        return CheckResult("logs", "fail", f"logs/ is not writable: {exc.strerror}")
+        result = CheckResult("logs", "fail", f"logs/ is not writable: {exc.strerror}")
+        result.recommendation = "chmod u+w logs logs/audit"
+        return result
     return CheckResult("logs", "ok", "writable")
 
 
@@ -673,8 +797,10 @@ def _check_ollama(context: Context) -> CheckResult:
         with urllib.request.urlopen(base.rstrip("/") + "/api/tags", timeout=3):
             return CheckResult("ollama", "ok", base)
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        return CheckResult("ollama", "warn", f"upstream does not answer: {base}",
-                           details=[str(exc)])
+        result = CheckResult("ollama", "warn", f"upstream does not answer: {base}",
+                             details=[str(exc)])
+        result.recommendation = "start Ollama (ollama serve) or correct OLLAMA_BASE_URL"
+        return result
 
 
 @_register("systemd")
@@ -691,8 +817,11 @@ def _check_systemd(context: Context) -> CheckResult:
         if state == "active":
             return CheckResult("systemd", "ok", f"{scope} unit active")
     if not seen:
-        return CheckResult("systemd", "warn", "no aidir unit found (run ./install.sh)")
+        result = CheckResult("systemd", "warn", "no aidir unit found")
+        result.recommendation = "run ./install.sh to install the unit"
+        return result
     result = CheckResult("systemd", "warn", "the unit is not active", details=seen)
+    result.recommendation = "start it: systemctl --user start aidir (or ./install.sh)"
     if context.privileges:
         scope = seen[0].split(":", 1)[0]
         result.fixes.append({
@@ -720,16 +849,26 @@ def _apply_fix(context: Context, fix: dict[str, Any], *, command: list[str] | No
         return
     if fix["class"] == PRIVILEGED and not context.privileges:
         return
+    fix["attempted"] = True
     if fix["class"] == PRIVILEGED and command is not None:
-        fix["applied"] = _sudo(command)
+        ok = _sudo(command)
+        fix["applied"] = ok
+        if not ok:
+            fix["error"] = "privileged command failed or was refused without a TTY"
         return
     runner = fix.get("run")
     if runner is not None:
-        fix["applied"] = bool(runner() == 0)
+        applied = bool(runner() == 0)
+        fix["applied"] = applied
+        if not applied:
+            fix["error"] = "the fix command returned a non-zero status"
         return
     if command is not None:
-        code, _out = _run(command, timeout=120)
+        code, output = _run(command, timeout=300)
         fix["applied"] = code == 0
+        if code != 0:
+            lines = [line for line in output.splitlines() if line.strip()]
+            fix["error"] = lines[-1][:300] if lines else f"exit status {code}"
 
 
 def _sudo(command: list[str]) -> bool:
@@ -766,6 +905,12 @@ def _compose_command(context: Context, args: Sequence[str]) -> list[str]:
 def _compose(context: Context, args: Sequence[str], *, timeout: int = 30) -> tuple[int, str]:
     """Run one compose subcommand."""
     return _run(_compose_command(context, args), timeout=timeout)
+
+
+def _compose_container(context: Context, service: str) -> str:
+    """Container id of one compose service, or an empty string."""
+    code, out = _compose(context, ["ps", "-q", service], timeout=15)
+    return out.strip() if code == 0 else ""
 
 
 def _compose_published_port(context: Context, service: str, container_port: int) -> int | None:
