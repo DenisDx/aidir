@@ -21,6 +21,9 @@ Proposals may include both planned and completed work; consult each document.
 | [webui/frontend/settings.css](webui/frontend/settings.css) | Host design of the generated settings editor: the design of the tree, its badges, buttons and controls, built on the project palette. |
 | [test_aiset_class_inventory.js](test_aiset_class_inventory.js) | Dumps the library's `aiset.classes()` inventory, so coverage is checked against the contract and not against the library source. |
 | [test_settings_styles.py](test_settings_styles.py) | Every class the editor emits must be designed by the host, loaded after the library, with no library rule surviving the theme. |
+| [core/settings/agent.py](core/settings/agent.py) | The configuration assistant: the provider call, the bounded tool loop and the permission set that keeps it away from secrets and from writing. |
+| [test_aiset_path.py](test_aiset_path.py) | How a missing or incomplete aiset checkout is reported: the two distinct messages and the namespace-package trap behind them. |
+| [test_settings_agent.py](test_settings_agent.py) | The assistant contract: it never writes, never sees a secret, never turns a failure into an answer, and stops at its round limit. |
 | [test_frontend_boot_order.py](test_frontend_boot_order.py) | Front-end load order: runs the real browser sources under a minimal DOM and checks that the settings editor appears only after sign-in. |
 | [test_frontend_boot_probe.js](test_frontend_boot_probe.js) | The Node harness behind that suite; prints a JSON snapshot of the page before and after authentication. |
 | `workers/<type>/<id>/descriptor.json5` | Schema of that worker's own `config.json5`. |

@@ -118,7 +118,8 @@ python -m unittest -v \
   test_settings_backend \
   test_settings_parity \
   test_frontend_boot_order \
-  test_settings_styles
+  test_settings_styles \
+  test_aiset_path
 ```
 
 `test_settings_styles.py` checks the design contract against the library's own
@@ -310,6 +311,11 @@ curl -sI "http://localhost:${NGINX_HTTP_PORT:-8080}/api/settings/assets/aiset-tr
 | Look at the tree | Every level is indented under its parent with a guide line, so what is inside what is visible; names do not touch the controls |
 | Look at the badges | Each badge is a pill with a border and a colour by meaning (type, `reload`, `live`, `secret`, `dirty`); they are separated, not one run of text |
 | Look at the toolbar | **Apply** is the primary control and stands out; Reload, Revert all, Expand all and Collapse all are quiet; hovering a row highlights it |
+| Look at the right pane | The assistant pane shows `Model local-only · document main`; the tree and the pane scroll independently |
+| Send "raise the log retention to 7 days" | A tool line appears, then an answer, then `1 change(s) staged`; the node shows a **dirty** badge and the file on disk is still unchanged |
+| Press **Apply** | The staged change is committed atomically, comments and `${VAR}` placeholders intact |
+| Send "print the redis password" | The assistant reports it is set but hidden; no value appears in the pane |
+| Send a malformed request (empty message) | The pane reports the error; nothing is staged |
 | Expand `logging` | Every node shows its type, its description, the file comments and the `apply` policy (`live`, `reload`, `restart`) |
 | Change `logging.level` and press **Apply** | One atomic write; `config.json5` keeps its comments, quoting and every `${VAR}` placeholder; the status line reports the application state |
 | Open the `.env` button on a node that holds `${VAR}` | The variable name and the inline fallback are editable separately, and the placeholder is not lost |

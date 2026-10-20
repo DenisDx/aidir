@@ -16,7 +16,7 @@ const FRONTEND = path.join(__dirname, 'webui', 'frontend');
 // ── Minimal DOM ────────────────────────────────────────────────────────────
 function stub(extra) {
   return Object.assign({
-    style: {}, dataset: {},
+    style: { setProperty() {}, removeProperty() {} }, dataset: {},
     classList: { add() {}, remove() {}, toggle() {}, contains() { return false; } },
     addEventListener() {}, removeEventListener() {}, appendChild() {}, removeChild() {},
     setAttribute() {}, getAttribute() { return null; }, focus() {}, blur() {},
@@ -24,6 +24,8 @@ function stub(extra) {
     closest() { return null; }, querySelectorAll() { return []; }, contains() { return false; },
     innerHTML: '', textContent: '', value: '', checked: false, options: [],
     children: [], rows: 3, minLength: 0, maxLength: 0, parentNode: null,
+    // The page measures the workspace to size both columns.
+    getBoundingClientRect() { return { top: 0, left: 0, width: 0, height: 0 }; },
   }, extra);
 }
 
@@ -55,6 +57,10 @@ global.document = {
 };
 
 global.window = global;
+// Browser globals the page uses that Node does not provide.
+global.addEventListener = () => {};
+global.matchMedia = query => ({ matches: false, media: query, addListener(){}, removeListener(){} });
+global.innerHeight = 1080;
 global.localStorage = { getItem() { return null; }, setItem() {}, removeItem() {} };
 global.location = { href: 'http://test/', search: '', pathname: '/', hash: '' };
 global.URL = URL;

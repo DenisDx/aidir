@@ -1508,6 +1508,7 @@ def create_app(
         The frontend builds its document selector from this, so a worker that
         gains its own configuration file appears without a frontend change.
         """
+        from core.settings.agent import describe
         from core.settings.runtime import get_runtime
         from core.settings.wsgi import ASSET_BASE
 
@@ -1517,7 +1518,86 @@ def create_app(
             "documents": runtime.document_ids(),
             "assets": ASSET_BASE,
             "revision": runtime.load("main").revision,
+            "assistant": describe(_settings_agent(app, runtime)),
         }
+
+    def _settings_agent(app: FastAPI, runtime):
+        """The assistant for the current configuration, rebuilt when it changes.
+
+        The conversation lives on the agent, so a fresh instance per request
+        would lose the history. The signature is the `ai` block as loaded, so a
+        reload that changes it replaces the agent and its conversations rather
+        than keeping one configured from the previous model.
+        """
+        from core.settings.agent import build_agent
+
+        effective = runtime.effective()
+        signature = json.dumps(effective.get("ai") or {}, sort_keys=True, default=str)
+        cached = getattr(app.state, "settings_agent", None)
+        if cached is None or getattr(app.state, "settings_agent_signature", None) != signature:
+            cached = build_agent(runtime.service, effective)
+            app.state.settings_agent = cached
+            app.state.settings_agent_signature = signature
+        return cached
+
+    @app.post("/api/settings/chat")
+    async def settings_chat(payload: dict, session: dict = Depends(_require_session)):
+        """One turn of the configuration assistant.
+
+        The assistant reads authorised configuration and returns validated
+        operations; it never writes. The browser stages them on the tree so the
+        user reviews the batch and presses Apply.
+        """
+        from core.settings.agent import AGENT_ERROR_STATUS, AgentError
+        from core.settings.runtime import get_runtime
+
+        runtime = get_runtime()
+        agent = _settings_agent(app, runtime)
+        if agent is None:
+            return JSONResponse(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                content={"ok": False, "error": {
+                    "code": "UNSUPPORTED_CAPABILITY",
+                    "message": "The configuration assistant is disabled by configuration"}},
+            )
+        message = str(payload.get("message") or "").strip()
+        if not message:
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content={"ok": False, "error": {"code": "BAD_REQUEST", "message": "message is required"}},
+            )
+        try:
+            result = await asyncio.to_thread(
+                agent.handle, {"message": message, "session": str(session.get("login") or "default")}
+            )
+        except AgentError as exc:
+            # Provider and protocol failures stay explicit, never success-shaped.
+            return JSONResponse(
+                status_code=AGENT_ERROR_STATUS.get(exc.code, 502),
+                content={"ok": False, "error": {
+                    "code": exc.code, "message": str(exc), "detail": exc.detail[:400]}},
+            )
+        return {"ok": True, **result}
+
+    @app.get("/api/settings/chat/history")
+    async def settings_chat_history(session: dict = Depends(_require_session)):
+        """The stored turns of the caller's own conversation."""
+        from core.settings.runtime import get_runtime
+
+        runtime = get_runtime()
+        agent = _settings_agent(app, runtime)
+        return {"ok": True, "messages": agent.history(str(session.get("login") or "default")) if agent else []}
+
+    @app.delete("/api/settings/chat")
+    async def settings_chat_clear(session: dict = Depends(_require_session)):
+        """Forget the caller's conversation."""
+        from core.settings.runtime import get_runtime
+
+        runtime = get_runtime()
+        agent = _settings_agent(app, runtime)
+        if agent is not None:
+            agent.forget(str(session.get("login") or "default"))
+        return {"ok": True}
 
     @app.post("/api/settings/reload")
     async def settings_reload(session: dict = Depends(_require_session)):

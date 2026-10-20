@@ -1075,6 +1075,12 @@
          library ships only light-theme defaults, and equal-specificity rules
          are decided by order. -->
     <link rel="stylesheet" href="settings.css">
+
+    <!-- Two panes, as in the aiset demo host: the editor on the left, the
+         configuration assistant on the right. The chat only reads and stages;
+         a change still reaches the file through Apply in the editor. -->
+    <div class="cfg-workspace">
+      <div class="cfg-pane cfg-pane-editor">
     <div class="card" id="cfg-aiset-card">
       <div class="card-title">Configuration editor</div>
       <div id="cfg-aiset-status">Loading the settings editor…</div>
@@ -1097,6 +1103,28 @@
         <button id="cfg-reload-btn" type="button">Reload settings</button>
         <button id="cfg-restart-btn" type="button">Restart aidir</button>
         <span id="cfg-aiset-lifecycle-status"></span>
+      </div>
+    </div>
+      </div>
+
+      <div class="cfg-pane cfg-pane-chat">
+        <div class="card" id="cfg-chat-card">
+          <div class="card-title">Assistant</div>
+          <div id="cfg-chat-model" class="cfg-chat-note">Checking the assistant…</div>
+          <div id="cfg-chat-history" class="cfg-chat-history" role="log" aria-live="polite"></div>
+          <form id="cfg-chat-form" class="cfg-chat-input">
+            <textarea id="cfg-chat-text" rows="3"
+              placeholder="Ask for a change, for example: raise the log retention to 7 days"
+              aria-label="Message to the configuration assistant"></textarea>
+            <div class="cfg-chat-actions">
+              <button type="submit" id="cfg-chat-send">Send</button>
+              <button type="button" id="cfg-chat-clear">Clear</button>
+            </div>
+          </form>
+          <div id="cfg-chat-note" class="cfg-chat-note">
+            Every proposal is staged for you to review and apply; the assistant never writes the file.
+          </div>
+        </div>
       </div>
     </div>
 

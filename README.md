@@ -37,9 +37,17 @@ sudo apt update && sudo apt install -y ca-certificates curl gnupg python3 python
 ## Installation
 
 ```bash
-git clone https://github.com/DenisDx/aidir.git
+git clone --recurse-submodules https://github.com/DenisDx/aidir.git
 cd aidir
 ./install.sh
+```
+
+`aiset`, the settings library, is a separate project tracked as a Git submodule.
+`--recurse-submodules` fetches it with the rest; if you cloned without the flag,
+initialise it once, or simply run `./install.sh`, which performs this step:
+
+```bash
+git submodule update --init --recursive
 ```
 
 Optional config template selection:
@@ -87,11 +95,29 @@ running and starts after the next service restart.
 ## Configuration
 
 The shared cross-project settings library, aiset, lives in the
-[aiset directory](aiset/) and is maintained separately from this repository's
-Git tracking. Its complete draft is in [aiset/SPEC_.md](aiset/SPEC_.md) and the
-integration plan for this project is in
+[aiset directory](aiset/) and is a **separate project with its own history**,
+consumed as a Git submodule pinned to one commit. Its complete draft is in
+[aiset/SPEC_.md](aiset/SPEC_.md) and the integration plan for this project is in
 [plan_aiset_integration.md](plan_aiset_integration.md). See
 [DOCUMENTS.MD](DOCUMENTS.MD) for the project document index.
+
+### Updating the aiset library
+
+aidir ships no copy of the library and does not vendor it. Work on aiset in its
+own repository, then move the pointer aidir records:
+
+```bash
+cd aiset
+git switch main            # a submodule checkout is on a detached HEAD
+git pull --ff-only
+# ...edit, test, commit and push aiset itself...
+cd ..
+git add aiset              # record the new commit in aidir
+git commit -m "aiset: <what changed>"
+```
+
+`git status` in aidir shows `modified: aiset (new commits)` whenever the library
+moved without the pointer being committed. That is the pin working, not noise.
 
 Configuration is split into two files:
 
@@ -197,6 +223,17 @@ the only implementation:
 - the **Settings** tab of the WebUI is a generated editor built from the
   descriptor, with a document selector for the root configuration and for every
   worker-local configuration;
+- next to the editor, a **configuration assistant** answers questions about the
+  configuration in plain language and proposes changes. It reads authorised nodes
+  and returns validated operations, which arrive in the tree as a staged batch:
+  the assistant never writes the file, and a change reaches disk only when you
+  press **Apply**. It uses this project's own OpenAI-compatible endpoint, so it
+  needs no second provider and no second set of credentials;
+- the `ai` section of `config.json5` configures the assistant. `ai.model`
+  defaults to `local-only`, a model that answers from this machine or from
+  192.168.1.110 and never leaves the network. The assistant's own principal
+  holds read and validate permissions only, so it cannot read a secret value even
+  if it is asked to;
 - the editor's JS and CSS are served by the library, not copied into
   `webui/frontend/`. The page requests them from `/api/settings/assets/`, so they
   travel the same route nginx already forwards to the WebUI backend;

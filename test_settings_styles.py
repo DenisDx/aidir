@@ -100,18 +100,32 @@ class HostStylesheetTests(unittest.TestCase):
         )
         self.assertGreater(len(self.inventory), 40, "the inventory collapsed")
 
-    def test_the_inventory_agrees_with_the_classes_in_the_page(self):
-        """A host must not be handed a contract the assets do not follow."""
-        declared = {entry["name"] for entry in self.inventory}
-        for name in declared:
-            if name in FORM_EDITOR or name in ("aiset-tree", "aiset-form"):
-                continue
-            self.assertIn(
-                name, "".join(self.library_css) + "".join(
-                    (AISET_ASSETS / "aiset-tree.js").read_text(encoding="utf-8")
-                ),
-                f"{name} is declared but appears nowhere in the assets",
+    def test_the_inventory_agrees_with_the_classes_the_assets_emit(self):
+        """A host must not be handed a contract the assets do not follow.
+
+        Two questions are kept apart on purpose. This one asks whether the
+        sources still *emit* every name the inventory promises; the stylesheet
+        question has its own test below.
+
+        Matching is on a name boundary, not a substring: `aiset-tree` occurs 178
+        times inside longer names such as `aiset-tree-row` and only 4 times as
+        itself, so a plain `assertIn` can never fail for the short names - which
+        is exactly the set a caller is tempted to skip.
+        """
+        sources = (AISET_ASSETS / "aiset.js").read_text(encoding="utf-8") + \
+                  (AISET_ASSETS / "aiset-tree.js").read_text(encoding="utf-8")
+        missing = [
+            entry["name"] for entry in sorted(self.inventory, key=lambda e: e["name"])
+            if not re.search(
+                r"(?<![A-Za-z0-9-])" + re.escape(entry["name"]) + r"(?![A-Za-z0-9-])",
+                sources,
             )
+        ]
+        self.assertEqual(
+            missing, [],
+            "the inventory promises classes the sources no longer emit: "
+            + ", ".join(missing),
+        )
 
     # -- coverage ---------------------------------------------------------
 
@@ -129,6 +143,26 @@ class HostStylesheetTests(unittest.TestCase):
         self.assertEqual(
             unpainted, [],
             "neither the host nor the library styles: " + ", ".join(unpainted),
+        )
+
+    def test_the_library_keeps_its_required_promise(self):
+        """`required` is the library's promise, not the host's obligation.
+
+        The coverage test above passes when a required class is painted by the
+        host, so a rule deleted from `aiset.css` would go unnoticed by a host
+        that happens to style the same selector. The library enforces the same
+        rule on its side in `tests/test_ui_assets.py`; a host reading the flag
+        deserves the same check, and gets it from the library's own assets.
+        """
+        library_names = set(re.findall(r"\.([A-Za-z][\w-]*)", self.library_css))
+        required = [e["name"] for e in self.inventory if e.get("required")]
+        self.assertGreaterEqual(len(required), 10, "no required classes are declared")
+        unpainted = [name for name in required if name not in library_names]
+        self.assertEqual(
+            unpainted, [],
+            "the library marks these required and must paint them; a host that "
+            "happens to style the same selector is not a substitute: "
+            + ", ".join(unpainted),
         )
 
     def test_every_required_class_is_painted_by_someone(self):
@@ -153,18 +187,39 @@ class HostStylesheetTests(unittest.TestCase):
             + ", ".join(unpainted),
         )
 
+    # Properties the library owns. A host rule that repeats them is a copy that
+    # will drift the next time the library changes its mind.
+    LIBRARY_OWNED = {
+        ".aiset-tree-children": ("padding-left", "margin-left", "border-left"),
+        ".aiset-tree-toggle": ("padding-left", "margin-left", "border-left"),
+        ".aiset-tree-toolbar": ("display", "align-items", "flex-wrap", "gap"),
+        ".aiset-tree-badges": ("display", "align-items", "flex-wrap"),
+        ".aiset-tree-staged-row": ("display", "align-items", "gap"),
+    }
+
     def test_the_host_does_not_reimplement_the_structure_the_library_owns(self):
-        """Item 5 moved the nesting rules into the library; a host copy drifts."""
-        for selector in (".aiset-tree-children", ".aiset-tree-toggle"):
-            blocks = [
-                body for selector_text, body in re.findall(
-                    r"([^{}]+)\{([^}]*)\}", self.host_body
-                ) if selector in " ".join(selector_text.split())
-            ]
-            for body in blocks:
-                if re.search(r"(padding-left|margin-left|border-left)", body):
+        """The structural half moved into the library; a host copy drifts.
+
+        `AGENT_INTEGRATION.md` section 8a.8 states the split, and
+        `proposal_improvement5.md` moved the containers into the library too, so
+        the guard covers the toolbar shell, the badge wrapper and the staged row
+        alongside the nesting rules. Only the host's own choices - padding, a
+        font size, a palette - may remain.
+        """
+        blocks = re.findall(r"([^{}]+)\{([^}]*)\}", self.host_body)
+        for selector, owned in self.LIBRARY_OWNED.items():
+            for selector_text, body in blocks:
+                if selector not in " ".join(selector_text.split()):
+                    continue
+                declared = {
+                    d.split(":")[0].strip()
+                    for d in body.split(";") if ":" in d
+                }
+                repeated = sorted(declared & set(owned))
+                if repeated:
                     self.fail(
-                        f"{selector} indentation is reimplemented in the host: {body.strip()}"
+                        f"{selector} restates library-owned {repeated} in the host: "
+                        f"{body.strip()}"
                     )
 
     # -- the variable mechanism -------------------------------------------
@@ -218,14 +273,21 @@ class HostStylesheetTests(unittest.TestCase):
         )
 
     def test_no_editor_rule_escapes_the_editor(self):
-        """An unscoped element rule silently restyles the host's own page."""
+        """An unscoped element rule silently restyles the host's own page.
+
+        The allowlist is what the host legitimately owns: its own `#cfg-*`
+        controls, its own `.cfg-*` page classes, and `#settings-tree`, which is
+        the element the editor mounts into and therefore belongs to the page
+        rather than to the library.
+        """
+        host_owned = (".aiset-", "#cfg-", ".cfg-", "#settings-tree")
         for selector in re.findall(r"(?m)^([^@{}/][^{}]*)\{", self.host_body):
             selector = selector.strip()
             if not selector or selector.startswith((":root", ":", "@")):
                 continue
             for part in selector.split(","):
                 part = part.strip()
-                if part.startswith((".aiset-", "#cfg-", ".cfg-")):
+                if part.startswith(host_owned):
                     continue
                 self.fail(f"rule escapes the editor and restyles the host: {part}")
 

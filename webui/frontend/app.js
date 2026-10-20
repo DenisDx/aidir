@@ -47,7 +47,7 @@ function showPage(name) {
   $(`page-${name}`).classList.add('active');
   $(`nav-${name}`).classList.add('active');
 
-  if (name === 'settings') initSettingsBackend();
+  if (name === 'settings') { initSettingsBackend(); sizeSettingsWorkspace(); }
   if (name === 'task-viewer') ensureTaskViewerMeta();
   if (name === 'llm')      loadWorkersModels();
   if (name === 'mcp')      loadMcpEndpoints();
@@ -89,6 +89,15 @@ async function apiGet(url) {
     return r.ok ? r.json().catch(() => null) : null;
   } catch {
     return null;
+  }
+}
+
+async function apiDelete(url) {
+  try {
+    const r = await fetch(url, { method: 'DELETE', credentials: 'include' });
+    return { ok: r.ok, status: r.status, data: await r.json().catch(() => ({})) };
+  } catch (error) {
+    return { ok: false, status: 0, data: { detail: error.message || 'Network error' } };
   }
 }
 
@@ -151,6 +160,7 @@ function onLoggedIn() {
   showScreen('app');
   showPage('dashboard');
   initSettingsBackend();
+  bindChatUi();
   loadTasks();
   ensureTaskViewerMeta();
   startLiveLogs();
@@ -1203,6 +1213,134 @@ function missingAssetsMessage() {
     '. Check that those URLs answer with JavaScript and not with an HTML page.';
 }
 
+// ── Configuration assistant ────────────────────────────────────────────────
+// Ported from the aiset demo host. The model reads the configuration and
+// proposes operations; they arrive here and are staged on the tree, so the
+// file still only changes when the user presses Apply.
+let chatInFlight = null;
+let chatAssistant = null;
+
+function chatEntry(role, body) {
+  const history = $('cfg-chat-history');
+  if (!history) return;
+  const entry = document.createElement('div');
+  entry.className = 'cfg-chat-entry cfg-chat-' + role;
+  const who = document.createElement('div');
+  who.className = 'cfg-chat-role';
+  who.textContent = role;
+  const text = document.createElement('div');
+  text.className = 'cfg-chat-body';
+  text.textContent = body;   // never innerHTML: the answer is model output
+  entry.appendChild(who);
+  entry.appendChild(text);
+  history.appendChild(entry);
+  history.scrollTop = history.scrollHeight;
+}
+
+function showChatModel(assistant) {
+  chatAssistant = assistant || null;
+  const note = $('cfg-chat-model');
+  const enabled = !!(chatAssistant && chatAssistant.enabled);
+  if (note) {
+    note.textContent = enabled
+      ? 'Model ' + chatAssistant.model + ' \u00b7 document ' + (chatAssistant.document || 'main')
+      : 'Disabled by configuration (ai.enabled)';
+    note.classList.toggle('cfg-chat-off', !enabled);
+  }
+  const send = $('cfg-chat-send');
+  const input = $('cfg-chat-text');
+  if (send) send.disabled = !enabled || !!chatInFlight;
+  if (input) input.disabled = !enabled;
+}
+
+function refreshChatBusy() {
+  const enabled = !!(chatAssistant && chatAssistant.enabled);
+  const send = $('cfg-chat-send');
+  const input = $('cfg-chat-text');
+  if (send) send.disabled = !enabled || !!chatInFlight;
+  if (input) input.disabled = !enabled || !!chatInFlight;
+}
+
+async function loadChatHistory() {
+  const res = await apiGet('/api/settings/chat/history');
+  const history = $('cfg-chat-history');
+  if (!history) return;
+  history.innerHTML = '';
+  const messages = (res && res.messages) || [];
+  messages.forEach(item => chatEntry(item.role, item.content));
+}
+
+function sendChatMessage(message) {
+  chatEntry('user', message);
+  chatInFlight = apiPost('/api/settings/chat', { message: message });
+  refreshChatBusy();
+  chatInFlight
+    .then(res => {
+      const data = (res && res.data) || {};
+      if (!res || !res.ok) {
+        chatEntry('error', (data.error && data.error.message) || 'The assistant could not be reached');
+        return;
+      }
+      (data.activity || []).forEach(item => {
+        chatEntry('tool', item.tool + ' ' + JSON.stringify(item.arguments || {}));
+      });
+      chatEntry('assistant', data.message || '(no answer)');
+      const staged = data.staged_operations || [];
+      if (staged.length && settingsEditor) {
+        settingsEditor.stageOperations(staged, 'assistant');
+        chatEntry('staged', staged.length + ' change(s) staged. Review them in the tree and press Apply.');
+      }
+    })
+    .catch(error => chatEntry('error', String((error && error.message) || error)))
+    .then(() => { chatInFlight = null; refreshChatBusy(); });
+}
+
+function bindChatUi() {
+  const form = $('cfg-chat-form');
+  if (!form || form.dataset.bound) return;
+  form.dataset.bound = '1';
+
+  form.addEventListener('submit', event => {
+    event.preventDefault();
+    const input = $('cfg-chat-text');
+    const message = input.value.trim();
+    if (!message || chatInFlight) return;
+    input.value = '';
+    sendChatMessage(message);
+  });
+
+  $('cfg-chat-text').addEventListener('keydown', event => {
+    // Enter sends; Shift+Enter inserts a newline.
+    if (event.key === 'Enter' && !event.shiftKey) {
+      event.preventDefault();
+      if (form.requestSubmit) form.requestSubmit();
+    }
+  });
+
+  $('cfg-chat-clear').addEventListener('click', async () => {
+    await apiDelete('/api/settings/chat');
+    $('cfg-chat-history').innerHTML = '';
+  });
+}
+
+// Measure how much of the viewport is left below the workspace, so both
+// columns can be exactly that tall. The alternative is a guessed constant, and
+// a guess stops matching as soon as the header above grows or shrinks.
+function sizeSettingsWorkspace() {
+  const workspace = document.querySelector('.cfg-workspace');
+  if (!workspace) return;
+  // Stacked layout has no single height to fill; let the content decide.
+  // matchMedia is absent in some embedded hosts, and layout must not throw.
+  const stacked = typeof window.matchMedia === 'function'
+    && window.matchMedia('(max-width: 1100px)').matches;
+  if (stacked) {
+    workspace.style.removeProperty('--cfg-height');
+    return;
+  }
+  const visible = window.innerHeight - workspace.getBoundingClientRect().top;
+  workspace.style.setProperty('--cfg-height', Math.max(320, visible - 24) + 'px');
+}
+
 async function initSettingsBackend() {
   if (settingsReady) return;
   const res = await apiGet('/api/settings-info');
@@ -1215,6 +1353,7 @@ async function initSettingsBackend() {
     return;
   }
   settingsDocuments = Array.isArray(res.documents) ? res.documents : [];
+  showChatModel(res.assistant);
 
   const select = $('cfg-document');
   select.innerHTML = '';
@@ -1233,6 +1372,7 @@ async function initSettingsBackend() {
   }
   settingsReady = true;
   await mountSettingsEditor(settingsDocuments[0] || 'main');
+  sizeSettingsWorkspace();
 }
 
 function mountSettingsEditor(documentId) {
@@ -1303,6 +1443,7 @@ function bindTaskViewerUi() {
 // ── Boot ───────────────────────────────────────────────────────────────────
 bindSettingsUi();
 bindTaskViewerUi();
+if (window.addEventListener) window.addEventListener('resize', sizeSettingsWorkspace);
 // initSettingsBackend() is deliberately absent here: it needs an authenticated
 // session and is called from onLoggedIn() and from the first visit to the
 // settings page instead.

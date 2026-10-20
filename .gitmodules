@@ -1,0 +1,3 @@
+[submodule "aiset"]
+	path = aiset
+	url = https://github.com/DenisDx/aiset.git

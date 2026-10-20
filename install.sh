@@ -152,6 +152,37 @@ require_file() {
   [[ -f "$1" ]] || die "Required file not found: $1"
 }
 
+# Ensures the aiset library is checked out. It is a Git submodule, so the whole
+# step is one standard git command; a clone made without --recurse-submodules
+# leaves the directory empty, and the failure would otherwise surface much later
+# as a ModuleNotFoundError at service start.
+ensure_aiset_checkout() {
+  local aiset_dir="$SCRIPT_DIR/aiset"
+
+  if [[ -f "$aiset_dir/src/aiset/service.py" ]]; then
+    info "aiset library present"
+    return 0
+  fi
+
+  if ! command -v git &>/dev/null || ! git -C "$SCRIPT_DIR" rev-parse --is-inside-work-tree &>/dev/null; then
+    warn "aiset is missing and this is not a Git work tree; skipping the submodule step."
+    warn "Provide the library another way, for example: $VENV_DIR/bin/pip install -e /path/to/aiset"
+    return 0
+  fi
+
+  if [[ ! -f "$SCRIPT_DIR/.gitmodules" ]]; then
+    die "aiset is missing and .gitmodules is absent. Restore the submodule with: git -C \"$SCRIPT_DIR\" submodule add https://github.com/DenisDx/aiset.git aiset"
+  fi
+
+  info "Initialising the aiset submodule…"
+  git -C "$SCRIPT_DIR" submodule update --init --recursive \
+    || die "Could not initialise the aiset submodule. Run manually: git -C \"$SCRIPT_DIR\" submodule update --init --recursive"
+
+  [[ -f "$aiset_dir/src/aiset/service.py" ]] \
+    || die "The aiset submodule is initialised but aiset/src/aiset/service.py is missing. Check 'git -C \"$SCRIPT_DIR\" submodule status'."
+  info "aiset library OK"
+}
+
 set_env_var() {
   local file="$1"
   local key="$2"
@@ -443,6 +474,9 @@ if [[ "$CONFIG_TEMPLATE_EXPLICIT" -eq 1 || ! -f "$CONFIG_FILE" ]]; then
 fi
 
 info "Prerequisites OK"
+
+# ── Step 1c: aiset submodule ──────────────────────────────────────────────────
+ensure_aiset_checkout
 
 # ── Step 1b: Config template setup ───────────────────────────────────────────
 if [[ "$CONFIG_TEMPLATE_EXPLICIT" -eq 1 || ! -f "$CONFIG_FILE" ]]; then

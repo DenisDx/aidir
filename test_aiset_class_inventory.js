@@ -41,6 +41,9 @@ const doc = {
 
 global.document = doc;
 global.window = global;
+// Browser globals the page uses that Node does not provide.
+global.addEventListener = () => {};
+global.matchMedia = query => ({ matches: false, media: query, addListener(){}, removeListener(){} });
 // Node 22 defines navigator as a getter-only global; define it instead.
 Object.defineProperty(global, 'navigator', { value: { userAgent: 'node' }, configurable: true });
 global.localStorage = { getItem() { return null; }, setItem() {}, removeItem() {} };

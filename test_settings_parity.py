@@ -43,7 +43,94 @@ CONFIG = ROOT / "config.json5"
 PLACEHOLDER = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-(.*?))?\}")
 
 
-def reference_values(path: Path, environ: dict[str, str]) -> dict:
+def load_descriptor() -> dict:
+    """The shipped descriptor, read once per test session."""
+    return json5.loads((ROOT / "config.descriptor.json5").read_text(encoding="utf-8"))
+
+
+def declared_conversions(node: dict, prefix: tuple = ()) -> dict[tuple, str]:
+    """Map every declared `env.convert` to its dotted path, straight from the descriptor.
+
+    `env.convert` is a public, documented rule rather than an internal detail,
+    so the reference reader applies it from the descriptor instead of sharing the
+    resolver. That keeps the two readers independent and turns "the backend
+    honours the declared conversion" into something the parity check verifies -
+    without it, `ai.enabled` compared `True` against the string "true".
+    """
+    out: dict[tuple, str] = {}
+    convert = ((node.get("env") or {}).get("convert")
+               if isinstance(node.get("env"), dict) else None)
+    if convert:
+        out[prefix] = convert
+    for key, child in (node.get("children") or {}).items():
+        out.update(declared_conversions(child, prefix + (str(key),)))
+    array = node.get("children") if node.get("type") == "array" else None
+    if isinstance(array, dict):
+        out.update(declared_conversions(array, prefix + ("0",)))
+    additional = node.get("additional_children")
+    if isinstance(additional, dict):
+        out.update(declared_conversions(additional, prefix + ("*",)))
+    return out
+
+
+def convert_value(value, convert: str):
+    """Apply one declared conversion, following the documented rules.
+
+    A value that does not convert becomes None and is reported, never guessed:
+    the backend raises an issue for the same input, and a reader that guessed
+    would disagree with it for the wrong reason.
+    """
+    if convert == "string" or not isinstance(value, str):
+        return value
+    if convert == "bool":
+        if value == "true":
+            return True
+        if value == "false":
+            return False
+        return None
+    text = value.strip()
+    try:
+        if convert == "int":
+            return int(text) if re.fullmatch(r"[+-]?\d+", text) else None
+        return float(text) if text else None
+    except ValueError:
+        return None
+
+
+def node_convert(node) -> str | None:
+    """The conversion a node declares for a substituted value, if any."""
+    env = node.get("env")
+    return env.get("convert") if isinstance(env, dict) else None
+
+
+def apply_env_conversions(document, descriptor):
+    """Return the document with every declared `env.convert` applied in place.
+
+    The conversion belongs to the node that *holds* the value, so it is read
+    from the child while walking, never from the parent.
+    """
+    if not isinstance(descriptor, dict) or not isinstance(document, dict):
+        return document
+    children = descriptor.get("children") or {}
+    array = children if descriptor.get("type") == "array" else None
+    additional = descriptor.get("additional_children")
+    for key, value in list(document.items()):
+        node = (array or {}).get(key)
+        if node is None and isinstance(additional, dict):
+            node = additional
+        if node is None:
+            node = children.get(key)
+        if not isinstance(node, dict):
+            continue
+        convert = node_convert(node)
+        if convert and convert != "string" and isinstance(value, str):
+            document[key] = convert_value(value, convert)
+        else:
+            document[key] = apply_env_conversions(value, node)
+    return document
+
+
+def reference_values(path: Path, environ: dict[str, str], descriptor: dict | None = None) -> dict:
     """Read a configuration file the way the replaced loader did.
 
     Substitution happens on the raw text before parsing, exactly as
@@ -62,7 +149,8 @@ def reference_values(path: Path, environ: dict[str, str]) -> dict:
 
         return PLACEHOLDER.sub(replace, text)
 
-    return json5.loads(substitute(path.read_text(encoding="utf-8")))
+    document = json5.loads(substitute(path.read_text(encoding="utf-8")))
+    return apply_env_conversions(document, (descriptor or {}).get("root"))
 
 
 def flatten(value, prefix: tuple = ()) -> dict:
@@ -85,8 +173,9 @@ class RootConfigParityTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.environ = {**read_dotenv(ROOT / ".env"), **{k: v for k, v in os.environ.items()}}
+        cls.descriptor = load_descriptor()
         cls.aiset = flatten(config.raw())
-        cls.reference = flatten(reference_values(CONFIG, cls.environ))
+        cls.reference = flatten(reference_values(CONFIG, cls.environ, cls.descriptor))
 
     def test_both_sides_see_the_same_keys(self):
         self.assertEqual(set(self.aiset) - set(self.reference), set())
@@ -122,13 +211,14 @@ class WorkerConfigParityTests(unittest.TestCase):
         cls.environ = {**read_dotenv(ROOT / ".env"), **{k: v for k, v in os.environ.items()}}
         cls.merged_entries = resolve_worker_configs(config.raw())
         cls.merged = flatten(cls.merged_entries)
+        cls.descriptor = load_descriptor()
         cls.reference_entries = cls._reference_merge()
         cls.reference = flatten(cls.reference_entries)
 
     @classmethod
     def _reference_merge(cls) -> dict:
         """Worker entries merged the way the removed local deep merge did."""
-        root_config = reference_values(CONFIG, cls.environ)
+        root_config = reference_values(CONFIG, cls.environ, cls.descriptor)
         root_items = (root_config.get("workers") or {}).get("items") or {}
         out: dict = {}
         # Every worker directory, not only the ones with a local file: a worker

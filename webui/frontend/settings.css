@@ -110,12 +110,9 @@
 .aiset-tree-editor .aiset-tree-name:hover { text-decoration-color: var(--aiset-muted); }
 
 /* ── Toolbar shell ─────────────────────────────────────────────────────
-   The library names these elements but paints none of them: no flex, no gap,
-   no spacing. Without this the buttons are bare inline text. */
-.aiset-tree-editor .aiset-tree-toolbar {
-  display: flex; align-items: center; gap: 8px;
-  padding: 10px 0 12px; flex-wrap: wrap;
-}
+   The library paints the layout - flex, alignment, wrap, gap, a margin - since
+   proposal_improvement5. Only the vertical rhythm is this host's. */
+.aiset-tree-editor .aiset-tree-toolbar { padding: 10px 0 12px; }
 
 /* ── Badges ───────────────────────────────────────────────────────────────
    The library paints the badge, the `aiset-tree-badges` wrapper and the `new` and
@@ -144,7 +141,9 @@
 .aiset-tree-editor .aiset-tree-badge.env     { color: var(--aiset-ok); border-color: var(--cfg-border-ok); }
 
 /* ── Status, issues, staged list ───────────────────────────────────────
-   Also unpainted by the library, and `required` in its own inventory. */
+   The library paints the box of every one of these since
+   proposal_improvement5. What stays here is the host's type size, spacing and
+   the colours of each state. */
 .aiset-tree-editor .aiset-tree-status { padding: 8px 0 2px; font-size: 12px; color: var(--aiset-muted); }
 .aiset-tree-editor .aiset-tree-status[data-state="ok"]      { color: var(--aiset-ok); }
 .aiset-tree-editor .aiset-tree-status[data-state="pending"] { color: var(--aiset-pending); }
@@ -158,10 +157,11 @@
 .aiset-tree-editor .aiset-tree-staged-source,
 .aiset-tree-editor .aiset-tree-staged-op { font-family: var(--mono); color: var(--aiset-muted); }
 
-/* ── Toolbar ──────────────────────────────────────────────────────────────
-   The library now names these buttons `aiset-tree-button` plus the role class
-   `apply`, `reload`, `revert`, and still paints none of them: the toolbar is
-   host design. This is the whole reason the role classes are worth having. */
+/* ── Toolbar buttons ────────────────────────────────────────────────────
+   The library names these buttons `aiset-tree-button` plus the role class
+   `apply`, `reload`, `revert`, and paints the shell around them but not the
+   buttons themselves: a button is host design. This is the whole reason the
+   role classes are worth having. */
 .aiset-tree-editor .aiset-tree-button {
   background: var(--aiset-surface); color: var(--aiset-text);
   border: 1px solid var(--aiset-border); border-radius: 6px;
@@ -241,3 +241,80 @@
 .aiset-tree-editor .aiset-tree-action.remove:hover:not(:disabled) {
   color: var(--aiset-err); border-color: var(--aiset-err);
 }
+/* ── Two-pane workspace: editor left, assistant right ─────────────────────
+   The same shape as the aiset demo host: two columns that each scroll on
+   their own, so a long tree never pushes the assistant off screen. Narrow
+   viewports stack the panes instead of squeezing both to unreadable. */
+.cfg-workspace {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(320px, 34%);
+  gap: 16px;
+  align-items: stretch;
+  /* One definite height for both columns, measured from the top of this
+     workspace down to the bottom of the viewport by sizeSettingsWorkspace().
+     The old `calc(72vh + 90px)` on the chat card was a guess at how tall the
+     editor is, and it stopped matching the moment the editor header changed. */
+  height: var(--cfg-height, 70vh);
+}
+.cfg-pane { min-width: 0; display: flex; flex-direction: column; min-height: 0; }
+
+@media (max-width: 1100px) {
+  /* Stacked, the two panes read as one column: let the content set the height
+     again, otherwise each pane is squeezed into half of the measured box. */
+  .cfg-workspace { grid-template-columns: 1fr; height: auto; }
+  #settings-tree { flex: 0 0 auto; max-height: 60vh; }
+  #cfg-chat-card { flex: 0 0 auto; }
+  #cfg-chat-card .cfg-chat-history { max-height: 60vh; }
+}
+
+/* The tree fills the column it is in and scrolls on its own. */
+#cfg-aiset-card {
+  display: flex; flex-direction: column;
+  flex: 1 1 auto; min-height: 0; margin-bottom: 0;
+}
+#settings-tree { flex: 1 1 auto; min-height: 0; overflow: auto; }
+
+/* ── Assistant pane ─────────────────────────────────────────────────────── */
+#cfg-chat-card {
+  display: flex; flex-direction: column;
+  flex: 1 1 auto; min-height: 0; margin-bottom: 0;
+}
+
+.cfg-chat-note { font-size: 11px; color: var(--muted); margin-bottom: 8px; }
+.cfg-chat-note.cfg-chat-off { color: var(--warn); }
+
+.cfg-chat-history {
+  flex: 1 1 auto; min-height: 0; overflow: auto;
+  padding: 8px; margin-bottom: 10px;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+}
+.cfg-chat-entry { margin-bottom: 10px; }
+.cfg-chat-role {
+  font-size: 10px; text-transform: uppercase; letter-spacing: .08em;
+  color: var(--muted); margin-bottom: 2px;
+}
+.cfg-chat-body { white-space: pre-wrap; word-break: break-word; font-size: 12.5px; line-height: 1.5; }
+.cfg-chat-user .cfg-chat-body { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; }
+.cfg-chat-assistant .cfg-chat-body { color: var(--text); }
+.cfg-chat-tool .cfg-chat-body { color: var(--muted); font-family: var(--mono); font-size: 11px; }
+.cfg-chat-error .cfg-chat-body { color: var(--err); }
+.cfg-chat-staged .cfg-chat-body { color: var(--ok); }
+
+.cfg-chat-input { display: flex; flex-direction: column; gap: 8px; margin-bottom: 10px; }
+.cfg-chat-input textarea {
+  width: 100%; box-sizing: border-box; resize: vertical;
+  background: var(--bg); color: var(--text);
+  border: 1px solid var(--border); border-radius: 6px;
+  padding: 7px 9px; font-family: inherit; font-size: 12.5px; line-height: 1.45;
+}
+.cfg-chat-input textarea:focus { outline: none; border-color: var(--accent); }
+.cfg-chat-input textarea:disabled { opacity: .55; cursor: not-allowed; }
+.cfg-chat-actions { display: flex; gap: 8px; }
+.cfg-chat-actions button {
+  padding: 6px 14px; border-radius: 6px; font: inherit; font-size: 12.5px; cursor: pointer;
+  background: var(--panel); color: var(--text); border: 1px solid var(--border);
+}
+.cfg-chat-actions button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.cfg-chat-actions button:disabled { opacity: .45; cursor: default; }
+#cfg-chat-send { background: var(--accent); border-color: var(--accent); color: #fff; }
+#cfg-chat-send:hover:not(:disabled) { color: #fff; opacity: .9; }
