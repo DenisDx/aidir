@@ -619,6 +619,24 @@
               env: { allowed: true, convert: "string" },
               ui: { placeholder: "0.0.0.0" },
             },
+            request_timeout: {
+              // Legacy: endpoint_openaix/ollama/mcp warn about it at startup and
+              // ignore it. Task lifetime comes from tasks.queue_timeout and
+              // tasks.run_timeout, one upstream call from the worker
+              // request_timeout. Declared so an older local config still loads:
+              // the previous loader substituted the placeholder before parsing
+              // and never validated the key.
+              type: "int",
+              minimum: 1,
+              maximum: 86400,
+              apply: "restart",
+              description: "Deprecated endpoint-level request timeout in seconds; ignored, use tasks.* and the worker request_timeout instead",
+              env: { allowed: true, convert: "int" },
+              ui: {
+                placeholder: "100",
+                help: "Deprecated. Task lifetime: tasks.queue_timeout and tasks.run_timeout; one upstream call: workers.items.<id>.request_timeout.",
+              },
+            },
             worker: {
               type: "string",
               min_length: 1,

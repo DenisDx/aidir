@@ -255,6 +255,55 @@ class DocumentLoadTests(unittest.TestCase):
                 )
 
 
+class LegacyFieldTests(unittest.TestCase):
+    """Fields kept only so an existing installation still starts."""
+
+    def test_a_legacy_endpoint_request_timeout_still_loads(self):
+        """The previous loader substituted placeholders before parsing.
+
+        It therefore never validated `endpoints.*.request_timeout`, and older
+        local configurations still carry it. The descriptor must declare it or
+        such a configuration stops aidir at startup with `env_not_allowed` -
+        the failure reported on a real machine after the migration.
+        """
+        import tempfile
+
+        text = ROOT_CONFIG.read_text(encoding="utf-8")
+        marker = '      "port": ${OPENAIX_ENDPOINT_PORT:-21434},\n'
+        self.assertIn(marker, text, "the endpoint block moved; update this fixture")
+        legacy = text.replace(
+            marker, marker + '      "request_timeout": ${REQUEST_TIMEOUT:-100},\n', 1
+        )
+        with tempfile.TemporaryDirectory(prefix="aidir-legacy-") as tmp:
+            path = Path(tmp) / "config.json5"
+            path.write_text(legacy, encoding="utf-8")
+            service = _build_service("main", ROOT_DESCRIPTOR, path)
+            result = service.load("main", principal=Principal.demo())
+            errors = [i for i in result.issues if i.get("severity") == "error"]
+        self.assertFalse(result.invalid_on_disk, result.reason)
+        self.assertEqual(errors, [], result.issues)
+
+    def test_the_legacy_timeout_resolves_to_an_integer(self):
+        import tempfile
+
+        text = ROOT_CONFIG.read_text(encoding="utf-8")
+        marker = '      "port": ${OPENAIX_ENDPOINT_PORT:-21434},\n'
+        legacy = text.replace(
+            marker, marker + '      "request_timeout": ${REQUEST_TIMEOUT:-100},\n', 1
+        )
+        with tempfile.TemporaryDirectory(prefix="aidir-legacy-") as tmp:
+            path = Path(tmp) / "config.json5"
+            path.write_text(legacy, encoding="utf-8")
+            service = _build_service("main", ROOT_DESCRIPTOR, path)
+            value = service.get(
+                "main", "/endpoints/0/request_timeout",
+                view="effective", principal=Principal.demo(),
+            ).value_text
+        # TEST_ENV sets REQUEST_TIMEOUT=100; an unquoted placeholder must become
+        # a number, not the string "100".
+        self.assertEqual(int(value), 100)
+
+
 class CoverageTests(unittest.TestCase):
     """No leaf of a configuration file may be invisible to its descriptor."""
 
