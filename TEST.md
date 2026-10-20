@@ -126,8 +126,10 @@ python -m unittest -v \
 `test_doctor.py` covers the host diagnostic: a drifted configuration key is
 reported with its fix class and removed only through `--fix-all`, a dry run writes
 nothing, a missing directory is created by `--fix`, and an unreachable Redis is
-reported within the socket timeout. `core/app.py --help` and the startup hint are
-also asserted.
+reported within the socket timeout. It also checks the restart-loop detection
+(`activating/auto-restart`, active unit preferred over an inactive one), that the
+service is not started again while something still fails, `--help`, and the
+`doctor.sh` wrapper.
 
 `test_settings_styles.py` checks the design contract against the library's own
 published inventory (`aiset.classes()`): every class is painted by the host or the

@@ -139,17 +139,18 @@ class SettingsRuntime:
         except Exception:  # pragma: no cover - logging must never break a write
             pass
 
-    def build(self) -> "SettingsRuntime":
-        """Register every document and load it once.
+    def build(self, *, refresh: bool = True) -> "SettingsRuntime":
+        """Register every document and, unless asked not to, load it once.
 
-        Raises SettingsError when a document is invalid on disk. The startup
-        rule is deliberate: a settings subsystem that quietly serves an empty
-        configuration is worse than a refused start.
+        `refresh=False` is for the doctor: it needs the documents registered to
+        inspect them, but an invalid document is the finding, not a startup
+        failure, and the load would log an error the report is about to explain.
         """
         self._register_main()
         self._register_workers()
         self._bind_callbacks()
-        self.refresh()
+        if refresh:
+            self.refresh()
         return self
 
     def _register_main(self) -> None:

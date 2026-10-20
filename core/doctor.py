@@ -121,6 +121,11 @@ class Context:
     runtime: Any = None
     config_error: str | None = None
     aidir_running: bool | None = None
+    service_scope: str | None = None
+    service_state: str = "unknown"
+    service_restarts: int = 0
+    service_stopped: bool = False
+    failed_checks: int = 0
 
     @property
     def classes(self) -> list[str]:
@@ -141,6 +146,7 @@ class Report:
     failed: list[str] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)
     aidir_running: bool = False
+    service: dict[str, Any] = field(default_factory=dict)
 
     @property
     def exit_code(self) -> int:
@@ -154,6 +160,7 @@ class Report:
             "ok": self.exit_code == 0,
             "checks": [check.to_dict() for check in self.checks],
             "aidir_running": self.aidir_running,
+            "service": self.service,
             "applied": self.applied,
             "failed": self.failed,
             "skipped": self.skipped,
@@ -274,7 +281,25 @@ def run(
 
     results: list[CheckResult] = []
     report = Report(checks=results)
+    context.service_scope, context.service_state, context.service_restarts = _service_state(context)
+    report.service = {
+        "scope": context.service_scope,
+        "state": context.service_state,
+        "restarts": context.service_restarts,
+    }
     report.aidir_running = _aidir_running(context)
+    if context.fix_all and _service_is_crashing(context):
+        if _service_stop(context):
+            context.service_stopped = True
+            report.applied.append(
+                f"service: stop the restart loop ({context.service_scope} unit)"
+            )
+        else:
+            report.failed.append(
+                "service: stop the restart loop -> refused; "
+                + ("re-run with --root" if context.service_scope == "system"
+                   else "systemctl stop failed")
+            )
     for name in order:
         if name not in selected:
             continue
@@ -283,6 +308,8 @@ def run(
         except Exception as exc:  # a broken check is a finding, not a crash
             result = CheckResult(name, "fail", f"{exc.__class__.__name__}: {exc}")
         results.append(result)
+        if result.status == "fail":
+            context.failed_checks += 1
         for item in result.fixes:
             where = " ".join(
                 part for part in (item.get("document"), item.get("path")) if part
@@ -393,7 +420,7 @@ def _check_config(context: Context) -> CheckResult:
 
     runtime = SettingsRuntime(root=context.root)
     try:
-        runtime.build()
+        runtime.build(refresh=False)
     except Exception as exc:
         context.config_error = str(exc)
     context.runtime = runtime
@@ -418,7 +445,7 @@ def _check_config(context: Context) -> CheckResult:
         for issue in report.issues:
             entry = {"document": document_id, **issue.to_dict()}
             issues.append(entry)
-            if issue.severity != "error":
+            if issue.severity != "error" or entry.get("resolved"):
                 continue
             suffix = f" -> {issue.fix}" if issue.fix else f" {issue.message}"
             if issue.fix and issue.after is not None:
@@ -445,17 +472,22 @@ def _check_config(context: Context) -> CheckResult:
                 "aidir is running with the old configuration; reload it: "
                 "systemctl reload aidir (SIGHUP), or restart it"
             )
-    if context.config_error:
-        # The build failed before the repair, so it is context, not a verdict:
-        # the per-document reports below decide whether anything is still wrong.
-        details.insert(0, context.config_error.splitlines()[0])
-
     if not runtime.service.documents:
         result = CheckResult("config", "fail",
                              "no configuration documents are registered", details=details)
         result.recommendation = "run ./install.sh; it creates config.json5 and .env"
         return result
+    if not failed:
+        # Populate the effective cache for the checks that read settings, now
+        # that every document is valid (after a repair, if one was applied).
+        try:
+            runtime.refresh()
+        except Exception:
+            pass
     errors = [item for item in issues if item["severity"] == "error"]
+    if failed and context.config_error:
+        # Only a still-broken document needs the pre-repair build error.
+        details.insert(0, context.config_error.splitlines()[0])
     if failed:
         status = "fail"
         message = f"{len(errors)} issue(s)"
@@ -646,7 +678,7 @@ def _check_compose(context: Context) -> CheckResult:
 
 @_register("redis")
 def _check_redis(context: Context) -> CheckResult:
-    """Redis must answer on the port the configuration names, and publish it."""
+    """Redis must answer on the port the configuration names, and stay up."""
     host, port, password = _redis_settings(context)
     reachable, error = _redis_ping(host, port, password)
     published = _compose_published_port(context, "redis", 6379)
@@ -654,8 +686,10 @@ def _check_redis(context: Context) -> CheckResult:
     details: list[str] = []
     if published is not None and published != port:
         details.append(f"the container publishes {published}, the configuration says {port}")
+    elif published is None:
+        details.append("the container's published port is unknown (docker compose port failed)")
     if reachable:
-        if not details:
+        if not details or published == port:
             return CheckResult("redis", "ok", f"{host}:{port} answers")
         result = CheckResult("redis", "warn",
                              f"{host}:{port} answers, published port differs", details=details)
@@ -666,17 +700,20 @@ def _check_redis(context: Context) -> CheckResult:
         return result
 
     details.insert(0, error or "no response")
-    if container:
-        details.append("the container exists but does not answer")
-    else:
-        details.append("the container is not running")
-    if _aidir_running(context):
-        details.append("aidir is running; it will reconnect after the container is back")
+    state = _docker_state(context, container) if container else "no container"
+    details.append(f"container: {state}")
+    if _service_is_crashing(context):
+        details.append(
+            f"aidir is in a restart loop ({context.service_state}, "
+            f"{context.service_restarts} restart(s)) until Redis answers"
+        )
+    elif _aidir_running(context):
+        details.append("aidir is running; it will reconnect after Redis is back")
     result = CheckResult("redis", "fail", f"cannot reach {host}:{port}", details=details)
 
     if context.fix_all:
-        # A container that exists but does not answer is usually stuck; recreating
-        # it is the only repair that works, and it is why this class is `visible`.
+        # A container that exists but does not answer is usually stuck or
+        # crash-looping; recreating it is the only repair that can help.
         action = "docker compose up -d --force-recreate redis"
         result.fixes.append({"action": action, "class": VISIBLE})
         _apply_fix(context, result.fixes[-1],
@@ -692,26 +729,56 @@ def _check_redis(context: Context) -> CheckResult:
         if reachable:
             return CheckResult("redis", "ok", f"{host}:{port} answers after the repair")
         result.details.append("still unreachable after the repair")
+        state = _docker_state(context, container) if container else state
 
-    if result.fixes and result.fixes[-1].get("attempted") and not result.fixes[-1].get("applied"):
-        output = str(result.fixes[-1].get("error", ""))
-        if "connectivity" in output or "iptables" in output or "proxy" in output:
-            result.recommendation = (
-                "Docker could not program the port. Restart it: "
-                "sudo systemctl restart docker; on WSL also run 'wsl --shutdown' "
-                "from Windows, then start Docker again"
-            )
-        else:
-            result.recommendation = (
-                "inspect it: docker compose logs --tail 50 redis; then "
-                "docker compose up -d --force-recreate redis"
-            )
-    elif not result.fixes:
-        result.recommendation = (
-            "run ./doctor.sh --fix-all to recreate the container, then "
-            "docker compose logs --tail 50 redis if it still does not answer"
-        )
+    if container and not context.dry_run:
+        # The log is the next thing an operator would read; put it in the report
+        # so the cause is visible without a second command.
+        for line in _container_log_lines(context, "redis"):
+            result.details.append(f"log: {line}")
+
+    attempted = bool(result.fixes and result.fixes[-1].get("attempted"))
+    output = str(result.fixes[-1].get("error", "")) if result.fixes else ""
+    result.recommendation = _redis_advice(
+        state=state,
+        output=output,
+        attempted=attempted,
+        aidir_running=_aidir_running(context),
+        crashing=_service_is_crashing(context),
+    )
     return result
+
+
+def _redis_advice(*, state: str, output: str, attempted: bool, aidir_running: bool,
+                  crashing: bool = False) -> str:
+    """The one or two actions worth taking for an unreachable Redis."""
+    parts: list[str] = []
+    if crashing:
+        parts.append(
+            "aidir is in a restart loop; --fix-all stops it before repairing and "
+            "starts it again afterwards"
+        )
+    elif aidir_running:
+        parts.append(
+            "stop aidir while repairing (systemctl --user stop aidir), then start it again"
+        )
+    lowered = output.lower()
+    engine_failure = any(word in lowered for word in ("connectivity", "iptables", "proxy"))
+    if attempted and engine_failure:
+        parts.append(
+            "Docker could not program the port: sudo systemctl restart docker; on WSL also "
+            "run 'wsl --shutdown' from Windows, then start Docker again"
+        )
+    elif state.startswith(("restarting", "exited", "dead")):
+        parts.append(
+            "the container does not stay up: fix the cause shown in its log lines "
+            "(volume permissions and port conflicts are the usual ones)"
+        )
+    elif attempted:
+        parts.append("still unreachable after the repair: read its log lines above")
+    elif not attempted:
+        parts.append("run ./doctor.sh --fix-all to recreate the container")
+    return "; ".join(parts)
 
 
 @_register("nginx")
@@ -749,20 +816,32 @@ def _check_ports(context: Context) -> CheckResult:
          _endpoint_port(settings, "mcp", 20001)),
         ("nginx", "0.0.0.0", _int_env(context, "NGINX_HTTP_PORT", 8080)),
     ]
-    busy: list[str] = []
+    busy: list[tuple[str, str, int]] = []
     for name, host, port in wanted:
         if port is None:
             continue
         if _port_free(host, port):
             continue
-        busy.append(f"{name} {host}:{port}")
+        busy.append((name, host, port))
     if not busy:
         return CheckResult("ports", "ok", "configured ports are free or owned")
-    running = _aidir_running(context)
-    if running:
+
+    # The nginx container legitimately holds its public port whenever it runs;
+    # reporting that as a conflict would make every healthy run yellow.
+    nginx_running = bool(_compose_container(context, "nginx"))
+    unexpected = [
+        (name, host, port) for name, host, port in busy
+        if not (name == "nginx" and nginx_running)
+    ]
+    if not unexpected:
+        return CheckResult("ports", "ok", "ports are owned by nginx and this instance")
+    if _aidir_running(context) and not any(
+        name in ("nginx",) for name, _host, _port in unexpected
+    ):
         return CheckResult("ports", "ok", "ports are owned by the running instance")
     return CheckResult("ports", "warn", "ports are in use",
-                       details=[f"{item} is in use" for item in busy])
+                       details=[f"{name} {host}:{port} is in use"
+                                for name, host, port in unexpected])
 
 
 @_register("logs")
@@ -805,34 +884,48 @@ def _check_ollama(context: Context) -> CheckResult:
 
 @_register("systemd")
 def _check_systemd(context: Context) -> CheckResult:
-    """Report the service unit; restarting it is privileged."""
-    seen: list[str] = []
-    for scope, command in (("system", ["systemctl", "is-active", "aidir"]),
-                           ("user", ["systemctl", "--user", "is-active", "aidir"])):
-        code, out = _run(command, timeout=10)
-        state = out.strip()
-        if state not in ("active", "inactive", "failed", "activating"):
-            continue
-        seen.append(f"{scope}: {state}")
-        if state == "active":
-            return CheckResult("systemd", "ok", f"{scope} unit active")
-    if not seen:
+    """Report the unit, and start it again if the doctor stopped a restart loop."""
+    label = f"{context.service_scope or 'no'} unit: {context.service_state}"
+
+    if context.service_stopped:
+        if not _should_start_after_repair(context):
+            # Starting it now would rebuild the restart loop that was just stopped.
+            result = CheckResult(
+                "systemd", "warn",
+                f"{context.service_scope} unit stopped; not started because "
+                f"{context.failed_checks} problem(s) remain",
+                details=["fix them, then start the unit"],
+            )
+            result.recommendation = _service_command(context, "start")
+            return result
+        if _service_start(context):
+            return CheckResult("systemd", "ok",
+                               f"{context.service_scope} unit started after the repairs")
+        result = CheckResult("systemd", "fail",
+                             f"{context.service_scope} unit was stopped and did not start",
+                             details=[f"state: {context.service_state}"])
+        result.recommendation = _service_command(context, "start")
+        return result
+
+    if context.service_scope is None:
         result = CheckResult("systemd", "warn", "no aidir unit found")
         result.recommendation = "run ./install.sh to install the unit"
         return result
-    result = CheckResult("systemd", "warn", "the unit is not active", details=seen)
-    result.recommendation = "start it: systemctl --user start aidir (or ./install.sh)"
-    if context.privileges:
-        scope = seen[0].split(":", 1)[0]
-        result.fixes.append({
-            "action": f"systemctl {'--user ' if scope == 'user' else ''}restart aidir",
-            "class": PRIVILEGED,
-        })
-        _apply_fix(context, result.fixes[-1],
-                   command=["systemctl"] + (["--user"] if scope == "user" else [])
-                   + ["restart", "aidir"])
-        if result.fixes[-1].get("applied") and not context.dry_run:
-            return CheckResult("systemd", "ok", f"{scope} unit restarted")
+
+    if context.service_state.startswith("active/running"):
+        return CheckResult("systemd", "ok", label)
+
+    details = [f"restarts: {context.service_restarts}"]
+    if _service_is_crashing(context):
+        result = CheckResult("systemd", "fail", label + " (restart loop)", details=details)
+        result.recommendation = (
+            "fix the dependency shown above, then start it: "
+            + _service_command(context, "start")
+        )
+        return result
+
+    result = CheckResult("systemd", "warn", label, details=details)
+    result.recommendation = "start it: " + _service_command(context, "start")
     return result
 
 
@@ -905,6 +998,141 @@ def _compose_command(context: Context, args: Sequence[str]) -> list[str]:
 def _compose(context: Context, args: Sequence[str], *, timeout: int = 30) -> tuple[int, str]:
     """Run one compose subcommand."""
     return _run(_compose_command(context, args), timeout=timeout)
+
+
+def _parse_service_show(output: str) -> tuple[str, int]:
+    """`ActiveState/SubState` and `NRestarts` from `systemctl show` output."""
+    fields: dict[str, str] = {}
+    for line in output.splitlines():
+        key, separator, value = line.partition("=")
+        if separator:
+            fields[key.strip()] = value.strip()
+    state = fields.get("ActiveState", "unknown")
+    substate = fields.get("SubState", "")
+    label = f"{state}/{substate}" if substate else state
+    try:
+        restarts = int(fields.get("NRestarts") or 0)
+    except ValueError:
+        restarts = 0
+    return label, restarts
+
+
+def _looks_crashing(state: str, restarts: int) -> bool:
+    """Whether a unit state means systemd is restarting it instead of running it."""
+    if state.startswith(("activating/auto-restart", "failed")):
+        return True
+    return restarts > 0 and not state.startswith("active/running")
+
+
+def _choose_service(candidates: list[tuple[str, str, int]]) -> tuple[str | None, str, int]:
+    """Pick the unit that matters: an active one, then a crash loop, then any.
+
+    A host may have both a system and a user unit installed. The inactive system
+    unit used to win because it was probed first, which hid the active user unit
+    and would have hidden a user-scope restart loop too.
+    """
+    for item in candidates:
+        if item[1].startswith("active/running"):
+            return item
+    for item in candidates:
+        if _looks_crashing(item[1], item[2]):
+            return item
+    if candidates:
+        return candidates[0]
+    return None, "unknown", 0
+
+
+def _service_state(context: Context) -> tuple[str | None, str, int]:
+    """Scope, `ActiveState/SubState` and restart count of the aidir unit."""
+    candidates: list[tuple[str, str, int]] = []
+    for scope, flags in (("system", []), ("user", ["--user"])):
+        code, out = _run(
+            ["systemctl", *flags, "show", "aidir",
+             "-p", "ActiveState", "-p", "SubState", "-p", "NRestarts"],
+            timeout=10,
+        )
+        if code != 0:
+            continue
+        state, restarts = _parse_service_show(out)
+        if state == "unknown":
+            continue
+        candidates.append((scope, state, restarts))
+    return _choose_service(candidates)
+
+
+def _service_is_crashing(context: Context) -> bool:
+    """Whether systemd is restarting the unit instead of running it."""
+    return _looks_crashing(context.service_state, context.service_restarts)
+
+
+def _service_command(context: Context, action: str) -> str:
+    """The systemctl command for the unit in its scope."""
+    flags = "--user " if context.service_scope == "user" else ""
+    return f"systemctl {flags}{action} aidir"
+
+
+def _should_start_after_repair(context: Context) -> bool:
+    """Start the unit only when nothing else is still failing."""
+    return context.service_stopped and context.failed_checks == 0
+
+
+def _service_stop(context: Context) -> bool:
+    """Stop the unit before repairs; a system unit needs --root."""
+    if context.dry_run or context.service_scope is None:
+        return False
+    command = ["systemctl"] + (["--user"] if context.service_scope == "user" else [])
+    if context.service_scope == "system":
+        if not context.privileges:
+            return False
+        return _sudo(command + ["stop", "aidir"])
+    code, _out = _run(command + ["stop", "aidir"], timeout=60)
+    return code == 0
+
+
+def _service_start(context: Context) -> bool:
+    """Start the unit after repairs; a system unit needs --root."""
+    if context.dry_run or context.service_scope is None:
+        return False
+    command = ["systemctl"] + (["--user"] if context.service_scope == "user" else [])
+    if context.service_scope == "system":
+        if not context.privileges:
+            return False
+        return _sudo(command + ["start", "aidir"])
+    code, _out = _run(command + ["start", "aidir"], timeout=60)
+    return code == 0
+
+
+def _docker_state(context: Context, container: str) -> str:
+    """One word on the container state: running, restarting, exited(1), dead."""
+    code, out = _run(
+        ["docker", "inspect", "-f",
+         "{{.State.Status}}|{{.State.Restarting}}|{{.State.ExitCode}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}",
+         container],
+        timeout=15,
+    )
+    if code != 0 or not out.strip():
+        return "unknown"
+    parts = out.strip().splitlines()[0].split("|")
+    status = parts[0] or "unknown"
+    restarting = len(parts) > 1 and parts[1] == "true"
+    exit_code = parts[2] if len(parts) > 2 else ""
+    health = parts[3] if len(parts) > 3 else ""
+    if status == "running" and health:
+        status = f"running ({health})"
+    elif status == "exited" and exit_code:
+        status = f"exited ({exit_code})"
+    if restarting:
+        status += ", restarting"
+    return status
+
+
+def _container_log_lines(context: Context, service: str, limit: int = 8) -> list[str]:
+    """The last log lines of one compose service; empty when unavailable."""
+    code, out = _compose(context, ["logs", "--tail", str(limit), service], timeout=20)
+    if code != 0:
+        return []
+    lines = [line.rstrip() for line in out.splitlines() if line.strip()]
+    return lines[-limit:]
 
 
 def _compose_container(context: Context, service: str) -> str:

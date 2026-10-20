@@ -692,6 +692,18 @@ repairs that **failed** with the command's own error, the repairs it skipped, an
 a recommendation for everything still wrong (for example, restart Docker when it
 cannot program a port, or reload aidir after a configuration repair).
 
+For Redis the report includes the container state (`running`, `restarting`,
+`exited (1)`, plus health) and its last log lines. A crash loop and a broken port
+forward look identical from outside - both time out - and only the log or the
+state tells them apart.
+
+If aidir itself is in a **restart loop** (systemd `activating/auto-restart`), the
+report shows the unit scope, its state and the restart count, and says so instead
+of claiming the service is running. `--fix-all` stops the unit before repairing
+the dependencies and starts it again at the end - but only if nothing else is
+still failing, because restarting it earlier would rebuild the same loop. Without
+`--fix-all` the report prints the `systemctl stop` command to run first.
+
 Exit codes: `0` healthy or warnings only, `1` failures remain, `2` repaired but
 issues remain. The file is written only when the repairs make it fully valid; a
 partial repair of an invalid file is reported, not stored.

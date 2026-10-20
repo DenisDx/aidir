@@ -95,6 +95,35 @@ class ConfigCheckTests(unittest.TestCase):
         self.assertEqual(report.checks[0].status, "fail")
         self.assertTrue(still_there)
 
+    def test_a_stale_key_inside_a_worker_union_is_repaired(self):
+        """040: `apiKey` sat at the worker level, inside a union node.
+
+        The validator reports that as a union issue at the worker path; the
+        repair has to remove the key itself, or the document can never become
+        valid and every other planned fix is skipped.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(Path(tmp))
+            config = root / "config.json5"
+            body = config.read_text(encoding="utf-8")
+            for worker in ("web_search", "web_fetch"):
+                body = body.replace(
+                    f'      "{worker}": {{',
+                    f'      "{worker}": {{\n        "apiKey": "${{BRAVE_APIKEY}}",',
+                    1,
+                )
+            config.write_text(body, encoding="utf-8")
+
+            safe = doctor.run(root=root, only=["config"], fix=True)
+            self.assertEqual(safe.checks[0].status, "fail")
+
+            report = doctor.run(root=root, only=["config"], fix_all=True)
+            after = config.read_text(encoding="utf-8")
+        self.assertEqual(report.checks[0].status, "ok", report.checks[0].details)
+        self.assertEqual(report.exit_code, 0)
+        for worker in ("web_search", "web_fetch"):
+            self.assertNotIn(f'"{worker}": {{\n        "apiKey"', after)
+
     def test_fix_all_deletes_the_key_and_reports_ok(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = make_root(Path(tmp), stale_key=True)
@@ -269,6 +298,96 @@ class VerdictTests(unittest.TestCase):
             payload = doctor.run(root=root, only=["redis"], fix_all=True).to_dict()
         self.assertIn("failed", payload)
         self.assertEqual(payload["exit_code"], 1)
+
+
+class ServiceStateTests(unittest.TestCase):
+    """Detecting a restart loop is what turns the report from misleading to useful."""
+
+    def test_show_output_is_parsed(self):
+        state, restarts = doctor._parse_service_show(
+            "ActiveState=activating\nSubState=auto-restart\nNRestarts=9\n"
+        )
+        self.assertEqual(state, "activating/auto-restart")
+        self.assertEqual(restarts, 9)
+
+    def test_a_crash_loop_is_recognised(self):
+        context = doctor.Context(root=ROOT, service_state="activating/auto-restart",
+                                 service_restarts=4)
+        self.assertTrue(doctor._service_is_crashing(context))
+
+    def test_a_recovered_service_is_not_a_loop(self):
+        context = doctor.Context(root=ROOT, service_state="active/running",
+                                 service_restarts=4)
+        self.assertFalse(doctor._service_is_crashing(context))
+
+    def test_an_active_unit_wins_over_an_inactive_one(self):
+        chosen = doctor._choose_service([
+            ("system", "inactive/dead", 0),
+            ("user", "active/running", 0),
+        ])
+        self.assertEqual(chosen, ("user", "active/running", 0))
+
+    def test_a_crashing_unit_wins_over_an_inactive_one(self):
+        chosen = doctor._choose_service([
+            ("system", "inactive/dead", 0),
+            ("user", "activating/auto-restart", 7),
+        ])
+        self.assertEqual(chosen[0], "user")
+        self.assertTrue(doctor._looks_crashing(chosen[1], chosen[2]))
+
+    def test_no_unit_is_reported_as_unknown(self):
+        self.assertEqual(doctor._choose_service([]), (None, "unknown", 0))
+
+    def test_the_service_is_not_started_while_something_still_fails(self):
+        """Restarting the loop before Redis is fixed would just rebuild it."""
+        stopped = doctor.Context(root=ROOT, service_stopped=True, failed_checks=1)
+        self.assertFalse(doctor._should_start_after_repair(stopped))
+        clean = doctor.Context(root=ROOT, service_stopped=True, failed_checks=0)
+        self.assertTrue(doctor._should_start_after_repair(clean))
+        running = doctor.Context(root=ROOT, service_stopped=False)
+        self.assertFalse(doctor._should_start_after_repair(running))
+
+    def test_the_advice_for_a_restart_loop_mentions_fix_all(self):
+        text = doctor._redis_advice(
+            state="running", output="", attempted=False, aidir_running=True, crashing=True
+        )
+        self.assertIn("restart loop", text)
+        self.assertIn("--fix-all", text)
+
+
+class RedisAdviceTests(unittest.TestCase):
+    """What the doctor tells an operator when Redis does not answer."""
+
+    def test_an_engine_failure_recommends_restarting_docker(self):
+        text = doctor._redis_advice(
+            state="running",
+            output="driver failed programming external connectivity on endpoint aidir_redis",
+            attempted=True,
+            aidir_running=False,
+        )
+        self.assertIn("restart docker", text.lower())
+
+    def test_a_crash_loop_points_at_the_log_lines(self):
+        text = doctor._redis_advice(
+            state="restarting", output="exit status 1", attempted=True, aidir_running=False
+        )
+        self.assertIn("does not stay up", text)
+        self.assertIn("log", text)
+
+    def test_a_running_service_is_told_to_stop_while_repairing(self):
+        text = doctor._redis_advice(
+            state="running (unhealthy)", output="", attempted=False, aidir_running=True
+        )
+        self.assertIn("stop aidir", text)
+        self.assertIn("--fix-all", text)
+
+    def test_docker_state_is_compact(self):
+        # The formatter is exercised through the check's helper; an unknown
+        # container must not raise.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(Path(tmp))
+            context = doctor.Context(root=root)
+            self.assertEqual(doctor._docker_state(context, "does-not-exist"), "unknown")
 
 
 class WrapperTests(unittest.TestCase):
