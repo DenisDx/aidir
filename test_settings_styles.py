@@ -265,6 +265,32 @@ class HostStylesheetTests(unittest.TestCase):
 
     # -- load order and scope ---------------------------------------------
 
+    def test_the_editor_host_carries_the_scope_class(self):
+        """Host rules are scoped to `.aiset-tree-editor`, but `mountTree` fills the
+        host directly and creates no wrapper element.
+
+        Regression: without the class on the host, every scoped rule silently
+        stops applying. The layout still looked right because the library paints
+        the structure, but the badges rendered as plain text.
+        """
+        page = INDEX.read_text(encoding="utf-8")
+        self.assertRegex(
+            page,
+            r'id="settings-tree"[^>]*class="[^"]*\baiset-tree-editor\b',
+            "the mount host must carry the class the host stylesheet scopes to",
+        )
+        self.assertIn(".aiset-tree-editor .aiset-tree-badge", HOST_CSS.read_text(encoding="utf-8"))
+
+    def test_the_helper_dialog_is_not_scoped_to_the_editor(self):
+        """The library appends the helper dialog to `document.body`.
+
+        A rule scoped to `.aiset-tree-editor` can never reach it, so the palette
+        for the dialog has to be global.
+        """
+        body = strip_comments(HOST_CSS.read_text(encoding="utf-8"))
+        self.assertIn(".aiset-form {", body)
+        self.assertNotIn(".aiset-tree-editor .aiset-form", body)
+
     def test_the_host_stylesheet_loads_after_the_library_one(self):
         self.assertLess(
             self.page.index("/api/settings/assets/aiset.css"),
@@ -308,6 +334,14 @@ class HostStylesheetTests(unittest.TestCase):
 
     def test_the_library_ships_a_focus_ring(self):
         self.assertIn(":focus-visible", self.library_css)
+
+    def test_the_toggle_is_a_fixed_square(self):
+        """The library sets display and font only, so the width followed the
+        glyph and `+`/`-` shifted the name column."""
+        block = re.search(r"\.aiset-tree-editor \.aiset-tree-toggle \{([^}]*)\}", self.host_body)
+        self.assertIsNotNone(block, "no rule for the toggle")
+        for prop in ("width:", "height:", "min-width:"):
+            self.assertIn(prop, block.group(1), prop)
 
     def test_the_toolbar_buttons_are_named_by_role(self):
         """A host must not have to reach Apply through `:first-child`."""

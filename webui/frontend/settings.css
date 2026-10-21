@@ -157,6 +157,22 @@
 .aiset-tree-editor .aiset-tree-staged-source,
 .aiset-tree-editor .aiset-tree-staged-op { font-family: var(--mono); color: var(--aiset-muted); }
 
+/* ── Toggle and type mark ─────────────────────────────────────────────
+   The library sets only display and font on the toggle, so its width followed
+   the glyph: `+` and `-` are not the same width, which shifted every name on the
+   row. A fixed square keeps the column aligned; a leaf reuses the same box for
+   its coloured type mark. */
+.aiset-tree-editor .aiset-tree-toggle {
+  display: inline-grid; place-items: center;
+  width: 20px; height: 20px; min-width: 20px; padding: 0;
+  background: var(--aiset-surface); color: var(--aiset-text);
+  border: 1px solid var(--aiset-border); border-radius: 5px;
+  font-size: 15px; font-weight: 700; line-height: 1; cursor: pointer;
+}
+.aiset-tree-editor .aiset-tree-toggle:hover { color: var(--aiset-accent); border-color: var(--aiset-accent); }
+.aiset-tree-editor .aiset-tree-toggle-type { background: transparent; border-color: transparent; cursor: default; }
+.aiset-tree-editor .aiset-tree-toggle-type:hover { color: inherit; border-color: transparent; }
+
 /* ── Toolbar buttons ────────────────────────────────────────────────────
    The library names these buttons `aiset-tree-button` plus the role class
    `apply`, `reload`, `revert`, and paints the shell around them but not the
@@ -198,22 +214,24 @@
    Helper dialogs and the raw editor are host-styled dialogs; the library
    positions them but does not paint them. */
 .aiset-tree-editor .aiset-tree-raw,
-.aiset-tree-editor .aiset-form {
+/* The helper dialog is appended to document.body, not inside the editor host,
+   so these rules must not be scoped to .aiset-tree-editor. */
+.aiset-form {
   background: var(--aiset-surface); border-color: var(--aiset-accent);
 }
 .aiset-tree-editor .aiset-tree-raw { border-radius: 6px; }
 .aiset-tree-editor .aiset-tree-raw-text,
-.aiset-tree-editor .aiset-form-control {
+.aiset-form-control {
   background: var(--bg); border-radius: 5px;
 }
 .aiset-tree-editor .aiset-tree-raw-actions button,
-.aiset-tree-editor .aiset-form-actions button {
+.aiset-form-actions button {
   background: var(--bg); color: var(--aiset-text);
   border: 1px solid var(--aiset-border); border-radius: 5px;
   padding: 4px 12px; font: inherit; cursor: pointer;
 }
 .aiset-tree-editor .aiset-tree-raw-actions button:hover:not(:disabled),
-.aiset-tree-editor .aiset-form-actions button:hover:not(:disabled) {
+.aiset-form-actions button:hover:not(:disabled) {
   border-color: var(--aiset-accent); color: var(--aiset-accent);
 }
 

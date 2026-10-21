@@ -709,24 +709,15 @@
             apply: "restart",
             description: "Per-worker settings keyed by worker id. A worker-local config.json5 overrides this",
             key_pattern: "^[A-Za-z0-9._-]+$",
-            // One entry per worker family. The resolver picks the alternative
-            // that declares a member (and validation accepts any alternative),
-            // so a ${VAR} below a worker is resolved and a key that only
-            // another family reads is an error.
+            // One plain object for every family: the union of eight object
+            // shapes made the editor offer eight identical "object" choices and
+            // gave no way to tell them apart. The cost is that a field read by
+            // one family validates in any worker; the worker descriptor of each
+            // local config still declares its own exact shape.
             additional_children: {
-              type: "union",
+              type: "worker_entry",
               apply: "restart",
-              description: "Settings of one worker; the accepted shape depends on the family of the worker",
-              children_options: [
-                { type: "worker_agent", description: "Agent that may call internal tools (openaix)" },
-                { type: "worker_llm", description: "Worker that forwards a model request" },
-                { type: "worker_search", description: "Search or fetch tool worker" },
-                { type: "worker_http_api", description: "Authenticated HTTP tool worker" },
-                { type: "worker_mcp_client", description: "Worker that exposes MCP servers as tools" },
-                { type: "worker_context", description: "Context preparation worker" },
-                { type: "worker_reject", description: "Worker that reacts to a refusal" },
-                { type: "worker_plain", description: "Worker with only the common switches" },
-              ],
+              description: "Settings of one worker; all fields any family accepts are declared",
             },
           },
         },

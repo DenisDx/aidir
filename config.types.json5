@@ -465,6 +465,36 @@
       // families that log name `logging`.
 
       // Agents that may call internal tools: openaix.
+      worker_entry: {
+        typedef: "worker_entry",
+        type: "object",
+        description: "Settings of one worker. Every field any family accepts is declared here, so the entry is a plain object rather than a union of eight near-identical shapes",
+        children: {
+          enabled: {"type": "bool", "description": "Whether this worker is loaded and may receive tasks"},
+          api: {"type": "string", "min_length": 1, "description": "Protocol override; normally taken from the provider of this worker"},
+          provider: {"type": "string", "min_length": 1, "description": "Provider id from models.providers this worker uses"},
+          request_timeout: {"type": "int", "minimum": 1, "maximum": 86400, "description": "Seconds allowed for one request to the model", "env": {"allowed": true, "convert": "int"}},
+          user_agent: {"type": "string", "description": "User-Agent header sent to the provider"},
+          logging: {"type": "worker_logging", "description": "Log level overrides of this worker"},
+          tools_max_turns: {"type": "int", "minimum": 1, "maximum": 1000, "description": "Tool turns of this worker; falls back to workers.tools_max_turns"},
+          generation_defaults: {"type": "object", "nullable": true, "description": "Default sampling parameters for the requests of this worker", "key_pattern": "^[A-Za-z0-9_]+$", "additional_children": {"type": "number", "description": "One default sampling parameter, for example repeat_penalty or num_predict"}},
+          tools: {"type": "object", "description": "Tools available to this worker, keyed by tool name", "key_pattern": "^[A-Za-z0-9._-]+$", "additional_children": {"type": "worker_tool", "description": "One available tool"}},
+          provider_cooldown_seconds: {"type": "int", "minimum": 0, "maximum": 86400, "description": "Seconds a failing provider is skipped before it is tried again"},
+          timeoutSeconds: {"type": "int", "minimum": 1, "maximum": 86400, "description": "Legacy outbound timeout in seconds, used when request_timeout is absent"},
+          providers: {"type": "array", "description": "Ordered fallback chain; the first available provider wins", "children": {"type": "search_provider", "description": "One provider of the chain"}},
+          max_response_chars: {"type": "int", "minimum": 1, "maximum": 100000000, "description": "Largest response body returned to the model, in characters"},
+          connectors: {"type": "object", "description": "Remote services this worker may call, keyed by connector id", "key_pattern": "^[A-Za-z0-9._-]+$", "additional_children": {"type": "http_connector", "description": "One connector"}},
+          tools_ttl: {"type": "int", "minimum": 1, "maximum": 86400, "description": "Seconds a remote tool listing is cached before it is fetched again"},
+          auth: {"type": "object", "description": "Default credentials for every remote MCP server of this worker", "children": {"type": {"type": "string", "enum": ["bearer", "basic", "none"], "description": "Authentication scheme"}, "token": {"type": "string", "secret": true, "description": "Bearer token; keep the placeholder and put the value in .env", "env": {"allowed": true, "convert": "string"}}}},
+          servers: {"type": "object", "description": "Remote MCP servers keyed by server id", "key_pattern": "^[A-Za-z0-9._-]+$", "additional_children": {"type": "mcp_server", "description": "One MCP server"}},
+          fallbacks: {"type": "array", "description": "Workers tried in order when the task is rejected", "children": {"type": "string", "min_length": 1, "description": "One fallback worker id"}},
+          retry_count: {"type": "int", "minimum": 0, "maximum": 100, "description": "How often the primary worker is retried"},
+          retry_period: {"type": "int", "minimum": 0, "maximum": 3600, "description": "Seconds between two retries"},
+          on_reject: {"type": "object", "description": "Reaction per rejection reason", "key_pattern": "^[A-Za-z0-9._-]+$", "additional_children": {"type": "object", "description": "One reaction", "children": {"action": {"type": "string", "enum": ["fallback-retry", "retry", "cancel", "fail"], "description": "What happens with the task"}, "retry_count": {"type": "int", "minimum": 0, "maximum": 100, "description": "How often to retry"}, "retry_period": {"type": "int", "minimum": 0, "maximum": 3600, "description": "Seconds between two retries"}}}},
+          includeWorkers: {"type": "bool", "description": "Include worker state in the result of this worker"},
+          includeResources: {"type": "bool", "description": "Include resource state in the result of this worker"},
+        },
+      },
       worker_agent: {
         typedef: "worker_agent",
         type: "object",

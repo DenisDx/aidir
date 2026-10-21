@@ -1098,7 +1098,9 @@
           Show objects and arrays as text
         </label>
       </div>
-      <div id="settings-tree"></div>
+      <!-- mountTree fills this element directly; the class is the scope the host
+           stylesheet and the library both use for the editor. -->
+      <div id="settings-tree" class="aiset-tree-editor"></div>
       <div id="cfg-aiset-lifecycle">
         <button id="cfg-reload-btn" type="button">Reload settings</button>
         <button id="cfg-restart-btn" type="button">Restart aidir</button>
