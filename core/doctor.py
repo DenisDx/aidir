@@ -19,10 +19,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -678,7 +680,20 @@ def _check_compose(context: Context) -> CheckResult:
 
 @_register("redis")
 def _check_redis(context: Context) -> CheckResult:
-    """Redis must answer on the port the configuration names, and stay up."""
+    """Redis on the host, in the container, and the mapping between them.
+
+    Four independent things can be wrong, and they need different fixes:
+
+    | Observation | Cause | Fix |
+    |---|---|---|
+    | connection refused, no container | the container is not running | start it |
+    | timeout, container running, Redis answers inside | the host port mapping is broken (WSL/Docker proxy) | restart Docker |
+    | timeout, Redis does not answer inside | the process is down or crash-looping | read the log, often volume permissions |
+    | the bind fails with `address already in use` | a host process owns the port | free it or move the port |
+
+    The check answers which one it is, and repairs the first three when the mode
+    allows it.
+    """
     host, port, password = _redis_settings(context)
     reachable, error = _redis_ping(host, port, password)
     published = _compose_published_port(context, "redis", 6379)
@@ -701,7 +716,13 @@ def _check_redis(context: Context) -> CheckResult:
 
     details.insert(0, error or "no response")
     state = _docker_state(context, container) if container else "no container"
+    inside, _inside_output = _container_redis_ping(context) if container else ("no container", "")
+    holder = None if _port_free(host, port) else _port_listener(port)
     details.append(f"container: {state}")
+    if container:
+        details.append(f"redis inside the container: {inside}")
+    if holder:
+        details.append(f"host port {port} is already held by {holder}")
     if _service_is_crashing(context):
         details.append(
             f"aidir is in a restart loop ({context.service_state}, "
@@ -711,32 +732,61 @@ def _check_redis(context: Context) -> CheckResult:
         details.append("aidir is running; it will reconnect after Redis is back")
     result = CheckResult("redis", "fail", f"cannot reach {host}:{port}", details=details)
 
-    if context.fix_all:
-        # A container that exists but does not answer is usually stuck or
-        # crash-looping; recreating it is the only repair that can help.
-        action = "docker compose up -d --force-recreate redis"
-        result.fixes.append({"action": action, "class": VISIBLE})
+    docker_holder = bool(holder) and any(
+        word in holder.lower() for word in ("docker-proxy", "dockerd", "containerd")
+    )
+    foreign_holder = bool(holder) and not docker_holder
+    logs = _container_log_lines(context, "redis") if container and not context.dry_run else []
+    permission_denied = any("permission denied" in line.lower() for line in logs)
+    listening_inside = inside.startswith(("pong", "auth-required"))
+
+    if context.fix_all and foreign_holder:
+        # Recreating cannot succeed and would destroy a possibly usable container.
+        result.details.append("repair skipped: the host port must be freed first")
+    elif context.fix_all and permission_denied and not listening_inside:
+        volume = context.root / "docker" / "volumes" / "redis"
+        chown = {
+            "action": f"chown -R 999:999 {volume.relative_to(context.root)}",
+            "class": PRIVILEGED,
+        }
+        result.fixes.append(chown)
+        _apply_fix(context, chown, command=["chown", "-R", "999:999", str(volume)])
+        if chown.get("applied"):
+            result.fixes.append({"action": "recreate redis", "class": VISIBLE})
+            _apply_fix(context, result.fixes[-1],
+                       command=_compose_command(context, ["up", "-d", "--force-recreate", "redis"]))
+    elif context.fix_all:
+        result.fixes.append({"action": "docker compose up -d --force-recreate redis",
+                             "class": VISIBLE})
         _apply_fix(context, result.fixes[-1],
                    command=_compose_command(context, ["up", "-d", "--force-recreate", "redis"]))
     elif context.fix and not container:
-        action = "docker compose up -d redis"
-        result.fixes.append({"action": action, "class": SAFE})
+        result.fixes.append({"action": "docker compose up -d redis", "class": SAFE})
         _apply_fix(context, result.fixes[-1],
                    command=_compose_command(context, ["up", "-d", "redis"]))
 
-    if result.fixes and result.fixes[-1].get("applied") and not context.dry_run:
-        reachable, error = _redis_ping(host, port, password)
-        if reachable:
-            return CheckResult("redis", "ok", f"{host}:{port} answers after the repair")
-        result.details.append("still unreachable after the repair")
-        state = _docker_state(context, container) if container else state
+    if any(fix.get("applied") for fix in result.fixes) and not context.dry_run:
+        reachable, error = _wait_redis(host, port, password)
 
+    if (not reachable and listening_inside and not foreign_holder
+            and context.fix_all and context.privileges and not context.dry_run):
+        # Redis is healthy inside the container, so only the host mapping is left.
+        result.fixes.append({"action": "restart Docker (host port mapping is broken)",
+                             "class": PRIVILEGED})
+        _apply_fix(context, result.fixes[-1], command=["systemctl", "restart", "docker"])
+        if result.fixes[-1].get("applied"):
+            reachable, error = _wait_redis(host, port, password)
+
+    if reachable:
+        return CheckResult("redis", "ok", f"{host}:{port} answers after the repair")
+
+    # Re-read the state and the log after the attempts: a crash loop usually
+    # explains itself in the last lines.
+    state = _docker_state(context, container) if container else state
     if container and not context.dry_run:
-        # The log is the next thing an operator would read; put it in the report
-        # so the cause is visible without a second command.
-        for line in _container_log_lines(context, "redis"):
+        logs = _container_log_lines(context, "redis")
+        for line in logs:
             result.details.append(f"log: {line}")
-
     attempted = bool(result.fixes and result.fixes[-1].get("attempted"))
     output = str(result.fixes[-1].get("error", "")) if result.fixes else ""
     result.recommendation = _redis_advice(
@@ -745,12 +795,20 @@ def _check_redis(context: Context) -> CheckResult:
         attempted=attempted,
         aidir_running=_aidir_running(context),
         crashing=_service_is_crashing(context),
+        port=port,
+        holder=holder,
+        inside=inside,
+        permission_denied=any("permission denied" in line.lower() for line in logs),
+        foreign_holder=foreign_holder,
     )
     return result
 
 
 def _redis_advice(*, state: str, output: str, attempted: bool, aidir_running: bool,
-                  crashing: bool = False) -> str:
+                  crashing: bool = False, port: int | None = None,
+                  holder: str | None = None, inside: str | None = None,
+                  permission_denied: bool = False,
+                  foreign_holder: bool = False) -> str:
     """The one or two actions worth taking for an unreachable Redis."""
     parts: list[str] = []
     if crashing:
@@ -762,7 +820,55 @@ def _redis_advice(*, state: str, output: str, attempted: bool, aidir_running: bo
         parts.append(
             "stop aidir while repairing (systemctl --user stop aidir), then start it again"
         )
+
+    if permission_denied:
+        parts.append(
+            "the volume is not writable by Redis: run "
+            "'sudo chown -R 999:999 docker/volumes/redis', then ./doctor.sh --fix-all"
+        )
+        return "; ".join(parts)
+    if foreign_holder:
+        parts.append(
+            f"host port {port} is held by {holder}: stop that process, or change "
+            "REDIS_PORT through ./install.sh"
+        )
+        return "; ".join(parts)
+
     lowered = output.lower()
+    already_bound = ("address already in use" in lowered
+                     or "port is already allocated" in lowered)
+    if already_bound:
+        if holder:
+            docker_holder = any(
+                word in holder.lower() for word in ("docker-proxy", "dockerd", "containerd")
+            )
+            if docker_holder:
+                parts.append(
+                    f"host port {port} is held by a Docker proxy ({holder}): check "
+                    f"'docker ps -a --filter publish={port}' for the container that owns it; "
+                    "if there is none, restart Docker (on WSL also 'wsl --shutdown')"
+                )
+            else:
+                parts.append(
+                    f"host port {port} is held by {holder}: stop that process, or change "
+                    "REDIS_PORT through ./install.sh"
+                )
+        else:
+            parts.append(
+                f"host port {port} is already in use: find the owner with "
+                f"'ss -ltnp | grep :{port}', then stop it or change REDIS_PORT "
+                "through ./install.sh"
+            )
+        return "; ".join(parts)
+
+    if inside and inside.startswith(("pong", "auth-required")):
+        parts.append(
+            "Redis answers inside the container but not on the host: the port "
+            "mapping is broken. Restart Docker: sudo systemctl restart docker; on WSL "
+            "also run 'wsl --shutdown' from Windows"
+        )
+        return "; ".join(parts)
+
     engine_failure = any(word in lowered for word in ("connectivity", "iptables", "proxy"))
     if attempted and engine_failure:
         parts.append(
@@ -1167,6 +1273,30 @@ def _redis_settings(context: Context) -> tuple[str, int, str]:
     return host, port, password
 
 
+def _container_redis_ping(context: Context) -> tuple[str, str]:
+    """Whether Redis answers *inside* its container: pong, auth-required, no."""
+    code, out = _compose(context, ["exec", "-T", "redis", "redis-cli", "ping"], timeout=15)
+    text = out.strip()
+    lowered = text.lower()
+    if "pong" in lowered:
+        return "pong", text
+    if "noauth" in lowered:
+        return "auth-required (listening)", text
+    if code != 0:
+        return "not answering", text
+    return "unknown", text
+
+
+def _wait_redis(host: str, port: int, password: str, seconds: int = 20) -> tuple[bool, str | None]:
+    """Poll Redis for a bounded time after a repair."""
+    deadline = time.monotonic() + seconds
+    while True:
+        reachable, error = _redis_ping(host, port, password)
+        if reachable or time.monotonic() >= deadline:
+            return reachable, error
+        time.sleep(1)
+
+
 def _redis_ping(host: str, port: int, password: str) -> tuple[bool, str | None]:
     """One short PING; returns (reachable, error)."""
     try:
@@ -1281,6 +1411,27 @@ def _endpoint_port(settings: Any, endpoint_id: str, default: int) -> int:
             except (TypeError, ValueError):
                 return default
     return default
+
+
+def _port_listener(port: int) -> str | None:
+    """Who holds a listening port, as `name (pid N)`; None when unknown."""
+    code, out = _run(["ss", "-ltnp"], timeout=10)
+    if code != 0:
+        return None
+    return _parse_listener(out, port)
+
+
+def _parse_listener(output: str, port: int) -> str | None:
+    """Extract the owning process from one `ss -ltnp` table."""
+    for line in output.splitlines():
+        if f":{port} " not in line and not line.rstrip().endswith(f":{port}"):
+            continue
+        match = re.search(r'users:\(\("([^"]+)",pid=(\d+)', line)
+        if match:
+            return f"{match.group(1)} (pid {match.group(2)})"
+        if "LISTEN" in line:
+            return "a process whose pid is not visible (run with sudo)"
+    return None
 
 
 def _port_free(host: str, port: int) -> bool:

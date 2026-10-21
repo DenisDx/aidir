@@ -300,6 +300,83 @@ class VerdictTests(unittest.TestCase):
         self.assertEqual(payload["exit_code"], 1)
 
 
+class PortConflictTests(unittest.TestCase):
+    """`address already in use` is a host port conflict, not a broken Docker."""
+
+    SS = (
+        "State Recv-Q Send-Q Local Address:Port Peer Address:Port Process\n"
+        'LISTEN 0 511 0.0.0.0:8080 0.0.0.0:* users:(("docker-proxy",pid=812,fd=4))\n'
+        'LISTEN 0 511 127.0.0.1:6380 0.0.0.0:* users:(("docker-proxy",pid=2041,fd=5))\n'
+    )
+
+    def test_the_listener_is_parsed(self):
+        self.assertEqual(doctor._parse_listener(self.SS, 6380), "docker-proxy (pid 2041)")
+        self.assertIsNone(doctor._parse_listener(self.SS, 6381))
+
+    def test_an_invisible_pid_is_reported(self):
+        output = "LISTEN 0 511 127.0.0.1:6380 0.0.0.0:*\n"
+        self.assertIn("not visible", doctor._parse_listener(output, 6380))
+
+    def test_a_docker_proxy_points_at_the_owning_container(self):
+        text = doctor._redis_advice(
+            state="no container",
+            output="failed to bind host port 127.0.0.1:6380/tcp: address already in use",
+            attempted=True,
+            aidir_running=False,
+            port=6380,
+            holder="docker-proxy (pid 2041)",
+        )
+        self.assertIn("docker ps -a --filter publish=6380", text)
+        self.assertIn("restart Docker", text)
+
+    def test_a_foreign_process_is_named_and_never_blames_docker(self):
+        text = doctor._redis_advice(
+            state="no container",
+            output="address already in use",
+            attempted=False,
+            aidir_running=False,
+            port=6380,
+            holder="redis-server (pid 512)",
+        )
+        self.assertIn("redis-server", text)
+        self.assertIn("./install.sh", text)
+        self.assertNotIn("restart Docker", text)
+
+    def test_redis_alive_inside_but_not_on_the_host_points_at_the_mapping(self):
+        text = doctor._redis_advice(
+            state="running", output="Timeout connecting to server", attempted=True,
+            aidir_running=False, port=6380, inside="pong",
+        )
+        self.assertIn("port mapping is broken", text)
+        self.assertIn("restart docker", text.lower())
+
+    def test_volume_permissions_are_fixed_with_chown_first(self):
+        text = doctor._redis_advice(
+            state="restarting", output="exit status 1", attempted=True,
+            aidir_running=False, permission_denied=True,
+        )
+        self.assertIn("chown -R 999:999", text)
+        self.assertNotIn("force-recreate", text)
+
+    def test_a_foreign_holder_is_freed_before_anything_else(self):
+        text = doctor._redis_advice(
+            state="no container", output="", attempted=False, aidir_running=False,
+            port=6380, holder="redis-server (pid 512)", foreign_holder=True,
+        )
+        self.assertIn("redis-server", text)
+        self.assertIn("./install.sh", text)
+
+    def test_an_unknown_holder_points_at_ss(self):
+        text = doctor._redis_advice(
+            state="no container",
+            output="address already in use",
+            attempted=False,
+            aidir_running=False,
+            port=6380,
+        )
+        self.assertIn("ss -ltnp", text)
+
+
 class ServiceStateTests(unittest.TestCase):
     """Detecting a restart loop is what turns the report from misleading to useful."""
 

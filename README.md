@@ -697,6 +697,32 @@ For Redis the report includes the container state (`running`, `restarting`,
 forward look identical from outside - both time out - and only the log or the
 state tells them apart.
 
+The Redis check separates four layers, because each has a different fix:
+
+| Observation | Cause | Repair |
+|---|---|---|
+| connection refused, no container | the container is not running | start it |
+| `redis inside the container: pong`, host still times out | the host port mapping is broken (WSL/Docker proxy) | restart Docker; with `--root` the doctor does it |
+| `redis inside the container: not answering` | Redis is down or crash-looping | read the log; a volume permission error is the usual cause, and `--root` lets the doctor `chown` it |
+| `address already in use` | a host process owns the port | free it, or move `REDIS_PORT` with `./install.sh` |
+
+`--fix-all --root` therefore repairs the first three automatically: it starts
+the container, fixes the volume ownership, recreates the container, or restarts
+Docker, then polls because a restarted engine needs a moment.
+
+A Redis failure distinguishes the two ways a container can lose its port:
+
+- `address already in use` means a **host** process owns the port. The report names
+  it (`docker-proxy (pid N)`, `redis-server (pid N)`, or "pid not visible"); the
+  fix is to stop that owner, remove the container that owns a stale proxy, or move
+  `REDIS_PORT` with `./install.sh`. Restarting Docker is recommended only when the
+  proxy has no owning container.
+- a connectivity/iptables/proxy error with a free port is a Docker networking
+  failure, and then restarting Docker (and `wsl --shutdown` on WSL) is right.
+
+When a foreign process holds the port, `--fix-all` does not destroy the container:
+recreating it cannot succeed and the container may still be usable.
+
 If aidir itself is in a **restart loop** (systemd `activating/auto-restart`), the
 report shows the unit scope, its state and the restart count, and says so instead
 of claiming the service is running. `--fix-all` stops the unit before repairing
