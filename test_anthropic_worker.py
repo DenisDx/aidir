@@ -111,6 +111,23 @@ class AnthropicWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.data["usage"]["completion_tokens"], 3)
         self.assertEqual(result.upstream_response["protocol"], "anthropic")
 
+    async def test_model_max_output_tokens_fallback(self) -> None:
+        """Use the per-model max_output_tokens when an internal client omits a limit."""
+        worker = self._worker()
+        worker._core = _Core({"anth": {**_provider(), "models": [{"id": "real", "max_output_tokens": 17}]}})
+        captured: dict = {}
+
+        async def respond(request: httpx.Request) -> httpx.Response:
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(200, json={"id": "msg_1", "type": "message", "content": [{"type": "text", "text": "ok"}], "stop_reason": "end_turn", "usage": {"input_tokens": 1, "output_tokens": 1}})
+
+        task = Task_agent(payload={"model": "real", "messages": [{"role": "user", "content": "hi"}]})
+        payload = {"model": "real", "messages": [{"role": "user", "content": "hi"}]}
+        async with httpx.AsyncClient(transport=httpx.MockTransport(respond), headers=worker._resolve_request_headers(task, "anth")) as client:
+            result = await worker._forward_sync(client, "http://upstream/v1/messages", payload, task=task)
+        self.assertTrue(result.ok)
+        self.assertEqual(captured["body"]["max_tokens"], 17)
+
     async def test_stream_decoding(self) -> None:
         """Decode Anthropic SSE into internal content and preserve raw events."""
         worker = self._worker()

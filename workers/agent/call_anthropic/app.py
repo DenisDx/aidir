@@ -45,10 +45,13 @@ class CallAnthropicWorker(CallOpenAIWorker):
         value = self._core.config.get(f"models.providers.{provider_id}")
         return value if isinstance(value, dict) else {}
 
-    def _default_max_tokens(self, provider_id: str) -> int | None:
-        """Return the configured fallback for Anthropic's required max_tokens."""
+    def _default_max_tokens(self, provider_id: str, model_id: str = "") -> int | None:
+        """Return the model or provider fallback for Anthropic's required max_tokens."""
+        model_cfg = self._resolve_model_cfg(model_id, provider_id=provider_id) if model_id else None
+        value = model_cfg.get("max_output_tokens") if isinstance(model_cfg, dict) else None
         provider_cfg = self._provider_cfg(provider_id)
-        value = provider_cfg.get("max_output_tokens")
+        if value is None:
+            value = provider_cfg.get("max_output_tokens")
         if value is None:
             value = (provider_cfg.get("defaults") or {}).get("max_output_tokens") if isinstance(provider_cfg.get("defaults"), dict) else None
         try:
@@ -72,7 +75,8 @@ class CallAnthropicWorker(CallOpenAIWorker):
     def _messages_payload(self, provider_id: str, payload: dict, *, stream: bool) -> dict:
         """Convert the internal payload into a Messages request."""
         internal = {**payload, "stream": bool(stream)}
-        return internal_request_to_messages(internal, default_max_tokens=self._default_max_tokens(provider_id))
+        model_id = str(payload.get("model") or "")
+        return internal_request_to_messages(internal, default_max_tokens=self._default_max_tokens(provider_id, model_id))
 
     async def _forward_sync(self, client, url: str, payload: dict, *, task=None, save_call: bool = False, task_id: str = "") -> WorkerResult:
         """Send one synchronous Messages request and normalize the response."""
