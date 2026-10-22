@@ -451,6 +451,54 @@ Use `exec_cmd` for a local server command. aidir starts it on demand, waits for 
 
 For a `llama-cpp` provider, resource `keep_alive` means restart-on-failure during its active window; it does not send API pings. Smart routes probe a running provider via `/v1/models`; an unavailable provider with `exec_cmd` remains eligible for lazy startup after the scheduler has freed resources.
 
+### Prefix-affinity smart routing and parallel sessions
+
+Smart `first_available` models keep requests with the same context head on the
+same concrete executor. This preserves the provider's KV cache across the turns
+of a harness conversation. The default behaviour is enabled in `routing`:
+
+```json5
+routing: {
+  kv_affinity: {
+    enabled: true,
+    resource_wait_timeout_seconds: 60,     // wait for a warm model
+    cold_model_wait_timeout_seconds: 0,    // never wait for an unloaded model
+    max_queue_diff_len: 8,                 // absolute queue head start
+    max_queue_diff_part: 3.0,              // and relative multiplier
+    resource_history_window_seconds: 600,
+    resource_blocked_ratio: 0.5,
+  },
+}
+```
+
+Affinity follows the selected executor. It is dropped when the executor fails
+or is known to have unloaded the model. It is also dropped when its queue is
+longer than the least loaded alternative by both configured thresholds, or when
+a warm model has been blocked by resource memory for longer than the wait
+timeout. A cold model is not worth waiting for because its cache is already gone. The router never stores prompt text: it keeps a truncated HMAC of a
+context prefix and a byte length.
+
+A model may serve several concurrent requests when its runtime has enough
+slots. Set `maxConcurrentRequests` and the incremental cost of one request in
+`sessionResources`; `resources` remains the one-time model footprint:
+
+```json5
+{
+  "id": "qwen3.8-27b-local",
+  "resources": {"local_machine": {"VRAM": 19000}},
+  "maxConcurrentRequests": 4,
+  "sessionResources": {"local_machine": {"VRAM": 1200}}
+}
+```
+
+The scheduler reserves the base footprint once and one session per active
+request. The admitted count is the smaller of `maxConcurrentRequests` and the
+sessions that fit in free memory. For Ollama, keep `maxConcurrentRequests` in
+line with `OLLAMA_NUM_PARALLEL`; for llama.cpp, do not exceed `--parallel`. The
+default remains `1`, which is the previous single-request behaviour. Queue-state
+responses expose `admission`, `model_loaded`, `active_count`,
+`max_concurrent_requests`, `session_resources`, and `memory_slots` when known.
+
 ### Anthropic Messages providers and endpoint
 
 Set an endpoint's `api` to `anthropic` to expose `POST /v1/messages`,

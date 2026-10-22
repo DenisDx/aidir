@@ -48,6 +48,7 @@ from core.logger import logger
 from core.local_server_manager import LocalServerManager
 from core.peer_resources import PeerResourceClient
 from core.hooks import HookManager
+from core.kv_affinity import KvAffinityStore, ModelReadinessTracker
 from core.queue_manager import QueueManager
 from core.resource_monitor import ResourceMonitor
 from core.resources import Resources
@@ -106,6 +107,12 @@ class Core:
         self.loop_workers: list[tuple[str, object]] = []
         self.resources = Resources([])
         self.resource_monitor: ResourceMonitor | None = None
+        self.kv_affinity = KvAffinityStore.from_config(self.config.raw())
+        self.model_readiness = ModelReadinessTracker(
+            history_window_seconds=int(
+                self.config.get("routing.kv_affinity.resource_history_window_seconds", 600) or 600
+            )
+        )
         self.llama_cpp_server_manager = LocalServerManager({}, _ROOT)
         self.hooks = HookManager(_ROOT, self.llama_cpp_server_manager, self.config.raw())
         self.envid_registry: EnvidRegistry | None = None
@@ -221,6 +228,17 @@ class Core:
         self.resources = Resources(self.config.get("resources") or [])
         self.resources.set_redis(self.redis, instance)
         self.resources.set_full_config(self.config.raw())
+        parallel_errors = self.resources.validate_model_parallel_config()
+        if parallel_errors:
+            raise RuntimeError(
+                "Invalid parallel model configuration:\n" + "\n".join(parallel_errors)
+            )
+        self.resources.set_candidate_invalidator(
+            lambda provider_id, model_id: (
+                self.kv_affinity.forget_candidate(provider_id, model_id),
+                self.model_readiness.clear_candidate(provider_id, model_id),
+            )
+        )
         self.llama_cpp_server_manager = LocalServerManager(self.config.raw(), _ROOT)
         self.hooks = HookManager(_ROOT, self.llama_cpp_server_manager, self.config.raw())
         self.resources.set_local_server_manager(self.llama_cpp_server_manager)
@@ -260,6 +278,9 @@ class Core:
             full_config=self.config.raw(),
             hooks=self.hooks,
             resource_monitor=self.resource_monitor,
+            kv_affinity=self.kv_affinity,
+            model_readiness=self.model_readiness,
+            affinity_config=self.config.get("routing.kv_affinity") or {},
         )
         await self.hooks.load()
         self._track_background_task(

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from core import log
 from core.resource import Resource
@@ -42,6 +42,8 @@ class Resources:
         self._ns: str = "aidir"
         self._full_config: dict = {}
         self._admission_lock = asyncio.Lock()
+        self._model_active: dict[tuple[str, str], int] = {}
+        self._candidate_invalidator: Callable[[str, str], None] | None = None
 
     def set_redis(self, redis: "aioredis.Redis", ns: str = "aidir") -> None:
         """Inject Redis client for model activity persistence (needed by cron keep_alive)."""
@@ -51,6 +53,19 @@ class Resources:
     def set_local_server_manager(self, manager) -> None:
         """Inject the manager used to stop locally owned llama.cpp servers."""
         self._local_server_manager = manager
+
+    def set_candidate_invalidator(self, callback: Callable[[str, str], None] | None) -> None:
+        """Inject the callback that drops routing affinity for an unloaded model."""
+        self._candidate_invalidator = callback
+
+    def _invalidate_candidate(self, provider_id: str, model_id: str) -> None:
+        """Tell the routing layer that an executor lost its KV cache."""
+        if self._candidate_invalidator is None:
+            return
+        try:
+            self._candidate_invalidator(str(provider_id or ""), str(model_id or ""))
+        except Exception:
+            pass
 
     def set_full_config(self, full_config: dict) -> None:
         """Store the current configuration for provider-specific resource behavior."""
@@ -126,6 +141,325 @@ class Resources:
             )
         }
 
+    @staticmethod
+    def _normalize_requirements(requirements: dict[str, dict[str, int]] | None) -> dict[str, dict[str, int]]:
+        """Normalize a resource requirement map to positive integers."""
+        out: dict[str, dict[str, int]] = {}
+        for resource_id, metrics in (requirements or {}).items():
+            if not isinstance(metrics, dict):
+                continue
+            normalized: dict[str, int] = {}
+            for metric, amount in metrics.items():
+                try:
+                    value = int(amount)
+                except (TypeError, ValueError):
+                    continue
+                if value > 0:
+                    normalized[str(metric)] = value
+            if normalized:
+                out[str(resource_id)] = normalized
+        return out
+
+    @staticmethod
+    def _merge_requirements(*maps: dict[str, dict[str, int]] | None) -> dict[str, dict[str, int]]:
+        """Sum several requirement maps."""
+        out: dict[str, dict[str, int]] = {}
+        for requirements in maps:
+            for resource_id, metrics in (requirements or {}).items():
+                bucket = out.setdefault(str(resource_id), {})
+                for metric, amount in (metrics or {}).items():
+                    bucket[str(metric)] = bucket.get(str(metric), 0) + int(amount)
+        return out
+
+    def _find_model_cfg(self, provider_id: str, model_id: str) -> dict | None:
+        """Return the configured model entry for a concrete provider/model."""
+        providers = (((self._full_config or {}).get("models") or {}).get("providers") or {})
+        provider = providers.get(provider_id) if isinstance(providers, dict) else None
+        if not isinstance(provider, dict):
+            return None
+        for model in provider.get("models") or []:
+            if not isinstance(model, dict):
+                continue
+            if model_id in {model.get("id"), model.get("name"), model.get("alias")}:
+                return model
+        return None
+
+    def validate_model_parallel_config(self) -> list[str]:
+        """Return configuration errors for models that enable parallel sessions."""
+        errors: list[str] = []
+        providers = (((self._full_config or {}).get("models") or {}).get("providers") or {})
+        if not isinstance(providers, dict):
+            return errors
+        for provider_id, provider in providers.items():
+            if not isinstance(provider, dict):
+                continue
+            for model in provider.get("models") or []:
+                if not isinstance(model, dict):
+                    continue
+                try:
+                    maximum = int(model.get("maxConcurrentRequests", 1) or 1)
+                except (TypeError, ValueError):
+                    maximum = 1
+                if maximum <= 1:
+                    continue
+                resources = self._normalize_requirements(model.get("resources") or {})
+                session = self._normalize_requirements(model.get("sessionResources") or {})
+                model_id = str(model.get("id") or model.get("alias") or model.get("name") or "")
+                for resource_id, metrics in resources.items():
+                    session_metrics = session.get(resource_id) or {}
+                    missing = [metric for metric in metrics if int(session_metrics.get(metric, 0) or 0) <= 0]
+                    if missing:
+                        errors.append(
+                            f"{provider_id}/{model_id}: maxConcurrentRequests > 1 requires "
+                            f"sessionResources for {resource_id} ({', '.join(missing)})"
+                        )
+        return errors
+
+    def model_parallel_config(self, provider_id: str, model_id: str) -> tuple[int, dict[str, dict[str, int]]]:
+        """Return (max concurrent requests, per-request session requirements)."""
+        model = self._find_model_cfg(provider_id, model_id) or {}
+        try:
+            maximum = max(1, int(model.get("maxConcurrentRequests", 1) or 1))
+        except (TypeError, ValueError):
+            maximum = 1
+        session = self._normalize_requirements(model.get("sessionResources") or {})
+        return maximum, session
+
+    @staticmethod
+    def _base_consumer_id(provider_id: str, model_id: str) -> str:
+        """Return the stable consumer id of one model's base reservation."""
+        return f"base:{provider_id}:{model_id}"
+
+    def model_active_count(self, provider_id: str, model_id: str) -> int:
+        """Return the number of active requests for one concrete model."""
+        return int(self._model_active.get((str(provider_id or ""), str(model_id or "")), 0))
+
+    def mark_model_started(self, provider_id: str, model_id: str) -> int:
+        """Increment and return the active request count of one model."""
+        key = (str(provider_id or ""), str(model_id or ""))
+        self._model_active[key] = int(self._model_active.get(key, 0)) + 1
+        return self._model_active[key]
+
+    def mark_model_finished(self, provider_id: str, model_id: str) -> int:
+        """Decrement and return the active request count of one model."""
+        key = (str(provider_id or ""), str(model_id or ""))
+        remaining = max(0, int(self._model_active.get(key, 0)) - 1)
+        if remaining:
+            self._model_active[key] = remaining
+        else:
+            self._model_active.pop(key, None)
+        return remaining
+
+    def model_is_loaded(
+        self,
+        requirements: dict[str, dict[str, int]] | None,
+        model_id: str,
+        provider_id: str,
+    ) -> bool:
+        """Return whether the model's base footprint is resident on every required resource."""
+        reqs = self._normalize_requirements(requirements)
+        if not reqs:
+            return False
+        base_id = self._base_consumer_id(provider_id, model_id)
+        for resource_id, metrics in reqs.items():
+            resource = self._items.get(resource_id)
+            if resource is None:
+                return False
+            if base_id in resource.consumers:
+                continue
+            if resource._matching_soft_consumer(model_id, metrics, provider_id) is None:
+                return False
+        return True
+
+    def _available_snapshot(self, requirements: dict[str, dict[str, int]]) -> dict[str, dict[str, int | float]]:
+        """Return the observed or estimated free capacity for the required resources."""
+        out: dict[str, dict[str, int | float]] = {}
+        for resource_id, metrics in requirements.items():
+            resource = self._items.get(resource_id)
+            if resource is None:
+                continue
+            snapshot = resource.availability_snapshot()
+            available = snapshot.get("available") or {}
+            out[resource_id] = {
+                metric: available.get(metric, 0)
+                for metric in metrics
+            }
+        return out
+
+    def evaluate_model_admission(
+        self,
+        requirements: dict[str, dict[str, int]] | None,
+        model_id: str,
+        provider_id: str,
+    ) -> dict:
+        """Return a model-aware admission decision without reserving anything."""
+        reqs = self._normalize_requirements(requirements)
+        reqs = self.local_admission_requirements(reqs)
+        maximum, session = self.model_parallel_config(provider_id, model_id)
+        session = self.local_admission_requirements(session)
+        active = self.model_active_count(provider_id, model_id)
+        result = {
+            "admission": "ready",
+            "admissible_now": True,
+            "admissible_after_unload": True,
+            "model_loaded": False,
+            "active_count": active,
+            "max_concurrent_requests": maximum,
+            "session_resources": session,
+            "free": self._available_snapshot(reqs),
+            "needed": {},
+            "resource_ready": True,
+            "resource_ready_after_unload": True,
+        }
+        if not reqs:
+            if active >= maximum:
+                result.update({"admission": "concurrency", "admissible_now": False})
+            return result
+
+        if active >= maximum:
+            result.update({"admission": "concurrency", "admissible_now": False, "admissible_after_unload": True})
+            return result
+
+        loaded = self.model_is_loaded(reqs, model_id, provider_id)
+        result["model_loaded"] = loaded
+        if maximum <= 1:
+            needed = {} if loaded else reqs
+            ready = loaded or self.check_available(reqs)
+            after = ready or self.check_available_after_unload(reqs)
+            reason = "ready" if ready else ("waiting_unload" if after else "base_memory")
+            result.update(
+                {
+                    "admission": reason,
+                    "admissible_now": ready,
+                    "admissible_after_unload": after,
+                    "needed": needed,
+                    "resource_ready": ready,
+                    "resource_ready_after_unload": after,
+                }
+            )
+            return result
+
+        needed = session if loaded else self._merge_requirements(reqs, session)
+        ready = self.check_available(needed)
+        if loaded:
+            after = all(
+                (resource := self._items.get(resource_id)) is not None
+                and resource.available_after_unloading_others(
+                    (session.get(resource_id) or {}),
+                    model_id,
+                    provider_id,
+                )
+                for resource_id in reqs
+            )
+        else:
+            after = self.check_available_after_unload(needed)
+        reason = "ready" if ready else ("waiting_unload" if after else ("session_memory" if loaded else "base_memory"))
+        result.update(
+            {
+                "admission": reason,
+                "admissible_now": ready,
+                "admissible_after_unload": after,
+                "needed": needed,
+                "resource_ready": ready,
+                "resource_ready_after_unload": after,
+            }
+        )
+        return result
+
+    def memory_slots(self, model_id: str, provider_id: str) -> int | None:
+        """Return how many additional sessions fit right now, or None when unknown."""
+        maximum, session = self.model_parallel_config(provider_id, model_id)
+        session = self.local_admission_requirements(session)
+        if maximum <= 1 or not session:
+            return None
+        remaining = max(0, maximum - self.model_active_count(provider_id, model_id))
+        available = self._available_snapshot(session)
+        for resource_id, metrics in session.items():
+            for metric, amount in metrics.items():
+                if int(amount) <= 0:
+                    continue
+                free = (available.get(resource_id) or {}).get(metric, 0)
+                try:
+                    remaining = min(remaining, int(float(free) // int(amount)))
+                except (TypeError, ValueError, ZeroDivisionError):
+                    return None
+        return max(0, remaining)
+
+    async def reserve_model_start(
+        self,
+        requirements: dict[str, dict[str, int]] | None,
+        model_id: str,
+        provider_id: str,
+        consumer_id: str,
+    ) -> dict | None:
+        """Atomically reserve the base and one session for a parallel model start."""
+        reqs = self._normalize_requirements(requirements)
+        reqs = self.local_admission_requirements(reqs)
+        maximum, session = self.model_parallel_config(provider_id, model_id)
+        session = self.local_admission_requirements(session)
+        if maximum <= 1:
+            return None
+        async with self._admission_lock:
+            admission = self.evaluate_model_admission(reqs, model_id, provider_id)
+            if not admission.get("admissible_now"):
+                return admission
+            base_id = self._base_consumer_id(provider_id, model_id)
+            for resource_id, metrics in reqs.items():
+                resource = self._items.get(resource_id)
+                if resource is None:
+                    return admission
+                if base_id not in resource.consumers:
+                    await resource.reserve_blind(
+                        metrics,
+                        consumer_id=base_id,
+                        model_id=model_id,
+                        provider_id=provider_id,
+                    )
+            for resource_id, metrics in session.items():
+                resource = self._items.get(resource_id)
+                if resource is not None:
+                    await resource.reserve_active(metrics, consumer_id=consumer_id)
+            self.mark_model_started(provider_id, model_id)
+            result = dict(admission)
+            result["reserved"] = True
+            result["base_requirements"] = reqs
+            result["session_requirements"] = session
+            return result
+
+    async def release_model_session(
+        self,
+        session_requirements: dict[str, dict[str, int]] | None,
+        model_id: str,
+        provider_id: str,
+        consumer_id: str,
+        base_requirements: dict[str, dict[str, int]] | None = None,
+        retain_base: bool = True,
+    ) -> None:
+        """Release one session and, when it was the last, return the base to soft tracking."""
+        session = self._normalize_requirements(session_requirements)
+        base = self._normalize_requirements(base_requirements)
+        async with self._admission_lock:
+            for resource_id, metrics in session.items():
+                resource = self._items.get(resource_id)
+                if resource is not None:
+                    await resource.release(metrics, consumer_id=consumer_id)
+            remaining = self.mark_model_finished(provider_id, model_id)
+            if remaining:
+                return
+            base_id = self._base_consumer_id(provider_id, model_id)
+            persistent = self._provider_api_type(provider_id, self._full_config) == "llama-cpp"
+            for resource_id, metrics in base.items():
+                resource = self._items.get(resource_id)
+                if resource is None or base_id not in resource.consumers:
+                    continue
+                await resource.release(
+                    metrics,
+                    consumer_id=base_id,
+                    model_id=model_id if retain_base else None,
+                    provider_id=provider_id,
+                    persistent=persistent and retain_base,
+                )
+
     async def force_unload_for(
         self,
         requirements: dict[str, dict[str, int]] | None = None,
@@ -154,6 +488,7 @@ class Resources:
                     if not unloaded:
                         all_unloaded = False
                         continue
+                    self._invalidate_candidate(provider_id, model_id)
                 res.clear_soft_consumer(model_id, entry_provider_id or None)
         return all_unloaded
 
@@ -174,6 +509,7 @@ class Resources:
                     full_config or self._full_config,
                 )
                 if unloaded:
+                    self._invalidate_candidate(provider_id, model_id)
                     resource.clear_soft_consumer(model_id, entry_provider_id or None)
                 else:
                     all_unloaded = False
@@ -218,6 +554,15 @@ class Resources:
         if not providers:
             return
         for resource in self.all():
+            removed = [
+                entry for entry in resource._soft_used
+                if str(entry.get("provider_id") or "").strip() in providers
+            ]
+            for entry in removed:
+                self._invalidate_candidate(
+                    str(entry.get("provider_id") or ""),
+                    str(entry.get("model_id") or ""),
+                )
             resource._soft_used = [
                 entry for entry in resource._soft_used
                 if str(entry.get("provider_id") or "").strip() not in providers

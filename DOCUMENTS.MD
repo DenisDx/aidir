@@ -22,6 +22,9 @@ Proposals may include both planned and completed work; consult each document.
 | [webui/frontend/settings.css](webui/frontend/settings.css) | Host design of the generated settings editor: the design of the tree, its badges, buttons and controls, built on the project palette. |
 | [test_aiset_class_inventory.js](test_aiset_class_inventory.js) | Dumps the library's `aiset.classes()` inventory, so coverage is checked against the contract and not against the library source. |
 | [test_settings_styles.py](test_settings_styles.py) | Every class the editor emits must be designed by the host, loaded after the library, with no library rule surviving the theme. |
+| [test_kv_affinity.py](test_kv_affinity.py) | Context fingerprint, anchor policy, bounded store, and readiness-history contract. |
+| [test_kv_affinity_routing.py](test_kv_affinity_routing.py) | Affinity selection, queue diversion, resource wait, scheduler refresh, and execution fallback. |
+| [test_session_resources.py](test_session_resources.py) | Model-aware parallel admission, base/session accounting, memory caps, and unload invalidation. |
 | [core/settings/agent.py](core/settings/agent.py) | The configuration assistant: the provider call, the bounded tool loop and the permission set that keeps it away from secrets and from writing. |
 | [doctor.sh](doctor.sh) | Wrapper: runs the doctor through `venv/bin/python core/app.py doctor` and forwards every argument, so `./doctor.sh --help` shows all options. |
 | [core/doctor.py](core/doctor.py) | Host diagnostics: the aiset doctor over every configuration document plus checks for the aiset checkout, `.env`, directories, the store lock, venv, Docker, Redis, nginx, ports, Ollama and systemd, with scheduled repairs. |
@@ -56,6 +59,7 @@ Proposals may include both planned and completed work; consult each document.
 | [before_tools_worker.md](before_tools_worker.md) | Pre-tool-call context-processing hook. |
 | [proposal_aidir_smart_router.md](proposal_aidir_smart_router.md) | Resource-aware smart routing design. |
 | [proposal_kv_keeper.md](proposal_kv_keeper.md) | KV-affinity smart routing: prefix fingerprinting, sticky candidate selection, queue-imbalance diversion, and per-request session resources. |
+| [plan_kv_keeper.md](plan_kv_keeper.md) | Implementation plan and live state for KV-affinity routing and parallel session admission. |
 | [proposal_http_api.md](proposal_http_api.md) | Token-authenticated HTTP API tool worker. |
 | [proposal_hooks.md](proposal_hooks.md) | Event-driven hook loading, lifecycle API, and llama.cpp empty-response recovery. |
 | [proposal_llama_cpp.md](proposal_llama_cpp.md) | llama.cpp provider and server-lifecycle integration. |

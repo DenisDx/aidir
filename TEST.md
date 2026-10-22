@@ -74,6 +74,9 @@ The suite includes tests for:
 - scheduler priority, queue bypass, timeout diagnostics, restart recovery,
   shutdown, and task call counts;
 - resource monitoring, resource reuse, peer resources, and context overflow;
+- prefix-affinity routing, context fingerprints, resource-wait history, and
+  per-model parallel session admission (`test_kv_affinity`,
+  `test_kv_affinity_routing`, `test_session_resources`);
 - cron logging and repair, hooks, HTTP API workers, web search fallback, and
   WebUI live logs and task viewer search.
 
@@ -96,13 +99,16 @@ python -m unittest -v \
   test_queue_restart_recovery \
   test_shutdown_lifecycle
 
-# Resource and timeout behavior
+# Resource, timeout, and KV-affinity behavior
 python -m unittest -v \
   test_resource_monitor \
   test_resource_reuse \
   test_peer_resources \
   test_scheduler_timeout_diagnostics \
-  test_context_overflow
+  test_context_overflow \
+  test_kv_affinity \
+  test_kv_affinity_routing \
+  test_session_resources
 
 # Endpoint, protocol, and WebUI behavior
 python -m unittest -v \

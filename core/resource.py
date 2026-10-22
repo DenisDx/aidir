@@ -403,6 +403,51 @@ class Resource:
                     by_consumer[key] = int(by_consumer.get(key, 0)) + inc
                     self._consumer_availability_generations[cid] = self._availability_generation
 
+    def available_after_unloading_others(
+        self,
+        required: dict[str, int] | None = None,
+        model_id: str = "",
+        provider_id: str | None = None,
+    ) -> bool:
+        """Return True if the requirement fits after evicting idle models except this one."""
+        if not self.use:
+            return False
+        req = required or {}
+        if self.has_command_availability() or self._availability_state.get("source") == "peer":
+            return self.is_available(req)
+        soft = self._compute_soft_used()
+        own = self._matching_soft_consumer(model_id, None, provider_id)
+        own_resources = (own or {}).get("resources") or {}
+        for key, amount in req.items():
+            need = int(amount)
+            if need <= 0:
+                continue
+            limit = int(self.limits.get(key, 0))
+            used = int(self.used.get(key, 0))
+            other_soft = int(soft.get(key, 0)) - int(own_resources.get(key, 0))
+            if used + max(0, other_soft) + need > limit:
+                return False
+        return True
+
+    async def reserve_active(
+        self,
+        required: dict[str, int] | None = None,
+        consumer_id: str = "",
+    ) -> None:
+        """Reserve amounts for an active request without clearing a warm soft consumer."""
+        req = required or {}
+        cid = consumer_id.strip()
+        async with self._lock:
+            for key, amount in req.items():
+                inc = int(amount)
+                if inc <= 0:
+                    continue
+                self.used[key] = int(self.used.get(key, 0)) + inc
+                if cid:
+                    by_consumer = self.consumers.setdefault(cid, {})
+                    by_consumer[key] = int(by_consumer.get(key, 0)) + inc
+                    self._consumer_availability_generations[cid] = self._availability_generation
+
     async def release(
         self,
         reserved: dict[str, int] | None = None,

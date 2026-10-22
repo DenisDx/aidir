@@ -373,16 +373,23 @@ class Endpoint_ollama(BaseEndpoint):
     ) -> Task_agent:
         """Create Task_agent and resolve smart routes before queueing when needed."""
         worker_id = self._resolve_worker_id(payload)
+        client_key = str(request.headers.get("x-aidir-kv-key") or "").strip() if request is not None else ""
         route = self._resolve_model_route((payload or {}).get("model"), worker_id)
         if route is not None and self._provider_api(route["resolved_provider"]) == "smart":
+            routing_payload = dict(payload)
+            if client_key:
+                routing_payload["_aidir_kv_key"] = client_key
             route = await self._resolve_smart_route(
                 route,
                 worker_id=worker_id,
-                payload=payload,
+                payload=routing_payload,
                 incoming_bearer_token=incoming_bearer_token,
             )
 
         task = self._create_task_for_payload(payload, stream, worker_id, route)
+        if client_key:
+            task.config = dict(task.config or {})
+            task.config["kv_client_key"] = client_key
         if incoming_bearer_token:
             task.config = dict(task.config or {})
             task.config["incoming_bearer_token"] = incoming_bearer_token
@@ -567,6 +574,22 @@ class Endpoint_ollama(BaseEndpoint):
                 return None
             return await self._core.queue.get_resource_queue_state(requirements, priority=priority)
 
+        async def get_model_queue_state(provider_id: str, model_id: str, priority: int) -> dict | None:
+            if self._core is None or self._core.queue is None:
+                return None
+            getter = getattr(self._core.queue, "get_model_queue_state", None)
+            if not callable(getter):
+                return None
+            return await getter(provider_id, model_id, priority=priority)
+
+        def evaluate_model_admission(requirements: dict, model_id: str, provider_id: str) -> dict | None:
+            if self._core is None or self._core.resources is None:
+                return None
+            evaluator = getattr(self._core.resources, "evaluate_model_admission", None)
+            if not callable(evaluator):
+                return None
+            return evaluator(requirements, model_id, provider_id)
+
         def check_resource_available(requirements: dict) -> bool:
             if self._core is None or self._core.resources is None:
                 return False
@@ -608,6 +631,14 @@ class Endpoint_ollama(BaseEndpoint):
             is_candidate_allowed=is_candidate_allowed,
             on_selection=self._log_smart_route_selection,
             on_failure=self._log_smart_route_failure,
+            kv_affinity=getattr(self._core, "kv_affinity", None) if self._core is not None else None,
+            readiness=getattr(self._core, "model_readiness", None) if self._core is not None else None,
+            affinity_config=(
+                self._core.config.get("routing.kv_affinity") or {}
+                if self._core is not None else {}
+            ),
+            get_model_queue_state=get_model_queue_state,
+            evaluate_model_admission=evaluate_model_admission,
         )
 
     async def _evaluate_smart_candidate(
@@ -658,13 +689,15 @@ class Endpoint_ollama(BaseEndpoint):
     def _log_smart_route_selection(self, route: dict) -> None:
         """Log selected smart route with candidate probe summary."""
         probes = route.get("candidate_probes") if isinstance(route, dict) else []
+        affinity = route.get("kv_affinity") if isinstance(route, dict) else None
         log(
             "http",
             "info",
             (
                 f"Smart route selected requested={route.get('requested_model')} provider={route.get('resolved_provider')} "
                 f"model={route.get('resolved_model')} strategy={route.get('strategy')} "
-                f"reason={route.get('selection_reason')} probes={json.dumps(probes, ensure_ascii=False)}"
+                f"reason={route.get('selection_reason')} affinity={json.dumps(affinity, ensure_ascii=False)} "
+                f"probes={json.dumps(probes, ensure_ascii=False)}"
             ),
             self.id,
         )

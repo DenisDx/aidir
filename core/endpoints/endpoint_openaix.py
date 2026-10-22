@@ -575,12 +575,15 @@ class Endpoint_openaix(Endpoint_ollama):
         """Create Task_agent and resolve smart routes before queueing when needed."""
         payload = self._apply_generation_defaults(payload)
         worker_id = self._resolve_worker_id(payload)
+        client_key = str(request.headers.get("x-aidir-kv-key") or "").strip() if request is not None else ""
         route = self._resolve_model_route((payload or {}).get("model"), worker_id)
         if request_kind == "embed":
             self._ensure_embedding_route(route)
         if route is not None and self._provider_api(route["resolved_provider"]) == "smart":
             routing_payload = dict(payload)
             routing_payload["request_kind"] = request_kind
+            if client_key:
+                routing_payload["_aidir_kv_key"] = client_key
             route = await self._resolve_smart_route(
                 route,
                 worker_id=worker_id,
@@ -592,6 +595,9 @@ class Endpoint_openaix(Endpoint_ollama):
             self._ensure_embedding_route(route)
 
         task = self._create_task_for_payload(payload, stream, worker_id, route, request_kind=request_kind)
+        if client_key:
+            task.config = dict(task.config or {})
+            task.config["kv_client_key"] = client_key
         if incoming_bearer_token:
             task.config = dict(task.config or {})
             task.config["incoming_bearer_token"] = incoming_bearer_token
@@ -1403,31 +1409,82 @@ class Endpoint_openaix(Endpoint_ollama):
                 message="Queue is not available",
             )
 
-        queue_state = await self._core.queue.get_resource_queue_state(resolved, priority=priority)
-        resource_ready = bool(self._core.resources and self._core.resources.check_available(resolved))
+        queue_state = None
+        if self._core.queue is not None:
+            getter = getattr(self._core.queue, "get_model_queue_state", None)
+            if callable(getter):
+                queue_state = await getter(provider_id, model_id, priority=priority)
+        if not isinstance(queue_state, dict):
+            queue_state = await self._core.queue.get_resource_queue_state(resolved, priority=priority)
+
+        local_filter = getattr(self._core.resources, "local_admission_requirements", None)
+        local_resolved = (
+            local_filter(resolved)
+            if self._core.resources is not None and callable(local_filter)
+            else resolved
+        )
+        admission = None
+        if self._core.resources is not None:
+            evaluator = getattr(self._core.resources, "evaluate_model_admission", None)
+            if callable(evaluator):
+                admission = evaluator(local_resolved, model_id, provider_id)
+        resource_ready = bool(
+            admission.get("resource_ready")
+            if isinstance(admission, dict)
+            else (self._core.resources and self._core.resources.check_available(local_resolved))
+        )
         resource_ready_after_unload = bool(
-            self._core.resources and self._core.resources.check_available_after_unload(resolved)
+            admission.get("resource_ready_after_unload")
+            if isinstance(admission, dict)
+            else (
+                self._core.resources
+                and self._core.resources.check_available_after_unload(local_resolved)
+            )
         )
         resource_reusable = bool(
             self._core.resources
             and callable(getattr(self._core.resources, "check_available_for_reuse", None))
             and self._core.resources.check_available_for_reuse(
-                resolved,
+                local_resolved,
                 model_id=model_id,
                 provider_id=provider_id,
             )
         )
         blocked_by_same_or_higher = queue_state["queued_count_total"] - queue_state["queued_count_below_priority"]
+        can_run_now = (
+            bool(admission.get("admissible_now"))
+            if isinstance(admission, dict)
+            else ((resource_ready_after_unload or resource_reusable) and blocked_by_same_or_higher == 0)
+        )
+        can_run_now = bool(can_run_now and blocked_by_same_or_higher == 0)
 
         payload = {
             "provider": provider_id,
             "model": model_id,
             "priority": priority,
-            "can_run_now": (resource_ready_after_unload or resource_reusable) and blocked_by_same_or_higher == 0,
+            "can_run_now": can_run_now,
             "queued_count_below_priority": queue_state["queued_count_below_priority"],
             "queued_count_total": queue_state["queued_count_total"],
             "priority_counts": queue_state["priority_counts"],
+            "resource_ready": resource_ready,
+            "resource_ready_after_unload": resource_ready_after_unload,
+            "resource_reusable": resource_reusable,
         }
+        if isinstance(admission, dict):
+            payload.update(
+                {
+                    "active_count": admission.get("active_count", 0),
+                    "max_concurrent_requests": admission.get("max_concurrent_requests", 1),
+                    "session_resources": admission.get("session_resources") or {},
+                    "model_loaded": bool(admission.get("model_loaded")),
+                    "admission": admission.get("admission"),
+                    "free": admission.get("free") or {},
+                    "needed": admission.get("needed") or {},
+                }
+            )
+            slots = getattr(self._core.resources, "memory_slots", None)
+            if callable(slots):
+                payload["memory_slots"] = slots(model_id, provider_id)
         if provider_id != requested_provider_id or model_id != requested_model_id:
             payload["requested_provider"] = requested_provider_id
             payload["requested_model"] = requested_model_id

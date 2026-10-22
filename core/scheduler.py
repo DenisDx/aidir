@@ -19,6 +19,7 @@ from core.task import Task, STATUS_QUEUED
 from core.worker import WorkerResult
 from core import log
 from core.smart_router import SmartRouter, SmartRouteError
+from core.kv_affinity import KvAffinityStore, ModelReadinessTracker
 
 if TYPE_CHECKING:
     from core.hooks import HookManager
@@ -45,6 +46,9 @@ class Scheduler:
         full_config: dict | None = None,
         hooks: "HookManager | None" = None,
         resource_monitor: "ResourceMonitor | None" = None,
+        kv_affinity: KvAffinityStore | None = None,
+        model_readiness: ModelReadinessTracker | None = None,
+        affinity_config: dict | None = None,
     ) -> None:
         self._queue = queue
         self._workers = workers
@@ -53,6 +57,9 @@ class Scheduler:
         self._full_config = full_config or {}
         self._hooks = hooks
         self._resource_monitor = resource_monitor
+        self._kv_affinity = kv_affinity
+        self._model_readiness = model_readiness
+        self._affinity_config = affinity_config if isinstance(affinity_config, dict) else {}
         self._running = False
         self._wake = asyncio.Event()
         self._active_runs: set[asyncio.Task] = set()
@@ -122,39 +129,86 @@ class Scheduler:
                         task_id = await self._queue.pop_next(task_type)
                         continue
                     local_reqs = self._resources.local_admission_requirements(reqs) if self._resources else reqs
-                    if local_reqs and self._resources and not self._resources.check_available(local_reqs):
-                        if requested_model_id and self._resources.check_available_for_reuse(
-                            local_reqs, requested_model_id, requested_provider_id
-                        ):
-                            log("system", "info", f"Task {task.id} reusing warm model {requested_model_id}")
-                        elif self._resources.check_available_after_unload(local_reqs):
-                            # Soft consumers (alive-time models) block the resource; force-unload them.
+                    model_admission = None
+                    model_max = 1
+                    if local_reqs and self._resources and requested_model_id:
+                        model_max, _ = self._resources.model_parallel_config(
+                            requested_provider_id,
+                            requested_model_id,
+                        )
+
+                    if local_reqs and self._resources and model_max > 1:
+                        admission = self._resources.evaluate_model_admission(
+                            local_reqs,
+                            requested_model_id,
+                            requested_provider_id,
+                        )
+                        if not admission.get("admissible_now") and admission.get("admission") == "waiting_unload":
                             log("system", "info",
-                                f"Task {task.id} needs force-unload of idle models to free resources")
+                                f"Task {task.id} needs force-unload of idle models to fit a session")
                             await self._resources.force_unload_for(
-                                local_reqs,
+                                admission.get("needed") or local_reqs,
                                 self._full_config,
                                 keep_model_id=requested_model_id or None,
                                 keep_provider_id=requested_provider_id or None,
                             )
-                            # Re-check actual soft reservations; a failed unload must keep its VRAM occupied.
-                            if not self._resources.check_available(local_reqs):
-                                task.next_retry_at = time.time() + 5
-                                deferred_tasks.append(task)
-                                log("system", "warn",
-                                    f"Task {task.id} delayed: resource unload did not free enough space")
-                                task_id = await self._queue.pop_next(task_type)
-                                continue
-                            # Fall through — resources are now available
-                        else:
-                            # Not enough even with force unload
+                            admission = self._resources.evaluate_model_admission(
+                                local_reqs,
+                                requested_model_id,
+                                requested_provider_id,
+                            )
+                        if not admission.get("admissible_now"):
                             task.next_retry_at = time.time() + 1
                             deferred_tasks.append(task)
-                            log("system", "info", f"Task {task.id} delayed: insufficient resources")
+                            log("system", "info",
+                                f"Task {task.id} delayed: {admission.get('admission')} for model {requested_model_id}")
                             task_id = await self._queue.pop_next(task_type)
                             continue
+                        model_admission = await self._resources.reserve_model_start(
+                            local_reqs,
+                            requested_model_id,
+                            requested_provider_id,
+                            consumer_id=f"{task.id}:{worker.id}",
+                        )
+                        if not isinstance(model_admission, dict) or not model_admission.get("admissible_now"):
+                            task.next_retry_at = time.time() + 1
+                            deferred_tasks.append(task)
+                            log("system", "info", f"Task {task.id} delayed: resources changed during model admission")
+                            task_id = await self._queue.pop_next(task_type)
+                            continue
+                    elif local_reqs and self._resources:
+                        if not self._resources.check_available(local_reqs):
+                            if requested_model_id and self._resources.check_available_for_reuse(
+                                local_reqs, requested_model_id, requested_provider_id
+                            ):
+                                log("system", "info", f"Task {task.id} reusing warm model {requested_model_id}")
+                            elif self._resources.check_available_after_unload(local_reqs):
+                                # Soft consumers (alive-time models) block the resource; force-unload them.
+                                log("system", "info",
+                                    f"Task {task.id} needs force-unload of idle models to free resources")
+                                await self._resources.force_unload_for(
+                                    local_reqs,
+                                    self._full_config,
+                                    keep_model_id=requested_model_id or None,
+                                    keep_provider_id=requested_provider_id or None,
+                                )
+                                # Re-check actual soft reservations; a failed unload must keep its VRAM occupied.
+                                if not self._resources.check_available(local_reqs):
+                                    task.next_retry_at = time.time() + 5
+                                    deferred_tasks.append(task)
+                                    log("system", "warn",
+                                        f"Task {task.id} delayed: resource unload did not free enough space")
+                                    task_id = await self._queue.pop_next(task_type)
+                                    continue
+                                # Fall through — resources are now available
+                            else:
+                                # Not enough even with force unload
+                                task.next_retry_at = time.time() + 1
+                                deferred_tasks.append(task)
+                                log("system", "info", f"Task {task.id} delayed: insufficient resources")
+                                task_id = await self._queue.pop_next(task_type)
+                                continue
 
-                    if self._resources and local_reqs:
                         reserved = await self._resources.reserve_if_available_or_reuse(
                             local_reqs,
                             consumer_id=f"{task.id}:{worker.id}",
@@ -168,7 +222,13 @@ class Scheduler:
                             task_id = await self._queue.pop_next(task_type)
                             continue
                     bg_task = asyncio.create_task(
-                        self._run_task(task, worker, local_reqs, resources_reserved=True),
+                        self._run_task(
+                            task,
+                            worker,
+                            local_reqs,
+                            resources_reserved=True,
+                            model_admission=model_admission,
+                        ),
                         name=f"task:{task.id}:{worker.id}",
                     )
                     self._active_runs.add(bg_task)
@@ -375,12 +435,11 @@ class Scheduler:
         worker: "BaseWorker",
         reserved_reqs: dict[str, dict[str, int]] | None = None,
         resources_reserved: bool = False,
+        model_admission: dict | None = None,
     ) -> None:
         """Execute one task; handle timeouts and exceptions."""
         log("worker", "info", f"Starting task {task.id}", worker.id)
         await self._queue.mark_running(task.id, worker.id)
-        if await self._apply_hook_control(task):
-            return
         consumer_id = f"{task.id}:{worker.id}"
         # Model id is used to track soft consumers (alive_time) after release
         model_id: str | None = (task.payload or {}).get("model") or None
@@ -396,10 +455,17 @@ class Scheduler:
                 provider_id=provider_id,
             )
 
+        model_counted = bool(model_admission is not None)
+        if not model_counted and self._resources and model_id and provider_id:
+            self._resources.mark_model_started(provider_id, model_id)
+            model_counted = True
+
         started = time.monotonic()
         failed_local_server_start = False
 
         try:
+            if await self._apply_hook_control(task):
+                return
             if self._hooks is not None and task.type == "agent":
                 await self._hooks.emit("before_llm_request", task, task.payload)
             if await self._apply_hook_control(task):
@@ -469,7 +535,16 @@ class Scheduler:
                 await self._queue.mark_failed(task, err)
 
         finally:
-            if self._resources and reserved_reqs:
+            if self._resources and model_admission is not None and model_id and provider_id:
+                await self._resources.release_model_session(
+                    model_admission.get("session_requirements") or {},
+                    model_id,
+                    provider_id,
+                    consumer_id,
+                    base_requirements=model_admission.get("base_requirements") or reserved_reqs or {},
+                    retain_base=not failed_local_server_start,
+                )
+            elif self._resources and reserved_reqs:
                 await self._resources.release_for(
                     reserved_reqs,
                     consumer_id=consumer_id,
@@ -477,6 +552,8 @@ class Scheduler:
                     provider_id=provider_id,
                     retain_model=not failed_local_server_start,
                 )
+            if self._resources and model_counted and model_admission is None and model_id and provider_id:
+                self._resources.mark_model_finished(provider_id, model_id)
 
     async def _fallback_smart_route_after_execution_failure(
         self,
@@ -509,8 +586,15 @@ class Scheduler:
         ):
             return False
 
+        if self._kv_affinity is not None:
+            self._kv_affinity.forget_candidate(failed_provider, failed_model)
+        if self._model_readiness is not None:
+            self._model_readiness.clear_candidate(failed_provider, failed_model)
+
         request_payload = dict(task.payload or {})
         request_payload["model"] = requested_model
+        if isinstance(task.config, dict) and task.config.get("kv_client_key"):
+            request_payload["_aidir_kv_key"] = str(task.config.get("kv_client_key") or "")
         incoming_bearer_token = str((task.config or {}).get("incoming_bearer_token") or "").strip()
         base_route = {
             "requested_model": requested_model,
@@ -620,6 +704,8 @@ class Scheduler:
         }
         request_payload = dict(task.payload or {})
         request_payload["model"] = requested_model
+        if isinstance(task.config, dict) and task.config.get("kv_client_key"):
+            request_payload["_aidir_kv_key"] = str(task.config.get("kv_client_key") or "")
         incoming_bearer_token = ""
         if isinstance(task.config, dict):
             incoming_bearer_token = str(task.config.get("incoming_bearer_token") or "").strip()
@@ -739,6 +825,20 @@ class Scheduler:
         async def get_local_queue_state(requirements: dict, priority: int) -> dict | None:
             return await self._queue.get_resource_queue_state(requirements, priority=priority)
 
+        async def get_model_queue_state(provider_id: str, model_id: str, priority: int) -> dict | None:
+            getter = getattr(self._queue, "get_model_queue_state", None)
+            if not callable(getter):
+                return None
+            return await getter(provider_id, model_id, priority=priority)
+
+        def evaluate_model_admission(requirements: dict, model_id: str, provider_id: str) -> dict | None:
+            if self._resources is None:
+                return None
+            evaluator = getattr(self._resources, "evaluate_model_admission", None)
+            if not callable(evaluator):
+                return None
+            return evaluator(requirements, model_id, provider_id)
+
         def check_resource_available(requirements: dict) -> bool:
             if self._resources is None:
                 return False
@@ -773,6 +873,11 @@ class Scheduler:
             probe_ollama_model_availability=self._probe_ollama_model_availability,
             resolve_probe_timeout_ms=self._resolve_probe_timeout_ms,
             resolve_worker_id_for_route=self._resolve_worker_id_for_route,
+            kv_affinity=self._kv_affinity,
+            readiness=self._model_readiness,
+            affinity_config=self._affinity_config,
+            get_model_queue_state=get_model_queue_state,
+            evaluate_model_admission=evaluate_model_admission,
         )
 
     def _provider_api(self, provider_id: str) -> str:

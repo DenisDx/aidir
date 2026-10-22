@@ -350,6 +350,53 @@ class QueueManager:
             ],
         }
 
+    async def get_model_queue_state(
+        self,
+        provider_id: str,
+        model_id: str,
+        priority: int = 5,
+    ) -> dict:
+        """Summarize queued tasks that target one concrete provider/model pair."""
+        provider = str(provider_id or "").strip()
+        model = str(model_id or "").strip()
+        counts_by_priority: dict[int, int] = {}
+        total_count = 0
+        below_priority_count = 0
+        if not provider or not model:
+            return {
+                "queued_count_total": 0,
+                "queued_count_below_priority": 0,
+                "priority_counts": [],
+            }
+
+        for task_type in self._QUEUE_TASK_TYPES:
+            queued = await self._redis.zrange(self._q(task_type), 0, -1, withscores=True)
+            if not queued:
+                continue
+            for raw_task_id, raw_score in queued:
+                task_id = raw_task_id.decode() if isinstance(raw_task_id, bytes) else str(raw_task_id)
+                data = await self._redis.hgetall(self._tk(task_id))
+                if not data or data.get("status") != STATUS_QUEUED:
+                    continue
+                route_provider = str(data.get("route_provider_id") or "")
+                route_model = str(data.get("model_id") or "")
+                if route_provider != provider or route_model != model:
+                    continue
+                priority_value = self._parse_int(data.get("priority"), default=int(raw_score))
+                total_count += 1
+                counts_by_priority[priority_value] = counts_by_priority.get(priority_value, 0) + 1
+                if priority_value > priority:
+                    below_priority_count += 1
+
+        return {
+            "queued_count_total": total_count,
+            "queued_count_below_priority": below_priority_count,
+            "priority_counts": [
+                {"priority": prio, "count": counts_by_priority[prio]}
+                for prio in sorted(counts_by_priority)
+            ],
+        }
+
     @staticmethod
     def _parse_int(value, default: int = 0) -> int:
         """Parse an integer value with a fallback default."""

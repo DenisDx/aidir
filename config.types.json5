@@ -392,6 +392,11 @@
             maximum: 1000,
             description: "Preference order; lower values are tried first",
           },
+          cache_group: {
+            type: "string",
+            min_length: 1,
+            description: "KV-cache compatibility group; overrides the concrete model entry",
+          },
         },
       },
 
