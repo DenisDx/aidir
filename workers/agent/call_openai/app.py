@@ -43,7 +43,7 @@ class CallOpenAIWorker(OpenAIxWorker):
         payload = self._apply_model_generation_defaults(dict(task.payload or {}), provider_id=provider_id)
         payload = self._apply_model_context_window(payload, provider_id=provider_id)
         payload = self._to_openai_payload(payload, task.stream)
-        url = f"{self._resolve_base_url(provider_id)}/v1/chat/completions"
+        url = self._chat_url(provider_id, task)
         save_call = self._resolve_save_llm_request(task.payload or {})
         headers = self._resolve_request_headers(task, provider_id)
 
@@ -68,6 +68,10 @@ class CallOpenAIWorker(OpenAIxWorker):
             )
             raise
 
+    def _chat_url(self, provider_id: str, task: Task | None = None) -> str:
+        """Return the upstream chat URL for this transport."""
+        return f"{self._resolve_base_url(provider_id)}/v1/chat/completions"
+
     @classmethod
     def _to_openai_payload(cls, payload: dict, stream: bool) -> dict:
         """Convert the internal Ollama-shaped task payload to OpenAI chat-completions syntax."""
@@ -81,7 +85,11 @@ class CallOpenAIWorker(OpenAIxWorker):
             if key not in internal_fields and key not in {"model", "messages", "stream", "num_predict"}
         }
         out["model"] = payload.get("model", "")
-        out["messages"] = list(payload.get("messages") or [])
+        out["messages"] = [
+            {key: value for key, value in message.items() if key != "anthropic_blocks"}
+            if isinstance(message, dict) else message
+            for message in (payload.get("messages") or [])
+        ]
         out["stream"] = bool(stream)
 
         options = payload.get("options") if isinstance(payload.get("options"), dict) else {}

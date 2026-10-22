@@ -1964,6 +1964,12 @@ async function loadAgentEndpoints() {
     opt.textContent = `${ep.id}  [${ep.api}  :${ep.port || '?'}]`;
     sel.appendChild(opt);
   });
+  sel.onchange = () => {
+    const ep = endpoints.find(item => item.id === sel.value);
+    const protocolSelect = $('agent-protocol-select');
+    if (ep && ep.api === 'anthropic') protocolSelect.value = 'anthropic';
+    else if (protocolSelect.value === 'anthropic') protocolSelect.value = ep && ep.api === 'openaix' ? 'openai' : 'ollama';
+  };
 }
 
 // Build request body from current UI state. user text already in agentMessages if extraUserText is undefined.
@@ -2102,8 +2108,13 @@ function handleAgentResponse(res) {
     content = data.message.content || '';
   } else if (data.content) {
     // Anthropic format
-    const block = Array.isArray(data.content) ? data.content[0] : data.content;
-    content = typeof block === 'string' ? block : (block?.text || JSON.stringify(data.content));
+    const blocks = Array.isArray(data.content) ? data.content : [data.content];
+    const text = blocks
+      .map(block => typeof block === 'string' ? block : block?.text)
+      .filter(Boolean)
+      .join('');
+    const toolCalls = blocks.filter(block => block && block.type === 'tool_use');
+    content = text || (toolCalls.length ? `[tool calls: ${toolCalls.map(call => call.name).join(', ')}]` : JSON.stringify(data.content));
   } else {
     content = JSON.stringify(data, null, 2);
   }

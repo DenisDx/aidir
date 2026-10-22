@@ -959,7 +959,7 @@ class Endpoint_openaix(Endpoint_ollama):
             return JSONResponse(self._ollama_sync_to_openai(result, task.id, request_body))
         if task.status == STATUS_FAILED:
             err = task.error or {}
-            upstream_response = upstream_error_response(err)
+            upstream_response = None if self._is_anthropic_route(task) else upstream_error_response(err)
             if upstream_response is not None:
                 log("http", "warning", f"{self.id} upstream error: task={task.id} status={upstream_response.status_code} message={err.get('message')}", self.id)
                 return upstream_response
@@ -1062,7 +1062,14 @@ class Endpoint_openaix(Endpoint_ollama):
 
                 if chunk is None:
                     if task.status == STATUS_FAILED:
-                        err = upstream_error_payload(task.error or {})
+                        error_payload = task.error or {}
+                        if self._is_anthropic_route(task):
+                            err = self._openai_error_payload(
+                                str(error_payload.get("code") or "UPSTREAM_ERROR"),
+                                str(error_payload.get("message") or "Upstream error"),
+                            )
+                        else:
+                            err = upstream_error_payload(error_payload)
                         encoded = f"data: {json.dumps(err)}\n\n".encode()
                         yield encoded
                         if spool is not None:

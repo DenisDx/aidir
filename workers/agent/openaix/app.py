@@ -454,7 +454,7 @@ class OpenAIxWorker(BaseWorker):
                 normalized.append(message)
                 continue
 
-            normalized_message = dict(message)
+            normalized_message = {key: value for key, value in message.items() if key != "anthropic_blocks"}
             normalized_message["content"] = cls._coerce_message_content_to_text(message.get("content"))
             normalized.append(normalized_message)
         return normalized
@@ -698,6 +698,11 @@ class OpenAIxWorker(BaseWorker):
         token = auth_cfg.get("token")
         if isinstance(token, str) and token.strip() and auth_type in {"bearer", "token", ""}:
             headers["Authorization"] = f"Bearer {token.strip()}"
+
+        if auth_type in {"x-api-key", "api-key"}:
+            api_key = auth_cfg.get("key") if auth_cfg.get("key") is not None else token
+            if isinstance(api_key, str) and api_key.strip():
+                headers["x-api-key"] = api_key.strip()
 
         if auth_type == "basic":
             username = auth_cfg.get("username")

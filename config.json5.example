@@ -134,6 +134,14 @@
       "middlewares": [] // TODO: add middleware ids here when needed
     },
     {
+      "id": "anthropic",
+      "api": "anthropic",
+      "port": ${ANTHROPIC_ENDPOINT_PORT:-21435},
+      "bindAddress": "${ANTHROPIC_ENDPOINT_HOST:-0.0.0.0}",
+      // fallback worker before model routing selects a provider-specific worker
+      "worker": "openaix"
+    },
+    {
       "id": "mcp",
       "api": "mcp",
       "port": ${MCP_ENDPOINT_PORT:-20001},
@@ -211,6 +219,10 @@
           "selftest": {"worker": "selftest"},
           "http_api": {"worker": "http_api"}
         }
+      },
+      "call_anthropic": {
+        "enabled": true,
+        "request_timeout": ${REQUEST_TIMEOUT:-100}
       },
       "openaix": {
         "enabled": true,

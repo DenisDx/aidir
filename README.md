@@ -451,6 +451,64 @@ Use `exec_cmd` for a local server command. aidir starts it on demand, waits for 
 
 For a `llama-cpp` provider, resource `keep_alive` means restart-on-failure during its active window; it does not send API pings. Smart routes probe a running provider via `/v1/models`; an unavailable provider with `exec_cmd` remains eligible for lazy startup after the scheduler has freed resources.
 
+### Anthropic Messages providers and endpoint
+
+Set an endpoint's `api` to `anthropic` to expose `POST /v1/messages`,
+`POST /v1/messages/count_tokens`, and `GET /v1/models` for Anthropic SDK clients
+and coding agents. Client credentials use `x-api-key` or `Authorization: Bearer`
+and are checked against the same `users.items` tokens as the other endpoints.
+
+Set a provider's `api` to `anthropic` to reach Anthropic-compatible servers
+through `POST {baseUrl}/v1/messages`. Use `auth.type: "x-api-key"` for
+Anthropic-native authentication or `auth.type: "bearer"` for gateways that use
+Bearer credentials. `anthropic_version` defaults to `2023-06-01`; the
+model-level `max_output_tokens` field supplies `max_tokens` when an OpenAI or
+Ollama client omits it.
+
+A mixed provider can override the transport per model:
+
+```json5
+{
+  "endpoints": [
+    {"id": "anthropic", "api": "anthropic", "port": 21435, "worker": "openaix"}
+  ],
+  "models": {
+    "providers": {
+      "anthropic_cloud": {
+        "api": "anthropic",
+        "baseUrl": "https://api.anthropic.com",
+        "auth": {"type": "x-api-key", "key": "${ANTHROPIC_API_KEY}"},
+        "models": [{"id": "claude-sonnet-4-6", "alias": "claude", "max_output_tokens": 8192}]
+      },
+      "opencode_go": {
+        "api": "opencode-go",
+        "baseUrl": "${OPENCODE_GO_BASE_URL:-https://opencode.ai/zen/go}",
+        "auth": {"type": "bearer", "token": "${OPENCODE_GO_API_KEY}"},
+        "models": [
+          {"id": "glm-5.3", "alias": "opencode-glm-5.3"},
+          {"id": "minimax-m3", "alias": "opencode-minimax-m3", "protocol": "anthropic-messages"}
+        ]
+      }
+    }
+  }
+}
+```
+
+`protocol` accepts `chat-completions` and `anthropic-messages`; without it, the
+provider `api` decides the default. OpenCode Go Qwen, MiniMax, and Claude models
+use `anthropic-messages`, while GLM, Kimi, DeepSeek, and MiMo keep Chat
+Completions. Sessions, `User-Agent`, and credentials remain owned by the
+OpenCode Go worker on both paths.
+
+Native Anthropic responses and SSE streams are returned byte for byte when the
+upstream also speaks Messages. Cross-protocol requests are converted, including
+system prompts, images, tool use and tool results, usage, stop reasons, and
+errors. Thinking blocks keep their signatures only while the corresponding
+assistant turn is unchanged; a context rewrite drops them with a warning.
+
+`count_tokens` is a deterministic local estimate and does not create a task or
+call a model.
+
 ### Network ports and routing map
 
 Runtime topology:
@@ -459,6 +517,7 @@ Runtime topology:
 browser/client
   -> host:8080 (nginx in docker, public HTTP + WS)
   -> host:21434 (OpenAIx/Ollama-compatible endpoint)
+  -> host:21435 (Anthropic Messages endpoint)
   -> host:20001 (MCP endpoint)
 
 nginx:80 in container
@@ -829,6 +888,17 @@ curl http://localhost:21434/api/chat \
     "model": "llama3",
     "messages": [{"role": "user", "content": "Count to 5."}],
     "stream": true
+  }'
+
+# Anthropic Messages request
+curl http://localhost:21435/v1/messages \
+  -H "x-api-key: $AIDIR_API_KEY" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude",
+    "max_tokens": 256,
+    "messages": [{"role": "user", "content": "Hello"}]
   }'
 
 # Explicit worker selection (extended syntax)

@@ -598,7 +598,7 @@
             },
             api: {
               type: "string",
-              enum: ["openaix", "ollama", "mcp"],
+              enum: ["openaix", "ollama", "anthropic", "mcp"],
               apply: "restart",
               description: "Protocol this endpoint speaks",
             },
@@ -773,7 +773,7 @@
               children: {
                 api: {
                   type: "string",
-                  enum: ["ollama", "openaix", "openai", "opencode-go", "llama-cpp", "smart"],
+                  enum: ["ollama", "openaix", "openai", "opencode-go", "anthropic", "llama-cpp", "smart"],
                   apply: "restart",
                   description: "Protocol dialect spoken by this provider",
                 },
@@ -815,6 +815,27 @@
                   apply: "restart",
                   description: "Seconds allowed for a managed llama.cpp server to become ready",
                 },
+                anthropic_version: {
+                  type: "string",
+                  min_length: 1,
+                  apply: "restart",
+                  description: "Anthropic API version sent to a Messages provider",
+                  env: { allowed: true, convert: "string" },
+                  ui: { placeholder: "2023-06-01" },
+                },
+                anthropic_beta: {
+                  type: "string",
+                  apply: "restart",
+                  description: "Optional anthropic-beta header value sent to a Messages provider",
+                  ui: { placeholder: "beta-feature-1" },
+                },
+                max_output_tokens: {
+                  type: "int",
+                  minimum: 1,
+                  maximum: 1000000,
+                  apply: "restart",
+                  description: "Fallback max_tokens for Messages requests when the client omits it",
+                },
                 auth: {
                   type: "object",
                   apply: "restart",
@@ -822,7 +843,7 @@
                   children: {
                     type: {
                       type: "string",
-                      enum: ["bearer", "basic", "none"],
+                      enum: ["bearer", "basic", "x-api-key", "none"],
                       apply: "restart",
                       description: "Authentication scheme sent with every request",
                     },
@@ -876,6 +897,19 @@
                         min_length: 1,
                         apply: "reload",
                         description: "Model id as the provider knows it",
+                      },
+                      protocol: {
+                        type: "string",
+                        enum: ["chat-completions", "anthropic-messages"],
+                        apply: "reload",
+                        description: "Transport protocol for this model; defaults to the provider api",
+                      },
+                      max_output_tokens: {
+                        type: "int",
+                        minimum: 1,
+                        maximum: 1000000,
+                        apply: "reload",
+                        description: "Per-model fallback max_tokens for Messages requests",
                       },
                       alias: {
                         type: "string",

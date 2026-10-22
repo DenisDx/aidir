@@ -56,6 +56,7 @@ from core.task import STATUS_CREATED, STATUS_QUEUED, STATUS_RUNNING
 from core.task import STATUS_CANCELED, STATUS_COMPLETED, STATUS_FAILED
 from core.workers_loader import load_workers, resolve_worker_configs
 from core.config_merger import update_config
+from core.endpoints.endpoint_anthropic import Endpoint_anthropic
 from core.endpoints.endpoint_ollama import Endpoint_ollama
 from core.endpoints.endpoint_openaix import Endpoint_openaix
 from core.endpoints.endpoint_mcp import Endpoint_mcp
@@ -701,6 +702,15 @@ def _build_ollama_server(core: Core, ep_cfg: dict) -> uvicorn.Server:
     return _Server(cfg), endpoint
 
 
+def _build_anthropic_server(core: Core, ep_cfg: dict) -> uvicorn.Server:
+    endpoint = Endpoint_anthropic(ep_cfg)
+    app = endpoint.create_app(core)
+    host = ep_cfg.get("bindAddress", "0.0.0.0")
+    port = int(ep_cfg.get("port", 21435))
+    cfg = _build_server_config(app, host, port)
+    return _Server(cfg), endpoint
+
+
 def _build_openaix_server(core: Core, ep_cfg: dict) -> uvicorn.Server:
     endpoint = Endpoint_openaix(ep_cfg)
     app = endpoint.create_app(core)
@@ -738,6 +748,10 @@ async def _init_endpoints(core: Core) -> list[tuple[uvicorn.Server, object]]:
             servers.append((server, ep))
         elif api == "mcp":
             server, ep = _build_mcp_server(core, ep_cfg)
+            await ep.initialize(core)
+            servers.append((server, ep))
+        elif api == "anthropic":
+            server, ep = _build_anthropic_server(core, ep_cfg)
             await ep.initialize(core)
             servers.append((server, ep))
         else:

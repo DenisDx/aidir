@@ -178,7 +178,21 @@ Expected: every descriptor prints `valid: True`, and the test run ends with
 `OK`. A failure names the exact configuration path that the descriptor does not
 cover; add the missing declaration to the descriptor, do not relax the test.
 
-## 5. Smoke test after startup or deployment
+### 4.2 Anthropic Messages protocol
+
+```bash
+python -m unittest -v \
+  test_anthropic_protocol \
+  test_anthropic_endpoint \
+  test_anthropic_worker \
+  test_anthropic_routing
+```
+
+These suites cover request/response conversion, native Anthropic response and
+SSE passthrough, synthesized streaming, `x-api-key` and Bearer authentication,
+tool use and tool results, thinking-block preservation, OpenCode Go header and
+per-model protocol selection, and direct/smart routing. They need no network
+and no Redis.
 
 ## 5. Smoke test after startup or deployment
 
@@ -229,6 +243,23 @@ OpenAI-compatible model discovery:
 ```bash
 curl -fsS \
   "http://127.0.0.1:${OPENAIX_ENDPOINT_PORT:-21434}/v1/models"
+```
+
+Anthropic Messages model discovery:
+
+```bash
+curl -fsS \
+  "http://127.0.0.1:${ANTHROPIC_ENDPOINT_PORT:-21435}/v1/models"
+```
+
+Anthropic Messages request (replace the key and model):
+
+```bash
+curl -fsS "http://127.0.0.1:${ANTHROPIC_ENDPOINT_PORT:-21435}/v1/messages" \
+  -H "x-api-key: ${AIDIR_API_KEY}" \
+  -H "anthropic-version: 2023-06-01" \
+  -H 'content-type: application/json' \
+  -d '{"model":"claude","max_tokens":256,"messages":[{"role":"user","content":"Hello"}]}'
 ```
 
 MCP JSON-RPC ping:

@@ -265,7 +265,7 @@ class Endpoint_ollama(BaseEndpoint):
 
     def _authorize_and_apply_envid(self, request: Request, body: dict) -> JSONResponse | None:
         """Validate API token, check envid access, and apply user autoassign_envid."""
-        token = self._extract_bearer_token(request)
+        token = self._extract_incoming_token(request)
         if not token:
             return None
 
@@ -309,6 +309,14 @@ class Endpoint_ollama(BaseEndpoint):
         if not auth_header.startswith("Bearer "):
             return ""
         return auth_header[7:].strip()
+
+    @classmethod
+    def _extract_incoming_token(cls, request: Request) -> str:
+        """Return x-api-key or a Bearer token supplied by an incoming client."""
+        api_key = str(request.headers.get("x-api-key") or "").strip()
+        if api_key:
+            return api_key
+        return cls._extract_bearer_token(request)
 
     def _find_api_user_by_token(self, token: str) -> dict | None:
         """Find API user from users.items by matching token."""
@@ -446,7 +454,7 @@ class Endpoint_ollama(BaseEndpoint):
             task.config["opencode_session"] = {"caller_reference": reference}
             return
 
-        token = self._extract_bearer_token(request)
+        token = self._extract_incoming_token(request)
         envid = str((task.payload or {}).get("envid") or "").strip()
         if token:
             identity_source, identity_value, effective_ttl = "authenticated", token, ttl_seconds
@@ -513,6 +521,9 @@ class Endpoint_ollama(BaseEndpoint):
             return routed_worker_id or worker_id
         if provider_api == "openai":
             routed_worker_id = self._resolve_worker_id_by_name("call_openai")
+            return routed_worker_id or worker_id
+        if provider_api == "anthropic":
+            routed_worker_id = self._resolve_worker_id_by_name("call_anthropic")
             return routed_worker_id or worker_id
         if provider_api == "opencode-go":
             routed_worker_id = self._resolve_worker_id_by_name("call_opencode_go")
@@ -593,6 +604,7 @@ class Endpoint_ollama(BaseEndpoint):
             probe_openai_model_availability=self._probe_openai_model_availability,
             resolve_probe_timeout_ms=self._resolve_probe_timeout_ms,
             resolve_worker_id_for_route=self._resolve_worker_id_for_route,
+            resolve_model_protocol=self._model_protocol,
             is_candidate_allowed=is_candidate_allowed,
             on_selection=self._log_smart_route_selection,
             on_failure=self._log_smart_route_failure,
@@ -794,6 +806,31 @@ class Endpoint_ollama(BaseEndpoint):
         """Return provider api type string for a configured provider."""
         return str(self._provider_cfg(provider_id).get("api") or "").strip()
 
+    def _is_anthropic_route(self, task) -> bool:
+        """Return whether a task was routed to an Anthropic Messages provider."""
+        provider_id = str(getattr(task, "route_provider_id", "") or "").strip()
+        if not provider_id:
+            route = (getattr(task, "config", None) or {}).get("route") if isinstance(getattr(task, "config", None), dict) else None
+            if isinstance(route, dict):
+                provider_id = str(route.get("resolved_provider") or "").strip()
+        if not provider_id or self._core is None or getattr(self._core, "config", None) is None:
+            return False
+        return self._provider_api(provider_id) == "anthropic"
+
+    def _model_protocol(self, provider_id: str, model_id: str) -> str:
+        """Return the configured transport protocol for one provider/model pair."""
+        model_cfg = self._find_provider_model_cfg(provider_id, model_id)
+        if isinstance(model_cfg, dict):
+            explicit = str(model_cfg.get("protocol") or "").strip()
+            if explicit:
+                return explicit
+        provider_api = self._provider_api(provider_id)
+        if provider_api == "anthropic":
+            return "anthropic-messages"
+        if provider_api in {"openai", "opencode-go", "openaix", "ollama", "llama-cpp"}:
+            return "chat-completions"
+        return ""
+
     def _resolve_probe_headers(self, provider_id: str, incoming_bearer_token: str = "") -> dict[str, str]:
         """Resolve auth headers for remote smart probes using provider override or pass-through bearer."""
         headers = self._build_auth_headers(self._provider_cfg(provider_id).get("auth") or {})
@@ -824,6 +861,11 @@ class Endpoint_ollama(BaseEndpoint):
         token = auth_cfg.get("token")
         if isinstance(token, str) and token.strip() and auth_type in {"bearer", "token", ""}:
             headers["Authorization"] = f"Bearer {token.strip()}"
+
+        if auth_type in {"x-api-key", "api-key"}:
+            api_key = auth_cfg.get("key") if auth_cfg.get("key") is not None else token
+            if isinstance(api_key, str) and api_key.strip():
+                headers["x-api-key"] = api_key.strip()
 
         if auth_type == "basic":
             username = auth_cfg.get("username")
@@ -957,6 +999,8 @@ class Endpoint_ollama(BaseEndpoint):
         if not base_url:
             return False
         headers = self._resolve_probe_headers(provider_id, incoming_bearer_token)
+        if self._provider_api(provider_id) == "anthropic":
+            headers.setdefault("anthropic-version", str(provider_cfg.get("anthropic_version") or "2023-06-01"))
         try:
             async with httpx.AsyncClient(timeout=max(0.001, timeout_ms / 1000.0), headers=headers) as client:
                 response = await client.get(f"{base_url}/v1/models")
@@ -1059,6 +1103,7 @@ class Endpoint_ollama(BaseEndpoint):
             "requested_alias": requested,
             "resolved_provider": selected["provider"],
             "resolved_model": selected["model_id"],
+            "resolved_protocol": self._model_protocol(selected["provider"], selected["model_id"]),
             "selection": "alias" if selected["rank"] == 0 else "model_id",
             "worker_preferred_provider": preferred_provider,
         }
@@ -1123,7 +1168,7 @@ class Endpoint_ollama(BaseEndpoint):
             return upstream if upstream is not None else JSONResponse(task.result or {})
         if task.status == STATUS_FAILED:
             error = task.error or {"message": "Worker error"}
-            upstream_response = upstream_error_response(error)
+            upstream_response = None if self._is_anthropic_route(task) else upstream_error_response(error)
             if upstream_response is not None:
                 return upstream_response
             if error.get("code") in {"TIMEOUT", "QUEUE_TIMEOUT"}:
@@ -1207,7 +1252,11 @@ class Endpoint_ollama(BaseEndpoint):
 
                 if chunk is None:
                     if task.status == STATUS_FAILED:
-                        encoded = (json.dumps(upstream_error_payload(task.error or {})) + "\n").encode()
+                        error_payload = task.error or {}
+                        if self._is_anthropic_route(task):
+                            encoded = (json.dumps({"error": {"code": error_payload.get("code", "UPSTREAM_ERROR"), "message": error_payload.get("message", "Upstream error")}}) + "\n").encode()
+                        else:
+                            encoded = (json.dumps(upstream_error_payload(error_payload)) + "\n").encode()
                         yield encoded
                         if spool is not None:
                             spool.write(encoded)

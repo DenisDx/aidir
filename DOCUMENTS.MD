@@ -55,9 +55,11 @@ Proposals may include both planned and completed work; consult each document.
 | [_proposal_update_1.md](_proposal_update_1.md) | Proposed first security-update round. |
 | [before_tools_worker.md](before_tools_worker.md) | Pre-tool-call context-processing hook. |
 | [proposal_aidir_smart_router.md](proposal_aidir_smart_router.md) | Resource-aware smart routing design. |
+| [proposal_kv_keeper.md](proposal_kv_keeper.md) | KV-affinity smart routing: prefix fingerprinting, sticky candidate selection, queue-imbalance diversion, and per-request session resources. |
 | [proposal_http_api.md](proposal_http_api.md) | Token-authenticated HTTP API tool worker. |
 | [proposal_hooks.md](proposal_hooks.md) | Event-driven hook loading, lifecycle API, and llama.cpp empty-response recovery. |
 | [proposal_llama_cpp.md](proposal_llama_cpp.md) | llama.cpp provider and server-lifecycle integration. |
 | [proposal_ollama_embed.md](proposal_ollama_embed.md) | Transparent Ollama embedding support through OpenAIx. |
+| [proposal_anthropic.md](proposal_anthropic.md) | Anthropic Messages endpoint, provider transport, per-model protocol routing, and OpenCode Go Messages models. |
 | [proposal_opencode_go.md](proposal_opencode_go.md) | OpenCode Go provider and session integration. |
 | [proposal_searxng.md](proposal_searxng.md) | SearXNG search/fetch worker integration. |

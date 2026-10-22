@@ -246,14 +246,14 @@ class WorkerConfigParityTests(unittest.TestCase):
     def test_both_sides_merge_the_same_entries(self):
         """Every worker directory is configured, with or without a local file."""
         self.assertEqual(set(self.merged_entries), set(self.reference_entries))
-        self.assertEqual(len(self.merged_entries), 15)
+        self.assertEqual(len(self.merged_entries), 16)
 
     def test_the_six_workers_with_a_local_file_are_present(self):
         with_local = {
             worker_id for worker_id, entry in self.merged_entries.items()
             if entry and self.reference_entries.get(worker_id) == entry
         }
-        self.assertEqual(len(with_local), 15)
+        self.assertEqual(len(with_local), 16)
         for worker_id in ("web_search", "web_fetch", "http_api", "openaix"):
             self.assertIn(worker_id, with_local)
 

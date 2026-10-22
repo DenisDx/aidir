@@ -45,6 +45,7 @@ class SmartRouter:
         check_resource_available_for_reuse: Callable[[dict, str, str], bool] | None = None,
         probe_openai_model_availability: Callable[..., Awaitable[bool]] | None = None,
         resolve_worker_id_for_route: Callable[[str, dict | None], str] | None = None,
+        resolve_model_protocol: Callable[[str, str], str] | None = None,
         is_candidate_allowed: Callable[[str, str], bool] | None = None,
         on_selection: Callable[[dict], None] | None = None,
         on_failure: Callable[[dict, str, list[dict]], None] | None = None,
@@ -63,6 +64,7 @@ class SmartRouter:
         self._probe_openai_model_availability = probe_openai_model_availability
         self._resolve_probe_timeout_ms = resolve_probe_timeout_ms
         self._resolve_worker_id_for_route = resolve_worker_id_for_route
+        self._resolve_model_protocol = resolve_model_protocol
         self._is_candidate_allowed = is_candidate_allowed
         self._on_selection = on_selection
         self._on_failure = on_failure
@@ -224,7 +226,7 @@ class SmartRouter:
         timeout_ms = self._resolve_probe_timeout_ms(item)
         provider_api = self._provider_api(provider_id)
 
-        if provider_api in {"openai", "opencode-go"} and self._probe_openai_model_availability is not None:
+        if provider_api in {"openai", "opencode-go", "anthropic"} and self._probe_openai_model_availability is not None:
             probe_ok = bool(
                 await self._probe_openai_model_availability(
                     provider_id,
@@ -368,6 +370,14 @@ class SmartRouter:
             reason=reason,
             candidate_probes=candidate_probes,
         )
+        if self._resolve_model_protocol is not None:
+            route_result["resolved_protocol"] = str(
+                self._resolve_model_protocol(
+                    str(route_result.get("resolved_provider") or ""),
+                    str(route_result.get("resolved_model") or ""),
+                )
+                or ""
+            )
         resolved_worker = self._default_worker_id
         if self._resolve_worker_id_for_route is not None:
             resolved_worker = str(self._resolve_worker_id_for_route(self._default_worker_id, route_result) or self._default_worker_id)

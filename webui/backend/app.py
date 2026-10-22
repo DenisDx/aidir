@@ -32,6 +32,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from core import log
 from core.error_logging import attach_request_id_middleware, get_or_create_request_id, log_exception
+from core.messages_protocol import internal_request_to_messages
 
 if TYPE_CHECKING:
     from core.app import Core
@@ -1465,10 +1466,18 @@ def create_app(
         if not port:
             raise HTTPException(status_code=503, detail="Endpoint has no port configured")
 
-        if protocol == "openai":
-            url = f"http://127.0.0.1:{port}/v1/chat/completions"
-        elif protocol == "anthropic":
+        if protocol == "anthropic":
+            if ep_api != "anthropic":
+                raise HTTPException(status_code=422, detail="Selected endpoint does not speak Anthropic Messages")
+            try:
+                body = internal_request_to_messages(body, default_max_tokens=4096)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc))
             url = f"http://127.0.0.1:{port}/v1/messages"
+        elif ep_api == "anthropic":
+            raise HTTPException(status_code=422, detail="Anthropic endpoints require the anthropic protocol")
+        elif protocol == "openai":
+            url = f"http://127.0.0.1:{port}/v1/chat/completions"
         else:
             url = f"http://127.0.0.1:{port}/api/chat"
 
