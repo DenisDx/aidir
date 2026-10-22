@@ -781,7 +781,7 @@
                   type: "string",
                   min_length: 1,
                   apply: "restart",
-                  description: "Base URL of the provider; for OpenCode Go it excludes the /v1 suffix",
+                  description: "Provider API root; OpenCode Go, OpenAI, and Anthropic paths append /v1 themselves",
                   env: { allowed: true, convert: "string" },
                   ui: { placeholder: "http://127.0.0.1:11434" },
                 },

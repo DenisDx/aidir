@@ -37,12 +37,12 @@ class _Config:
 class _Core:
     """Minimal core used by the endpoint contract tests."""
 
-    def __init__(self, *, stream_chunks=None, error=None, users=None) -> None:
+    def __init__(self, *, stream_chunks=None, error=None, users=None, providers=None) -> None:
         data = {
             "instance": "test",
             "workers": {"default": "openaix", "items": {"openaix": {"enabled": True}}},
             "models": {
-                "providers": {
+                "providers": providers or {
                     "local": {
                         "api": "openaix",
                         "models": [{"id": "real-model", "alias": "alias"}],
@@ -59,11 +59,13 @@ class _Core:
         self.resources = None
         self.queue = None
         self.delete_task = AsyncMock()
+        self.tasks = []
         self._stream_chunks = stream_chunks
         self._error = error
 
     async def on_task_added(self, task) -> None:
         """Complete the queued task immediately or fail it with the configured error."""
+        self.tasks.append(task)
         if self._error is not None:
             task.error = dict(self._error)
             task.status = STATUS_FAILED
@@ -102,6 +104,17 @@ class AnthropicEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["role"], "assistant")
         self.assertEqual(payload["content"][0], {"type": "text", "text": "hello"})
         self.assertEqual(payload["usage"], {"input_tokens": 2, "output_tokens": 1})
+
+    def test_configured_task_timeouts_are_applied(self) -> None:
+        """Apply tasks.queue_timeout and tasks.run_timeout to the queued task."""
+        core = _Core()
+        response = _client(core).post(
+            "/v1/messages",
+            json={"model": "alias", "max_tokens": 32, "messages": [{"role": "user", "content": "hi"}]},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(core.tasks[0].queue_timeout, 5)
+        self.assertEqual(core.tasks[0].run_timeout, 5)
 
     def test_count_tokens_does_not_queue(self) -> None:
         """Estimate tokens directly and require no task."""
@@ -160,6 +173,16 @@ class AnthropicEndpointTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(response.status_code, 404)
         self.assertEqual(response.json()["error"]["type"], "not_found_error")
+
+    def test_embedding_model_is_rejected_for_chat(self) -> None:
+        """Reject an embedding-only model with invalid_request_error."""
+        core = _Core(providers={"local": {"api": "openaix", "models": [{"id": "embed", "alias": "embed", "embedding": True}]}})
+        response = _client(core).post(
+            "/v1/messages",
+            json={"model": "embed", "max_tokens": 32, "messages": [{"role": "user", "content": "hi"}]},
+        )
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(response.json()["error"]["type"], "invalid_request_error")
 
     def test_timeout_error_mapping(self) -> None:
         """Map a failed timed-out task to a 504 Anthropic timeout error."""

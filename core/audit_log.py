@@ -32,7 +32,10 @@ _JOURNALS = {
     "task": "tasks",
     "task_reconciliation": "tasks",
 }
-_SECRET_METADATA_KEYS = {"authorization", "cookie", "set-cookie", "token", "api_key", "api-key", "password", "secret"}
+_SECRET_METADATA_KEYS = {
+    "authorization", "cookie", "set-cookie", "token", "api_key", "api-key",
+    "x-api-key", "x-opencode-session", "password", "secret",
+}
 _DATA_URI_RE = re.compile(r"^data:((?:image|audio|video)/[a-z0-9.+-]+);base64,([a-z0-9+/=\s]+)$", re.IGNORECASE)
 
 

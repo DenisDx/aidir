@@ -242,6 +242,17 @@ class MessagesStreamingTests(unittest.TestCase):
         self.assertEqual(events[1]["content_block"]["name"], "run")
         self.assertEqual(events[2]["delta"]["type"], "input_json_delta")
 
+    def test_encoder_streams_incremental_tool_arguments(self) -> None:
+        """Emit one tool_use block whose input_json_delta values are incremental."""
+        encoder = AnthropicStreamEncoder(model="m", message_id="msg_1")
+        encoder.feed({"message": {"tool_calls": [{"id": "call_1", "function": {"name": "run", "arguments": ""}}]}, "done": False})
+        first = encoder.feed({"message": {"tool_calls": [{"id": "call_1", "function": {"name": "run", "arguments": "{\"x\":"}}]}, "done": False})
+        second = encoder.feed({"message": {"tool_calls": [{"id": "call_1", "function": {"name": "run", "arguments": "1}"}}]}, "done": False})
+        final = encoder.feed({"done": True, "done_reason": "tool_calls"})
+        self.assertEqual(first[0]["delta"], {"type": "input_json_delta", "partial_json": "{\"x\":"})
+        self.assertEqual(second[0]["delta"], {"type": "input_json_delta", "partial_json": "1}"})
+        self.assertEqual(final[0]["type"], "content_block_stop")
+
     def test_decoder_text_and_tool_use(self) -> None:
         """Assemble text, tool calls, stop reason, and usage from SSE events."""
         decoder = AnthropicStreamDecoder()

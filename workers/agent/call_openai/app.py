@@ -105,6 +105,7 @@ class CallOpenAIWorker(OpenAIxWorker):
         """Send an OpenAI-compatible llama.cpp request and normalize the response for endpoints."""
         provider_id = self._resolve_task_provider_id(task) if task is not None else self._provider_id
         upstream_payload = {**payload, "stream": False}
+        upstream_payload.pop("thinking", None)
         request = self._build_json_request(client, url, upstream_payload)
         history_entry = await self._begin_llm_call(task, url=url, payload=upstream_payload, provider_id=provider_id, save_call=save_call, request_body=request.content) if task else None
         response = await self._send_json_request(client, request, upstream_payload)
@@ -143,6 +144,7 @@ class CallOpenAIWorker(OpenAIxWorker):
         content_parts: list[str] = []
         thinking_parts: list[str] = []
         upstream_payload = {**payload, "stream": True}
+        upstream_payload.pop("thinking", None)
         response_spool = None
         request = self._build_json_request(client, url, upstream_payload)
         history_entry = await self._begin_llm_call(task, url=url, payload=upstream_payload, provider_id=provider_id, save_call=save_call, request_body=request.content) if task else None

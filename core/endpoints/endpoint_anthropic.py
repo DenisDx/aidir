@@ -10,7 +10,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from core import log
-from core.endpoints.endpoint_ollama import Endpoint_ollama
+from core.endpoints.endpoint_openaix import Endpoint_openaix
 from core.error_logging import attach_request_id_middleware, get_or_create_request_id, log_exception
 from core.messages_protocol import (
     AnthropicStreamEncoder,
@@ -29,7 +29,7 @@ from core.upstream_errors import upstream_error_response
 from core.upstream_response import UpstreamChunk, original_chunk, original_response
 
 
-class Endpoint_anthropic(Endpoint_ollama):
+class Endpoint_anthropic(Endpoint_openaix):
     """Endpoint implementing the Anthropic Messages protocol."""
 
     api = "anthropic"
@@ -151,6 +151,17 @@ class Endpoint_anthropic(Endpoint_ollama):
                 code="INVALID_MODEL",
                 message=f"Unknown model: {internal_payload.get('model') or ''}",
             )
+        provider_id = str(route.get("resolved_provider") or "")
+        model_id = str(route.get("resolved_model") or "")
+        model_cfg = self._find_provider_model_cfg(provider_id, model_id)
+        if isinstance(model_cfg, dict) and model_cfg.get("embedding") is True:
+            self._audit_pre_task_rejection(request, protocol="anthropic", status_code=422, error_code="EMBEDDING_NOT_SUPPORTED", reason=model_id)
+            return self._messages_error_response(
+                request,
+                status_code=422,
+                code="EMBEDDING_NOT_SUPPORTED",
+                message=f"Model '{internal_payload.get('model') or model_id}' does not support chat",
+            )
 
         self._audit_client_request(task, request, body, protocol="anthropic", raw_body=raw_body)
 
@@ -209,10 +220,6 @@ class Endpoint_anthropic(Endpoint_ollama):
         if not isinstance(messages, list) or not messages:
             return self._messages_error_response(request, status_code=400, code="INVALID_REQUEST", message="Field 'messages' must be a non-empty array")
         return JSONResponse({"input_tokens": estimate_input_tokens(body)})
-
-    def _external_model_id(self, model_cfg: dict) -> str:
-        """Return the client-facing alias or model id."""
-        return self._model_alias(model_cfg) or self._model_id(model_cfg)
 
     def _messages_models_response(self) -> dict:
         """Build the Anthropic model list response."""
@@ -380,11 +387,14 @@ class Endpoint_anthropic(Endpoint_ollama):
                 if chunk is None:
                     if task.status == STATUS_FAILED:
                         error = task.error if isinstance(task.error, dict) else {}
+                        error_code = str(error.get("code") or "")
+                        upstream_status = int(error.get("upstream_status") or 0)
+                        if error_code.upper() in {"", "UPSTREAM_ERROR", "UPSTREAM_INVALID_JSON"} and upstream_status:
+                            error_type = messages_error_type_for_status(upstream_status)
+                        else:
+                            error_type = messages_error_type_for_code(error_code)
                         encoded = sse_event_bytes(
-                            messages_error_payload(
-                                messages_error_type_for_code(str(error.get("code") or "")),
-                                str(error.get("message") or "Request failed"),
-                            )
+                            messages_error_payload(error_type, str(error.get("message") or "Request failed"))
                         )
                         yield encoded
                         if spool is not None:

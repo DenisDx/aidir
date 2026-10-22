@@ -85,6 +85,13 @@ class CallOllamaWorker(BaseWorker):
             )
 
         payload: dict = dict(task.payload)    # shallow copy; we may mutate stream/options
+        payload.pop("thinking", None)
+        if isinstance(payload.get("messages"), list):
+            payload["messages"] = [
+                {key: value for key, value in message.items() if key != "anthropic_blocks"}
+                if isinstance(message, dict) else message
+                for message in payload["messages"]
+            ]
         provider_id = self._resolve_task_provider_id(task)
         base_url = self._resolve_base_url(provider_id)
         request_kind = str((task.config or {}).get("request_kind") or "chat").strip().lower()
@@ -114,6 +121,7 @@ class CallOllamaWorker(BaseWorker):
                 log_exception("worker", "call_ollama", f"Unexpected embedding error task={task.id} provider={provider_id}", exc)
                 return WorkerResult(ok=False, error={"code": "EXCEPTION", "message": self._describe_exception(exc)})
 
+        payload = self._normalize_generation_fields(payload)
         payload = self._apply_model_generation_defaults(payload, provider_id=provider_id)
         payload = self._apply_model_context_window(payload, provider_id=provider_id)
         stream: bool = task.stream
@@ -212,6 +220,21 @@ class CallOllamaWorker(BaseWorker):
             return repr_text
 
         return exc.__class__.__name__
+
+    @classmethod
+    def _normalize_generation_fields(cls, payload: dict) -> dict:
+        """Move OpenAI-style generation aliases into Ollama options."""
+        if not isinstance(payload, dict):
+            return payload
+        out = dict(payload)
+        options = dict(out.get("options")) if isinstance(out.get("options"), dict) else {}
+        for field_name, option_name in cls._GENERATION_OPTION_FIELDS.items():
+            value = out.get(field_name)
+            if value is not None and options.get(option_name) is None:
+                options[option_name] = value
+        if options:
+            out["options"] = options
+        return out
 
     def _apply_model_context_window(self, payload: dict, provider_id: str | None = None) -> dict:
         """Set options.num_ctx from model config contextWindow when not explicitly provided."""

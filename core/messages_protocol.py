@@ -9,7 +9,6 @@ from __future__ import annotations
 import json
 import math
 import uuid
-from typing import Any
 
 ANTHROPIC_VERSION = "2023-06-01"
 DEFAULT_MAX_TOKENS = 4096
@@ -72,7 +71,7 @@ def messages_error_type_for_code(code: str) -> str:
         return "rate_limit_error"
     if normalized in {"overloaded", "overloaded_error", "queue_error", "no_worker"}:
         return "overloaded_error"
-    if normalized in {"invalid_request", "invalid_request_error", "validation_error"}:
+    if normalized in {"invalid_request", "invalid_request_error", "validation_error", "invalid_envid", "embedding_not_supported"}:
         return "invalid_request_error"
     return "api_error"
 
@@ -130,6 +129,13 @@ def _coerce_text_content(content: object) -> str:
         value = content.get("text")
         return value if isinstance(value, str) else ""
     return str(content)
+
+
+def _collapse_text_parts(parts: list[dict]) -> str | list[dict]:
+    """Return plain text when every part is text, otherwise keep OpenAI content parts."""
+    if parts and all(part.get("type") == "text" for part in parts):
+        return "\n".join(str(part.get("text") or "") for part in parts if part.get("text"))
+    return parts if parts else ""
 
 
 def _data_url_parts(url: str) -> tuple[str, str] | None:
@@ -392,7 +398,7 @@ def messages_request_to_internal(body: dict, *, default_max_tokens: int | None =
             internal_messages.extend(pending_tool_results)
             pending_tool_results = []
 
-        message_out: dict = {"role": role, "content": text_parts if text_parts else ""}
+        message_out: dict = {"role": role, "content": _collapse_text_parts(text_parts)}
         if tool_calls:
             message_out["tool_calls"] = tool_calls
         if opaque_blocks:
@@ -879,7 +885,8 @@ class AnthropicStreamEncoder:
         self.output_tokens = 0
         self.stop_reason = "end_turn"
         self.stop_sequence: str | None = None
-        self._tool_calls: dict[int, dict] = {}
+        self._tool_calls: dict[str, dict] = {}
+        self._open_tool_call_id: str | None = None
 
     def _message_start(self) -> dict:
         """Build and mark the initial message_start event."""
@@ -904,6 +911,7 @@ class AnthropicStreamEncoder:
             return []
         event = {"type": "content_block_stop", "index": self.block_index}
         self.open_block = None
+        self._open_tool_call_id = None
         return [event]
 
     def _start_block(self, block_type: str, content_block: dict) -> list[dict]:
@@ -919,6 +927,10 @@ class AnthropicStreamEncoder:
         if self.stopped or not isinstance(chunk, dict):
             return []
         events: list[dict] = []
+        usage = chunk.get("usage") if isinstance(chunk.get("usage"), dict) else {}
+        if usage:
+            self.input_tokens = int(usage.get("prompt_tokens") or usage.get("input_tokens") or self.input_tokens or 0)
+            self.output_tokens = int(usage.get("completion_tokens") or usage.get("output_tokens") or self.output_tokens or 0)
         if not self.started:
             events.append(self._message_start())
         message = chunk.get("message") if isinstance(chunk.get("message"), dict) else {}
@@ -939,29 +951,41 @@ class AnthropicStreamEncoder:
             call_id = str(call.get("id") or "")
             if not call_id:
                 call_id = f"toolu_{uuid.uuid4().hex[:12]}"
+            if self.open_block == "tool_use" and self._open_tool_call_id != call_id:
+                events.extend(self._close_block())
             if call_id not in self._tool_calls:
-                self._tool_calls[call_id] = call
+                self._tool_calls[call_id] = {"name": str(function.get("name") or ""), "arguments": ""}
                 events.extend(
                     self._start_block(
                         "tool_use",
                         {"type": "tool_use", "id": call_id, "name": str(function.get("name") or ""), "input": {}},
                     )
                 )
-                arguments = _stringify_arguments(function.get("arguments"))
-                if arguments:
+                self._open_tool_call_id = call_id
+            raw_arguments = function.get("arguments")
+            if isinstance(raw_arguments, str):
+                arguments = raw_arguments
+            elif raw_arguments is None:
+                arguments = ""
+            else:
+                arguments = _stringify_arguments(raw_arguments)
+            previous = self._tool_calls[call_id]["arguments"]
+            if arguments:
+                if arguments.startswith(previous):
+                    delta = arguments[len(previous):]
+                    self._tool_calls[call_id]["arguments"] = arguments
+                else:
+                    delta = arguments
+                    self._tool_calls[call_id]["arguments"] = previous + arguments
+                if delta:
                     events.append(
                         {
                             "type": "content_block_delta",
                             "index": self.block_index,
-                            "delta": {"type": "input_json_delta", "partial_json": arguments},
+                            "delta": {"type": "input_json_delta", "partial_json": delta},
                         }
                     )
-                events.extend(self._close_block())
 
-        usage = chunk.get("usage") if isinstance(chunk.get("usage"), dict) else {}
-        if usage:
-            self.input_tokens = int(usage.get("prompt_tokens") or usage.get("input_tokens") or self.input_tokens or 0)
-            self.output_tokens = int(usage.get("completion_tokens") or usage.get("output_tokens") or self.output_tokens or 0)
         if chunk.get("done"):
             self.stop_reason = _finish_reason_to_stop_reason(chunk.get("done_reason") or chunk.get("stop_reason"), stop_sequence=chunk.get("stop_sequence"))
             self.stop_sequence = chunk.get("stop_sequence")

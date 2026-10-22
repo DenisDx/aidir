@@ -1318,6 +1318,7 @@ class Endpoint_openaix(Endpoint_ollama):
             "requested_alias": requested,
             "resolved_provider": selected["provider"],
             "resolved_model": selected["model_id"],
+            "resolved_protocol": self._model_protocol(selected["provider"], selected["model_id"]),
             "selection": "alias" if selected["rank"] == 0 else "model_id",
             "worker_preferred_provider": preferred_provider,
         }
@@ -1829,7 +1830,7 @@ class Endpoint_openaix(Endpoint_ollama):
 
     def _ollama_sync_to_openai(self, data: dict, task_id: str, request_body: dict) -> dict:
         """Convert non-stream ollama chat response to OpenAI chat.completion shape."""
-        msg = data.get("message") or {}
+        msg = {key: value for key, value in (data.get("message") or {}).items() if key != "anthropic_blocks"}
         content = msg.get("content", "")
         model = data.get("model") or request_body.get("model") or ""
         tool_calls = self._ollama_tool_calls_to_openai(msg.get("tool_calls"))
@@ -1865,7 +1866,7 @@ class Endpoint_openaix(Endpoint_ollama):
         """Convert one ollama stream chunk to OpenAI chat.completion.chunk shape."""
         if isinstance(chunk, UpstreamChunk) and chunk.protocol == "ollama" and chunk.original is not None:
             chunk = chunk.original
-        msg = chunk.get("message") or {}
+        msg = {key: value for key, value in (chunk.get("message") or {}).items() if key != "anthropic_blocks"}
         done = bool(chunk.get("done", False))
         tool_calls = self._ollama_tool_calls_to_openai(msg.get("tool_calls"), streaming=True)
 

@@ -26,7 +26,10 @@ class CallAnthropicWorker(CallOpenAIWorker):
 
     def _chat_url(self, provider_id: str, task: Task | None = None) -> str:
         """Return the Anthropic Messages inference URL."""
-        return f"{self._resolve_base_url(provider_id)}/v1/messages"
+        base_url = self._resolve_base_url(provider_id)
+        if base_url.endswith("/v1"):
+            base_url = base_url[:-3]
+        return f"{base_url}/v1/messages"
 
     def _resolve_request_headers(self, task: Task, provider_id: str) -> dict[str, str]:
         """Add the Anthropic version header to configured authentication headers."""

@@ -1165,7 +1165,9 @@ class Endpoint_ollama(BaseEndpoint):
 
         if task.status == STATUS_COMPLETED:
             upstream = original_response(task.upstream_response, "ollama")
-            return upstream if upstream is not None else JSONResponse(task.result or {})
+            if upstream is not None:
+                return upstream
+            return JSONResponse(self._strip_anthropic_message(task.result or {}))
         if task.status == STATUS_FAILED:
             error = task.error or {"message": "Worker error"}
             upstream_response = None if self._is_anthropic_route(task) else upstream_error_response(error)
@@ -1185,6 +1187,13 @@ class Endpoint_ollama(BaseEndpoint):
             {"error": {"code": "CANCELED", "message": "Task was canceled"}},
             status_code=_HTTP_BUSY,
         )
+
+    def _strip_anthropic_message(self, result: dict) -> dict:
+        """Remove Anthropic-only message extensions from a non-Anthropic client response."""
+        message = result.get("message") if isinstance(result, dict) else None
+        if not isinstance(message, dict) or "anthropic_blocks" not in message:
+            return result
+        return {**result, "message": {key: value for key, value in message.items() if key != "anthropic_blocks"}}
 
     async def _streaming_response(self, task: Task_agent) -> Response:
         """Wait for first output so executor failures can retain their HTTP status."""

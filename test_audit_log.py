@@ -690,3 +690,15 @@ class AuditLogTests(unittest.TestCase):
 
             self.assertEqual(event["metadata"]["tenant_secret"], "[REDACTED]")
             self.assertEqual(event["data"], {"tenant_secret": "body-value"})
+
+    def test_anthropic_and_opencode_headers_are_redacted(self):
+        """Redact x-api-key and x-opencode-session from audit metadata."""
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            audit_log = AuditLog(temporary_directory)
+            event = audit_log.record_raw_event(
+                "client_request",
+                metadata={"x-api-key": "k", "x-opencode-session": "s", "anthropic-version": "2023-06-01"},
+            )
+            self.assertEqual(event["metadata"]["x-api-key"], "[REDACTED]")
+            self.assertEqual(event["metadata"]["x-opencode-session"], "[REDACTED]")
+            self.assertEqual(event["metadata"]["anthropic-version"], "2023-06-01")
