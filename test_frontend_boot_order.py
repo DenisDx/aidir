@@ -96,6 +96,11 @@ class FrontendBootOrderTests(unittest.TestCase):
         self.assertEqual(self.report["afterLogin"]["statusLine"], "")
         self.assertNotIn("afterLoginError", self.report)
 
+    def test_host_checkboxes_follow_the_editor_view_state(self):
+        """Search can enable show-absent by itself; the host must reflect that."""
+        self.assertTrue(self.report["afterViewChange"]["showAbsent"])
+        self.assertTrue(self.report["afterViewChange"]["valuesAsText"])
+
 
 class SettingsPageMarkupTests(unittest.TestCase):
     """The markup the editor binds to must still be present."""

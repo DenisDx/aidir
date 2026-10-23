@@ -104,11 +104,19 @@ global.apiPost = async () => ({ ok: true, status: 200, data: { ok: true } });
 
 // ── Library assets are plain <script> tags ahead of app.js ────────────────
 const mounts = [];
+const treeState = { showAbsent: false, valuesAsText: false, handlers: {} };
 global.aiset = {
   mountTree(selector, options) {
     mounts.push({ selector, document: options && options.document });
+    treeState.showAbsent = !!(options && options.showAbsent);
+    treeState.valuesAsText = !!(options && options.valuesAsText);
     treeNode.innerHTML = '<div class="aiset">editor</div>';
-    return { on() {}, destroy() {}, setDocument() {} };
+    return {
+      on(name, handler) { treeState.handlers[name] = handler; },
+      destroy() {}, setDocument() {},
+      getShowAbsent() { return treeState.showAbsent; },
+      getValuesAsText() { return treeState.valuesAsText; },
+    };
   },
 };
 
@@ -152,6 +160,18 @@ function snapshot() {
     }
     await new Promise(resolve => setTimeout(resolve, 60));
     report.afterLogin = snapshot();
+
+    // Search may reveal a declared-but-absent key by switching the view on;
+    // the host checkboxes must follow the editor rather than keep their state.
+    treeState.showAbsent = true;
+    treeState.valuesAsText = true;
+    if (treeState.handlers.viewchange) {
+      treeState.handlers.viewchange({ showAbsent: true, valuesAsText: true });
+    }
+    report.afterViewChange = {
+      showAbsent: !!els['cfg-show-absent'].checked,
+      valuesAsText: !!els['cfg-values-as-text'].checked,
+    };
   }
 
   process.stdout.write(JSON.stringify(report, null, 2));

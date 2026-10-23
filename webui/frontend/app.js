@@ -1331,6 +1331,15 @@ function bindSettingsUi() {
   $('cfg-restart-btn').addEventListener('click', restartAidir);
 }
 
+// The editor owns both view options, and search may switch show-absent on by
+// itself to reveal a declared but unwritten key. Mirror the editor's state back
+// into the host checkboxes so they never contradict the tree.
+function syncSettingsViewOptions() {
+  if (!settingsEditor) return;
+  $('cfg-show-absent').checked = settingsEditor.getShowAbsent() === true;
+  $('cfg-values-as-text').checked = settingsEditor.getValuesAsText() === true;
+}
+
 /**
  * List the configuration documents and mount the editor on the first one.
  *
@@ -1532,6 +1541,7 @@ function mountSettingsEditor(documentId) {
     node.style.color = event.state === 'error' ? 'var(--err)' : 'var(--muted)';
   });
   settingsEditor.on('applied', () => setCfgStatus('cfg-aiset-lifecycle-status', 'Saved.', true));
+  settingsEditor.on('viewchange', syncSettingsViewOptions);
 
   return settingsEditor.ready;
 }
