@@ -407,11 +407,11 @@ timeouts and transport failures are retried.
 ```
 
 On the peer's OpenAIx endpoint, `peer_resources.auth_mode` controls access to
-`/v1/resources` and `/api/resources`. The default `endpoint` mode requires the
-normal bearer-token and environment authorization checks; `disabled` permits
-read-only resource discovery on a trusted network. The reading side needs the
-credentials: give the provider an `auth` block with the token the peer knows
-(see "Peer task visibility" above).
+`/v1/resources` and `/api/resources`. The default `disabled` mode permits
+read-only resource discovery on a trusted network; `endpoint` requires the
+normal bearer-token and environment authorization checks. With `endpoint` the
+reading side needs the credentials: give the provider an `auth` block with the
+token the peer knows (see "Peer task visibility" below).
 
 ### Peer task visibility
 
@@ -420,14 +420,15 @@ local task queue. Rows from another instance show their source instance, worker,
 and resolved model; their actions are read-only. The peer endpoint serves
 `GET /v1/tasks`, returning only active task summaries without request or
 response bodies. `peer_tasks.auth_mode` on the peer's `openaix` endpoint controls
-that route: **`endpoint` (the default) requires the normal bearer-token and
-environment authorization checks**, while `disabled` publishes it on a trusted
-network. Both the local and remote instances must run a version that provides
+that route: **`disabled` (the default) publishes it on a trusted network**,
+while `endpoint` requires the normal bearer-token and environment authorization
+checks. Both the local and remote instances must run a version that provides
 this route.
 
-Because the peer publishes its state only with a token, **the reading side must
-carry one**: give the provider an `auth` block with the token the peer knows in
-its `users.items`:
+Because the peer publishes its state without a token by default, an existing
+deployment needs no extra configuration. When `endpoint` is selected, **the
+reading side must carry a token**: give the provider an `auth` block with the
+token the peer knows in its `users.items`:
 
 ```json5
 "remote_aidir_110": {

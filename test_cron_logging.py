@@ -212,6 +212,16 @@ class TestCronLogging(unittest.TestCase):
             self.assertEqual(log_file.stat().st_ino, original_inode)
             self.assertEqual(log_file.read_bytes(), b"recent\nnew process output\n")
 
+    def test_maintenance_core_does_not_own_task_recovery(self) -> None:
+        """The cron Core must not mark live tasks as interrupted by a restart."""
+        maintenance = cron.Core.__new__(cron.Core)
+        maintenance._loop_workers_only = True
+        primary = cron.Core.__new__(cron.Core)
+        primary._loop_workers_only = False
+
+        self.assertFalse(maintenance._owns_task_recovery())
+        self.assertTrue(primary._owns_task_recovery())
+
     def test_loop_workers_cycle_does_not_manage_local_servers(self) -> None:
         """Cron loop workers must not stop production-owned llama.cpp servers."""
         class _MaintenanceCore:

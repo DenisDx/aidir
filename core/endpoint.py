@@ -118,13 +118,14 @@ class BaseEndpoint(ABC):
     def _peer_auth_mode(self, block: object) -> str:
         """Return the publication mode of a peer block.
 
-        `endpoint` is the default: the peer task list and the resource inventory
-        of an instance are not published to the network without a token.
+        `disabled` is the default: an existing multi-instance deployment keeps
+        publishing its read-only task list and resource inventory on a trusted
+        network. `endpoint` turns the token requirement on explicitly.
         """
         config = block if isinstance(block, dict) else {}
-        mode = str(config.get("auth_mode") or "endpoint").strip().lower()
+        mode = str(config.get("auth_mode") or "disabled").strip().lower()
         if mode not in {"disabled", "endpoint"}:
-            return "endpoint"
+            return "disabled"
         return mode
 
     @staticmethod

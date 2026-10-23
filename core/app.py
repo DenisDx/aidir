@@ -126,6 +126,15 @@ class Core:
         self._manage_local_servers = manage_local_servers
         self._loop_workers_only = loop_workers_only
 
+    def _owns_task_recovery(self) -> bool:
+        """Return whether this Core may terminalize tasks left by a previous run.
+
+        A maintenance-only Core (the cron process) shares Redis with the live
+        service. Recovering the task hashes there would mark the live tasks as
+        interrupted while their workers are still running them.
+        """
+        return not self._loop_workers_only
+
     def _track_background_task(self, task: asyncio.Task) -> None:
         """Track a background task and log unexpected failures."""
         self._background_tasks.add(task)
@@ -225,9 +234,10 @@ class Core:
             task_created_callback=self._on_task_created,
             audit_log=self.audit_log,
         )
-        recovery = await self.queue.recover_startup_tasks()
-        if any(recovery.values()):
-            log("system", "info", f"Task recovery: {recovery}")
+        if self._owns_task_recovery():
+            recovery = await self.queue.recover_startup_tasks()
+            if any(recovery.values()):
+                log("system", "info", f"Task recovery: {recovery}")
 
         # ── Envid registry ─────────────────────────────────────────────────
         self.envid_registry = EnvidRegistry(self.redis, instance)
