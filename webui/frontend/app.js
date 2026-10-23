@@ -15,6 +15,18 @@ let runtimeState = {
   active_tasks: 0,
   restart_wait_timeout: 120,
 };
+// A restart is latched. The banner must survive the whole restart: the service
+// is unreachable while it is down, so there is no successful poll to keep it
+// alive, and the shutdown may not have set its flag yet. The latch is released
+// when the service answers again after having been observed down.
+let restartLatched = false;
+let serverWasDown = false;
+// Every poll carries a number. A poll that was already in flight when the
+// service went down may still answer, and its answer belongs to the service
+// that was shutting down. The latch may only be released by a poll that
+// started after the service was seen down.
+let pollSequence = 0;
+let serverDownSequence = 0;
 let cronHealth = null;
 
 const SERVER_UNAVAILABLE_STATUSES = new Set([502, 503, 504]);
@@ -85,11 +97,25 @@ async function apiPost(url, body) {
 async function apiGet(url) {
   try {
     const r = await fetch(url, { credentials: 'include' });
-    if (r.status === 401) { doLogout(); return null; }
+    if (r.status === 401) {
+      // A restart takes the service down and brings it back with the same
+      // sessions. Logging the operator out in the middle of a restart would
+      // hide the banner that tells them what is happening.
+      if (!isRestartInProgress()) { doLogout(); }
+      return null;
+    }
     return r.ok ? r.json().catch(() => null) : null;
   } catch {
+    // The service is unreachable: it is down or restarting. The poll that
+    // owns this request records it, because only that poll knows whether its
+    // answer still belongs to the service that was shutting down.
     return null;
   }
+}
+
+function isRestartInProgress() {
+  // Return whether a restart was requested and has not completed yet.
+  return restartLatched || Boolean(runtimeState.restart_requested);
 }
 
 async function apiDelete(url) {
@@ -177,7 +203,11 @@ function applyRuntimeStatus(runtime) {
     ...runtime,
   };
 
-  const isBusy = !!runtimeState.restart_requested;
+  // The service may not have set its flag yet, and it answers with the old
+  // value until the shutdown starts. The latch keeps the banner up until the
+  // service was seen down and came back. Only the poll that owns the sequence
+  // may release it, so a poll that was already in flight cannot.
+  const isBusy = isRestartInProgress();
   const statusEl = $('runtime-status');
   const bannerEl = $('runtime-banner');
   const restartBtn = $('restart-btn');
@@ -332,9 +362,12 @@ async function requestRestart() {
   if (!confirmed) return;
 
   $('restart-btn').disabled = true;
+  restartLatched = true;
+  serverWasDown = false;
 
   const res = await apiPost('/api/restart', {});
   if (!res.ok) {
+    restartLatched = false;
     $('restart-btn').disabled = false;
     window.alert(res.data.detail || 'Failed to request restart');
     return;
@@ -390,15 +423,28 @@ async function repairCron() {
 async function loadTasks() {
   if (tasksLoadInFlight) return;
   tasksLoadInFlight = true;
+  const sequence = ++pollSequence;
 
   try {
     const [data, status] = await Promise.all([
     apiGet('/api/tasks'),
     apiGet('/api/status'),
   ]);
-  if (status && status.runtime) {
-    applyRuntimeStatus(status.runtime);
-  }
+    if (status && status.runtime) {
+      // The service answered. If it was seen down before this poll started,
+      // the service is back and the restart is over. A poll that was already
+      // in flight when the service went down answers with the state of the
+      // service that was shutting down, and must not release the latch.
+      if (serverWasDown && sequence > serverDownSequence) {
+        restartLatched = false;
+        serverWasDown = false;
+      }
+      applyRuntimeStatus(status.runtime);
+    } else if (restartLatched) {
+      // The service is not answering. The restart is under way.
+      if (!serverWasDown) { serverWasDown = true; serverDownSequence = sequence; }
+      applyRuntimeStatus({});
+    }
   if (status) {
     renderSystemHealth(status.health);
     renderExecutionHealth(status.health && status.health.execution);

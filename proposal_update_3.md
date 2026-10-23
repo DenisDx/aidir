@@ -52,6 +52,7 @@ Priority meaning:
 | V25 | Lifecycle | P1 | The planned restart exited with code 0, so the supervisor never restarted the service | **Fixed** |
 | V26 | Lifecycle | P2 | A live log socket held the graceful shutdown back for the whole grace period | **Fixed** |
 | V27 | Tests | P3 | The test suite writes into the real log files, so the log of a production instance contains test doubles | Open |
+| V28 | Front end | P1 | The restart banner disappeared while the service had not restarted yet | **Fixed** |
 
 ---
 
@@ -545,6 +546,58 @@ run.
 
 ---
 
+### V28. The restart banner disappeared while the service had not restarted (P1, Fixed)
+
+**Evidence**
+- The reported symptom: the yellow "the service is restarting" banner appeared
+  and then vanished, while the service had not restarted yet.
+- Two independent causes, both in the front end:
+
+  1. `apiGet` answers 401 by calling `doLogout()`. The banner lives in the
+     application screen, and `doLogout()` switches to the login screen — so the
+     banner is not visible any more. A 401 during a restart loses the operator's
+     session in the middle of the operation.
+  2. The banner was derived from the **last successful poll**. A service that
+     stopped answering produced no poll, and a poll that was **already in flight**
+     when the operator clicked answered with the state of the service that was
+     shutting down — `restart_requested: false` — which cleared the banner
+     immediately.
+
+  The second cause is a race with a sub-millisecond window, and the three-second
+  poll lands in it regularly.
+
+**Impact**
+The operator saw the service "finish restarting" while it had not even started.
+The only reliable signal that a restart is under way disappeared, and the
+operator was occasionally signed out.
+
+**Fix (applied)**
+- **The backend**: the `POST /api/restart` route waits (up to a second) until the
+  service has actually set its own `restart_requested` flag, and then answers with
+  the real state. The shutdown runs in the background, and the flag is only set
+  when the shutdown starts; the window between the click and the flag is exactly
+  the window the poll raced in.
+- **The front end**:
+  - a 401 during a restart is **not** a logout: the session is kept, and the
+    operator is checked again when the service is back;
+  - the restart state is **latched**: it survives a service that stopped
+    answering;
+  - every poll carries a sequence number, and the latch may only be released by a
+    poll that **started after** the service was seen down. A poll that was already
+    in flight answers with the state of the service that was shutting down and
+    must not release the latch.
+
+**Validation**
+- `test_restart_banner.js` (with `test_restart_banner.py`) drives the real
+  front-end sources through the whole restart and reports what the banner shows.
+  On the previous code the banner disappeared as soon as the service stopped
+  answering, and the 401 sent the operator to the login screen; now it survives
+  both and goes away only when the service is back.
+- The live restart: the route answers with `restart_requested: true` in 50 ms and
+  the service comes back.
+
+---
+
 ## 5. The orphaned tasks
 
 ### V21. A remote that stops answering must not fail the task (P1, Fixed)
@@ -896,7 +949,7 @@ the resource panel, but the operator has to know to look there.
 | **1** | V1–V4, V5–V8, V9, V10, V14, V18 | **Done.** The environment, the diagnostics of a managed server, the stuck task and the silent cancel. |
 | **2** | V21–V24 | **Done.** The bounds: an unreachable remote no longer fails the task, a request cannot remove the timeout of its task, a removed task does not keep a waiting status, and the cron cycle reaps the orphans. |
 | **3** | V11, V12, V13, V16, V17, V19, V20 | **Done.** The visibility: a remote candidate is measured before it is chosen, the waiting reason reaches the dashboard, the quarantined task is terminal, the sessions belong to the instance, the doctor sees the foreign namespaces, a planned restart is not a traceback, and a provider that failed to start is in the health card. |
-| **4** | V25, V26 | **Done.** The lifecycle: the planned restart keeps the exit code the supervisor needs, and a live log socket no longer holds the graceful shutdown back. |
+| **4** | V25, V26, V28 | **Done.** The lifecycle: the planned restart keeps the exit code the supervisor needs, a live log socket no longer holds the graceful shutdown back, and the restart banner survives the whole restart. |
 
 **Everything in this proposal is now applied.** The items that stay open are
 recorded in the sections themselves: the terminate action is not remote-aware
@@ -914,7 +967,7 @@ suite still writes into the real log files (V27).
   `test_execution_visibility.py` (V12, V13, V16, V20),
   `test_terminate_persisted.py` (V14), `test_queue_bounds.py` (V22, V23),
   `test_orphaned_tasks.py` (V24), `test_restart_exit.py` (V19, V25, V26),
-  `test_doctor.py` (V17, V18).
+  `test_restart_banner.py` (V28), `test_doctor.py` (V17, V18).
 - The open items need a test each, in the module that owns the area:
   `test_kv_affinity_routing.py` for V11, `test_cron_logging.py` for V15 and V16,
   `test_settings_backend.py` for V17, `test_cron_logging.py` for V19, and

@@ -1237,6 +1237,15 @@ def create_app(
         if not runtime["restart_requested"]:
             log("webui", "warn", f"Restart requested by user {session['login']}", "control")
             asyncio.create_task(callback())
+            # The shutdown runs in the background, and the service only sets its
+            # own flag when the shutdown actually starts. A poll that lands in
+            # that window would answer "not restarting" and hide the banner the
+            # operator is watching. Waiting for the flag makes the answer and
+            # the later polls agree.
+            for _ in range(20):
+                await asyncio.sleep(0.05)
+                if core.get_runtime_status().get("restart_requested"):
+                    break
 
         return {
             "ok": True,
