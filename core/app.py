@@ -429,6 +429,38 @@ class Core:
             "restart_wait_timeout": self.restart_wait_timeout_seconds(),
         }
 
+    async def get_runtime_health(self) -> dict:
+        """Return why the execution is not moving, for the dashboard.
+
+        The log is not enough here: the default log level hides the deferral
+        messages, so an operator would never learn that a task waits for a
+        remote that cannot run it. The status is the channel that is always
+        visible.
+        """
+        deferred = (
+            self.scheduler.deferred_tasks_snapshot()
+            if self.scheduler is not None
+            else {"count": 0, "by_reason": {}, "tasks": []}
+        )
+        orphaned = 0
+        if self.redis is not None:
+            try:
+                instance = str(self.config.get("instance", "aidir") or "aidir")
+                raw = await self.redis.get(f"{instance}:cron:orphaned_tasks")
+                orphaned = int(raw or 0)
+            except Exception:
+                orphaned = 0
+        startup_errors = (
+            self.llama_cpp_server_manager.startup_errors()
+            if self.llama_cpp_server_manager is not None
+            else {}
+        )
+        return {
+            "deferred": deferred,
+            "orphaned_tasks": orphaned,
+            "provider_startup_errors": startup_errors,
+        }
+
     def embedded_cron_enabled(self) -> bool:
         """Return whether this Core process runs its maintenance cycle internally."""
         return self._embedded_cron_enabled
@@ -600,7 +632,11 @@ class Core:
 
         task = self.queue.get_task(task_id)
         if task is None:
-            return None
+            # The task is not in the in-memory registry. It may still exist as a
+            # Redis hash - an orphaned task, one that no queue holds. A cancel
+            # that silently does nothing leaves the task visible as queued
+            # forever, so the hash is terminated too.
+            return await self._terminate_persisted_task(task_id)
 
         if task.status in {STATUS_CREATED, STATUS_QUEUED}:
             await self.queue.mark_canceled(task)
@@ -612,6 +648,16 @@ class Core:
             await self.queue.delete_task(task.id)
             return task.to_redis_hash()
 
+        return task.to_redis_hash()
+
+    async def _terminate_persisted_task(self, task_id: str) -> dict | None:
+        """Terminate a task that only exists as a Redis hash, and report the result."""
+        task = await self.queue.get_persisted_task(task_id)
+        if task is None:
+            return None
+        if task.status in {STATUS_CREATED, STATUS_QUEUED, STATUS_RUNNING}:
+            await self.queue.mark_canceled(task)
+        await self.queue.delete_task(task.id)
         return task.to_redis_hash()
 
     def task_parent_chain_max_depth(self) -> int:
@@ -912,13 +958,30 @@ async def main() -> None:
         log("core", "info", "=== APPLICATION SHUTDOWN COMPLETE ===")
 
     if restart_via_self_exit:
-        raise SystemExit(1)
+        # A restart requested through the WebUI is a normal operation, not a
+        # crash: the supervisor starts the process again. It is reported as an
+        # event, and the exit code is not logged as a fatal error.
+        log("core", "info", "Restart requested through the WebUI; exiting for the supervisor")
+        raise _PlannedRestart()
+
+
+class _PlannedRestart(SystemExit):
+    """A restart the process asked for itself; the supervisor starts it again."""
+
+    def __init__(self) -> None:
+        """Exit with the code the supervisor needs to restart the service."""
+        super().__init__(1)
 
 
 if __name__ == "__main__":
     log("core", "info", "=== PROCESS STARTED ===")
     try:
         asyncio.run(main())
+    except _PlannedRestart:
+        log("core", "info", "=== PROCESS EXITED FOR A PLANNED RESTART ===")
+    except SystemExit as exc:
+        log("core", "info", f"=== PROCESS EXITED WITH CODE {exc.code} ===")
+        raise
     except BaseException as exc:
         log_exception("system", "fatal", "Fatal crash in core entrypoint", exc)
         raise

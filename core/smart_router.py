@@ -616,7 +616,12 @@ class SmartRouter:
             except Exception:
                 admission_result = None
 
-        if requirements is not None and self._get_local_queue_state is not None and self._check_resource_available is not None:
+        if (
+            requirements is not None
+            and provider_api != "openaix"
+            and self._get_local_queue_state is not None
+            and self._check_resource_available is not None
+        ):
             queue_state = None
             if self._get_model_queue_state is not None:
                 try:

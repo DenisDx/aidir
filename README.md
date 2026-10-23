@@ -462,7 +462,30 @@ Set a provider's `api` to `llama-cpp` to use `llama-server` through its OpenAI-c
 
 llama.cpp HTTP errors are returned with the original status, complete response body, and content type, without replacing their message, code, type, or extra diagnostic fields with an aidir error envelope. This also applies to streaming requests rejected before their first output. Once streaming has begun, the original JSON error is forwarded as an SSE or NDJSON error event; the already-sent HTTP status cannot change. Connection failures and timeouts still use aidir's own error handling.
 
-Use `exec_cmd` for a local server command. aidir starts it on demand, waits for `/health`, and records its PID in `logs/llama_cpp_servers.json`. Only such recorded processes are stopped when shared resources need VRAM. An already healthy server is treated as external and is never stopped. Leave `exec_cmd` empty for an externally managed or remote server.
+Use `exec_cmd` for a local server command. aidir starts it on demand, waits for
+`/health`, and records its PID in `logs/llama_cpp_servers.json`. Only such recorded
+processes are stopped when shared resources need VRAM. An already healthy server is
+treated as external and is never stopped. Leave `exec_cmd` empty for an externally
+managed or remote server.
+
+The managed server inherits the environment of the aidir process, which includes
+the values of `.env`. A service that starts under systemd has a much smaller
+environment than an interactive shell, so a variable the upstream needs — for
+example `CUDA_VISIBLE_DEVICES` or `LD_LIBRARY_PATH` — should be declared
+explicitly:
+
+```json5
+{
+  "exec_cmd": "~/llama-cpp-src/llama-cpp-turboquant/build/bin/llama-server -m model.gguf --port 8888",
+  "env": { "CUDA_VISIBLE_DEVICES": "0", "LD_LIBRARY_PATH": "/usr/local/cuda/lib64" }
+}
+```
+
+The server's output is copied into `logs/local_llama_cpp.log` (or
+`logs/llama_cpp_<id>.log`) and into the aidir log with the tag `llama_cpp`. If the
+server does not become ready, the exit status and its last output lines are
+reported before the process is stopped, so the cause is not lost with it.
+
 
 For a `llama-cpp` provider, resource `keep_alive` means restart-on-failure during its active window; it does not send API pings. Smart routes probe a running provider via `/v1/models`; an unavailable provider with `exec_cmd` remains eligible for lazy startup after the scheduler has freed resources. A healthy managed server is adopted across an aidir restart; only an unhealthy inherited process is stopped.
 
@@ -494,6 +517,39 @@ longer than the least loaded alternative by both configured thresholds, or when
 a warm model has been blocked by resource memory for longer than the wait
 timeout. A cold model is not worth waiting for because its cache is already gone. The router never stores prompt text: it keeps a truncated HMAC of a
 context prefix and a byte length.
+
+A remote aidir that cannot run the resolved model — not enough free VRAM, for
+example — is **not** a reason to wait. Before a task is handed to a remote
+instance, aidir asks that instance whether the model can run; a refusal excludes
+that candidate and the route is resolved again, so a local candidate that is warm
+serves the request instead. The refusal is repeated at most a few times; after
+that the task fails with `REMOTE_CANNOT_RUN` and a message naming the provider,
+the model and the reason, instead of waiting for the whole queue timeout.
+
+A remote that does **not** answer is a different case: it may be restarting. The
+candidate is skipped for that attempt only, the task is re-routed to any
+candidate that can take it, and if there is none the task keeps waiting for the
+remote — bounded by `tasks.queue_timeout` — so it goes back to the remote as soon
+as it answers.
+
+No task waits without a bound. A request may not remove the timeout of its own
+task: `timeout: 0` and `queue_timeout: 0` fall back to the configured defaults.
+A task that leaves the queue before it runs — a client disconnect, for instance —
+is marked canceled, and the cron cycle fails the tasks whose hash says `queued`
+while no queue holds them, so the dashboard never shows a task that waits forever.
+
+The **System health** card of the dashboard shows why the execution is not moving:
+how many tasks wait and why, one line per reason, plus the tasks that were left
+in no queue and the providers that failed to start. The same reasons appear in
+the `Waiting for` column of the task tables, so a task that waits for a remote
+instance says so, and names the instance. The log is not the only channel: the
+default log level hides the deferral messages, so the status is the one that is
+always visible.
+
+`./doctor.sh --only namespaces` reports the instance namespaces that hold task
+data next to the configured one, with the command that removes the ones you no
+longer need. The WebUI sessions belong to one instance, so a session created on
+another instance does not open this one.
 
 A model may serve several concurrent requests when its runtime has enough
 slots. Set `maxConcurrentRequests` and the incremental cost of one request in

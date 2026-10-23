@@ -655,6 +655,11 @@
         "baseUrl": "http://127.0.0.1:8888",
         // Leave empty for an externally managed or remote llama-server.
         "exec_cmd": "",
+        // Extra environment for a server that aidir starts, applied on top of the
+        // aidir process environment. Use it for variables the service cannot
+        // inherit from an interactive shell, for example CUDA_VISIBLE_DEVICES
+        // or LD_LIBRARY_PATH.
+        //"env": {"CUDA_VISIBLE_DEVICES": "0"},
         "startup_timeout": 120,
         "models": [
           {

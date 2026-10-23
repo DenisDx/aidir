@@ -30,6 +30,11 @@ if TYPE_CHECKING:
 
 _SUPPORTED_TYPES = ("agent", "tool")  # TODO: extend with request, tts, stt…
 
+# How many times a task may be deferred because a remote aidir refuses to run
+# the model before the task is failed with a clear error. Without a limit the
+# task waits for its whole queue timeout and the client sees nothing.
+_MAX_REMOTE_REFUSALS = 5
+
 
 class Scheduler:
     """
@@ -65,6 +70,15 @@ class Scheduler:
         self._active_runs: set[asyncio.Task] = set()
         self._idle = asyncio.Event()
         self._idle.set()
+        # Remote candidates that refused the task, and how often the refusal was
+        # repeated. A remote that cannot run the model is not a transient
+        # condition, so the task is re-routed instead of being deferred forever.
+        self._remote_blocked_candidates: dict[str, set[tuple[str, str]]] = {}
+        self._remote_refusal_counts: dict[str, int] = {}
+        # Why every waiting task waits. The log is not enough: the default log
+        # level hides the deferral messages, so the operator would never learn
+        # why a task is not running.
+        self._deferred: dict[str, dict] = {}
 
     def notify_new_task(self) -> None:
         """Wake the scheduler loop when a new task is enqueued."""
@@ -102,6 +116,7 @@ class Scheduler:
                     if worker is None:
                         # No compatible worker – re-enqueue and skip
                         deferred_tasks.append(task)
+                        self._note_deferral(task, "no worker for this task type")
                         log("system", "warn",
                             f"No worker for task {task_id} (type={task_type}), re-queued")
                         task_id = await self._queue.pop_next(task_type)
@@ -115,17 +130,25 @@ class Scheduler:
                     if reqs and self._resource_monitor and not await self._resource_monitor.refresh_required_availability(reqs):
                         task.next_retry_at = time.time() + 1
                         deferred_tasks.append(task)
+                        self._note_deferral(task, "the measured availability of a resource is unavailable")
                         log("system", "warn", f"Task {task.id} delayed: resource availability probe failed")
                         task_id = await self._queue.pop_next(task_type)
                         continue
-                    if not await self._remote_route_can_run(
+                    remote_ok, remote_kind, remote_reason = await self._remote_route_status(
                         task,
                         requested_provider_id,
                         requested_model_id,
-                    ):
-                        task.next_retry_at = time.time() + 1
-                        deferred_tasks.append(task)
-                        log("system", "info", f"Task {task.id} delayed: remote aidir cannot run the model now")
+                    )
+                    if not remote_ok:
+                        await self._handle_remote_refusal(
+                            task,
+                            worker,
+                            requested_provider_id,
+                            requested_model_id,
+                            remote_kind,
+                            remote_reason,
+                            deferred_tasks,
+                        )
                         task_id = await self._queue.pop_next(task_type)
                         continue
                     local_reqs = self._resources.local_admission_requirements(reqs) if self._resources else reqs
@@ -160,7 +183,8 @@ class Scheduler:
                         if not admission.get("admissible_now"):
                             task.next_retry_at = time.time() + 1
                             deferred_tasks.append(task)
-                            log("system", "info",
+                            self._note_deferral(task, f"the model is not admissible: {admission.get('admission')}")
+                            log("system", "warning",
                                 f"Task {task.id} delayed: {admission.get('admission')} for model {requested_model_id}")
                             task_id = await self._queue.pop_next(task_type)
                             continue
@@ -173,7 +197,8 @@ class Scheduler:
                         if not isinstance(model_admission, dict) or not model_admission.get("admissible_now"):
                             task.next_retry_at = time.time() + 1
                             deferred_tasks.append(task)
-                            log("system", "info", f"Task {task.id} delayed: resources changed during model admission")
+                            self._note_deferral(task, "the resources changed during the admission")
+                            log("system", "warning", f"Task {task.id} delayed: resources changed during model admission")
                             task_id = await self._queue.pop_next(task_type)
                             continue
                     elif local_reqs and self._resources:
@@ -196,6 +221,7 @@ class Scheduler:
                                 if not self._resources.check_available(local_reqs):
                                     task.next_retry_at = time.time() + 5
                                     deferred_tasks.append(task)
+                                    self._note_deferral(task, "the idle models did not free enough memory")
                                     log("system", "warn",
                                         f"Task {task.id} delayed: resource unload did not free enough space")
                                     task_id = await self._queue.pop_next(task_type)
@@ -205,7 +231,8 @@ class Scheduler:
                                 # Not enough even with force unload
                                 task.next_retry_at = time.time() + 1
                                 deferred_tasks.append(task)
-                                log("system", "info", f"Task {task.id} delayed: insufficient resources")
+                                self._note_deferral(task, "insufficient resources")
+                                log("system", "warning", f"Task {task.id} delayed: insufficient resources")
                                 task_id = await self._queue.pop_next(task_type)
                                 continue
 
@@ -218,7 +245,8 @@ class Scheduler:
                         if not reserved:
                             task.next_retry_at = time.time() + 1
                             deferred_tasks.append(task)
-                            log("system", "info", f"Task {task.id} delayed: resources changed during admission")
+                            self._note_deferral(task, "the resources changed during the admission")
+                            log("system", "warning", f"Task {task.id} delayed: resources changed during admission")
                             task_id = await self._queue.pop_next(task_type)
                             continue
                     bg_task = asyncio.create_task(
@@ -439,6 +467,7 @@ class Scheduler:
     ) -> None:
         """Execute one task; handle timeouts and exceptions."""
         log("worker", "info", f"Starting task {task.id}", worker.id)
+        self._clear_deferral(task.id)
         await self._queue.mark_running(task.id, worker.id)
         consumer_id = f"{task.id}:{worker.id}"
         # Model id is used to track soft consumers (alive_time) after release
@@ -554,6 +583,8 @@ class Scheduler:
                 )
             if self._resources and model_counted and model_admission is None and model_id and provider_id:
                 self._resources.mark_model_finished(provider_id, model_id)
+            self._clear_remote_tracking(task.id)
+            self._clear_deferral(task.id)
 
     async def _fallback_smart_route_after_execution_failure(
         self,
@@ -707,13 +738,147 @@ class Scheduler:
         await self._queue.mark_failed(task, {"code": "QUEUE_TIMEOUT", "message": timeout_message})
         return True
 
-    async def _refresh_smart_route_for_dispatch(self, task: Task, worker_id: str) -> None:
-        """Re-resolve queued smart routes so stale busy-fallback selections can move to a newly available candidate."""
+    async def _handle_remote_refusal(
+        self,
+        task: Task,
+        worker: "BaseWorker",
+        provider_id: str,
+        model_id: str,
+        kind: str,
+        reason: str,
+        deferred_tasks: list,
+    ) -> None:
+        """Re-route a task whose remote candidate refused it, or fail it with a clear reason.
+
+        A `capacity` refusal is a stable fact: the remote answered and cannot
+        run the model. The candidate is excluded for the rest of the task's
+        life, so the route moves to a candidate that can take it. When no
+        candidate is left the task fails instead of waiting for its whole queue
+        timeout for a fact that will not change.
+
+        An `unreachable` refusal is transient: the remote may be restarting. The
+        candidate is skipped for this attempt only, so the task goes back to it
+        as soon as it answers. While it is down the task waits, bounded by its
+        own queue timeout.
+        """
+        blocked = self._remote_blocked_candidates.setdefault(task.id, set())
+        excluded = set(blocked)
+        if kind == "capacity":
+            blocked.add((provider_id, model_id))
+        else:
+            excluded.add((provider_id, model_id))
+        refreshed = await self._refresh_smart_route_for_dispatch(
+            task,
+            worker.id,
+            excluded_candidates=excluded,
+        )
+        if refreshed:
+            self._remote_refusal_counts.pop(task.id, None)
+            # The task was already popped from the queue. It has to go back in,
+            # otherwise the new route is never dispatched.
+            task.next_retry_at = 0.0
+            deferred_tasks.append(task)
+            return
+
+        if kind != "capacity":
+            # The remote is down. The task waits for it, and every attempt
+            # probes it again. The queue timeout is the bound.
+            task.next_retry_at = time.time() + 1
+            deferred_tasks.append(task)
+            self._note_deferral(task, f"waiting for the remote aidir '{provider_id}': {reason}")
+            log(
+                "system",
+                "warning",
+                f"Task {task.id} delayed: remote aidir provider '{provider_id}' is unreachable "
+                f"({reason}); the task waits for it or is re-routed",
+            )
+            return
+
+        attempts = self._remote_refusal_counts.get(task.id, 0) + 1
+        self._remote_refusal_counts[task.id] = attempts
+        if attempts >= _MAX_REMOTE_REFUSALS:
+            self._clear_remote_tracking(task.id)
+            self._clear_deferral(task.id)
+            await self._queue.mark_failed(task, {
+                "code": "REMOTE_CANNOT_RUN",
+                "message": (
+                    f"No candidate can run the task: the remote aidir provider "
+                    f"'{provider_id}' cannot run '{model_id}' ({reason})"
+                ),
+            })
+            return
+
+        task.next_retry_at = time.time() + 1
+        deferred_tasks.append(task)
+        self._note_deferral(task, f"the remote aidir '{provider_id}' cannot run '{model_id}': {reason}")
+        log(
+            "system",
+            "warning",
+            f"Task {task.id} delayed: remote aidir provider '{provider_id}' cannot run "
+            f"'{model_id}' ({reason}), attempt {attempts}/{_MAX_REMOTE_REFUSALS}",
+        )
+
+    def _clear_remote_tracking(self, task_id: str) -> None:
+        """Drop the per-task remote refusal bookkeeping."""
+        self._remote_blocked_candidates.pop(task_id, None)
+        self._remote_refusal_counts.pop(task_id, None)
+
+    def _note_deferral(self, task: Task, reason: str) -> None:
+        """Record why a task waits, so the operator can see it in the status."""
+        entry = self._deferred.get(task.id)
+        if entry is None:
+            entry = {"since": time.time()}
+            self._deferred[task.id] = entry
+        entry["reason"] = reason
+        route = (task.config or {}).get("route") if isinstance(task.config, dict) else None
+        route = route if isinstance(route, dict) else {}
+        entry["provider"] = str(route.get("resolved_provider") or task.route_provider_id or "")
+        entry["model"] = str(route.get("resolved_model") or task.model_id or "")
+        entry["worker"] = str(task.worker_id or "")
+
+    def _clear_deferral(self, task_id: str) -> None:
+        """Drop the deferral record of a task that is no longer waiting."""
+        self._deferred.pop(task_id, None)
+
+    def defer_reason_for(self, task_id: str) -> dict:
+        """Return why one task waits, or an empty mapping when it does not wait."""
+        entry = self._deferred.get(task_id)
+        return dict(entry) if entry else {}
+
+    def deferred_tasks_snapshot(self) -> dict:
+        """Return the waiting tasks and the reason every one of them waits."""
+        by_reason: dict[str, int] = {}
+        for entry in self._deferred.values():
+            reason = str(entry.get("reason") or "unknown")
+            by_reason[reason] = by_reason.get(reason, 0) + 1
+        tasks = [
+            {
+                "id": task_id,
+                "reason": entry.get("reason"),
+                "provider": entry.get("provider", ""),
+                "model": entry.get("model", ""),
+                "worker": entry.get("worker", ""),
+                "waiting_since": entry.get("since"),
+            }
+            for task_id, entry in sorted(self._deferred.items(), key=lambda item: item[1].get("since") or 0)
+        ]
+        return {"count": len(tasks), "by_reason": by_reason, "tasks": tasks[:50]}
+
+    async def _refresh_smart_route_for_dispatch(
+        self,
+        task: Task,
+        worker_id: str,
+        excluded_candidates: set[tuple[str, str]] | None = None,
+    ) -> bool:
+        """Re-resolve queued smart routes so stale busy-fallback selections can move to a newly available candidate.
+
+        Returns whether the resolved route changed.
+        """
         route_cfg = (task.config or {}).get("route") if isinstance(task.config, dict) else None
         if not isinstance(route_cfg, dict):
-            return
+            return False
         if str(route_cfg.get("selection") or "").strip() != "smart_route":
-            return
+            return False
 
         requested_provider = str(route_cfg.get("requested_provider") or "").strip()
         requested_model = str(
@@ -723,9 +888,9 @@ class Scheduler:
             or ""
         ).strip()
         if not requested_provider or not requested_model:
-            return
+            return False
         if self._provider_api(requested_provider) != "smart":
-            return
+            return False
 
         base_route = {
             "requested_model": requested_model,
@@ -747,13 +912,14 @@ class Scheduler:
                 request_payload=request_payload,
                 request_priority=task.priority,
                 incoming_bearer_token=incoming_bearer_token,
+                excluded_candidates=excluded_candidates,
             )
         except SmartRouteError:
-            return
+            return False
 
         next_route = dict(resolution.route or {})
         if not next_route:
-            return
+            return False
 
         current_provider = str(route_cfg.get("resolved_provider") or "").strip()
         current_model = str(route_cfg.get("resolved_model") or "").strip()
@@ -762,7 +928,7 @@ class Scheduler:
         if current_provider == next_provider and current_model == next_model:
             task.config = dict(task.config or {})
             task.config["route"] = next_route
-            return
+            return False
 
         task.config = dict(task.config or {})
         task.config["route"] = next_route
@@ -782,6 +948,7 @@ class Scheduler:
                 f"{current_provider}/{current_model} -> {next_provider}/{next_model}"
             ),
         )
+        return True
 
     def _resolve_resource_requirements(self, task: Task, worker_id: str) -> dict[str, dict[str, int]]:
         """Resolve resource requirements from task or worker/model config."""
@@ -834,10 +1001,32 @@ class Scheduler:
         model_id: str,
     ) -> bool:
         """Ask a remote aidir whether its resolved model can run before forwarding work."""
+        ok, _kind, _reason = await self._remote_route_status(task, provider_id, model_id)
+        return ok
+
+    async def _remote_route_status(
+        self,
+        task: Task,
+        provider_id: str,
+        model_id: str,
+    ) -> tuple[bool, str, str]:
+        """Ask a remote aidir whether its resolved model can run, and say why not.
+
+        The kind of refusal decides what happens next:
+
+        - `capacity` - the remote answered and cannot run the model now. That is
+          a property of its free memory and it does not change while the task
+          waits, so the candidate is excluded for good.
+        - `unreachable` - the remote did not answer. That is transient: the
+          remote may be restarting, so the candidate is skipped for this attempt
+          only and the task goes back to it as soon as it answers.
+
+        Returns (may_run, kind, reason).
+        """
         if not provider_id or self._provider_api(provider_id) != "openaix":
-            return True
+            return True, "", ""
         if not model_id:
-            return False
+            return False, "unreachable", "the remote model id is empty"
         incoming_bearer_token = ""
         if isinstance(task.config, dict):
             incoming_bearer_token = str(task.config.get("incoming_bearer_token") or "").strip()
@@ -848,7 +1037,18 @@ class Scheduler:
             timeout_ms=1500,
             incoming_bearer_token=incoming_bearer_token,
         )
-        return isinstance(queue_state, dict) and bool(queue_state.get("can_run_now"))
+        if not isinstance(queue_state, dict):
+            return False, "unreachable", "the remote aidir did not answer the queue-state probe"
+        if not queue_state.get("can_run_now"):
+            admission = str(queue_state.get("admission") or "unknown")
+            free = queue_state.get("free") or {}
+            needed = queue_state.get("needed") or {}
+            return (
+                False,
+                "capacity",
+                f"the remote reports admission={admission}, free={free}, needed={needed}",
+            )
+        return True, "", ""
 
     def _make_smart_router(self, worker_id: str) -> SmartRouter:
         """Build a shared smart router for scheduler-time route refresh."""

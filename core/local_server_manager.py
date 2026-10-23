@@ -50,6 +50,10 @@ class LocalServerManager:
         error = self._startup_errors.get(provider_id)
         return dict(error) if error else None
 
+    def startup_errors(self) -> dict[str, dict[str, str]]:
+        """Return the failed startup result of every local provider."""
+        return {provider_id: dict(error) for provider_id, error in self._startup_errors.items()}
+
     async def _ensure_running(self, provider_id: str, model_id: str = "") -> None:
         """Start and await a local llama.cpp provider without recording status."""
         provider = self._provider(provider_id)
@@ -85,15 +89,33 @@ class LocalServerManager:
             log_path = self._log_path(provider_id)
             log_path.parent.mkdir(parents=True, exist_ok=True)
             try:
-                with log_path.open("ab", buffering=0) as output:
-                    process = await asyncio.create_subprocess_exec(
-                        *command,
-                        stdout=output,
-                        stderr=asyncio.subprocess.STDOUT,
-                        start_new_session=True,
-                    )
+                output = log_path.open("ab", buffering=0)
             except OSError as exc:
+                raise LocalServerError(
+                    "LLAMA_CPP_START_FAILED",
+                    f"Cannot open the log file for '{provider_id}': {exc}",
+                ) from exc
+            try:
+                process = await asyncio.create_subprocess_exec(
+                    *command,
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                    env=self._child_env(provider),
+                    start_new_session=True,
+                )
+            except OSError as exc:
+                output.close()
                 raise LocalServerError("LLAMA_CPP_START_FAILED", f"Cannot start '{provider_id}': {exc}") from exc
+
+            # The child's output is copied into its log file and into the aidir log.
+            # A pipe is used instead of a file descriptor so that a startup
+            # failure is visible while it happens: with a plain file the child's
+            # stdout is block-buffered and its content is lost when it is killed.
+            pump = asyncio.create_task(
+                self._pump_child_output(provider_id, process, output),
+                name=f"llama-cpp-output:{provider_id}",
+            )
 
             record = {
                 "pid": process.pid,
@@ -104,8 +126,13 @@ class LocalServerManager:
             try:
                 await self._wait_ready(provider_id, base_url, record, process)
             except LocalServerError:
+                # Collect the evidence before the process is killed: its buffered
+                # output disappears with it.
+                await self._collect_startup_evidence(provider_id, process, pump, log_path)
                 await self.stop(provider_id)
+                await self._finish_output_pump(pump, output)
                 raise
+            await self._collect_startup_evidence(provider_id, process, pump, log_path, only_if_finished=True)
 
     async def stop(self, provider_id: str) -> bool:
         """Terminate the persisted aidir-owned process for a provider; never touch unowned servers."""
@@ -176,6 +203,118 @@ class LocalServerManager:
         provider = providers.get(provider_id) if isinstance(providers, dict) else None
         return provider if isinstance(provider, dict) else {}
 
+    def _child_env(self, provider: dict) -> dict[str, str]:
+        """Return the environment for a managed server process.
+
+        The process environment is the base; it already carries the `.env`
+        values, because the settings runtime publishes them into `os.environ`.
+        A provider may add or override entries through its own `env` map, so a
+        managed server can be given `CUDA_VISIBLE_DEVICES`, `LD_LIBRARY_PATH` or
+        a fork-specific knob explicitly instead of relying on the shell the
+        service happens to inherit.
+        """
+        env = dict(os.environ)
+        declared = provider.get("env")
+        if isinstance(declared, dict):
+            for name, value in declared.items():
+                key = str(name or "").strip()
+                if key:
+                    env[key] = str(value)
+        return env
+
+    async def _pump_child_output(self, provider_id: str, process, output) -> None:
+        """Copy the managed server output into its log file and the aidir log."""
+        try:
+            stream = process.stdout
+            if stream is None:
+                return
+            while True:
+                raw = await stream.readline()
+                if not raw:
+                    break
+                try:
+                    output.write(raw)
+                except (OSError, ValueError):
+                    pass
+                line = raw.decode("utf-8", "replace").rstrip("\r\n")
+                if line:
+                    log("system", "info", f"llama.cpp provider '{provider_id}': {line}", "llama_cpp")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+        finally:
+            try:
+                output.close()
+            except (OSError, ValueError):
+                pass
+
+    async def _collect_startup_evidence(
+        self,
+        provider_id: str,
+        process,
+        pump,
+        log_path: Path,
+        *,
+        only_if_finished: bool = False,
+    ) -> None:
+        """Log the child's exit status and its last output lines.
+
+        Called before the process is killed, because a killed process loses its
+        buffered output. `only_if_finished` keeps a healthy server silent.
+        """
+        if only_if_finished and process.returncode is None:
+            return
+        tail = self._log_tail(log_path)
+        status = f"exit code {process.returncode}" if process.returncode is not None else "still running"
+        if tail:
+            log(
+                "system",
+                "error",
+                f"llama.cpp provider '{provider_id}' startup output ({status}):\n{tail}",
+                "llama_cpp",
+            )
+        else:
+            log(
+                "system",
+                "error",
+                f"llama.cpp provider '{provider_id}' produced no output ({status})",
+                "llama_cpp",
+            )
+        if pump is not None and not pump.done():
+            pump.cancel()
+
+    @staticmethod
+    async def _finish_output_pump(pump, output=None, timeout: float = 2.0) -> None:
+        """Stop the output reader and make sure the log file is closed."""
+        if pump is None:
+            if output is not None:
+                try:
+                    output.close()
+                except (OSError, ValueError):
+                    pass
+            return
+        done, pending = await asyncio.wait({pump}, timeout=timeout)
+        for task in pending:
+            task.cancel()
+        if output is not None:
+            # A pump cancelled before its first step never runs its own cleanup,
+            # so the handle is closed here as well. Closing twice is harmless.
+            try:
+                output.close()
+            except (OSError, ValueError):
+                pass
+
+    @staticmethod
+    def _log_tail(log_path: Path, limit: int = 40) -> str:
+        """Return the last lines of a managed server log file."""
+        try:
+            content = log_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+        lines = [line for line in content.splitlines() if line.strip()]
+        return "\n".join(lines[-limit:])
+
     async def _wait_ready(self, provider_id: str, base_url: str, record: dict, process=None) -> None:
         """Wait for the owned server health endpoint or raise an actionable startup error."""
         provider = self._provider(provider_id)
@@ -195,7 +334,11 @@ class LocalServerManager:
                 return
             await asyncio.sleep(0.5)
 
-        raise LocalServerError("UPSTREAM_UNREACHABLE", f"llama.cpp provider '{provider_id}' was not ready within {timeout}s")
+        raise LocalServerError(
+            "UPSTREAM_UNREACHABLE",
+            f"llama.cpp provider '{provider_id}' was not ready within {timeout}s "
+            f"(see {self._log_path(provider_id)})",
+        )
 
     @staticmethod
     async def _is_healthy(base_url: str) -> bool:

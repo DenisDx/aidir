@@ -775,7 +775,12 @@ class Endpoint_openaix(Endpoint_ollama):
 
     @staticmethod
     def _resolve_timeout(value: object, default: int, field_name: str = "timeout") -> int:
-        """Return a non-negative request timeout or its configured default."""
+        """Return a positive request timeout or its configured default.
+
+        A request may not remove the bound: zero would mean "no limit" in the
+        task model, and a task without a queue timeout would wait forever.
+        Zero therefore falls back to the configured default.
+        """
         if value is None:
             return default
         if isinstance(value, bool):
@@ -786,6 +791,8 @@ class Endpoint_openaix(Endpoint_ollama):
             raise HTTPException(status_code=400, detail=f"{field_name} must be a non-negative integer") from exc
         if timeout < 0 or str(value).strip() not in {str(timeout), f"+{timeout}"}:
             raise HTTPException(status_code=400, detail=f"{field_name} must be a non-negative integer")
+        if timeout == 0:
+            return default
         return timeout
 
     async def _resolve_smart_route(

@@ -263,6 +263,68 @@ function renderSystemHealth(health) {
     : `Last success ${timestamp} (${age}; threshold ${threshold}s)`;
 }
 
+function renderExecutionHealth(execution) {
+  const indicator = $('health-execution-indicator');
+  const detail = $('health-execution-detail');
+  const reasons = $('health-execution-reasons');
+  if (!indicator || !detail || !reasons) return;
+
+  const data = execution || {};
+  const deferred = data.deferred || {};
+  const waiting = Number(deferred.count) || 0;
+  const orphaned = Number(data.orphaned_tasks) || 0;
+  const startupErrors = data.provider_startup_errors || {};
+  const failedProviders = Object.keys(startupErrors).length;
+
+  const problems = waiting + orphaned + failedProviders;
+  indicator.classList.toggle('alert', problems > 0);
+
+  const parts = [];
+  parts.push(waiting ? `${waiting} task(s) waiting` : 'no task is waiting');
+  if (orphaned) parts.push(`${orphaned} orphaned task(s)`);
+  if (failedProviders) parts.push(`${failedProviders} provider(s) failed to start`);
+  detail.textContent = parts.join(', ');
+
+  reasons.innerHTML = '';
+  const byReason = deferred.by_reason || {};
+  const entries = Object.entries(byReason);
+  if (entries.length) {
+    reasons.hidden = false;
+    entries.forEach(([reason, count]) => {
+      const row = document.createElement('div');
+      const counter = document.createElement('span');
+      counter.className = 'health-reason-count';
+      counter.textContent = `${count}x`;
+      const text = document.createElement('span');
+      text.textContent = reason;
+      row.appendChild(counter);
+      row.appendChild(text);
+      reasons.appendChild(row);
+    });
+  } else {
+    reasons.hidden = true;
+  }
+
+  if (failedProviders) {
+    reasons.hidden = false;
+    Object.entries(startupErrors).forEach(([providerId, error]) => {
+      const row = document.createElement('div');
+      const counter = document.createElement('span');
+      counter.className = 'health-reason-count';
+      counter.textContent = '1x';
+      const text = document.createElement('span');
+      const name = document.createElement('span');
+      name.className = 'health-reason-provider';
+      name.textContent = providerId;
+      text.appendChild(name);
+      text.appendChild(document.createTextNode(` ${error.code || 'START_FAILED'}: ${error.message || ''}`));
+      row.appendChild(counter);
+      row.appendChild(text);
+      reasons.appendChild(row);
+    });
+  }
+}
+
 async function requestRestart() {
   const confirmed = window.confirm(
     'Restart the service now? New external tasks will be blocked, queued external tasks will be canceled, and active tasks will be given time to finish before shutdown.'
@@ -339,6 +401,7 @@ async function loadTasks() {
   }
   if (status) {
     renderSystemHealth(status.health);
+    renderExecutionHealth(status.health && status.health.execution);
   }
   if (!data) return;
 
@@ -363,6 +426,13 @@ async function loadTasks() {
       : '';
     const instanceLabel = t.instance || '—';
     const remoteBadge = isRemote ? ' <span class="badge badge-running">remote</span>' : '';
+    // Why a waiting task waits, so the operator sees where it is stuck.
+    let waitingCell = '—';
+    if (t.waiting_reason) {
+      const since = t.waiting_since ? ` · ${fmtAge(Math.floor(Date.now() / 1000) - Number(t.waiting_since))}` : '';
+      const where = t.waiting_provider ? ` (${t.waiting_provider})` : '';
+      waitingCell = `<div style="color:var(--warn);font-size:11px">${escapeHtml(t.waiting_reason)}${escapeHtml(where)}</div><div style="color:var(--muted);font-size:11px">waiting${escapeHtml(since)}</div>`;
+    }
     const readOnlyTitle = isRemote ? 'Read-only task from another aidir instance' : '';
     tr.innerHTML = `
       <td style="font-family:monospace;font-size:11px">${escapeHtml(t.id || '')}</td>
@@ -373,6 +443,7 @@ async function loadTasks() {
       <td>${escapeHtml(modelName)}${modelDetails}</td>
       <td style="color:var(--muted);font-size:12px">${fmtTime(t.created_at)}</td>
       <td style="color:var(--muted);font-size:12px">${fmtTaskDuration(t.started_at)}</td>
+      <td style="font-size:11px">${waitingCell}</td>
       <td style="white-space:nowrap">${timeoutText} ${timeoutField && !isRemote ? `<button class="btn-sm" data-dashboard-extend-timeout="${escapeHtml(t.id || '')}">add</button>` : ''}</td>
       <td style="color:var(--muted);font-size:12px">${requestPreview}</td>
       <td>${Number(t.llm_call_count || 0)}</td>
@@ -794,7 +865,7 @@ function renderTaskViewerRows(tasks) {
   body.innerHTML = '';
   if (!tasks.length) {
     const tr = document.createElement('tr');
-    tr.innerHTML = '<td colspan="14" style="color:var(--muted)">No tasks match the current filters.</td>';
+    tr.innerHTML = '<td colspan="15" style="color:var(--muted)">No tasks match the current filters.</td>';
     body.appendChild(tr);
     return;
   }
@@ -813,6 +884,7 @@ function renderTaskViewerRows(tasks) {
       <td>${escapeHtml(task.type || '—')}</td>
       <td style="color:var(--muted);font-size:12px">${escapeHtml(fmtDateTime(task.created_at))}</td>
       <td style="color:var(--muted);font-size:12px">${escapeHtml(fmtTaskDuration(task.started_at, task.finished_at))}</td>
+      <td style="font-size:11px">${task.waiting_reason ? `<span style="color:var(--warn)">${escapeHtml(task.waiting_reason)}</span>` : '—'}</td>
       <td style="color:var(--muted);font-size:12px">${requestPreview}</td>
       <td>${escapeHtml(String(Number(task.llm_call_count || 0)))}</td>
       <td style="color:var(--muted);font-size:12px">${escapeHtml(fmtDateTime(task.last_operation_at))}</td>

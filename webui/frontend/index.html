@@ -131,6 +131,15 @@
   .health-label { font-weight: 600; }
   .health-detail { color: var(--muted); font-size: 12px; }
   .health-repair { margin-left: auto; font-size: 11px; padding: 3px 7px; }
+  .health-reasons {
+    margin-top: 6px; padding-left: 19px;
+    font-size: 11px; color: var(--muted);
+  }
+  .health-reasons div { padding: 1px 0; }
+  .health-reasons .health-reason-count {
+    color: var(--text); font-weight: 600; margin-right: 6px;
+  }
+  .health-reasons .health-reason-provider { color: var(--accent); }
 
   .page { display: none; padding: 20px; }
   .page.active { display: block; }
@@ -686,6 +695,12 @@
           <button id="repair-cron-btn" class="btn-sm health-repair" type="button" title="Add or repair the aidir cron entry">Repair cron</button>
           <span id="embedded-cron-status" class="health-detail health-repair" hidden>Embedded cron enabled</span>
         </div>
+        <div class="health-row">
+          <span id="health-execution-indicator" class="health-indicator" aria-label="Execution status"></span>
+          <span class="health-label">Execution</span>
+          <span id="health-execution-detail" class="health-detail">Checking...</span>
+        </div>
+        <div id="health-execution-reasons" class="health-reasons" hidden></div>
       </div>
     </div>
 
@@ -695,7 +710,7 @@
         <thead>
           <tr>
             <th>ID</th><th>Type</th><th>Status</th><th>Instance</th>
-            <th>Worker</th><th>Model</th><th>Created</th><th>Duration</th><th>Timeout</th><th>First message</th><th>LLM calls</th><th>JSON</th><th>Action</th>
+            <th>Worker</th><th>Model</th><th>Created</th><th>Duration</th><th>Waiting for</th><th>Timeout</th><th>First message</th><th>LLM calls</th><th>JSON</th><th>Action</th>
           </tr>
         </thead>
         <tbody id="tasks-body"></tbody>
@@ -816,6 +831,7 @@
             <th>Type</th>
             <th>Created</th>
             <th>Duration</th>
+            <th>Waiting for</th>
             <th>First message</th>
             <th>LLM calls</th>
             <th>Last op</th>

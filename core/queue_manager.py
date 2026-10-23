@@ -15,7 +15,7 @@ import redis.asyncio as aioredis
 from core import log
 from core.task import (
     Task,
-    STATUS_QUEUED, STATUS_RUNNING,
+    STATUS_CREATED, STATUS_QUEUED, STATUS_RUNNING,
     STATUS_COMPLETED, STATUS_FAILED, STATUS_CANCELED,
 )
 
@@ -91,6 +91,7 @@ class QueueManager:
                         task_id,
                         json.dumps({"task_type": task_type, "reason": str(exc)}),
                     )
+                    await self._mark_quarantined(task_id, task_type, str(exc))
                     quarantined += 1
                     log("system", "warning", f"Quarantined persisted queue entry {task_id}: {exc}")
                     continue
@@ -112,6 +113,7 @@ class QueueManager:
                         task_id,
                         json.dumps({"task_type": raw.get("type") or "", "reason": str(exc)}),
                     )
+                    await self._mark_quarantined(task_id, raw.get("type") or "", str(exc))
                     quarantined += 1
                     log("system", "warning", f"Quarantined orphaned persisted task {task_id}: {exc}")
                     continue
@@ -139,6 +141,30 @@ class QueueManager:
             restarted += 1
 
         return {"recovered": recovered, "quarantined": quarantined, "restarted": restarted}
+
+    async def _mark_quarantined(self, task_id: str, task_type: str, reason: str) -> None:
+        """Give a quarantined task a terminal status.
+
+        A hash that keeps `queued` while no queue holds it is an orphan: the
+        scheduler never picks it up, the cron job treats it as waiting, and the
+        dashboard shows a task that waits forever. The quarantine is where such
+        a task belongs, and the hash has to say so.
+        """
+        now = datetime.now(timezone.utc)
+        error = {
+            "code": "QUARANTINED",
+            "message": f"The task was quarantined and can never be dispatched: {reason}",
+        }
+        try:
+            await self._redis.hset(self._tk(task_id), mapping={
+                "status": STATUS_FAILED,
+                "updated_at": now.isoformat(),
+                "finished_at": now.isoformat(),
+                "error": json.dumps(error),
+                "error_code": error["code"],
+            })
+        except Exception:
+            pass
 
     async def pop_next(self, task_type: str) -> Optional[str]:
         """Pop the highest-priority (lowest score) task id from the queue."""
@@ -231,9 +257,25 @@ class QueueManager:
         """Remove task from memory and ZSET queue.
         External tasks (created by endpoints) keep their Redis HASH for cron cleanup;
         internal tasks are fully deleted from Redis immediately.
+        A task that is still waiting is marked canceled first: a hash that keeps
+        `queued` while no queue holds it is an orphan - the scheduler never picks
+        it up, the cron job never reaps it, and the dashboard shows it waiting
+        forever.
         """
         task = self._tasks.pop(task_id, None)
         is_external = task.external if task is not None else False
+        if is_external and task is not None and task.status in {STATUS_CREATED, STATUS_QUEUED}:
+            task.status = STATUS_CANCELED
+            task.updated_at = datetime.now(timezone.utc)
+            task.finished_at = task.updated_at
+            task.error = {"code": "TASK_REMOVED", "message": "The task was removed while it was waiting"}
+            await self._redis.hset(self._tk(task_id), mapping={
+                "status": STATUS_CANCELED,
+                "updated_at": task.updated_at.isoformat(),
+                "finished_at": task.finished_at.isoformat(),
+                "error": json.dumps(task.error),
+                "error_code": task.error["code"],
+            })
         pipe = self._redis.pipeline()
         if not is_external:
             pipe.delete(self._tk(task_id))
@@ -242,8 +284,30 @@ class QueueManager:
             pipe.zrem(self._q(task_type), task_id)
         await pipe.execute()
 
+
     def get_task(self, task_id: str) -> Optional[Task]:
         return self._tasks.get(task_id)
+
+    async def get_persisted_task(self, task_id: str) -> Optional[Task]:
+        """Return a task from its Redis hash, even when it is not in memory.
+
+        A task whose hash says `queued` but which is in no queue is orphaned: the
+        scheduler will never pick it up, and the in-memory registry does not
+        know it. The terminate path needs it, otherwise a cancel is a silent
+        no-op and the task stays visible as queued forever.
+        """
+        if task_id in self._tasks:
+            return self._tasks[task_id]
+        try:
+            raw = await self._redis.hgetall(self._tk(task_id))
+        except Exception:
+            return None
+        if not raw:
+            return None
+        try:
+            return Task.from_redis_hash(raw)
+        except Exception:
+            return None
 
     def list_tasks(self) -> list[Task]:
         return list(self._tasks.values())

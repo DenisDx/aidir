@@ -3,13 +3,26 @@
 This index describes document responsibilities, not implementation status.
 Proposals may include both planned and completed work; consult each document.
 
+## Specifications
+
+| Document | Responsibility |
+|---|---|
+| [SPEC_NEW.md](SPEC_NEW.md) | **The main technical specification and the entry point for agents and developers**: purpose, architecture, domain model, component interfaces, implementation decisions, file system, configuration model, security, testing, known problems. |
+| [spec/protocols.md](spec/protocols.md) | The complete HTTP surface: every route, the request and response contracts, the headers, the error envelopes, the streaming rules. |
+| [spec/scheduling.md](spec/scheduling.md) | The task lifecycle, the queue semantics, the scheduler algorithm, the resource model, the smart router, the KV affinity mechanism. |
+| [spec/configuration.md](spec/configuration.md) | The `aiset` integration, the descriptor format, the document model, the worker-local configuration, the generated settings editor, the configuration assistant. |
+| [spec/operations.md](spec/operations.md) | Installation, systemd, Docker/Compose, nginx, the doctor, the cron cycle, the logs, the audit retention, the operational test protocol. |
+| [SPEC.md](SPEC.md) | The original project specification; read-only for agents. Superseded by SPEC_NEW.md. |
+| [openaix_spec.md](openaix_spec.md) | OpenAIx protocol extensions and request/response contracts (normative). |
+| [spec_timeouts.md](spec_timeouts.md) | Queue, execution, outbound-call, and restart timeout semantics (normative). |
+| [aiset/SPEC_.md](aiset/SPEC_.md) | Complete editable aiset specification, maintained in the separately tracked/ignored aiset directory; finalized as SPEC.md later. |
+
 ## Project and workflow
 
 | Document | Responsibility |
 |---|---|
 | [README.md](README.md) | User-facing installation, configuration, operation, and troubleshooting. |
 | [TEST.md](TEST.md) | Smoke, automated, regression, and manual acceptance test procedures. |
-| [SPEC.md](SPEC.md) | Original project specification; read-only for agents. |
 | [AGENTS.md](AGENTS.md) | Agent workflow and maintenance rules; read-only for agents. |
 | [TODO.md](TODO.md) | Existing task notes and configuration reminders. |
 | [plan_aiset_integration.md](plan_aiset_integration.md) | Migration plan of the settings subsystem to the aiset library: phases, descriptor rules, risks, delivery state. |
@@ -41,11 +54,8 @@ Proposals may include both planned and completed work; consult each document.
 
 | Document | Responsibility |
 |---|---|
-| [aiset/SPEC_.md](aiset/SPEC_.md) | Complete editable aiset specification, maintained in the separately tracked/ignored aiset directory; finalized as SPEC.md later. |
 | [aiset/proposal_improvement_aidir.md](aiset/proposal_improvement_aidir.md) | Changes the aiset library needed for this integration, ranked, each with a reproduction; all implemented in the library. |
 | [aiset/proposal_improvement2.md](aiset/proposal_improvement2.md) | Further changes the aiset library needs, written after the first round landed; not applied, aiset is a separate project. |
-| [spec_timeouts.md](spec_timeouts.md) | Queue, execution, outbound-call, and restart timeout semantics. |
-| [openaix_spec.md](openaix_spec.md) | OpenAIx protocol extensions and request/response contracts. |
 | [searxng_integration.md](searxng_integration.md) | SearXNG deployment and aidir configuration instructions. |
 
 ## Proposals and refactoring plans
@@ -56,7 +66,9 @@ Proposals may include both planned and completed work; consult each document.
 | [_proposal_log_refactoring.md](_proposal_log_refactoring.md) | Logging/audit storage and viewer refactoring. |
 | [_proposal_refactoring_1.md](_proposal_refactoring_1.md) | First refactoring plan and execution record. |
 | [_proposal_update_1.md](_proposal_update_1.md) | Proposed first security-update round. |
-| [before_tools_worker.md](before_tools_worker.md) | Pre-tool-call context-processing hook. |
+| [before_tools_worker.md](before_tools_worker.md) | Pre-tool-call context-processing hook. Deferred; see SPEC_NEW.md §14.4. |
+| [proposal_update1.md](proposal_update1.md) | The current work list: the 45 confirmed defects and design gaps from SPEC_NEW.md §14, each with its evidence, the proposed modification and its validation. Excludes the two deferred tasks (the middleware chain and `before_tools`). |
+| [proposal_update_3.md](proposal_update_3.md) | The defects found while investigating a managed llama.cpp server that hangs before opening its listener, and a task that stays `queued` after its execution was handed to a remote aidir. Items V1-V20; the applied ones are marked as fixed. |
 | [proposal_aidir_smart_router.md](proposal_aidir_smart_router.md) | Resource-aware smart routing design. |
 | [proposal_kv_keeper.md](proposal_kv_keeper.md) | KV-affinity smart routing: prefix fingerprinting, sticky candidate selection, queue-imbalance diversion, and per-request session resources. |
 | [plan_kv_keeper.md](plan_kv_keeper.md) | Implementation plan and live state for KV-affinity routing and parallel session admission. |

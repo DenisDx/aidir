@@ -86,15 +86,47 @@ def read_dotenv(path: Path = ENV_FILE) -> dict[str, str]:
     return values
 
 
-def build_resolver(env_file: Path = ENV_FILE) -> Resolver:
+def apply_dotenv_to_environment(values: dict[str, str]) -> None:
+    """Publish the .env values into the process environment, without overriding it.
+
+    The pre-aiset loader used `load_dotenv(override=False)`, which populated
+    `os.environ` as a side effect. The migration reproduced the *precedence* but
+    not the side effect, and code that reads the environment directly depends on
+    it: the managed local server passes its own environment to the child
+    process, `AIDIR_OPENCODE_SESSION_HMAC_SECRET` and `AIDIR_KV_AFFINITY_SECRET`
+    are read from `os.environ`, and the tool workers fall back to `BRAVE_APIKEY`.
+    A variable already exported in the shell keeps its value.
+
+    Only the running instance may do this. A runtime built for another root -
+    the doctor inspecting a different checkout, for instance - must not touch
+    the process environment.
+    """
+    for name, value in values.items():
+        if name and name not in os.environ:
+            os.environ[name] = value
+
+
+def build_resolver(
+    env_file: Path = ENV_FILE,
+    *,
+    environ: dict[str, str] | None = None,
+) -> Resolver:
     """Resolver with the one policy aiset defines for every host.
 
     host overrides, then the process environment, then .env, then the inline
     `:-` default, then the descriptor default. `.env` is injected as data, so a
     variable exported in the shell still wins over the file, which is exactly
     what `load_dotenv(override=False)` did before the migration.
+
+    `environ` defaults to the process environment. A caller that inspects
+    another root passes an empty mapping, so that root's own `.env` decides the
+    placeholders and the process environment of the inspecting host does not.
     """
-    return Resolver(overrides={}, dotenv=read_dotenv(env_file), environ=os.environ)
+    return Resolver(
+        overrides={},
+        dotenv=read_dotenv(env_file),
+        environ=os.environ if environ is None else environ,
+    )
 
 
 def format_load_failure(document_id: str, result) -> str:
@@ -117,14 +149,26 @@ def format_load_failure(document_id: str, result) -> str:
 class SettingsRuntime:
     """Owns the aiset Service and the mapping from document id to file."""
 
-    def __init__(self, root: Path | None = None) -> None:
+    def __init__(
+        self,
+        root: Path | None = None,
+        *,
+        publish_environment: bool = False,
+        environ: dict[str, str] | None = None,
+    ) -> None:
         self.root = Path(root) if root else ROOT
         self.service = Service(
             AisetStoreSettings(backup_depth=5, lock_timeout_seconds=10.0),
             audit=self._audit,
         )
         self._effective: dict[str, dict[str, Any]] = {}
-        self._resolver = build_resolver(self.root / ".env")
+        env_file = self.root / ".env"
+        if publish_environment:
+            # The running instance publishes its own .env into the process
+            # environment, so that the managed local server, the session secret
+            # and the tool workers see the same values the configuration does.
+            apply_dotenv_to_environment(read_dotenv(env_file))
+        self._resolver = build_resolver(env_file, environ=environ)
         self._callbacks_bound = False
 
     # ── construction ────────────────────────────────────────────────
@@ -294,7 +338,7 @@ def get_runtime() -> SettingsRuntime:
     """Process-wide settings runtime, built on first use."""
     global _RUNTIME
     if _RUNTIME is None:
-        _RUNTIME = SettingsRuntime().build()
+        _RUNTIME = SettingsRuntime(publish_environment=True).build()
     return _RUNTIME
 
 

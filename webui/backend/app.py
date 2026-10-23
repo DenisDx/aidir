@@ -41,7 +41,10 @@ if TYPE_CHECKING:
 
 _FRONTEND_DIR = Path(__file__).parent.parent / "frontend"
 _LOGS_DIR     = Path(__file__).parent.parent.parent / "logs"
+# The sessions belong to one instance. A shared prefix would let a session
+# created on one instance open another one.
 _SESSION_PREFIX = "aidir:session:"
+_LEGACY_SESSION_PREFIX = "aidir:session:"
 _ROOT = _LOGS_DIR.parent
 _CRON_MARKER = "# aidir-cron"
 _LOG_FILE_SUFFIXES = frozenset({".log", ".jsonl"})
@@ -332,10 +335,32 @@ async def _cron_health(core: "Core") -> dict[str, Any]:
     }
 
 
-def _task_to_api_item(task: dict[str, Any]) -> dict[str, Any]:
+def _waiting_info(core: "Core", task_id: str) -> dict[str, Any]:
+    """Return why the task waits, so the operator can see where it is stuck."""
+    scheduler = getattr(core, "scheduler", None)
+    getter = getattr(scheduler, "defer_reason_for", None)
+    if not callable(getter) or not task_id:
+        return {}
+    try:
+        entry = getter(task_id) or {}
+    except Exception:
+        return {}
+    if not entry:
+        return {}
+    return {
+        "waiting_reason": str(entry.get("reason") or ""),
+        "waiting_since": entry.get("since"),
+        "waiting_provider": str(entry.get("provider") or ""),
+        "waiting_model": str(entry.get("model") or ""),
+    }
+
+
+def _task_to_api_item(task: dict[str, Any], core: "Core | None" = None) -> dict[str, Any]:
     """Return a single normalized task shape for WebUI list and detail APIs."""
     last_op = _task_last_operation_at(task)
     item = dict(task)
+    if core is not None:
+        item.update(_waiting_info(core, str(item.get("id") or "")))
     item["worker_id"] = item.get("worker_id") or ""
     item["parent_worker"] = item.get("parent_worker") or ""
     item["envid"] = _task_envid(item)
@@ -434,7 +459,7 @@ def _first_request_preview(task_type: str, raw_payload: Any) -> str:
     return _clip_request_preview(_preview_text(payload.get("prompt")))
 
 
-def _task_summary_from_hash(task_hash: dict[str, str]) -> dict[str, Any]:
+def _task_summary_from_hash(task_hash: dict[str, str], core: "Core | None" = None) -> dict[str, Any]:
     """Return search-safe task metadata without decoding raw task bodies or histories."""
     status = str(task_hash.get("status") or "")
     error = _parse_json_field(task_hash.get("error")) if status == "failed" else None
@@ -458,6 +483,8 @@ def _task_summary_from_hash(task_hash: dict[str, str]) -> dict[str, Any]:
     task["external"] = str(task["external"] or "0") in {"1", "true", "True"}
     last_op = _task_last_operation_at(task)
     task["last_operation_at"] = last_op.isoformat() if last_op else None
+    if core is not None:
+        task.update(_waiting_info(core, str(task.get("id") or "")))
     return task
 
 
@@ -584,7 +611,7 @@ async def _list_active_tasks(core: "Core") -> list[dict[str, Any]]:
                 continue
             task_id = str(task_hash.get("id") or "")
             if task_id:
-                item = _task_to_api_item(_task_from_hash(task_hash))
+                item = _task_to_api_item(_task_from_hash(task_hash), core)
                 item["instance"] = str(namespace)
                 item["remote"] = False
                 tasks[task_id] = item
@@ -594,7 +621,7 @@ async def _list_active_tasks(core: "Core") -> list[dict[str, Any]]:
 
     for task in core.queue.list_tasks():
         if task.status in active_statuses:
-            item = _task_to_api_item(_task_from_hash(task.to_redis_hash()))
+            item = _task_to_api_item(_task_from_hash(task.to_redis_hash()), core)
             item["instance"] = str(namespace)
             item["remote"] = False
             tasks[task.id] = item
@@ -634,6 +661,19 @@ def _find_user(core: "Core", login: str, password: str) -> dict | None:
     return None
 
 
+def _session_prefix(core: "Core") -> str:
+    """Return the Redis prefix of the sessions of this instance."""
+    config = getattr(core, "config", None)
+    getter = getattr(config, "get", None)
+    instance = "aidir"
+    if callable(getter):
+        try:
+            instance = str(getter("instance", "aidir") or "aidir")
+        except Exception:
+            instance = "aidir"
+    return f"{_SESSION_PREFIX}{instance}:"
+
+
 async def _create_session(core: "Core", user: dict) -> str:
     """Generate a session token and store it in Redis with TTL."""
     token = secrets.token_hex(32)
@@ -643,15 +683,21 @@ async def _create_session(core: "Core", user: dict) -> str:
         "permissions": user.get("permissions", []),
         "created_at":  datetime.now(timezone.utc).isoformat(),
     })
-    await core.redis.set(f"{_SESSION_PREFIX}{token}", payload, ex=ttl)
+    await core.redis.set(f"{_session_prefix(core)}{token}", payload, ex=ttl)
     return token
 
 
 async def _get_session(core: "Core", token: str) -> dict | None:
-    """Return session data for token, or None if invalid/expired."""
+    """Return session data for token, or None if invalid/expired.
+
+    A session written before the instance-scoped prefix was introduced is still
+    accepted, so an upgrade does not log every operator out.
+    """
     if not token:
         return None
-    raw = await core.redis.get(f"{_SESSION_PREFIX}{token}")
+    raw = await core.redis.get(f"{_session_prefix(core)}{token}")
+    if raw is None:
+        raw = await core.redis.get(f"{_LEGACY_SESSION_PREFIX}{token}")
     if raw is None:
         return None
     try:
@@ -818,7 +864,7 @@ def create_app(
         aidir_token: str | None = Cookie(default=None),
     ):
         if aidir_token:
-            await core.redis.delete(f"{_SESSION_PREFIX}{aidir_token}")
+            await core.redis.delete(f"{_session_prefix(core)}{aidir_token}")
         response.delete_cookie("aidir_token")
         return {"ok": True}
 
@@ -890,7 +936,7 @@ def create_app(
                 live_task = core.queue.get_task(task_id) if task_id and core.queue else None
                 if live_task is not None:
                     raw = live_task.to_redis_hash()
-                task = _task_summary_from_hash(raw)
+                task = _task_summary_from_hash(raw, core)
                 task_envid = str(task.get("envid") or "")
                 if envid and task_envid != envid:
                     continue
@@ -943,13 +989,13 @@ def create_app(
         """Return full JSON for one task, from live memory or Redis."""
         live_task = core.queue.get_task(task_id) if core.queue else None
         if live_task is not None:
-            return {"task": _task_to_api_item(_task_from_hash(live_task.to_redis_hash()))}
+            return {"task": _task_to_api_item(_task_from_hash(live_task.to_redis_hash()), core)}
 
         ns = core.config.get("instance", "aidir")
         raw = await core.redis.hgetall(f"{ns}:task:{task_id}")
         if not raw:
             raise HTTPException(status_code=404, detail="Task not found")
-        return {"task": _task_to_api_item(_task_from_hash(raw))}
+        return {"task": _task_to_api_item(_task_from_hash(raw), core)}
 
     @app.get("/api/tasks/viewer/{task_id}/detail")
     async def task_viewer_detail(task_id: str, session: dict = Depends(_require_session)):
@@ -957,13 +1003,13 @@ def create_app(
         live_task = core.queue.get_task(task_id) if core.queue else None
         if live_task is not None:
             raw = live_task.to_redis_hash()
-            task = _task_summary_from_hash(raw)
+            task = _task_summary_from_hash(raw, core)
         else:
             ns = core.config.get("instance", "aidir")
             raw = await core.redis.hgetall(f"{ns}:task:{task_id}")
             if not raw:
                 raise HTTPException(status_code=404, detail="Task not found")
-            task = _task_summary_from_hash(raw)
+            task = _task_summary_from_hash(raw, core)
         task["first_message_preview"] = _first_request_preview(
             str(task.get("type") or ""),
             raw.get("payload"),
@@ -1038,7 +1084,7 @@ def create_app(
             raise HTTPException(status_code=404, detail="Task not found")
 
         log("webui", "warn", f"Task termination requested by user {session['login']}: {task_id}", "control")
-        return {"ok": True, "task": _task_to_api_item(_task_from_hash(task_hash))}
+        return {"ok": True, "task": _task_to_api_item(_task_from_hash(task_hash), core)}
 
     @app.post("/api/tasks/{task_id}/extend-timeout")
     async def extend_task_timeout(task_id: str, session: dict = Depends(_require_session)):
@@ -1048,7 +1094,7 @@ def create_app(
             raise HTTPException(status_code=404, detail="Active task not found")
 
         log("webui", "info", f"Task timeout extended by user {session['login']}: {task_id}", "control")
-        return {"ok": True, "task": _task_to_api_item(_task_from_hash(task.to_redis_hash()))}
+        return {"ok": True, "task": _task_to_api_item(_task_from_hash(task.to_redis_hash()), core)}
 
     # ── Status ────────────────────────────────────────────────────────────────
 
@@ -1058,6 +1104,10 @@ def create_app(
             wid: {"task_type": w.task_type, "enabled": w.enabled}
             for wid, w in core.workers.items()
         }
+        runtime_health = {}
+        health_reader = getattr(core, "get_runtime_health", None)
+        if callable(health_reader):
+            runtime_health = await health_reader()
         return {
             "instance": core.config.get("instance", "aidir"),
             "workers":  workers_info,
@@ -1067,6 +1117,7 @@ def create_app(
             "health": {
                 "cron": await _cron_health(core),
                 "audit": core.audit_log.health() if core.audit_log else {"status": "unavailable"},
+                "execution": runtime_health,
             },
         }
 

@@ -989,6 +989,14 @@
                     help: "Empty is valid: the provider is then expected to be running already.",
                   },
                 },
+                env: {
+                  type: "object",
+                  apply: "restart",
+                  description: "Extra environment variables for a managed local server, for example CUDA_VISIBLE_DEVICES or LD_LIBRARY_PATH. They are applied on top of the aidir process environment",
+                  additional_children: {
+                    type: "string",
+                  },
+                },
                 startup_timeout: {
                   type: "int",
                   minimum: 1,

@@ -9,6 +9,7 @@ so not every job runs on every cron invocation.
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 import time
 from pathlib import Path
@@ -242,7 +243,13 @@ async def cleanup_stale_tasks(redis: aioredis.Redis) -> None:
 
 
 async def cleanup_expired_tasks(redis: aioredis.Redis) -> None:
-    """Delete completed external tasks older than config.external_task_live seconds."""
+    """Delete completed external tasks older than config.external_task_live seconds.
+
+    The same pass reaps the orphaned tasks: a hash that says `queued` while no
+    queue holds it can never be dispatched, and nothing else would ever finish
+    it. Such a task is marked failed with `ORPHANED_TASK`, so the dashboard
+    shows a terminal state instead of a task that waits forever.
+    """
     interval = int(config.get("cron_period") or 60)
     interval = max(10, interval)
     if not await _should_run(redis, "cleanup_expired_tasks", interval):
@@ -260,14 +267,39 @@ async def cleanup_expired_tasks(redis: aioredis.Redis) -> None:
     pattern = f"{ns}:task:*"
     cutoff = time.time() - max_age
     deleted = 0
+    orphaned = 0
+
+    queued_members: set[str] = set()
+    for task_type in ("agent", "tool"):
+        try:
+            queued_members.update(await redis.zrange(f"{ns}:queue:{task_type}", 0, -1))
+        except Exception as exc:
+            log("system", "warning", f"cleanup_expired_tasks: cannot read the {task_type} queue: {exc}")
 
     cursor = 0
     while True:
         cursor, keys = await redis.scan(cursor, match=pattern, count=100)
         for key in keys:
             try:
-                fields = await redis.hmget(key, "external", "finished_at", "status")
-                is_external, finished_at, status = fields
+                fields = await redis.hmget(key, "external", "finished_at", "status", "id")
+                is_external, finished_at, status, task_id = fields
+                task_id = str(task_id or key.rsplit(":", 1)[-1])
+                if status == "queued" and task_id not in queued_members:
+                    from datetime import datetime, timezone
+                    now = datetime.now(timezone.utc)
+                    error = {
+                        "code": "ORPHANED_TASK",
+                        "message": "The task was waiting in no queue and could never be dispatched",
+                    }
+                    await redis.hset(key, mapping={
+                        "status": "failed",
+                        "updated_at": now.isoformat(),
+                        "finished_at": now.isoformat(),
+                        "error": json.dumps(error),
+                        "error_code": error["code"],
+                    })
+                    orphaned += 1
+                    continue
                 if is_external != "1":
                     continue
                 if status not in ("completed", "failed", "canceled"):
@@ -287,8 +319,21 @@ async def cleanup_expired_tasks(redis: aioredis.Redis) -> None:
         if cursor == 0:
             break
 
+    # The count is published so that the dashboard can show it without a scan
+    # of every task hash on every status request.
+    try:
+        await redis.set(f"{ns}:cron:orphaned_tasks", orphaned)
+    except Exception as exc:
+        log("system", "warning", f"cleanup_expired_tasks: cannot publish the orphan count: {exc}")
+
     if deleted:
         log("system", "info", f"cleanup_expired_tasks: deleted {deleted} expired task(s)")
+    if orphaned:
+        log(
+            "system",
+            "warning",
+            f"cleanup_expired_tasks: failed {orphaned} orphaned task(s) that were waiting in no queue",
+        )
 
 
 async def run_loop_workers_cycle(redis: aioredis.Redis, core: Core | None = None) -> None:

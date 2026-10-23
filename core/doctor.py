@@ -420,7 +420,7 @@ def _check_config(context: Context) -> CheckResult:
     except Exception as exc:
         return CheckResult("config", "fail", str(exc).splitlines()[0])
 
-    runtime = SettingsRuntime(root=context.root)
+    runtime = SettingsRuntime(root=context.root, environ={})
     try:
         runtime.build(refresh=False)
     except Exception as exc:
@@ -887,6 +887,61 @@ def _redis_advice(*, state: str, output: str, attempted: bool, aidir_running: bo
     return "; ".join(parts)
 
 
+@_register("namespaces")
+def _check_namespaces(context: Context) -> CheckResult:
+    """Redis must not hold the data of an instance that is no longer configured.
+
+    Two instances on one machine keep their own namespace, so the data of an
+    old instance is harmless but confusing: it occupies space, it shows up in
+    the statistics, and the instance id in the URLs does not describe it. The
+    check only reports; removing another instance's data is the operator's
+    decision.
+    """
+    settings = _resolved(context)
+    instance = str((settings.get("instance") or "aidir") or "aidir")
+    host = _str(settings, "redis.host", None) or _env(context).get("REDIS_HOST", "127.0.0.1")
+    port = _int(settings, "redis.port", None) or _int_env(context, "REDIS_PORT", 6379)
+    password = _str(settings, "redis.password", None) or _env(context).get("REDIS_PASSWORD", "")
+
+    try:
+        import redis
+
+        client = redis.Redis(
+            host=host, port=port, password=password or None,
+            socket_connect_timeout=2, socket_timeout=2,
+        )
+        client.ping()
+        keys = list(client.scan_iter(match="*:task:*", count=500))
+    except Exception as exc:
+        return CheckResult(
+            "namespaces", "warn", f"cannot read the namespaces: {exc.__class__.__name__}"
+        )
+
+    counts: dict[str, int] = {}
+    for key in keys:
+        name = key.decode("utf-8", "replace") if isinstance(key, bytes) else str(key)
+        name = name.split(":", 1)[0]
+        if not name or name == instance:
+            continue
+        counts[name] = counts.get(name, 0) + 1
+
+    if not counts:
+        return CheckResult("namespaces", "ok", f"only the namespace '{instance}' holds task data")
+
+    other = ", ".join(f"{name} ({count} task(s))" for name, count in sorted(counts.items()))
+    result = CheckResult(
+        "namespaces",
+        "warn",
+        f"Redis also holds the task data of another instance: {other}",
+    )
+    result.details.append(
+        f"The configured instance is '{instance}'. The data above belongs to an "
+        "instance that is not configured here; it can be removed with "
+        f"'redis-cli --scan --pattern \"<name>:task:*\"' once you are sure it is not needed."
+    )
+    return result
+
+
 @_register("nginx")
 def _check_nginx(context: Context) -> CheckResult:
     """The nginx container must be running."""
@@ -1318,7 +1373,7 @@ def _resolved(context: Context) -> dict[str, Any]:
         try:
             from core.settings.runtime import SettingsRuntime
 
-            runtime = SettingsRuntime(root=context.root)
+            runtime = SettingsRuntime(root=context.root, environ={})
             try:
                 runtime.build()
             except Exception:
