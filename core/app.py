@@ -973,12 +973,20 @@ class _PlannedRestart(SystemExit):
         super().__init__(1)
 
 
-if __name__ == "__main__":
+def run_entrypoint() -> None:
+    """Run the application and report how the process ended.
+
+    The exit code is part of the contract with the supervisor: a restart that
+    the process asked for itself must leave with a non-zero code, because the
+    unit is configured with `Restart=on-failure`. A clean exit would be taken
+    for "the service is fine" and the service would stay down.
+    """
     log("core", "info", "=== PROCESS STARTED ===")
     try:
         asyncio.run(main())
     except _PlannedRestart:
         log("core", "info", "=== PROCESS EXITED FOR A PLANNED RESTART ===")
+        raise
     except SystemExit as exc:
         log("core", "info", f"=== PROCESS EXITED WITH CODE {exc.code} ===")
         raise
@@ -987,3 +995,7 @@ if __name__ == "__main__":
         raise
     finally:
         log("core", "info", "=== PROCESS EXITED ===")
+
+
+if __name__ == "__main__":
+    run_entrypoint()

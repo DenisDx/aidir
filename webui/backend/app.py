@@ -176,6 +176,29 @@ def _list_log_files() -> list[str]:
     )
 
 
+async def _stream_log_lines(core: "Core", websocket: WebSocket, log_file: Path) -> None:
+    """Stream the new log lines until the client leaves or the service stops.
+
+    A live log socket must not hold the graceful shutdown back: the connection
+    would keep uvicorn waiting for its whole grace period, and the shutdown
+    would end with a cancelled handler instead of a clean exit.
+    """
+    cursor = _new_log_tail_cursor(log_file)
+    try:
+        while True:
+            if core.get_runtime_status().get("restart_requested"):
+                break
+            await asyncio.sleep(1)
+            cursor, new_lines = _read_appended_log_lines(log_file, cursor)
+            for line in new_lines:
+                await websocket.send_text(line)
+    except WebSocketDisconnect:
+        pass
+    except asyncio.CancelledError:
+        # The shutdown cancelled the connection. That is not an error.
+        pass
+
+
 def _resolve_log_file(file_name: str) -> Path:
     """Resolve a requested log file name safely under the logs directory."""
     requested = (file_name or "").strip()
@@ -1307,11 +1330,20 @@ def create_app(
 
         try:
             while True:
+                # A live log socket must not hold the graceful shutdown back:
+                # the connection would keep uvicorn waiting for its full
+                # grace period, and the shutdown would end with a cancelled
+                # handler instead of a clean exit.
+                if core.get_runtime_status().get("restart_requested"):
+                    break
                 await asyncio.sleep(1)
                 cursor, new_lines = _read_appended_log_lines(log_file, cursor)
                 for line in new_lines:
                     await websocket.send_text(line)
         except WebSocketDisconnect:
+            pass
+        except asyncio.CancelledError:
+            # The shutdown cancelled the connection. That is not an error.
             pass
 
     # ── Settings ─────────────────────────────────────────────────────────────

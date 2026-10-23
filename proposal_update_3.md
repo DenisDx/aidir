@@ -49,6 +49,9 @@ Priority meaning:
 | V18 | Diagnostics | P3 | The doctor resolved the placeholders of the inspected root against the process environment | **Fixed** |
 | V19 | Diagnostics | P3 | A planned WebUI restart is logged as an error traceback | **Fixed** |
 | V20 | Diagnostics | P3 | A managed server that fails to start is visible in the resource panel only | **Fixed** |
+| V25 | Lifecycle | P1 | The planned restart exited with code 0, so the supervisor never restarted the service | **Fixed** |
+| V26 | Lifecycle | P2 | A live log socket held the graceful shutdown back for the whole grace period | **Fixed** |
+| V27 | Tests | P3 | The test suite writes into the real log files, so the log of a production instance contains test doubles | Open |
 
 ---
 
@@ -455,6 +458,93 @@ is not remote-aware.
 
 ---
 
+### V25. The planned restart exited with code 0 (P1, Fixed)
+
+**Evidence**
+- The first version of the V19 fix caught the planned restart and did not
+  re-raise it, so `asyncio.run()` returned normally and the process left with
+  code 0.
+- The unit is generated with `Restart=on-failure` (`install.sh:682-703`), so a
+  clean exit is taken for "the service is fine": the supervisor did not restart
+  it, and the service stayed down after the Restart button.
+- The journal of the affected machine showed the process leaving and nothing
+  after it.
+
+**Impact**
+The Restart button stopped the service instead of restarting it. The WebUI became
+unreachable and the instance looked hung.
+
+**Fix (applied)**
+- The planned restart is re-raised, so the process leaves with code 1 and the
+  supervisor restarts the service.
+- `run_entrypoint()` was extracted so the exit code is covered by a test.
+
+**Validation**
+- `test_restart_exit.py` covers the exit code of the planned restart and of a
+  real crash.
+- The live restart: `Main process exited, code=exited, status=1/FAILURE`,
+  `Scheduled restart job`, and the service answered again.
+
+---
+
+### V26. A live log socket held the graceful shutdown back (P2, Fixed)
+
+**Evidence**
+- `webui/backend/app.py` — the log WebSocket handler looped forever and never
+  looked at the shutdown state, so the connection kept uvicorn waiting for its
+  whole `timeout_graceful_shutdown` before it was cancelled.
+- The cancellation surfaced as an exception in the journal:
+
+  ```
+  File "/home/denis/aidir/webui/backend/app.py", line 1310, in ws_logs
+      await asyncio.sleep(1)
+  asyncio.exceptions.CancelledError: Task cancelled, timeout graceful shutdown exceeded
+  ```
+
+**Impact**
+Every shutdown of an instance with an open dashboard cost the full grace period
+and ended with a traceback that looked like a failure of the service.
+
+**Fix (applied)**
+- The streaming loop leaves as soon as the service reports that a restart is in
+  progress, and a cancellation is not an error any more.
+- The loop was extracted into `_stream_log_lines()` so it can be tested.
+
+**Validation**
+- `test_restart_exit.py`: the handler returns instead of looping forever.
+- The live restart: no `CancelledError` in the journal, and the shutdown took
+  about a second instead of the full grace period.
+
+---
+
+### V27. The test suite writes into the real log files (P3, Open)
+
+**Evidence**
+- `core.log` writes into the project's `logs/` directory, and the test suite
+  calls the code paths that log. The log of a running instance therefore
+  contains the doubles' messages:
+
+  ```
+  2026-10-23T09:53:04 [WARN] [system] cleanup_expired_tasks: cannot read the agent queue: '_Redis' object has no attribute 'zrange'
+  2026-10-23T09:52:57 [ERROR] [system] close check 3
+  2026-10-23T09:52:56 [ERROR] [system:llama_cpp] llama.cpp provider 'llama_local' startup output (still running): first-line
+  ```
+
+**Impact**
+An operator reading the log of a production instance sees test messages, and
+cannot tell them from a real failure. It also makes the log grow with every test
+run.
+
+**Proposed modification**
+1. Point the logger at a temporary directory while the tests run: an environment
+   variable, or a fixture that redirects the log root.
+2. Or make the logger silent unless a test asks for it.
+
+**Validation**
+- A test that the log files of the project are not touched by the suite.
+
+---
+
 ## 5. The orphaned tasks
 
 ### V21. A remote that stops answering must not fail the task (P1, Fixed)
@@ -743,9 +833,21 @@ broken.
 - The planned restart raises a dedicated `_PlannedRestart`, which the entry point
   reports as an event. The exit code stays 1, so the supervisor still restarts
   the service.
+- The entry point was extracted into `run_entrypoint()` so that its behavior can
+  be tested without starting the service.
+
+**The regression this introduced (V25)**
+The first version of the fix caught `_PlannedRestart` and did **not** re-raise it.
+The process then left with code 0, the unit's `Restart=on-failure` treated the
+clean exit as "the service is fine", and the service stayed down after the Restart
+button. The exception must be re-raised: the exit code is a contract with the
+supervisor, not a detail of the log.
 
 **Validation**
-- The entry point was exercised; the log shows the event instead of a traceback.
+- `test_restart_exit.py`: the planned restart leaves with code 1, it is not
+  logged as a crash, and a real crash still is.
+- The live service was restarted through the WebUI button: the process left with
+  `status=1/FAILURE`, systemd scheduled the restart, and the service was back.
 
 ---
 
@@ -794,11 +896,13 @@ the resource panel, but the operator has to know to look there.
 | **1** | V1–V4, V5–V8, V9, V10, V14, V18 | **Done.** The environment, the diagnostics of a managed server, the stuck task and the silent cancel. |
 | **2** | V21–V24 | **Done.** The bounds: an unreachable remote no longer fails the task, a request cannot remove the timeout of its task, a removed task does not keep a waiting status, and the cron cycle reaps the orphans. |
 | **3** | V11, V12, V13, V16, V17, V19, V20 | **Done.** The visibility: a remote candidate is measured before it is chosen, the waiting reason reaches the dashboard, the quarantined task is terminal, the sessions belong to the instance, the doctor sees the foreign namespaces, a planned restart is not a traceback, and a provider that failed to start is in the health card. |
+| **4** | V25, V26 | **Done.** The lifecycle: the planned restart keeps the exit code the supervisor needs, and a live log socket no longer holds the graceful shutdown back. |
 
 **Everything in this proposal is now applied.** The items that stay open are
 recorded in the sections themselves: the terminate action is not remote-aware
-(V13), the doctor reports the foreign namespace but does not remove it (V17), and
-the orphan count is not yet in the health panel of the dashboard (V15).
+(V13), the doctor reports the foreign namespace but does not remove it (V17), the
+orphan count is not yet in the health panel of the dashboard (V15), and the test
+suite still writes into the real log files (V27).
 
 ---
 
@@ -809,7 +913,8 @@ the orphan count is not yet in the health panel of the dashboard (V15).
   `test_remote_candidate_measurement.py` (V11),
   `test_execution_visibility.py` (V12, V13, V16, V20),
   `test_terminate_persisted.py` (V14), `test_queue_bounds.py` (V22, V23),
-  `test_orphaned_tasks.py` (V24), `test_doctor.py` (V17, V18).
+  `test_orphaned_tasks.py` (V24), `test_restart_exit.py` (V19, V25, V26),
+  `test_doctor.py` (V17, V18).
 - The open items need a test each, in the module that owns the area:
   `test_kv_affinity_routing.py` for V11, `test_cron_logging.py` for V15 and V16,
   `test_settings_backend.py` for V17, `test_cron_logging.py` for V19, and
