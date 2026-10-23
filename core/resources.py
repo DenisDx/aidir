@@ -489,6 +489,7 @@ class Resources:
                         all_unloaded = False
                         continue
                     self._invalidate_candidate(provider_id, model_id)
+                    await self._clear_model_activity(rid, model_id, provider_id)
                 res.clear_soft_consumer(model_id, entry_provider_id or None)
         return all_unloaded
 
@@ -510,6 +511,7 @@ class Resources:
                 )
                 if unloaded:
                     self._invalidate_candidate(provider_id, model_id)
+                    await self._clear_model_activity(resource.id, model_id, provider_id)
                     resource.clear_soft_consumer(model_id, entry_provider_id or None)
                 else:
                     all_unloaded = False
@@ -731,6 +733,8 @@ class Resources:
                     "model_id": model_id,
                     "resource_id": rid,
                     "released_at": now,
+                    "last_used_at": now,
+                    "last_ping_at": now,
                     "keep_alive": res.keep_alive,
                     "keep_alive_period": res.keep_alive_period,
                     "provider": effective_provider_id,
@@ -795,6 +799,86 @@ class Resources:
                     resource = self._items.get(str(resource_id))
                     if resource is not None and isinstance(requirements, dict):
                         resource.add_soft_consumer(requirements, model_id, provider_id, persistent=True)
+
+    async def restore_activity_consumers(self, full_config: dict) -> int:
+        """Restore idle-model occupancy persisted for keep-alive across an aidir restart."""
+        if self._redis is None:
+            return 0
+        import json
+        cursor = 0
+        restored = 0
+        while True:
+            cursor, keys = await self._redis.scan(
+                cursor,
+                match=f"{self._ns}:resource:*:activity:*",
+                count=100,
+            )
+            for key in keys:
+                raw = await self._redis.get(key)
+                if not raw:
+                    continue
+                try:
+                    data = json.loads(raw)
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(data, dict):
+                    continue
+                resource_id = str(data.get("resource_id") or "").strip()
+                model_id = str(data.get("model_id") or "").strip()
+                provider_id = str(data.get("provider") or "").strip()
+                resource = self._items.get(resource_id)
+                if resource is None or not model_id or not provider_id:
+                    continue
+                if self._provider_api_type(provider_id, full_config) == "llama-cpp":
+                    # Managed llama.cpp occupancy is restored from its verified PID record.
+                    continue
+                requirements = self._model_requirements_for(resource_id, model_id, provider_id, full_config)
+                if not requirements:
+                    continue
+                keep_alive = int(data.get("keep_alive") or 0)
+                last_used = float(data.get("last_used_at") or data.get("released_at") or 0)
+                retention = max(resource.alive_time, keep_alive)
+                if retention > 0 and time.time() - last_used >= retention:
+                    continue
+                resource.add_soft_consumer(
+                    requirements,
+                    model_id,
+                    provider_id,
+                    persistent=False,
+                    released_at=last_used,
+                    expires_at=last_used + retention,
+                )
+                restored += 1
+            if cursor == 0:
+                break
+        if restored:
+            log("system", "info", f"Restored {restored} idle model reservation(s) from activity records")
+        return restored
+
+    @staticmethod
+    def _model_requirements_for(
+        resource_id: str,
+        model_id: str,
+        provider_id: str,
+        full_config: dict | None,
+    ) -> dict[str, int] | None:
+        """Return configured resource requirements for one provider model."""
+        if not full_config:
+            return None
+        providers = ((full_config.get("models") or {}).get("providers") or {})
+        provider = providers.get(provider_id) if isinstance(providers, dict) else None
+        if not isinstance(provider, dict):
+            return None
+        for model in provider.get("models") or []:
+            if not isinstance(model, dict):
+                continue
+            if model_id not in {model.get("id"), model.get("name"), model.get("alias")}:
+                continue
+            requirements = (model.get("resources") or {}).get(resource_id)
+            if not isinstance(requirements, dict):
+                return None
+            return {str(key): int(value) for key, value in requirements.items()}
+        return None
 
     @staticmethod
     def _provider_api_type(provider_id: str | None, full_config: dict | None) -> str:

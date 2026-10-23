@@ -243,10 +243,13 @@ class Core:
         self.hooks = HookManager(_ROOT, self.llama_cpp_server_manager, self.config.raw())
         self.resources.set_local_server_manager(self.llama_cpp_server_manager)
         if self._manage_local_servers:
-            stopped_providers = await self.llama_cpp_server_manager.stop_all()
+            kept_providers, stopped_providers = await self.llama_cpp_server_manager.adopt_existing()
+            if kept_providers:
+                log("core", "info", f"Adopted healthy inherited llama.cpp providers: {kept_providers}")
             if stopped_providers:
-                log("core", "info", f"Stopped inherited llama.cpp providers during startup: {stopped_providers}")
+                log("core", "info", f"Stopped unhealthy inherited llama.cpp providers: {stopped_providers}")
             self.resources.restore_owned_llama_cpp_consumers(self.config.raw(), self.llama_cpp_server_manager)
+            await self.resources.restore_activity_consumers(self.config.raw())
         # Initialize each worker with its config section
         for wid, w in self.workers.items():
             setattr(w, "_core", self)

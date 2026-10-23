@@ -3,14 +3,114 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import time
 import unittest
+from unittest.mock import AsyncMock
 
 from core.resource import Resource
 from core.resources import Resources
 
 
+class _ActivityRedis:
+    """Fake Redis for activity-record restoration and deletion."""
+
+    def __init__(self, data: dict[str, str]) -> None:
+        """Store activity records keyed by Redis key."""
+        self.data = data
+        self.deleted: list[str] = []
+
+    async def scan(self, cursor, match, count):
+        """Return every seeded activity key in one page."""
+        return 0, list(self.data)
+
+    async def get(self, key):
+        """Return one activity record."""
+        return self.data.get(key)
+
+    async def delete(self, key):
+        """Delete one activity record."""
+        self.deleted.append(key)
+        self.data.pop(key, None)
+
+    async def set(self, key, value, ex=None):
+        """Persist one activity record for the cron keep-alive tests."""
+        self.data[key] = value
+
+
 class TestResourceReuse(unittest.IsolatedAsyncioTestCase):
     """Validate that repeated requests can reuse the same warm model."""
+
+    async def test_observed_free_memory_can_be_recovered_by_unloading_soft_consumers(self) -> None:
+        """Plan an unload when observed free VRAM is low only because idle models hold it."""
+        resource = Resource(
+            "gpu", "cuda", {"VRAM": 22}, alive_time=300,
+            availability={"command": "nvidia-smi", "metric": "VRAM"},
+        )
+        resource.record_observed_availability("command", {"VRAM": 5})
+        resource.add_soft_consumer({"VRAM": 10}, "idle-model", "ollama_local")
+
+        self.assertFalse(resource.is_available({"VRAM": 12}))
+        self.assertTrue(resource.is_available_after_unload({"VRAM": 12}))
+        self.assertFalse(resource.is_available_after_unload({"VRAM": 16}))
+
+    async def test_activity_restore_rebuilds_soft_consumer_after_restart(self) -> None:
+        """Restore an idle Ollama model from its persisted keep-alive activity record."""
+        now = time.time()
+        key = "aidir:resource:gpu:activity:ollama_local:model-a"
+        redis = _ActivityRedis({
+            key: json.dumps({
+                "model_id": "model-a",
+                "resource_id": "gpu",
+                "provider": "ollama_local",
+                "released_at": now - 60,
+                "last_used_at": now - 60,
+                "last_ping_at": now - 60,
+                "keep_alive": 5000,
+                "keep_alive_period": 250,
+            }),
+        })
+        resources = Resources([{"id": "gpu", "type": "cuda", "limits": {"VRAM": 22}, "alive_time": 300, "keep_alive": 5000}])
+        resources.set_redis(redis, "aidir")
+        full_config = {"models": {"providers": {"ollama_local": {
+            "api": "ollama",
+            "models": [{"id": "model-a", "resources": {"gpu": {"VRAM": 10}}}],
+        }}}}
+
+        restored = await resources.restore_activity_consumers(full_config)
+
+        self.assertEqual(restored, 1)
+        snapshot = resources.get("gpu").snapshot()
+        self.assertEqual(snapshot["soft_used"]["VRAM"], 10)
+        self.assertEqual(snapshot["soft_consumers"][0]["model_id"], "model-a")
+        self.assertGreater(snapshot["soft_consumers"][0]["expires_in"], 0)
+
+    async def test_force_unload_clears_keep_alive_activity(self) -> None:
+        """Do not let cron resurrect a model that was explicitly unloaded."""
+        now = time.time()
+        key = "aidir:resource:gpu:activity:ollama_local:model-a"
+        redis = _ActivityRedis({
+            key: json.dumps({
+                "model_id": "model-a",
+                "resource_id": "gpu",
+                "provider": "ollama_local",
+                "released_at": now,
+                "last_used_at": now,
+                "keep_alive": 5000,
+                "keep_alive_period": 250,
+            }),
+        })
+        resources = Resources([{"id": "gpu", "type": "cuda", "limits": {"VRAM": 22}, "alive_time": 300, "keep_alive": 5000}])
+        resources.set_redis(redis, "aidir")
+        resources.set_full_config({"models": {"providers": {"ollama_local": {"api": "ollama"}}}})
+        resources.get("gpu").add_soft_consumer({"VRAM": 10}, "model-a", "ollama_local")
+        resources._call_provider_unload = AsyncMock(return_value=True)
+
+        unloaded = await resources.force_unload_for({"gpu": {"VRAM": 10}})
+
+        self.assertTrue(unloaded)
+        self.assertEqual(redis.deleted, [key])
+        self.assertEqual(resources.get("gpu").snapshot()["soft_consumers"], [])
 
     async def test_resource_reuses_same_soft_model_without_double_counting(self) -> None:
         """Turns a matching soft consumer back into active usage instead of treating it as a blocker."""

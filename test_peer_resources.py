@@ -5,6 +5,8 @@ from __future__ import annotations
 import unittest
 from unittest.mock import patch
 
+from types import SimpleNamespace
+
 from fastapi.testclient import TestClient
 
 from core.endpoints.endpoint_openaix import Endpoint_openaix
@@ -31,8 +33,9 @@ class _Config:
 class _Core:
     """Provide resources and configuration required by the OpenAIx endpoint."""
 
-    def __init__(self, config: dict) -> None:
+    def __init__(self, config: dict, tasks: list | None = None) -> None:
         self.config = _Config(config)
+        self.queue = SimpleNamespace(list_tasks=lambda: list(tasks or []))
         self.resources = Resources([{
             "id": "gpu",
             "type": "cuda",
@@ -144,6 +147,90 @@ class TestPeerResources(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["protocol_version"], 1)
         self.assertEqual(response.json()["data"][0]["id"], "gpu")
+
+    def test_peer_tasks_are_public_by_default_and_omit_bodies(self) -> None:
+        """Expose active task summaries without request or response payloads."""
+        active = SimpleNamespace(
+            id="remote-task",
+            type="agent",
+            status="running",
+            worker_id="openaix",
+            priority=5,
+            created_at=None,
+            updated_at=None,
+            started_at=None,
+            finished_at=None,
+            route_provider_id="remote_aidir_110",
+            model_id="qwen3.8-27b-local",
+            llm_call_count=2,
+            envid="env-1",
+            parent_worker="",
+            request_preview="type=agent model=qwen3.8-27b-local messages=1",
+            payload={"messages": [{"role": "user", "content": "secret body"}]},
+            config={
+                "route": {
+                    "requested_alias": "smart_qwen3.8-27b",
+                    "resolved_provider": "remote_aidir_110",
+                    "resolved_model": "qwen3.8-27b-local",
+                },
+                "route_trace": {"route_id": "route-1"},
+            },
+        )
+        completed = SimpleNamespace(
+            id="done-task",
+            type="agent",
+            status="completed",
+            worker_id="openaix",
+            priority=5,
+            created_at=None,
+            updated_at=None,
+            started_at=None,
+            finished_at=None,
+            route_provider_id="",
+            model_id="done-model",
+            llm_call_count=1,
+            envid="",
+            parent_worker="",
+            request_preview="",
+            payload={},
+            config={},
+        )
+        core = _Core({"http": {"max_request_size": 1024}, "instance": "remote-aidir"}, [active, completed])
+        endpoint = Endpoint_openaix({"id": "openaix", "api": "openaix"})
+
+        with TestClient(endpoint.create_app(core)) as client:
+            response = client.get("/v1/tasks")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["instance"], "remote-aidir")
+        self.assertEqual([task["id"] for task in body["data"]], ["remote-task"])
+        task = body["data"][0]
+        self.assertEqual(task["model_id"], "qwen3.8-27b-local")
+        self.assertEqual(task["requested_model"], "smart_qwen3.8-27b")
+        self.assertEqual(task["route_provider_id"], "remote_aidir_110")
+        self.assertEqual(task["route_id"], "route-1")
+        self.assertNotIn("payload", task)
+        self.assertNotIn("secret body", response.text)
+
+    def test_peer_tasks_endpoint_auth_mode_requires_bearer_token(self) -> None:
+        """Reject anonymous task-list requests when the endpoint auth mode is on."""
+        config = {
+            "http": {"max_request_size": 1024},
+            "instance": "remote-aidir",
+            "users": {"items": [{"token": "peer-token"}]},
+        }
+        endpoint_config = {"peer_tasks": {"auth_mode": "endpoint"}}
+        with self._client(endpoint_config, config) as client:
+            self.assertEqual(client.get("/v1/tasks").status_code, 401)
+            self.assertEqual(
+                client.get("/v1/tasks", headers={"Authorization": "Bearer invalid"}).status_code,
+                401,
+            )
+            response = client.get("/v1/tasks", headers={"Authorization": "Bearer peer-token"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["data"], [])
 
     def test_peer_client_caches_definitive_non_peer_but_retries_transient_failures(self) -> None:
         """Cache endpoint absence while allowing a later retry after an HTTP failure."""

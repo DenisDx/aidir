@@ -348,10 +348,13 @@ async def keep_alive_ping(redis: aioredis.Redis) -> None:
                 keep_alive_period = int(data.get("keep_alive_period") or 0)
                 if not keep_alive or not keep_alive_period:
                     continue
-                released_at = float(data.get("released_at") or 0)
-                age = now - released_at
-                # Skip if keep_alive window has passed or ping not yet due
-                if age >= keep_alive or age < keep_alive_period:
+                last_used = float(data.get("last_used_at") or data.get("released_at") or 0)
+                last_ping = float(data.get("last_ping_at") or last_used or 0)
+                # The window starts at the last real use, not at the last ping.
+                if now - last_used >= keep_alive:
+                    await redis.delete(key)
+                    continue
+                if now - last_ping < keep_alive_period:
                     continue
                 model_id = data.get("model_id") or ""
                 resource_id = data.get("resource_id") or ""
@@ -372,7 +375,8 @@ async def keep_alive_ping(redis: aioredis.Redis) -> None:
                     except LocalServerError as exc:
                         log("system", "warn", f"llama.cpp keep-alive restart failed for {provider_id}: {exc}")
                         continue
-                    data["released_at"] = now
+                    data["last_used_at"] = last_used
+                    data["last_ping_at"] = now
                     ttl = max(keep_alive, 3600)
                     await redis.set(key, json.dumps(data), ex=ttl)
                     pinged += 1
@@ -384,13 +388,14 @@ async def keep_alive_ping(redis: aioredis.Redis) -> None:
                 url = f"{base_url}/api/generate"
                 async with httpx.AsyncClient(timeout=15.0) as client:
                     await client.post(url, json={"model": model_id, "keep_alive": keep_alive_period * 2})
-                # Update last-activity timestamp in Redis
-                data["released_at"] = now
+                # Remember the ping, but keep the original last-use timestamp.
+                data["last_used_at"] = last_used
+                data["last_ping_at"] = now
                 ttl = max(keep_alive, 3600)
                 await redis.set(key, json.dumps(data), ex=ttl)
                 pinged += 1
                 log("system", "info",
-                    f"keep_alive ping: {model_id} on {resource_id} (age={age:.0f}s)")
+                    f"keep_alive ping: {model_id} on {resource_id} (age={now - last_used:.0f}s)")
             except Exception as exc:
                 log("system", "warn", f"keep_alive_ping: error processing {key}: {exc}")
         if cursor == 0:

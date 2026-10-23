@@ -120,6 +120,95 @@ class ViewerSearchTests(unittest.TestCase):
         self.assertEqual(tasks[0]["status"], "running")
         self.assertEqual(tasks[0]["model_id"], "remote-model")
 
+    def test_dashboard_exposes_resolved_smart_route_model(self):
+        """Show the concrete model, requested alias, and provider for a smart task."""
+        task_id = "smart-task"
+        redis = _Redis({
+            f"aidir:task:{task_id}": {
+                **_summary(task_id, "2026-10-01T12:00:00+00:00", ""),
+                "status": "running",
+                "model_id": "",
+                "route_provider_id": "",
+                "config": json.dumps({
+                    "route": {
+                        "selection": "smart_route",
+                        "requested_alias": "smart_gemma-4-26B",
+                        "requested_model": "smart_gemma-4-26B",
+                        "resolved_provider": "ollama_local",
+                        "resolved_model": "juilpark/gemma-4-26B-A4B-it-heretic:q4_k_m",
+                    },
+                }),
+            },
+        })
+        core = _Core(redis)
+        core.queue.list_tasks.return_value = []
+
+        async def session(*args, **kwargs):
+            """Provide an authenticated Dashboard session."""
+            return {"permissions": ["all"], "login": "test"}
+
+        async def no_peers(core):
+            """Return no peer task rows for this local-only case."""
+            return []
+
+        with patch("webui.backend.app._get_session", session), \
+             patch("webui.backend.app._fetch_peer_tasks", no_peers):
+            response = TestClient(create_app(core)).get("/api/tasks")
+
+        self.assertEqual(response.status_code, 200)
+        task = response.json()["tasks"][0]
+        self.assertEqual(task["model_id"], "juilpark/gemma-4-26B-A4B-it-heretic:q4_k_m")
+        self.assertEqual(task["requested_model"], "smart_gemma-4-26B")
+        self.assertEqual(task["route_provider_id"], "ollama_local")
+        self.assertEqual(task["route_selection"], "smart_route")
+        self.assertFalse(task["remote"])
+
+    def test_dashboard_merges_remote_peer_tasks_as_read_only(self):
+        """Include active tasks published by another aidir and mark them remote."""
+        task_id = "local-task"
+        redis = _Redis({
+            f"aidir:task:{task_id}": {
+                **_summary(task_id, "2026-10-01T12:00:00+00:00", "local-model"),
+                "status": "queued",
+            },
+        })
+        core = _Core(redis)
+        core.queue.list_tasks.return_value = []
+
+        async def session(*args, **kwargs):
+            """Provide an authenticated Dashboard session."""
+            return {"permissions": ["all"], "login": "test"}
+
+        async def peers(core):
+            """Return one active task from a remote instance."""
+            return [{
+                "id": "peer-task",
+                "type": "agent",
+                "status": "running",
+                "worker_id": "openaix",
+                "model_id": "remote-model",
+                "requested_model": "smart_remote",
+                "route_provider_id": "remote_aidir_110",
+                "created_at": "2026-10-01T12:01:00+00:00",
+                "updated_at": "2026-10-01T12:01:30+00:00",
+                "last_operation_at": "2026-10-01T12:01:30+00:00",
+                "instance": "aidir110",
+                "remote": True,
+                "source_provider": "remote_aidir_110",
+            }]
+
+        with patch("webui.backend.app._get_session", session), \
+             patch("webui.backend.app._fetch_peer_tasks", peers):
+            response = TestClient(create_app(core)).get("/api/tasks")
+
+        self.assertEqual(response.status_code, 200)
+        tasks = {task["id"]: task for task in response.json()["tasks"]}
+        self.assertEqual(set(tasks), {"local-task", "peer-task"})
+        self.assertTrue(tasks["peer-task"]["remote"])
+        self.assertEqual(tasks["peer-task"]["instance"], "aidir110")
+        self.assertEqual(tasks["peer-task"]["model_id"], "remote-model")
+        self.assertFalse(tasks["local-task"]["remote"])
+
     def test_search_uses_batched_hashes_and_bounded_results(self):
         """Return top-k rows without requiring valid heavy Redis task fields."""
         hashes = {

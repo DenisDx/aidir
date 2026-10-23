@@ -5,9 +5,9 @@ import json
 import hashlib
 import tempfile
 import unittest
+from unittest.mock import AsyncMock, patch
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
 
 import httpx
 from fastapi.testclient import TestClient
@@ -400,6 +400,29 @@ class TestLocalServerManager(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             manager = LocalServerManager({}, Path(directory))
             self.assertFalse(await manager.stop("llama_local"))
+
+    async def test_adopt_existing_keeps_healthy_and_stops_unhealthy(self) -> None:
+        """Survive an aidir restart without killing a healthy managed llama.cpp server."""
+        config = {"models": {"providers": {
+            "healthy": {"baseUrl": "http://127.0.0.1:8888", "exec_cmd": "/bin/true"},
+            "stale": {"baseUrl": "http://127.0.0.1:8889", "exec_cmd": "/bin/true"},
+        }}}
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory) / "logs"
+            state_dir.mkdir()
+            (state_dir / "llama_cpp_servers.json").write_text(
+                json.dumps({"healthy": {"pid": 1}, "stale": {"pid": 2}}),
+                encoding="utf-8",
+            )
+            manager = LocalServerManager(config, Path(directory))
+            with patch.object(LocalServerManager, "_is_owned_process", return_value=True), \
+                 patch.object(LocalServerManager, "_is_healthy", side_effect=[True, False]), \
+                 patch.object(LocalServerManager, "stop", AsyncMock(return_value=True)) as stop:
+                kept, stopped = await manager.adopt_existing()
+
+        self.assertEqual(kept, ["healthy"])
+        self.assertEqual(stopped, ["stale"])
+        stop.assert_awaited_once_with("stale")
 
     async def test_failed_startup_is_retained_for_status(self) -> None:
         """Exposes a local process early exit as a provider startup error."""

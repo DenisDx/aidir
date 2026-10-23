@@ -847,6 +847,19 @@
                 description: "Legacy tool entry: the worker that implements the tool",
               },
             },
+            peer_tasks: {
+              type: "object",
+              apply: "restart",
+              description: "Read-only active-task listing for dashboards of other aidir instances",
+              children: {
+                auth_mode: {
+                  type: "string",
+                  enum: ["disabled", "endpoint"],
+                  apply: "restart",
+                  description: "disabled publishes task summaries on a trusted network; endpoint requires the normal bearer token and envid checks",
+                },
+              },
+            },
           },
         },
       },

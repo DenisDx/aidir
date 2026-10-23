@@ -348,35 +348,50 @@ async function loadTasks() {
   body.innerHTML = '';
   data.tasks.forEach(t => {
     const tr = document.createElement('tr');
-    const canTerminate = ['created', 'queued', 'running'].includes(String(t.status || '').toLowerCase());
+    const isRemote = Boolean(t.remote);
+    const canTerminate = !isRemote && ['created', 'queued', 'running'].includes(String(t.status || '').toLowerCase());
     const timeoutField = t.status === 'queued' ? 'queue_timeout' : t.status === 'running' ? 'run_timeout' : '';
     const timeoutValue = timeoutField ? Number(t[timeoutField]) : NaN;
     const timeoutText = Number.isFinite(timeoutValue) ? `${timeoutValue}s` : '—';
     const requestPreview = escapeHtml(firstMessagePreview(t));
+    const modelName = t.model_id || '—';
+    const modelMeta = [];
+    if (t.requested_model && t.requested_model !== t.model_id) modelMeta.push(`requested ${t.requested_model}`);
+    if (t.route_provider_id) modelMeta.push(t.route_provider_id);
+    const modelDetails = modelMeta.length
+      ? `<div style="color:var(--muted);font-size:11px">${escapeHtml(modelMeta.join(' · '))}</div>`
+      : '';
+    const instanceLabel = t.instance || '—';
+    const remoteBadge = isRemote ? ' <span class="badge badge-running">remote</span>' : '';
+    const readOnlyTitle = isRemote ? 'Read-only task from another aidir instance' : '';
     tr.innerHTML = `
       <td style="font-family:monospace;font-size:11px">${escapeHtml(t.id || '')}</td>
-      <td>${t.type}</td>
-      <td><span class="badge badge-${t.status}">${t.status}</span></td>
-      <td>${t.worker_id || '—'}</td>
+      <td>${escapeHtml(t.type || '—')}</td>
+      <td><span class="badge badge-${escapeHtml(t.status || 'created')}">${escapeHtml(t.status || 'created')}</span></td>
+      <td style="font-size:12px">${escapeHtml(instanceLabel)}${remoteBadge}</td>
+      <td>${escapeHtml(t.worker_id || '—')}</td>
+      <td>${escapeHtml(modelName)}${modelDetails}</td>
       <td style="color:var(--muted);font-size:12px">${fmtTime(t.created_at)}</td>
       <td style="color:var(--muted);font-size:12px">${fmtTaskDuration(t.started_at)}</td>
-      <td style="white-space:nowrap">${timeoutText} ${timeoutField ? `<button class="btn-sm" data-dashboard-extend-timeout="${escapeHtml(t.id || '')}">add</button>` : ''}</td>
+      <td style="white-space:nowrap">${timeoutText} ${timeoutField && !isRemote ? `<button class="btn-sm" data-dashboard-extend-timeout="${escapeHtml(t.id || '')}">add</button>` : ''}</td>
       <td style="color:var(--muted);font-size:12px">${requestPreview}</td>
       <td>${Number(t.llm_call_count || 0)}</td>
       <td>
         <div class="task-viewer-actions">
-          <button class="btn-sm" data-dashboard-json="${escapeHtml(t.id || '')}">Show JSON</button>
-          <button class="btn-sm" data-dashboard-steps="${escapeHtml(t.id || '')}">Show steps</button>
+          <button class="btn-sm" data-dashboard-json="${escapeHtml(t.id || '')}" ${isRemote ? `disabled title="${escapeHtml(readOnlyTitle)}"` : ''}>Show JSON</button>
+          <button class="btn-sm" data-dashboard-steps="${escapeHtml(t.id || '')}" ${isRemote ? `disabled title="${escapeHtml(readOnlyTitle)}"` : ''}>Show steps</button>
         </div>
       </td>
       <td>
         <div class="task-viewer-actions">
-          <button class="btn-sm" data-dashboard-terminate="${escapeHtml(t.id || '')}" ${canTerminate ? '' : 'disabled'}>Terminate</button>
+          <button class="btn-sm" data-dashboard-terminate="${escapeHtml(t.id || '')}" ${canTerminate ? '' : `disabled${readOnlyTitle ? ` title="${escapeHtml(readOnlyTitle)}"` : ''}`}>Terminate</button>
         </div>
       </td>
     `;
-    tr.querySelector('[data-dashboard-json]').addEventListener('click', () => openTaskViewerJson(t.id));
-    tr.querySelector('[data-dashboard-steps]').addEventListener('click', () => openTaskViewerSteps(t));
+    const jsonBtn = tr.querySelector('[data-dashboard-json]');
+    if (jsonBtn && !isRemote) jsonBtn.addEventListener('click', () => openTaskViewerJson(t.id));
+    const stepsBtn = tr.querySelector('[data-dashboard-steps]');
+    if (stepsBtn && !isRemote) stepsBtn.addEventListener('click', () => openTaskViewerSteps(t));
     const terminateBtn = tr.querySelector('[data-dashboard-terminate]');
     if (terminateBtn) {
       terminateBtn.addEventListener('click', () => terminateDashboardTask(t.id, terminateBtn));
@@ -611,7 +626,9 @@ function requestPreviewText(value) {
 function firstMessagePreview(task, maxLength = 40) {
   const persistedPreview = task && typeof task.first_message_preview === 'string'
     ? task.first_message_preview
-    : '';
+    : task && typeof task.request_preview === 'string'
+      ? task.request_preview
+      : '';
   const payload = task && typeof task.payload === 'object' ? task.payload : null;
   const messages = Array.isArray(payload && payload.messages) ? payload.messages : [];
   const firstMessage = messages.length > 0 && messages[0] && typeof messages[0] === 'object' ? messages[0] : null;
@@ -777,7 +794,7 @@ function renderTaskViewerRows(tasks) {
   body.innerHTML = '';
   if (!tasks.length) {
     const tr = document.createElement('tr');
-    tr.innerHTML = '<td colspan="13" style="color:var(--muted)">No tasks match the current filters.</td>';
+    tr.innerHTML = '<td colspan="14" style="color:var(--muted)">No tasks match the current filters.</td>';
     body.appendChild(tr);
     return;
   }
@@ -791,6 +808,7 @@ function renderTaskViewerRows(tasks) {
       <td><span class="badge badge-${escapeHtml(task.status || 'created')}">${escapeHtml(task.status || 'created')}</span></td>
       <td style="color:var(--err);font-size:12px;max-width:320px">${escapeHtml(errorDetails)}</td>
       <td>${escapeHtml(task.worker_id || '—')}</td>
+      <td>${escapeHtml(task.model_id || '—')}</td>
       <td>${escapeHtml(task.envid || '—')}</td>
       <td>${escapeHtml(task.type || '—')}</td>
       <td style="color:var(--muted);font-size:12px">${escapeHtml(fmtDateTime(task.created_at))}</td>

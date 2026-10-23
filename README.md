@@ -403,6 +403,21 @@ On the peer's OpenAIx endpoint, `peer_resources.auth_mode` controls access to
 read-only resource discovery on a trusted network. Set `endpoint` to require
 the normal bearer-token and environment authorization checks.
 
+### Peer task visibility
+
+The dashboard merges active tasks from every `api: "openaix"` provider into the
+local task queue. Rows from another instance show their source instance, worker,
+and resolved model; their actions are read-only. The peer endpoint serves
+`GET /v1/tasks`, returning only active task summaries without request or
+response bodies. `peer_tasks.auth_mode` on the peer's `openaix` endpoint controls
+that route: `disabled` (default) publishes it on a trusted network, while
+`endpoint` requires the normal bearer-token and environment authorization
+checks. Both the local and remote instances must run a version that provides
+this route.
+
+The dashboard's Model column shows the concrete model selected for a smart
+route. A secondary line shows the requested alias and the provider.
+
 ### Safe resource telemetry
 
 Use `telemetry.sensors` to explicitly allow selected existing sensor readings in
@@ -449,7 +464,9 @@ llama.cpp HTTP errors are returned with the original status, complete response b
 
 Use `exec_cmd` for a local server command. aidir starts it on demand, waits for `/health`, and records its PID in `logs/llama_cpp_servers.json`. Only such recorded processes are stopped when shared resources need VRAM. An already healthy server is treated as external and is never stopped. Leave `exec_cmd` empty for an externally managed or remote server.
 
-For a `llama-cpp` provider, resource `keep_alive` means restart-on-failure during its active window; it does not send API pings. Smart routes probe a running provider via `/v1/models`; an unavailable provider with `exec_cmd` remains eligible for lazy startup after the scheduler has freed resources.
+For a `llama-cpp` provider, resource `keep_alive` means restart-on-failure during its active window; it does not send API pings. Smart routes probe a running provider via `/v1/models`; an unavailable provider with `exec_cmd` remains eligible for lazy startup after the scheduler has freed resources. A healthy managed server is adopted across an aidir restart; only an unhealthy inherited process is stopped.
+
+For Ollama resources, `keep_alive` is counted from the last real model use. Periodic keep-alive pings do not move that timestamp, so a model is not kept in VRAM indefinitely. On startup aidir restores idle-model reservations from the Redis activity records, so the dashboard and the scheduler still see models that survived a crash; an explicit force-unload also removes the matching activity record.
 
 ### Prefix-affinity smart routing and parallel sessions
 

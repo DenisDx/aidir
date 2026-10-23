@@ -148,6 +148,20 @@ class LocalServerManager:
                 stopped.append(provider_id)
         return stopped
 
+    async def adopt_existing(self) -> tuple[list[str], list[str]]:
+        """Keep healthy inherited servers and stop only unhealthy or unconfigured ones."""
+        kept: list[str] = []
+        stopped: list[str] = []
+        for provider_id in list(self.owned_records()):
+            provider = self._provider(provider_id)
+            base_url = str(provider.get("baseUrl") or "").rstrip("/")
+            if base_url and await self._is_healthy(base_url):
+                kept.append(provider_id)
+                continue
+            if await self.stop(provider_id):
+                stopped.append(provider_id)
+        return kept, stopped
+
     def owned_records(self) -> dict[str, dict]:
         """Return valid persisted records for aidir-owned running processes only."""
         return {

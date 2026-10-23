@@ -185,14 +185,24 @@ class Resource:
         )
         return float(available[metric]) - reserved_after_observation
 
+    @staticmethod
+    def _soft_entry_active(entry: dict, now: float) -> bool:
+        """Return whether one soft-consumer record still occupies memory."""
+        if entry.get("persistent"):
+            return True
+        expires_at = entry.get("expires_at")
+        if expires_at is not None:
+            return now < float(expires_at)
+        return now - float(entry.get("released_at") or 0) < float(entry.get("alive_time") or 0)
+
     def _compute_soft_used(self) -> dict[str, int]:
-        """Sum resources held by soft consumers still within alive_time window."""
-        if not self.alive_time:
+        """Sum resources held by soft consumers still within their retention window."""
+        if not self.alive_time and not self.keep_alive:
             return {}
         now = time.time()
         total: dict[str, int] = {}
         for entry in self._soft_used:
-            if entry.get("persistent") or now - entry["released_at"] < self.alive_time:
+            if self._soft_entry_active(entry, now):
                 for k, v in entry["resources"].items():
                     total[k] = total.get(k, 0) + v
         return total
@@ -279,9 +289,22 @@ class Resource:
         """Return True if amounts fit assuming all soft consumers are force-unloaded."""
         if not self.use:
             return False
-        if self.has_command_availability():
-            return self.is_available(required)
         req = required or {}
+        if self.has_command_availability():
+            soft = self._compute_soft_used()
+            for key, amount in req.items():
+                need = int(amount)
+                if need <= 0:
+                    continue
+                observed = self._observed_available_after_reservations(key)
+                if observed is None:
+                    available = self._availability_state.get("available") or {}
+                    if key not in available:
+                        return False
+                    observed = float(available[key])
+                if need > observed + int(soft.get(key, 0)):
+                    return False
+            return True
         for key, amount in req.items():
             need = int(amount)
             if need <= 0:
@@ -293,14 +316,11 @@ class Resource:
         return True
 
     def get_active_soft_consumers(self) -> list[dict]:
-        """Return soft consumers still within alive_time window."""
-        if not self.alive_time:
+        """Return soft consumers still within their retention window."""
+        if not self.alive_time and not self.keep_alive:
             return []
         now = time.time()
-        return [
-            entry for entry in self._soft_used
-            if entry.get("persistent") or now - entry["released_at"] < self.alive_time
-        ]
+        return [entry for entry in self._soft_used if self._soft_entry_active(entry, now)]
 
     def has_reusable_soft_consumer(
         self,
@@ -327,13 +347,20 @@ class Resource:
         provider_id: str,
         *,
         persistent: bool = False,
+        released_at: float | None = None,
+        expires_at: float | None = None,
     ) -> None:
         """Record a model that occupies resources outside an active task reservation."""
         self.clear_soft_consumer(model_id, provider_id)
+        now = time.time()
+        released = now if released_at is None else float(released_at)
+        if not persistent and expires_at is None:
+            expires_at = released + max(self.alive_time, self.keep_alive)
         self._soft_used.append({
             "consumer_id": f"{provider_id}:{model_id}",
             "resources": {key: int(value) for key, value in resources.items() if int(value) > 0},
-            "released_at": time.time(),
+            "released_at": released,
+            "expires_at": expires_at,
             "model_id": model_id,
             "provider_id": provider_id,
             "persistent": persistent,
@@ -473,11 +500,13 @@ class Resource:
             if cid and cid in self.consumers and not self.consumers[cid]:
                 self.consumers.pop(cid, None)
                 self._consumer_availability_generations.pop(cid, None)
-            # Track soft consumer - model may remain in VRAM for alive_time seconds after release
+            # Track soft consumer - Ollama keeps the model for keep_alive, otherwise alive_time.
             mid = (model_id or "").strip()
             pid = str(provider_id or "").strip()
-            if self.alive_time > 0 and req and mid:
-                # Refresh existing entry so timestamp reflects the latest release
+            if (self.alive_time > 0 or self.keep_alive > 0) and req and mid:
+                now = time.time()
+                retention = max(self.alive_time, self.keep_alive)
+                # Refresh existing entry so timestamps reflect the latest release
                 self._soft_used = [
                     entry for entry in self._soft_used
                     if entry.get("model_id") != mid
@@ -486,7 +515,8 @@ class Resource:
                 self._soft_used.append({
                     "consumer_id": cid,
                     "resources": {k: int(v) for k, v in req.items() if int(v) > 0},
-                    "released_at": time.time(),
+                    "released_at": now,
+                    "expires_at": None if persistent else now + retention,
                     "model_id": mid,
                     "provider_id": pid,
                     "persistent": persistent,
@@ -499,16 +529,22 @@ class Resource:
             for cid, usage in sorted(self.consumers.items())
         ]
         soft = self._compute_soft_used()
-        soft_consumers = [
-            {
-                "model_id": e["model_id"],
-                "provider_id": e.get("provider_id", ""),
-                "resources": e["resources"],
-                "expires_in": None if e.get("persistent") else max(0, round(self.alive_time - (time.time() - e["released_at"]))),
-                "persistent": bool(e.get("persistent")),
-            }
-            for e in self.get_active_soft_consumers()
-        ]
+        now = time.time()
+        soft_consumers = []
+        for entry in self.get_active_soft_consumers():
+            if entry.get("persistent"):
+                expires_in = None
+            elif entry.get("expires_at") is not None:
+                expires_in = max(0, round(float(entry["expires_at"]) - now))
+            else:
+                expires_in = max(0, round(self.alive_time - (now - entry["released_at"])))
+            soft_consumers.append({
+                "model_id": entry["model_id"],
+                "provider_id": entry.get("provider_id", ""),
+                "resources": entry["resources"],
+                "expires_in": expires_in,
+                "persistent": bool(entry.get("persistent")),
+            })
         return {
             "id": self.id,
             "type": self.type,

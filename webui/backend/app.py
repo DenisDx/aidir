@@ -11,6 +11,7 @@ Provides:
 from __future__ import annotations
 
 import asyncio
+import base64
 import heapq
 import hmac
 import json
@@ -24,6 +25,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
+import httpx
 from fastapi import (
     Cookie, Depends, FastAPI, HTTPException, Request,
     Response, WebSocket, WebSocketDisconnect, status,
@@ -338,6 +340,27 @@ def _task_to_api_item(task: dict[str, Any]) -> dict[str, Any]:
     item["parent_worker"] = item.get("parent_worker") or ""
     item["envid"] = _task_envid(item)
     item["last_operation_at"] = last_op.isoformat() if last_op else None
+
+    config = item.get("config") if isinstance(item.get("config"), dict) else {}
+    route = config.get("route") if isinstance(config.get("route"), dict) else {}
+    payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+    item["model_id"] = str(
+        item.get("model_id")
+        or route.get("resolved_model")
+        or payload.get("model")
+        or ""
+    )
+    item["requested_model"] = str(
+        route.get("requested_alias")
+        or route.get("requested_model")
+        or ""
+    )
+    item["route_provider_id"] = str(
+        item.get("route_provider_id")
+        or route.get("resolved_provider")
+        or ""
+    )
+    item["route_selection"] = str(route.get("selection") or "")
     return item
 
 
@@ -438,6 +461,107 @@ def _task_summary_from_hash(task_hash: dict[str, str]) -> dict[str, Any]:
     return task
 
 
+def _peer_auth_headers(auth: object) -> dict[str, str]:
+    """Build provider authentication headers for a read-only peer request."""
+    if not isinstance(auth, dict):
+        return {}
+    headers = {
+        str(key): str(value)
+        for key, value in (auth.get("headers") or {}).items()
+        if isinstance(key, str) and isinstance(value, str)
+    }
+    authorization = auth.get("authorization")
+    if isinstance(authorization, str) and authorization.strip():
+        headers["Authorization"] = authorization.strip()
+    auth_type = str(auth.get("type") or "bearer").strip().lower()
+    token = auth.get("token")
+    if isinstance(token, str) and token.strip() and auth_type in {"", "bearer", "token"}:
+        headers["Authorization"] = f"Bearer {token.strip()}"
+    if auth_type == "basic":
+        username = auth.get("username")
+        password = auth.get("password")
+        if isinstance(username, str) and isinstance(password, str):
+            encoded = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
+            headers["Authorization"] = f"Basic {encoded}"
+    return headers
+
+
+def _peer_task_targets(core: "Core") -> list[tuple[str, str, dict[str, str]]]:
+    """Return deduplicated OpenAIx peers that can publish active task state."""
+    providers = core.config.get("models.providers") or {}
+    if not isinstance(providers, dict):
+        return []
+    targets: list[tuple[str, str, dict[str, str]]] = []
+    seen_urls: set[str] = set()
+    for provider_id, provider in providers.items():
+        if not isinstance(provider, dict) or str(provider.get("api") or "") != "openaix":
+            continue
+        base_url = str(provider.get("baseUrl") or "").rstrip("/")
+        if not base_url or base_url in seen_urls:
+            continue
+        seen_urls.add(base_url)
+        targets.append((str(provider_id), base_url, _peer_auth_headers(provider.get("auth"))))
+    return targets
+
+
+async def _fetch_peer_tasks(core: "Core") -> list[dict[str, Any]]:
+    """Fetch active tasks from configured OpenAIx peers without failing the dashboard."""
+    targets = _peer_task_targets(core)
+    if not targets:
+        return []
+    local_instance = str(core.config.get("instance", "aidir") or "aidir")
+    try:
+        timeout_ms = int(core.config.get("webui.tasks.peer_timeout_ms", 1200) or 1200)
+    except (TypeError, ValueError):
+        timeout_ms = 1200
+    timeout = max(0.05, timeout_ms / 1000.0)
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        responses = await asyncio.gather(
+            *(
+                client.get(f"{base_url}/v1/tasks", headers=headers)
+                for _, base_url, headers in targets
+            ),
+            return_exceptions=True,
+        )
+
+    peers: list[dict[str, Any]] = []
+    for (provider_id, base_url, _), response in zip(targets, responses):
+        if isinstance(response, Exception):
+            log("webui", "debug", f"Peer task probe failed for {provider_id}: {response}", "tasks")
+            continue
+        if response.status_code != 200:
+            continue
+        try:
+            payload = response.json()
+        except ValueError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        peer_instance = str(payload.get("instance") or provider_id)
+        if peer_instance == local_instance:
+            continue
+        rows = payload.get("data")
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("status") or "").lower() not in {"created", "queued", "running"}:
+                continue
+            task = dict(row)
+            task["id"] = str(task.get("id") or "")
+            if not task["id"]:
+                continue
+            task["instance"] = peer_instance
+            task["remote"] = True
+            task["source_provider"] = provider_id
+            last_op = _task_last_operation_at(task)
+            task["last_operation_at"] = last_op.isoformat() if last_op else None
+            peers.append(task)
+    return peers
+
+
 async def _list_active_tasks(core: "Core") -> list[dict[str, Any]]:
     """Return active Redis-backed tasks, preferring current-process task state."""
     active_statuses = {"created", "queued", "running"}
@@ -460,14 +584,23 @@ async def _list_active_tasks(core: "Core") -> list[dict[str, Any]]:
                 continue
             task_id = str(task_hash.get("id") or "")
             if task_id:
-                tasks[task_id] = _task_to_api_item(_task_from_hash(task_hash))
+                item = _task_to_api_item(_task_from_hash(task_hash))
+                item["instance"] = str(namespace)
+                item["remote"] = False
+                tasks[task_id] = item
 
         if cursor == 0:
             break
 
     for task in core.queue.list_tasks():
         if task.status in active_statuses:
-            tasks[task.id] = _task_to_api_item(_task_from_hash(task.to_redis_hash()))
+            item = _task_to_api_item(_task_from_hash(task.to_redis_hash()))
+            item["instance"] = str(namespace)
+            item["remote"] = False
+            tasks[task.id] = item
+
+    for task in await _fetch_peer_tasks(core):
+        tasks[f"{task['instance']}:{task['id']}"] = task
 
     return sorted(
         tasks.values(),

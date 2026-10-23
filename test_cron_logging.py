@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -21,8 +23,14 @@ class _FakeRedis:
     async def get(self, key: str):
         return self.data.get(key)
 
-    async def set(self, key: str, value: str):
+    async def set(self, key: str, value: str, ex=None):
         self.data[key] = value
+
+    async def scan(self, cursor, match, count):
+        return 0, list(self.data)
+
+    async def delete(self, key):
+        self.data.pop(key, None)
 
     async def aclose(self):
         self.closed = True
@@ -400,6 +408,90 @@ class TestCronLogging(unittest.TestCase):
                 setattr(cron, name, original)
 
         self.assertIn("aidir111:cron:last_success_at", redis.data)
+
+
+class TestKeepAliveWindow(unittest.TestCase):
+    """Validate that keep-alive pings do not extend the last-use window forever."""
+
+    def setUp(self) -> None:
+        """Preserve the cron configuration replaced by each test."""
+        self.orig_config = cron.config
+
+    def tearDown(self) -> None:
+        """Restore the cron configuration."""
+        cron.config = self.orig_config
+
+    def _config(self) -> _DummyConfig:
+        """Return a config with one local Ollama provider."""
+        return _DummyConfig({
+            "instance": "aidir",
+            "models": {"providers": {"ollama_local": {"api": "ollama", "baseUrl": "http://127.0.0.1:11434"}}},
+        })
+
+    def test_expired_keep_alive_record_is_deleted_without_ping(self) -> None:
+        """Stop pinging after keep_alive seconds from the last real use."""
+        now = time.time()
+        key = "aidir:resource:gpu:activity:ollama_local:model-a"
+        redis = _FakeRedis()
+        redis.data[key] = json.dumps({
+            "model_id": "model-a",
+            "resource_id": "gpu",
+            "provider": "ollama_local",
+            "last_used_at": now - 6000,
+            "last_ping_at": now - 300,
+            "keep_alive": 5000,
+            "keep_alive_period": 250,
+        })
+        cron.config = self._config()
+
+        asyncio.run(cron.keep_alive_ping(redis))
+
+        self.assertNotIn(key, redis.data)
+
+    def test_ping_updates_last_ping_but_not_last_use(self) -> None:
+        """Keep the original last-use timestamp when a keep-alive ping is due."""
+        now = time.time()
+        key = "aidir:resource:gpu:activity:ollama_local:model-a"
+        redis = _FakeRedis()
+        redis.data[key] = json.dumps({
+            "model_id": "model-a",
+            "resource_id": "gpu",
+            "provider": "ollama_local",
+            "last_used_at": now - 600,
+            "last_ping_at": now - 300,
+            "keep_alive": 5000,
+            "keep_alive_period": 250,
+        })
+        cron.config = self._config()
+
+        class _Client:
+            """Record keep-alive posts without touching Ollama."""
+
+            def __init__(self, *args, **kwargs) -> None:
+                """Store constructor arguments."""
+                self.kwargs = kwargs
+                self.posts: list[tuple[str, dict]] = []
+
+            async def __aenter__(self):
+                """Enter the async client context."""
+                return self
+
+            async def __aexit__(self, *args) -> None:
+                """Exit the async client context."""
+
+            async def post(self, url, json=None):
+                """Record one ping."""
+                self.posts.append((url, json))
+                return type("_Response", (), {"status_code": 200})()
+
+        client = _Client()
+        with patch("httpx.AsyncClient", return_value=client):
+            asyncio.run(cron.keep_alive_ping(redis))
+
+        record = json.loads(redis.data[key])
+        self.assertAlmostEqual(record["last_used_at"], now - 600, delta=1)
+        self.assertGreater(record["last_ping_at"], now - 10)
+        self.assertEqual(client.posts[0][1]["keep_alive"], 500)
 
 
 if __name__ == "__main__":

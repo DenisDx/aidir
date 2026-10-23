@@ -50,6 +50,11 @@ class Endpoint_openaix(Endpoint_ollama):
         self._peer_resources_auth_mode = str(peer_resources_cfg.get("auth_mode") or "disabled").strip().lower()
         if self._peer_resources_auth_mode not in {"disabled", "endpoint"}:
             self._peer_resources_auth_mode = "disabled"
+        peer_tasks_cfg = endpoint_cfg.get("peer_tasks")
+        peer_tasks_cfg = peer_tasks_cfg if isinstance(peer_tasks_cfg, dict) else {}
+        self._peer_tasks_auth_mode = str(peer_tasks_cfg.get("auth_mode") or "disabled").strip().lower()
+        if self._peer_tasks_auth_mode not in {"disabled", "endpoint"}:
+            self._peer_tasks_auth_mode = "disabled"
         self._model_resolution_warnings_emitted: set[str] = set()
 
     def create_app(self, core) -> FastAPI:
@@ -126,6 +131,10 @@ class Endpoint_openaix(Endpoint_ollama):
         async def ollama_resource(resource_id: str, request: Request):
             return self._peer_resources_response(request, resource_id)
 
+        @app.get("/v1/tasks")
+        async def openai_tasks(request: Request):
+            return self._peer_tasks_response(request)
+
         @app.get("/v1/providers/{provider_id}/models/{model_id:path}/queue-state")
         async def openai_model_queue_state(provider_id: str, model_id: str, priority: int = 5):
             return await self._model_queue_state_response(
@@ -168,17 +177,9 @@ class Endpoint_openaix(Endpoint_ollama):
 
     def _peer_resources_response(self, request: Request, resource_id: str | None = None) -> JSONResponse:
         """Return sanitized peer resource state after applying configured access policy."""
-        if self._peer_resources_auth_mode == "endpoint":
-            if not self._extract_bearer_token(request):
-                return self._error_response(
-                    protocol="openai",
-                    status_code=401,
-                    code="UNAUTHORIZED",
-                    message="Bearer authentication is required for peer resources",
-                )
-            auth_error = self._authorize_and_apply_envid(request, {})
-            if auth_error is not None:
-                return auth_error
+        auth_error = self._peer_access_error(request, self._peer_resources_auth_mode, "peer resources")
+        if auth_error is not None:
+            return auth_error
 
         resources = getattr(self._core, "resources", None)
         if resources is None:
@@ -205,6 +206,96 @@ class Endpoint_openaix(Endpoint_ollama):
             "protocol_version": 1,
             "data": [self._peer_resource_payload(resource.snapshot()) for resource in resources.all()],
         })
+
+    def _peer_tasks_response(self, request: Request) -> JSONResponse:
+        """Return active tasks for read-only cross-instance dashboard visibility."""
+        auth_error = self._peer_access_error(request, self._peer_tasks_auth_mode, "peer tasks")
+        if auth_error is not None:
+            return auth_error
+
+        queue = getattr(self._core, "queue", None)
+        tasks = queue.list_tasks() if queue is not None and hasattr(queue, "list_tasks") else []
+        active = {"created", "queued", "running"}
+        payload = [
+            self._peer_task_payload(task)
+            for task in tasks
+            if str(getattr(task, "status", "")).lower() in active
+        ]
+        payload.sort(
+            key=lambda item: item.get("updated_at") or item.get("created_at") or "",
+            reverse=True,
+        )
+        return JSONResponse({
+            "object": "list",
+            "protocol_version": 1,
+            "instance": str(self._core.config.get("instance", "aidir") or "aidir"),
+            "data": payload[:1000],
+        })
+
+    def _peer_access_error(
+        self,
+        request: Request,
+        auth_mode: str,
+        subject: str,
+    ) -> JSONResponse | None:
+        """Apply the optional endpoint auth policy shared by peer read-only APIs."""
+        if auth_mode != "endpoint":
+            return None
+        if not self._extract_bearer_token(request):
+            return self._error_response(
+                protocol="openai",
+                status_code=401,
+                code="UNAUTHORIZED",
+                message=f"Bearer authentication is required for {subject}",
+            )
+        return self._authorize_and_apply_envid(request, {})
+
+    @staticmethod
+    def _peer_task_payload(task) -> dict:
+        """Build one minimal read-only task row without request or response bodies."""
+        config = getattr(task, "config", None)
+        config = config if isinstance(config, dict) else {}
+        route = config.get("route") if isinstance(config.get("route"), dict) else {}
+        trace = config.get("route_trace") if isinstance(config.get("route_trace"), dict) else {}
+        payload = getattr(task, "payload", None)
+        payload = payload if isinstance(payload, dict) else {}
+
+        def _iso(value):
+            """Return an ISO timestamp or an empty string."""
+            return value.isoformat() if hasattr(value, "isoformat") else ""
+
+        return {
+            "id": str(getattr(task, "id", "") or ""),
+            "type": str(getattr(task, "type", "") or ""),
+            "status": str(getattr(task, "status", "") or ""),
+            "worker_id": str(getattr(task, "worker_id", "") or ""),
+            "priority": int(getattr(task, "priority", 0) or 0),
+            "created_at": _iso(getattr(task, "created_at", None)),
+            "updated_at": _iso(getattr(task, "updated_at", None)),
+            "started_at": _iso(getattr(task, "started_at", None)),
+            "finished_at": _iso(getattr(task, "finished_at", None)),
+            "route_provider_id": str(
+                getattr(task, "route_provider_id", "")
+                or route.get("resolved_provider")
+                or ""
+            ),
+            "model_id": str(
+                getattr(task, "model_id", "")
+                or route.get("resolved_model")
+                or payload.get("model")
+                or ""
+            ),
+            "requested_model": str(
+                route.get("requested_alias")
+                or route.get("requested_model")
+                or ""
+            ),
+            "route_id": str(trace.get("route_id") or ""),
+            "llm_call_count": int(getattr(task, "llm_call_count", 0) or 0),
+            "envid": str(getattr(task, "envid", "") or ""),
+            "parent_worker": str(getattr(task, "parent_worker", "") or ""),
+            "request_preview": str(getattr(task, "request_preview", "") or "")[:300],
+        }
 
     @staticmethod
     def _peer_resource_payload(snapshot: dict) -> dict:
