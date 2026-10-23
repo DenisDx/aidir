@@ -10,11 +10,12 @@ from unittest.mock import AsyncMock, patch
 import httpx
 from fastapi.testclient import TestClient
 
+from core.context import Context
 from core.endpoints.endpoint_ollama import Endpoint_ollama
 from core.endpoints.endpoint_openaix import Endpoint_openaix
 from core.queue_manager import QueueManager
 from core.scheduler import Scheduler
-from core.task import STATUS_COMPLETED, Task
+from core.task import STATUS_COMPLETED, STATUS_FAILED, Task
 from core.task_types.task_agent import Task_agent
 from core.upstream_response import UpstreamChunk, capture_response, original_payload, original_response
 from core.worker import WorkerResult
@@ -379,6 +380,47 @@ class ResponseTransparencyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(task.status, STATUS_COMPLETED)
         self.assertEqual(task.upstream_response, metadata)
         self.assertEqual(json.loads(redis.hset.call_args.kwargs["mapping"]["upstream_response"]), metadata)
+
+    def test_task_hash_has_no_none_values_with_empty_context(self) -> None:
+        """Serialize an empty runtime context without a None envid breaking Redis."""
+        task = Task_agent(payload={"model": "model", "messages": []})
+        task.context = Context.empty()
+        values = task.to_redis_hash()
+        self.assertEqual(values["envid"], "")
+        self.assertTrue(all(isinstance(value, str) for value in values.values()))
+
+    async def test_scheduler_preserves_upstream_error_when_fallback_requeue_fails(self) -> None:
+        """Keep the real upstream failure when smart-fallback persistence fails."""
+        redis = SimpleNamespace(hset=AsyncMock())
+        queue = QueueManager(redis)
+        task = Task_agent(payload={"model": "local-only", "messages": []}, stream=True)
+        task.config = {
+            "route": {
+                "requested_model": "local-only",
+                "requested_alias": "local-only",
+                "requested_provider": "smart",
+                "resolved_provider": "llama_local",
+                "resolved_model": "qwen-local",
+                "selection": "smart_route",
+                "resolved_worker": "openaix",
+            }
+        }
+        queue._tasks[task.id] = task
+        error = {"code": "UPSTREAM_ERROR", "message": "request exceeds the available context size"}
+        worker = SimpleNamespace(
+            id="openaix",
+            execute=AsyncMock(return_value=WorkerResult(ok=False, error=error)),
+        )
+        scheduler = Scheduler(queue, {"openaix": worker})
+        resolution = SimpleNamespace(route={"resolved_provider": "remote", "resolved_model": "qwen-remote", "resolved_worker": "openaix"})
+        router = SimpleNamespace(resolve_route=AsyncMock(return_value=resolution))
+        with patch.object(scheduler, "_provider_api", return_value="smart"), \
+                patch.object(scheduler, "_make_smart_router", return_value=router), \
+                patch.object(queue, "add_task", AsyncMock(side_effect=TypeError("persistence failed"))):
+            await scheduler._run_task(task, worker)
+        self.assertEqual(task.status, STATUS_FAILED)
+        self.assertEqual(task.error, error)
+        self.assertEqual(json.loads(redis.hset.call_args.kwargs["mapping"]["error"]), error)
 
     async def test_queue_persists_and_clears_original_response(self) -> None:
         """Persist the final transport and clear it before a subsequent attempt."""

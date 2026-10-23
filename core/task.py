@@ -151,7 +151,7 @@ class Task:
             "request_preview": self.request_preview or self._request_preview(),
             "route_provider_id": self.route_provider_id or str(self.config.get("provider_id") or ""),
             "model_id": self.model_id or str(self.payload.get("model") or ""),
-            "envid": self.envid or (self.context.envid if self.context else ""),
+            "envid": self.envid or (self.context.envid if self.context else "") or "",
         }
 
     def _request_preview(self) -> str:

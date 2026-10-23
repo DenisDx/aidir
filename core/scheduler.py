@@ -613,6 +613,14 @@ class Scheduler:
             )
         except SmartRouteError:
             return False
+        except Exception as exc:
+            log(
+                "worker",
+                "error",
+                f"Task {task.id} smart execution fallback resolution failed: {exc}",
+                worker_id,
+            )
+            return False
 
         next_route = dict(resolution.route or {})
         next_provider = str(next_route.get("resolved_provider") or "").strip()
@@ -620,6 +628,13 @@ class Scheduler:
         if not next_provider or not next_model or (next_provider, next_model) == (failed_provider, failed_model):
             return False
 
+        previous_config = task.config
+        previous_payload = task.payload
+        previous_requirements = task.resource_requirements
+        previous_route_provider_id = task.route_provider_id
+        previous_model_id = task.model_id
+        previous_worker_id = task.worker_id
+        previous_next_retry_at = task.next_retry_at
         task.config = dict(task.config or {})
         task.config["route"] = next_route
         task.payload = dict(task.payload or {})
@@ -629,7 +644,23 @@ class Scheduler:
         task.model_id = next_model
         task.worker_id = str(next_route.get("resolved_worker") or worker_id)
         task.next_retry_at = 0.0
-        await self._queue.add_task(task)
+        try:
+            await self._queue.add_task(task)
+        except Exception as exc:
+            task.config = previous_config
+            task.payload = previous_payload
+            task.resource_requirements = previous_requirements
+            task.route_provider_id = previous_route_provider_id
+            task.model_id = previous_model_id
+            task.worker_id = previous_worker_id
+            task.next_retry_at = previous_next_retry_at
+            log(
+                "worker",
+                "error",
+                f"Task {task.id} smart execution fallback requeue failed: {exc}",
+                worker_id,
+            )
+            return False
         log(
             "worker",
             "info",
@@ -1132,11 +1163,21 @@ class Scheduler:
             task.retry_attempt += 1
             task.next_retry_at = time.time() + max(0, retry_period)
 
+        async def _requeue() -> bool:
+            """Requeue the failed task, keeping the original error when persistence fails."""
+            try:
+                await self._queue.add_task(task)
+            except Exception as exc:
+                log("worker", "error", f"Task {task.id} requeue failed: {exc}", worker_id)
+                return False
+            return True
+
         if action == "retry":
             if task.retry_attempt >= retry_count:
                 return False
             _schedule_retry()
-            await self._queue.add_task(task)
+            if not await _requeue():
+                return False
             log("worker", "info", f"Task {task.id} retry scheduled #{task.retry_attempt}", worker_id)
             return True
 
@@ -1148,7 +1189,8 @@ class Scheduler:
                 task.worker_id = fallbacks[task.fallback_index]
                 task.fallback_index += 1
                 task.next_retry_at = time.time() + max(0, retry_period)
-                await self._queue.add_task(task)
+                if not await _requeue():
+                    return False
                 log("worker", "info", f"Task {task.id} fallback -> {task.worker_id}", worker_id)
                 return True
 
@@ -1158,7 +1200,8 @@ class Scheduler:
                 task.fallback_index = 0
                 task.worker_id = fallbacks[0]
                 task.fallback_index = 1
-                await self._queue.add_task(task)
+                if not await _requeue():
+                    return False
                 log("worker", "info", f"Task {task.id} fallback cycle retry #{task.retry_attempt}", worker_id)
                 return True
 
