@@ -60,12 +60,12 @@ class TestCronLogging(unittest.TestCase):
     """Validate cron trim/wipe behavior for all logs and per-log overrides."""
 
     def setUp(self) -> None:
-        self.orig_logs_dir = cron._LOGS_DIR
+        self.orig_logs_dir = cron.logs_dir
         self.orig_config = cron.config
         self.orig_should_run = cron._should_run
 
     def tearDown(self) -> None:
-        cron._LOGS_DIR = self.orig_logs_dir
+        cron.logs_dir = self.orig_logs_dir
         cron.config = self.orig_config
         cron._should_run = self.orig_should_run
 
@@ -73,7 +73,7 @@ class TestCronLogging(unittest.TestCase):
         """Trims both .log and .jsonl files using global max_log_size."""
         with tempfile.TemporaryDirectory() as tmp:
             logs_dir = Path(tmp)
-            cron._LOGS_DIR = logs_dir
+            cron.logs_dir = lambda: logs_dir
             cron.config = _DummyConfig({
                 "instance": "aidir",
                 "logging": {
@@ -101,7 +101,7 @@ class TestCronLogging(unittest.TestCase):
         """Uses override max_log_size for matching log file while keeping global defaults."""
         with tempfile.TemporaryDirectory() as tmp:
             logs_dir = Path(tmp)
-            cron._LOGS_DIR = logs_dir
+            cron.logs_dir = lambda: logs_dir
             cron.config = _DummyConfig({
                 "instance": "aidir",
                 "logging": {
@@ -134,7 +134,7 @@ class TestCronLogging(unittest.TestCase):
         """Uses trim_period rather than wipe_period to schedule size trimming."""
         with tempfile.TemporaryDirectory() as tmp:
             logs_dir = Path(tmp)
-            cron._LOGS_DIR = logs_dir
+            cron.logs_dir = lambda: logs_dir
             cron.config = _DummyConfig({
                 "instance": "aidir",
                 "logging": {
@@ -159,7 +159,7 @@ class TestCronLogging(unittest.TestCase):
         """Uses a larger cap configured for one ordinary log file."""
         with tempfile.TemporaryDirectory() as tmp:
             logs_dir = Path(tmp)
-            cron._LOGS_DIR = logs_dir
+            cron.logs_dir = lambda: logs_dir
             cron.config = _DummyConfig({
                 "instance": "aidir",
                 "logging": {

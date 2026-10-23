@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Awaitable, Callable, Optional
 
@@ -29,6 +30,10 @@ class QueueManager:
     In-memory registry holds live Task objects for event signaling.
     """
 
+    # How long a queue-state aggregation is reused. The answer is a snapshot of
+    # a moving queue, and the dashboard asks for it every three seconds.
+    QUEUE_STATE_CACHE_SECONDS = 1.0
+
     def __init__(
         self,
         redis_client: aioredis.Redis,
@@ -42,6 +47,10 @@ class QueueManager:
         self._tasks: dict[str, Task] = {}          # task_id -> Task
         self._status_change_callback = status_change_callback
         self._task_created_callback = task_created_callback
+        # The queue-state aggregation scans every queued task, and the dashboard
+        # asks for it every three seconds. The answer is a snapshot, so a short
+        # cache is enough and the cost of the scan disappears.
+        self._queue_state_cache: dict[tuple, tuple[float, dict]] = {}
         self._audit_log = audit_log
 
     _QUEUE_TASK_TYPES = ("agent", "tool")
@@ -373,12 +382,32 @@ class QueueManager:
             },
         )
 
+    def _cached_queue_state(self, key: tuple) -> dict | None:
+        """Return a cached aggregation when it is still fresh."""
+        entry = self._queue_state_cache.get(key)
+        if entry is None:
+            return None
+        stored_at, value = entry
+        if time.monotonic() - stored_at > self.QUEUE_STATE_CACHE_SECONDS:
+            self._queue_state_cache.pop(key, None)
+            return None
+        return dict(value)
+
+    def _store_queue_state(self, key: tuple, value: dict) -> dict:
+        """Remember an aggregation for the next moments."""
+        self._queue_state_cache[key] = (time.monotonic(), dict(value))
+        return dict(value)
+
     async def get_resource_queue_state(
         self,
         requirements: dict[str, dict[str, int]] | None = None,
         priority: int = 5,
     ) -> dict:
         """Summarize queued tasks that match a resource requirement set."""
+        cache_key = ("resources", self._normalize_requirements(requirements), int(priority))
+        cached = self._cached_queue_state(cache_key)
+        if cached is not None:
+            return cached
         target = self._normalize_requirements(requirements)
         counts_by_priority: dict[int, int] = {}
         total_count = 0
@@ -405,14 +434,14 @@ class QueueManager:
                 if priority_value > priority:
                     below_priority_count += 1
 
-        return {
+        return self._store_queue_state(cache_key, {
             "queued_count_total": total_count,
             "queued_count_below_priority": below_priority_count,
             "priority_counts": [
                 {"priority": prio, "count": counts_by_priority[prio]}
                 for prio in sorted(counts_by_priority)
             ],
-        }
+        })
 
     async def get_model_queue_state(
         self,
@@ -423,6 +452,10 @@ class QueueManager:
         """Summarize queued tasks that target one concrete provider/model pair."""
         provider = str(provider_id or "").strip()
         model = str(model_id or "").strip()
+        cache_key = ("model", provider, model, int(priority))
+        cached = self._cached_queue_state(cache_key)
+        if cached is not None:
+            return cached
         counts_by_priority: dict[int, int] = {}
         total_count = 0
         below_priority_count = 0
@@ -452,14 +485,14 @@ class QueueManager:
                 if priority_value > priority:
                     below_priority_count += 1
 
-        return {
+        return self._store_queue_state(cache_key, {
             "queued_count_total": total_count,
             "queued_count_below_priority": below_priority_count,
             "priority_counts": [
                 {"priority": prio, "count": counts_by_priority[prio]}
                 for prio in sorted(counts_by_priority)
             ],
-        }
+        })
 
     @staticmethod
     def _parse_int(value, default: int = 0) -> int:

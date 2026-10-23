@@ -68,7 +68,8 @@ Proposals may include both planned and completed work; consult each document.
 | [_proposal_update_1.md](_proposal_update_1.md) | Proposed first security-update round. |
 | [before_tools_worker.md](before_tools_worker.md) | Pre-tool-call context-processing hook. Deferred; see SPEC_NEW.md §14.4. |
 | [proposal_update1.md](proposal_update1.md) | The current work list: the 45 confirmed defects and design gaps from SPEC_NEW.md §14, each with its evidence, the proposed modification and its validation. Excludes the two deferred tasks (the middleware chain and `before_tools`). |
-| [proposal_update_3.md](proposal_update_3.md) | The defects found while investigating a managed llama.cpp server that hangs before opening its listener, and a task that stays `queued` after its execution was handed to a remote aidir. Items V1-V20; the applied ones are marked as fixed. |
+| [proposal_update_3.md](proposal_update_3.md) | The defects found while investigating a managed llama.cpp server that hangs before opening its listener, and a task that stays `queued` after its execution was handed to a remote aidir. Items V1-V28; the applied ones are marked as fixed. |
+| [proposal_update4.md](proposal_update4.md) | **The complete ledger of the open work**: every item that survived the two previous rounds, each with its source. Items W1-W49, plus the record of the items that are closed. |
 | [proposal_aidir_smart_router.md](proposal_aidir_smart_router.md) | Resource-aware smart routing design. |
 | [proposal_kv_keeper.md](proposal_kv_keeper.md) | KV-affinity smart routing: prefix fingerprinting, sticky candidate selection, queue-imbalance diversion, and per-request session resources. |
 | [plan_kv_keeper.md](plan_kv_keeper.md) | Implementation plan and live state for KV-affinity routing and parallel session admission. |

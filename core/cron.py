@@ -22,11 +22,10 @@ from core.config import config  # noqa: E402
 from core import log             # noqa: E402
 from core.app import Core        # noqa: E402
 from core.audit_log import AuditLog  # noqa: E402
+from core.logger import logs_dir  # noqa: E402
 from core.workers_loader import resolve_worker_configs  # noqa: E402
 
 import redis.asyncio as aioredis  # noqa: E402
-
-_LOGS_DIR = _ROOT / "logs"
 
 
 def _to_int(value, default: int) -> int:
@@ -41,7 +40,7 @@ def _iter_log_files() -> list[Path]:
     """Return deterministic list of log files subject to wipe/trim maintenance."""
     out: list[Path] = []
     for pattern in ("*.log", "*.jsonl"):
-        out.extend(sorted(_LOGS_DIR.glob(pattern)))
+        out.extend(sorted(logs_dir().glob(pattern)))
     return out
 
 
@@ -109,7 +108,7 @@ async def wipe_logs(redis: aioredis.Redis) -> None:
     global_period = _to_int(config.get("logging.wipe_period") or 0, 0)
     global_max_age = _to_int(config.get("logging.wipe_max_age") or global_period, global_period)
 
-    _LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    logs_dir().mkdir(parents=True, exist_ok=True)
     processed: list[str] = []
 
     from core.logger import _wipe_file
@@ -185,7 +184,7 @@ async def trim_logs_by_size(redis: aioredis.Redis) -> None:
     trimmed_files = []
     
     try:
-        _LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        logs_dir().mkdir(parents=True, exist_ok=True)
 
         for log_file in _iter_log_files():
             period = _effective_log_setting(log_file, "trim_period", global_period)
@@ -216,7 +215,7 @@ async def retain_audit_logs(redis: aioredis.Redis) -> None:
     period = _to_int(audit_cfg.get("retention_period"), 3600)
     if not await _should_run(redis, "retain_audit_logs", period):
         return
-    directory = Path(audit_cfg.get("directory") or _LOGS_DIR / "audit")
+    directory = Path(audit_cfg.get("directory") or logs_dir() / "audit")
     if not directory.is_absolute():
         directory = _ROOT / directory
     audit_log = AuditLog(directory)

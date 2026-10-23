@@ -186,6 +186,14 @@ You can add more templates such as `prod.json5.example`, `lab.json5.example`, an
 
 JSON5 format (comments and trailing commas allowed). Uses `${VAR}` and `${VAR:-default}` substitution from `.env`. Contains no secrets or machine-specific paths directly.
 
+**A reload re-applies what may change at runtime.** `systemctl --user reload aidir`
+(SIGHUP) or the **Reload settings** button in the WebUI re-read the file and
+re-initializes the workers, so a new provider, a new timeout or a new tool set
+takes effect at once. The resource registry is updated in place, so the memory a
+running task holds is not thrown away. The structural sections — the listeners
+and the WebUI — are **reported** instead: they need a restart, and the log says
+which ones changed.
+
 Key sections:
 
 - **`endpoints`** — which APIs to expose and on which ports
@@ -399,9 +407,11 @@ timeouts and transport failures are retried.
 ```
 
 On the peer's OpenAIx endpoint, `peer_resources.auth_mode` controls access to
-`/v1/resources` and `/api/resources`. The default `disabled` mode permits
-read-only resource discovery on a trusted network. Set `endpoint` to require
-the normal bearer-token and environment authorization checks.
+`/v1/resources` and `/api/resources`. The default `endpoint` mode requires the
+normal bearer-token and environment authorization checks; `disabled` permits
+read-only resource discovery on a trusted network. The reading side needs the
+credentials: give the provider an `auth` block with the token the peer knows
+(see "Peer task visibility" above).
 
 ### Peer task visibility
 
@@ -410,10 +420,27 @@ local task queue. Rows from another instance show their source instance, worker,
 and resolved model; their actions are read-only. The peer endpoint serves
 `GET /v1/tasks`, returning only active task summaries without request or
 response bodies. `peer_tasks.auth_mode` on the peer's `openaix` endpoint controls
-that route: `disabled` (default) publishes it on a trusted network, while
-`endpoint` requires the normal bearer-token and environment authorization
-checks. Both the local and remote instances must run a version that provides
+that route: **`endpoint` (the default) requires the normal bearer-token and
+environment authorization checks**, while `disabled` publishes it on a trusted
+network. Both the local and remote instances must run a version that provides
 this route.
+
+Because the peer publishes its state only with a token, **the reading side must
+carry one**: give the provider an `auth` block with the token the peer knows in
+its `users.items`:
+
+```json5
+"remote_aidir_110": {
+  "api": "openaix",
+  "baseUrl": "http://192.168.1.110:21434",
+  "auth": { "type": "bearer", "token": "${PEER_AIDIR_TOKEN}" },
+  "models": [ ... ]
+}
+```
+
+Without it, the peer answers `401` and this instance sees neither its task list
+nor its resource availability. `./doctor.sh --only auth` reports every provider
+that is missing the credentials.
 
 The dashboard's Model column shows the concrete model selected for a smart
 route. A secondary line shows the requested alias and the provider.
@@ -786,6 +813,13 @@ These tools require `BRAVE_APIKEY` (via `.env` and `config.json5` mapping).
 
 `http_api` is wired by default in endpoint config, but the worker itself is disabled until configured.
 To disable MCP exposure explicitly, remove `http_api` from `endpoints[].tools` where `id: "mcp"`.
+
+The MCP endpoint can spend money and reach the network, so the shipped
+configuration sets `endpoints[].require_auth: true` for it: a request must carry
+a valid API token (`x-api-key` or `Authorization: Bearer`). Add one to
+`users.items`. On a machine that is not reachable from outside, set
+`require_auth: false` for that endpoint. The same flag protects the queue-depth
+routes and the model lists of the other endpoints.
 
 Quick checks:
 

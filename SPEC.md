@@ -1865,11 +1865,11 @@ initialises too early still looks correct.
 
 | # | Problem | Where |
 |---|---|---|
-| 1 | `logging.levels.workers` and `logging.alllevels.workers` (plural) never match the logger type `worker` (singular); `worker.log` falls back to the global level | `core/logger.py:140,155` vs `config.json5.example:69,75` |
-| 2 | `endpoints[].peer_resources` is read by the endpoint and documented in the README but **not declared** in the descriptor — adding it to a configuration file is a startup error | `core/endpoints/endpoint_openaix.py:48-52` vs `config.descriptor.json5:750-865` |
+| 1 | ~~`logging.levels.workers` (plural) never matches the logger type `worker`~~ **Fixed**: the keys are `worker`, and a startup diagnostic names every threshold whose key is not a known subsystem | `core/logger.py`; `core/app.py` |
+| 2 | ~~`endpoints[].peer_resources` is read by the endpoint but **not declared** in the descriptor~~ **Fixed**: the block is declared and read | `config.descriptor.json5` |
 | 3 | `envids.check_period_minutes` and `envids.store_duration_minutes` are declared and shipped but read by nobody; envid contexts in Redis never expire | `config.descriptor.json5:1437-1452` |
 | 4 | `logging.logs` / `logging.log_overrides` is read by the cron job but not declared in the descriptor, so it cannot be set through the editor | `core/cron.py:60` |
-| 5 | `Core.reload_config` refreshes only the settings cache; workers, endpoints and resources are not rebuilt | `core/app.py:385-391` |
+| 5 | ~~`Core.reload_config` refreshes only the settings cache~~ **Fixed**: the reload re-initializes the workers, updates the resource registry in place and reports the structural sections | `core/app.py` |
 | 6 | The README's WebUI route table still lists `/api/config`, `/api/config/raw` and `/api/config/fields`, which were removed | `README.md:646` |
 | 7 | `proposal_hooks.md` states both bundled hooks ship disabled; `hooks/llama_cpp_empty_response_recovery.py` has `ENABLED = True` | `proposal_hooks.md:160-163` |
 | 8 | `prod.json5.example`, referenced by the README, does not exist in the repository | `README.md:62-63` |

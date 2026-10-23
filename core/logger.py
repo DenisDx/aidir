@@ -8,13 +8,31 @@ Level scale: 0=EMERG … 7=DEBUG (systemd-journald compatible).
 from __future__ import annotations
 
 import json
+import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 _ROOT = Path(__file__).parent.parent
-_LOGS_DIR = _ROOT / "logs"
+
+
+def logs_dir() -> Path:
+    """Return the directory the log files are written to.
+
+    `AIDIR_LOG_DIR` moves it. The test suite uses it so that a test run does
+    not write into the logs of the running instance: the doubles' messages
+    would otherwise be indistinguishable from a real failure for whoever reads
+    the log afterwards.
+    """
+    override = str(os.environ.get("AIDIR_LOG_DIR") or "").strip()
+    if override:
+        return Path(override)
+    return _ROOT / "logs"
+
+# The log types the code writes. A threshold for any other name never matches,
+# and the mistake is invisible: the file simply keeps the global level.
+KNOWN_SUBSYSTEMS = frozenset({"system", "core", "worker", "webui", "audit", "http", "hooks"})
 
 # Numeric ↔ name mappings (systemd-journald scale)
 _INT_TO_NAME: dict[int, str] = {
@@ -61,7 +79,7 @@ class CoreLogger:
     """
 
     def __init__(self) -> None:
-        _LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        logs_dir().mkdir(parents=True, exist_ok=True)
         self._cfg = None
 
     def _config(self):
@@ -164,19 +182,39 @@ class CoreLogger:
         lvl_int = _level_int(level)
         line = _format(type_, lvl_int, message, tag, self._timezone())
 
+        target = logs_dir()
+
         # Individual type log (e.g. logs/worker.log)
         if lvl_int <= self._threshold(type_, tag, individual=True):
-            _append(_LOGS_DIR / f"{type_}.log", line)
+            _append(target / f"{type_}.log", line)
 
         # Shared all.log
         if lvl_int <= self._threshold(type_, tag, individual=False):
-            _append(_LOGS_DIR / "all.log", line)
+            _append(target / "all.log", line)
+
+    def warn_unknown_subsystems(self) -> list[str]:
+        """Report the log thresholds whose key is not a subsystem the code writes.
+
+        A key that does not name a log type never matches anything, so the
+        threshold is silently ignored. The mistake is invisible otherwise.
+        """
+        cfg = self._config()
+        unknown: list[str] = []
+        for section in ("levels", "alllevels"):
+            values = cfg.get(f"logging.{section}", {}) or {}
+            if not isinstance(values, dict):
+                continue
+            for name in values:
+                if str(name).strip() not in KNOWN_SUBSYSTEMS:
+                    unknown.append(f"logging.{section}.{name}")
+        return sorted(unknown)
 
     def wipe_logs(self, max_age_seconds: int) -> None:
         """Remove log lines older than max_age_seconds from *.log and *.jsonl files."""
         cutoff = time.time() - max_age_seconds
+        target = logs_dir()
         for pattern in ("*.log", "*.jsonl"):
-            for log_file in _LOGS_DIR.glob(pattern):
+            for log_file in target.glob(pattern):
                 _wipe_file(log_file, cutoff)
 
 

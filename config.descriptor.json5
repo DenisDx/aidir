@@ -509,7 +509,7 @@
       // ── Resources (VRAM pools) ─────────────────────────────────────────
       resources: {
         type: "array",
-        apply: "restart",
+        apply: "reload",
         description: "Physical or remote resource pools the scheduler places models on",
         children: {
           type: "object",
@@ -811,6 +811,11 @@
               apply: "reload",
               description: "Worker id that serves agent tasks here; falls back to workers.default",
             },
+            require_auth: {
+              type: "bool",
+              apply: "restart",
+              description: "When true, every route of this endpoint needs a valid API token. The default is false, so an existing deployment keeps working",
+            },
             logging: {
               type: "object",
               apply: "live",
@@ -860,6 +865,19 @@
                 },
               },
             },
+            peer_resources: {
+              type: "object",
+              apply: "restart",
+              description: "Read-only resource inventory of this instance, for the dashboards and the schedulers of other aidir instances",
+              children: {
+                auth_mode: {
+                  type: "string",
+                  enum: ["disabled", "endpoint"],
+                  apply: "restart",
+                  description: "disabled publishes the resource inventory on a trusted network; endpoint requires the normal bearer token and envid checks",
+                },
+              },
+            },
           },
         },
       },
@@ -867,7 +885,7 @@
       // ── Workers ────────────────────────────────────────────────────────
       workers: {
         type: "object",
-        apply: "restart",
+        apply: "reload",
         description: "Worker registry: everything aidir can execute",
         children: {
           tools_max_turns: {
@@ -939,7 +957,7 @@
       // ── Models and providers ───────────────────────────────────────────
       models: {
         type: "object",
-        apply: "restart",
+        apply: "reload",
         description: "Model catalogue and the providers that serve it",
         children: {
           providers: {

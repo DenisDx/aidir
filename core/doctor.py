@@ -1025,6 +1025,66 @@ def _check_logs(context: Context) -> CheckResult:
     return CheckResult("logs", "ok", "writable")
 
 
+@_register("auth")
+def _check_auth(context: Context) -> CheckResult:
+    """The surfaces that answer without a token must be the ones that are meant to.
+
+    The MCP tool endpoint can spend money and reach the network, the queue depth
+    describes the capacity of the machine, and the peer surfaces publish the
+    state of this instance. The check reports the ones that are open, and the
+    providers that cannot read a peer because the peer publishes its state only
+    with a token.
+    """
+    settings = _resolved(context)
+    endpoints = settings.get("endpoints") or []
+    findings: list[str] = []
+    for endpoint in endpoints if isinstance(endpoints, list) else []:
+        if not isinstance(endpoint, dict):
+            continue
+        endpoint_id = str(endpoint.get("id") or "")
+        api = str(endpoint.get("api") or "")
+        requires_auth = bool(endpoint.get("require_auth"))
+        if requires_auth:
+            continue
+        if api == "mcp":
+            findings.append(
+                f"the MCP endpoint '{endpoint_id}' publishes its tools without a token; "
+                "set endpoints[].require_auth to true and add a token to users.items"
+            )
+        elif api in {"openaix", "ollama"}:
+            findings.append(
+                f"the endpoint '{endpoint_id}' publishes its queue depth and its model list "
+                "without a token; set endpoints[].require_auth to true on a machine that "
+                "is reachable from outside"
+            )
+
+    providers = ((settings.get("models") or {}).get("providers") or {})
+    for provider_id, provider in (providers.items() if isinstance(providers, dict) else []):
+        if not isinstance(provider, dict) or str(provider.get("api") or "") != "openaix":
+            continue
+        auth = provider.get("auth")
+        has_token = False
+        if isinstance(auth, dict):
+            token = auth.get("token")
+            has_token = isinstance(token, str) and bool(token.strip())
+            has_token = has_token or bool(auth.get("authorization")) or bool(auth.get("headers"))
+        if not has_token:
+            findings.append(
+                f"the peer provider '{provider_id}' carries no credentials, so this instance "
+                "cannot read the state the peer publishes with a token; add auth to the provider"
+            )
+
+    if not findings:
+        return CheckResult("auth", "ok", "every surface that needs a token has one")
+    result = CheckResult("auth", "warn", f"{len(findings)} surface(s) are open")
+    result.details.extend(findings)
+    result.recommendation = (
+        "Add a token to users.items and set endpoints[].require_auth, or accept the exposure "
+        "on a machine that is not reachable from outside"
+    )
+    return result
+
+
 @_register("ollama")
 def _check_ollama(context: Context) -> CheckResult:
     """The Ollama upstream must answer; the doctor never starts it."""

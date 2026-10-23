@@ -75,6 +75,7 @@ class Scheduler:
         # condition, so the task is re-routed instead of being deferred forever.
         self._remote_blocked_candidates: dict[str, set[tuple[str, str]]] = {}
         self._remote_refusal_counts: dict[str, int] = {}
+        self._peer_auth_warned: set[str] = set()
         # Why every waiting task waits. The log is not enough: the default log
         # level hides the deferral messages, so the operator would never learn
         # why a task is not running.
@@ -1222,6 +1223,13 @@ class Scheduler:
                     except httpx.HTTPError:
                         continue
 
+                    if response.status_code in {401, 403}:
+                        # The peer publishes its state only with a token, and
+                        # this instance has none. Say so once, instead of
+                        # letting the candidate disappear silently.
+                        self._warn_peer_unauthorized(provider_id, response.status_code)
+                        return None
+
                     if response.status_code < 200 or response.status_code >= 300:
                         continue
 
@@ -1287,6 +1295,23 @@ class Scheduler:
             if normalized_model_id in candidate_names:
                 return True
         return False
+
+    def _warn_peer_unauthorized(self, provider_id: str, status_code: int) -> None:
+        """Report once that a peer refused this instance because it has no token."""
+        key = f"peer-auth:{provider_id}"
+        if key in self._peer_auth_warned:
+            return
+        self._peer_auth_warned.add(key)
+        log(
+            "system",
+            "warning",
+            (
+                f"The peer provider '{provider_id}' answered HTTP {status_code}: it publishes its "
+                "state only with a token, and this instance sends none. Add auth to the provider, "
+                "or set the peer's peer_tasks/peer_resources auth_mode to disabled."
+            ),
+            "routing",
+        )
 
     def _resolve_probe_headers(self, provider_id: str, incoming_bearer_token: str = "") -> dict[str, str]:
         """Resolve smart-probe auth headers with provider override or bearer fallback."""

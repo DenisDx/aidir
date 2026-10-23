@@ -66,13 +66,16 @@
       "overflow_policy": "best_effort"
     },
     "levels": { // thresholds for individual per-type log files
-      "workers": "warning",
+      // The key is the log type, exactly as it appears in the file name:
+      // system, core, worker, webui, audit, http, hooks.
+      "system": "info",
+      "worker": "warning",
       "http": "warning",
       "webui": "warning",
     },
     "alllevels": { // thresholds for all.log
       "core": 3, // WARNING
-      "workers": 3,
+      "worker": 3,
       "http": 3, // INFO
       "webui": 3
     }
@@ -172,6 +175,10 @@
       "api": "mcp",
       "port": ${MCP_ENDPOINT_PORT:-20001},
       "bindAddress": "${MCP_ENDPOINT_HOST:-0.0.0.0}",
+      // The published tools can spend money and reach the network, so this
+      // endpoint asks for a valid API token. Add one to users.items, or set
+      // require_auth to false on a machine that is not reachable from outside.
+      "require_auth": true,
       "logging": {
         // Example: keep endpoint logs more verbose for MCP debugging
         "level": "debug",

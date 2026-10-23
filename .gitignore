@@ -30,6 +30,9 @@ config.json5.lock
 
 memory/
 AGENTS.md
-SPEC.md
+
+#local files
+_local_*.*
+_local_*/
 
 # aiset is a Git submodule (see .gitmodules), not an ignored directory.

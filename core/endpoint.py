@@ -2,10 +2,14 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 import json
 from typing import TYPE_CHECKING, Any
+
+from fastapi import Request
+from fastapi.responses import JSONResponse
 
 from core import log
 
@@ -18,6 +22,16 @@ class BaseEndpoint(ABC):
 
     id: str = ""
     api: str = ""
+
+    def __init__(self, endpoint_cfg: dict | None = None) -> None:
+        endpoint_cfg = endpoint_cfg if isinstance(endpoint_cfg, dict) else {}
+        self.id = str(endpoint_cfg.get("id") or "")
+        self._cfg = endpoint_cfg if isinstance(endpoint_cfg, dict) else {}
+        self._core: "Core | None" = None
+        # When true, every route of this endpoint needs a valid API token. The
+        # default is false: an existing deployment keeps working, and the
+        # operator turns the protection on where it is wanted.
+        self._require_auth = bool(self._cfg.get("require_auth", False))
 
     def _attach_ingress_logging(self, app: Any) -> None:
         """Log every incoming HTTP request before endpoint processing."""
@@ -45,6 +59,73 @@ class BaseEndpoint(ABC):
             ),
             self.id or None,
         )
+
+    @staticmethod
+    def _extract_bearer_token(request: Request) -> str:
+        """Extract the Bearer token from the Authorization header."""
+        auth_header = request.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer "):
+            return ""
+        return auth_header[7:].strip()
+
+    @classmethod
+    def _extract_incoming_token(cls, request: Request) -> str:
+        """Return the x-api-key or the Bearer token supplied by a client."""
+        api_key = str(request.headers.get("x-api-key") or "").strip()
+        if api_key:
+            return api_key
+        return cls._extract_bearer_token(request)
+
+    def _find_api_user_by_token(self, token: str) -> dict | None:
+        """Find the API account whose token matches, comparing in constant time."""
+        users_cfg = self._core.config.get("users", {}) if self._core else {}
+        items = users_cfg.get("items") if isinstance(users_cfg, dict) else None
+
+        # Backward compatibility for the legacy list format.
+        if isinstance(users_cfg, list):
+            items = users_cfg
+
+        if not isinstance(items, list):
+            return None
+
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            raw_token = item.get("token")
+            if not isinstance(raw_token, str):
+                continue
+            if hmac.compare_digest(raw_token, token):
+                return item
+        return None
+
+    def _authorize_request(self, request: Request) -> JSONResponse | None:
+        """Return a 401 response when this endpoint requires a token and none is valid.
+
+        The endpoints that carry the inference traffic have always accepted an
+        anonymous request, and that stays the default. The introspection and the
+        tool surfaces turn the requirement on explicitly.
+        """
+        if not self._require_auth:
+            return None
+        token = self._extract_incoming_token(request)
+        if token and self._find_api_user_by_token(token) is not None:
+            return None
+        return JSONResponse(
+            {"error": {"code": "UNAUTHORIZED", "message": "This endpoint requires a valid API token"}},
+            status_code=401,
+        )
+
+    def _peer_auth_mode(self, block: object) -> str:
+        """Return the publication mode of a peer block.
+
+        `endpoint` is the default: the peer task list and the resource inventory
+        of an instance are not published to the network without a token.
+        """
+        config = block if isinstance(block, dict) else {}
+        mode = str(config.get("auth_mode") or "endpoint").strip().lower()
+        if mode not in {"disabled", "endpoint"}:
+            return "endpoint"
+        return mode
 
     @staticmethod
     def _normalize_utc(value: datetime | None) -> datetime | None:

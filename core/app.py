@@ -7,6 +7,7 @@ Handles SIGHUP for config reload.
 from __future__ import annotations
 
 import asyncio
+import json
 import faulthandler
 import signal
 import sys
@@ -44,7 +45,7 @@ from core.audit_log import AuditLog
 from core.config import Config, config as _global_config
 from core.error_logging import log_exception
 from core.envid import EnvidRegistry
-from core.logger import logger
+from core.logger import KNOWN_SUBSYSTEMS, logger, logs_dir
 from core.local_server_manager import LocalServerManager
 from core.peer_resources import PeerResourceClient
 from core.hooks import HookManager
@@ -149,9 +150,27 @@ class Core:
     async def start(self) -> None:
         log("core", "info", "Core starting")
 
+        unknown_thresholds = logger.warn_unknown_subsystems()
+        if unknown_thresholds:
+            log(
+                "system",
+                "warning",
+                (
+                    f"These log thresholds name no known subsystem and never apply: "
+                    f"{', '.join(unknown_thresholds)}. The log types are: "
+                    f"{', '.join(sorted(KNOWN_SUBSYSTEMS))}."
+                ),
+                "logging",
+            )
+
         audit_directory = Path(self.config.get("logging.audit.directory", "logs/audit"))
         if not audit_directory.is_absolute():
-            audit_directory = _ROOT / audit_directory
+            # A relative directory that starts with "logs" belongs to the log
+            # root, which the test suite moves out of the way.
+            if audit_directory.parts and audit_directory.parts[0] == "logs":
+                audit_directory = logs_dir() / Path(*audit_directory.parts[1:])
+            else:
+                audit_directory = _ROOT / audit_directory
         self.audit_log = AuditLog(
             audit_directory,
             secret_metadata_keys=self.config.get("logging.audit.secret_metadata_keys", []),
@@ -382,13 +401,78 @@ class Core:
         total_elapsed = time.monotonic() - started_at
         log("core", "info", f"Core stopping completed in {total_elapsed:.3f}s")
 
-    def reload_config(self) -> None:
-        """Reload config from disk (triggered by SIGHUP)."""
+    async def reload_config(self) -> dict:
+        """Re-read the configuration and re-apply the parts that may change at runtime.
+
+        The workers are re-initialized and the resource registry is updated in
+        place, so the reservations of the running tasks survive. The sections
+        that are structural - the listeners, the WebUI, the local servers - are
+        reported instead: they need a restart, and a reload that pretended
+        otherwise would be a lie.
+        """
+        before = self.config.raw()
         try:
             self.config.load()
-            log("system", "info", "Config reloaded")
         except Exception as exc:
             log("system", "error", f"Config reload failed: {exc}")
+            return {"ok": False, "error": str(exc)}
+
+        after = self.config.raw()
+        result: dict = {"ok": True, "workers": [], "resources": {}, "restart_required": []}
+
+        # The workers: their section is re-applied, so a new provider or a new
+        # timeout takes effect without a restart.
+        try:
+            workers_cfg = resolve_worker_configs(after)
+            self.workers_cfg = workers_cfg
+            for worker_id, worker in self.workers.items():
+                await worker.initialize({**workers_cfg.get(worker_id, {}), "_core": self})
+                result["workers"].append(worker_id)
+        except Exception as exc:
+            log("system", "error", f"Config reload: the workers could not be re-initialized: {exc}")
+            result["workers_error"] = str(exc)
+
+        # The resources: the registry is updated in place, so the memory a
+        # running task holds is not thrown away.
+        try:
+            result["resources"] = self.resources.apply_config(after.get("resources") or [])
+        except Exception as exc:
+            log("system", "error", f"Config reload: the resources could not be updated: {exc}")
+            result["resources_error"] = str(exc)
+
+        result["restart_required"] = self._sections_needing_restart(before, after)
+        if result["restart_required"]:
+            log(
+                "system",
+                "warning",
+                (
+                    "These configuration sections changed and need a restart: "
+                    f"{', '.join(result['restart_required'])}"
+                ),
+            )
+        log(
+            "system",
+            "info",
+            (
+                f"Config reloaded: workers={len(result['workers'])} "
+                f"resources_added={len(result['resources'].get('added', []))} "
+                f"resources_updated={len(result['resources'].get('updated', []))} "
+                f"resources_removed={len(result['resources'].get('removed', []))} "
+                f"restart_required={','.join(result['restart_required']) or '-'}"
+            ),
+        )
+        return result
+
+    @staticmethod
+    def _sections_needing_restart(before: dict, after: dict) -> list[str]:
+        """Return the structural sections whose content changed."""
+        changed: list[str] = []
+        for section in ("endpoints", "webui"):
+            if json.dumps(before.get(section), sort_keys=True) != json.dumps(
+                after.get(section), sort_keys=True
+            ):
+                changed.append(section)
+        return changed
 
     # ── Core API ──────────────────────────────────────────────────────────────
 
@@ -917,9 +1001,14 @@ async def main() -> None:
 
     loop.set_exception_handler(_loop_exception_handler)
 
-    # SIGHUP → reload config
+    # SIGHUP → reload config. The signal handler takes a plain callable, so the
+    # coroutine is scheduled explicitly: passing the coroutine function itself
+    # would create the coroutine and drop it, and the reload would never run.
     try:
-        loop.add_signal_handler(signal.SIGHUP, core.reload_config)
+        loop.add_signal_handler(
+            signal.SIGHUP,
+            lambda: asyncio.create_task(core.reload_config()),
+        )
     except (NotImplementedError, AttributeError):
         pass  # Windows
 

@@ -29,6 +29,7 @@ class Endpoint_mcp(BaseEndpoint):
     api = "mcp"
 
     def __init__(self, endpoint_cfg: dict) -> None:
+        super().__init__(endpoint_cfg)
         self.id = endpoint_cfg.get("id", "mcp")
         self._cfg = endpoint_cfg
         self._core: "Core | None" = None
@@ -91,6 +92,9 @@ class Endpoint_mcp(BaseEndpoint):
 
     async def _handle_rpc(self, request: Request) -> JSONResponse:
         """Dispatch MCP request by method name."""
+        unauthorized = self._authorize_request(request)
+        if unauthorized is not None:
+            return unauthorized
         try:
             body, raw_body = await self._read_json_body(request)
         except Exception:

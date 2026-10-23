@@ -106,9 +106,42 @@ class TestPeerResources(unittest.TestCase):
         endpoint = Endpoint_openaix({"id": "openaix", **endpoint_config})
         return TestClient(endpoint.create_app(_Core(config)))
 
+    def test_resources_require_a_token_by_default(self) -> None:
+        """The resource inventory of an instance is not published without a token."""
+        with self._client({}, {"http": {"max_request_size": 1024}}) as client:
+            response = client.get("/v1/resources/gpu")
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_resources_can_be_published_without_a_token_on_request(self) -> None:
+        """A trusted network can still opt out of the token requirement."""
+        with self._client(
+            {"peer_resources": {"auth_mode": "disabled"}},
+            {"http": {"max_request_size": 1024}},
+        ) as client:
+            response = client.get("/v1/resources/gpu")
+
+        self.assertEqual(response.status_code, 200)
+
+    def test_resources_are_readable_with_a_valid_token(self) -> None:
+        """A peer that holds the token reads the inventory."""
+        with self._client(
+            {},
+            {
+                "http": {"max_request_size": 1024},
+                "users": {"items": [{"login": "peer", "token": "peer-token"}]},
+            },
+        ) as client:
+            response = client.get("/v1/resources/gpu", headers={"Authorization": "Bearer peer-token"})
+
+        self.assertEqual(response.status_code, 200)
+
     def test_resources_are_public_by_default_with_safe_telemetry(self) -> None:
         """Return resource state with whitelist telemetry but no executable configuration."""
-        with self._client({}, {"http": {"max_request_size": 1024}}) as client:
+        with self._client(
+            {"peer_resources": {"auth_mode": "disabled"}},
+            {"http": {"max_request_size": 1024}},
+        ) as client:
             response = client.get("/v1/resources/gpu")
 
         self.assertEqual(response.status_code, 200)
@@ -147,6 +180,16 @@ class TestPeerResources(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["protocol_version"], 1)
         self.assertEqual(response.json()["data"][0]["id"], "gpu")
+
+    def test_peer_tasks_require_a_token_by_default(self) -> None:
+        """The task list of an instance is not published without a token."""
+        core = _Core({"http": {"max_request_size": 1024}, "instance": "remote-aidir"}, [])
+        endpoint = Endpoint_openaix({"id": "openaix", "api": "openaix"})
+
+        with TestClient(endpoint.create_app(core)) as client:
+            response = client.get("/v1/tasks")
+
+        self.assertEqual(response.status_code, 401)
 
     def test_peer_tasks_are_public_by_default_and_omit_bodies(self) -> None:
         """Expose active task summaries without request or response payloads."""
@@ -196,7 +239,11 @@ class TestPeerResources(unittest.TestCase):
             config={},
         )
         core = _Core({"http": {"max_request_size": 1024}, "instance": "remote-aidir"}, [active, completed])
-        endpoint = Endpoint_openaix({"id": "openaix", "api": "openaix"})
+        endpoint = Endpoint_openaix({
+            "id": "openaix",
+            "api": "openaix",
+            "peer_tasks": {"auth_mode": "disabled"},
+        })
 
         with TestClient(endpoint.create_app(core)) as client:
             response = client.get("/v1/tasks")

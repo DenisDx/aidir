@@ -580,6 +580,21 @@ async def _fetch_peer_tasks(core: "Core") -> list[dict[str, Any]]:
         if isinstance(response, Exception):
             log("webui", "debug", f"Peer task probe failed for {provider_id}: {response}", "tasks")
             continue
+        if response.status_code in {401, 403}:
+            # The peer publishes its task list only with a token, and this
+            # instance sends none. Say it once, instead of silently showing an
+            # empty peer list.
+            log(
+                "webui",
+                "warning",
+                (
+                    f"The peer provider '{provider_id}' answered HTTP {response.status_code}: it "
+                    "publishes its task list only with a token, and this instance sends none. "
+                    "Add auth to the provider, or set the peer's peer_tasks auth_mode to disabled."
+                ),
+                "tasks",
+            )
+            continue
         if response.status_code != 200:
             continue
         try:
@@ -1846,7 +1861,7 @@ def create_app(
         try:
             runtime = get_runtime()
             runtime.refresh()
-            core.reload_config()
+            applied = await core.reload_config()
         except SettingsError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         except Exception as exc:
@@ -1854,7 +1869,11 @@ def create_app(
             raise HTTPException(status_code=500, detail=f"Failed to reload settings: {exc}") from exc
 
         log("webui", "info", f"Settings reloaded by user {session['login']}", "control")
-        return {"ok": True, "revision": runtime.load("main").revision}
+        return {
+            "ok": True,
+            "revision": runtime.load("main").revision,
+            "restart_required": (applied or {}).get("restart_required", []),
+        }
 
     # ── Static files ──────────────────────────────────────────────────────────
     # Served last so API routes take priority

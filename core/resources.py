@@ -45,6 +45,66 @@ class Resources:
         self._model_active: dict[tuple[str, str], int] = {}
         self._candidate_invalidator: Callable[[str, str], None] | None = None
 
+    def apply_config(self, items: list[dict] | None = None) -> dict:
+        """Update the registry in place from a new configuration.
+
+        The reservations of the resources that stay are kept: a reload must not
+        throw away the memory a running task holds. A resource that appears
+        starts empty, and one that disappears is dropped with its state.
+        """
+        wanted: dict[str, dict] = {}
+        for item in (items or []):
+            rid = str(item.get("id", "")).strip()
+            if rid:
+                wanted[rid] = item
+
+        added: list[str] = []
+        updated: list[str] = []
+        for rid, item in wanted.items():
+            existing = self._items.get(rid)
+            if existing is None:
+                self._items[rid] = Resource(
+                    rid,
+                    str(item.get("type") or "generic"),
+                    item.get("limits") or {},
+                    alive_time=int(item.get("alive_time") or 0),
+                    keep_alive=int(item.get("keep_alive") or 0),
+                    keep_alive_period=int(item.get("keep_alive_period") or 0),
+                    provider=item.get("provider"),
+                    monitoring=item.get("monitoring"),
+                    availability=item.get("availability"),
+                    units=item.get("units"),
+                    telemetry=item.get("telemetry"),
+                )
+                added.append(rid)
+                continue
+
+            limits = {str(k): int(v) for k, v in (item.get("limits") or {}).items()}
+            existing.type = str(item.get("type") or existing.type)
+            existing.limits = limits
+            existing.used = {metric: existing.used.get(metric, 0) for metric in limits}
+            existing.alive_time = int(item.get("alive_time") or 0)
+            existing.keep_alive = int(item.get("keep_alive") or 0)
+            existing.keep_alive_period = int(item.get("keep_alive_period") or 0)
+            existing.provider = item.get("provider")
+            existing.monitoring = dict(item.get("monitoring") or {})
+            existing.availability = dict(item.get("availability") or {})
+            existing.units = (
+                {str(metric): str(unit) for metric, unit in (item.get("units") or {}).items()}
+                if isinstance(item.get("units"), dict)
+                else {}
+            )
+            existing.telemetry = dict(item.get("telemetry") or {})
+            updated.append(rid)
+
+        removed: list[str] = []
+        for rid in list(self._items):
+            if rid not in wanted:
+                removed.append(rid)
+                del self._items[rid]
+
+        return {"added": added, "updated": updated, "removed": removed}
+
     def set_redis(self, redis: "aioredis.Redis", ns: str = "aidir") -> None:
         """Inject Redis client for model activity persistence (needed by cron keep_alive)."""
         self._redis = redis

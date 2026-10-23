@@ -45,16 +45,8 @@ class Endpoint_openaix(Endpoint_ollama):
         self._errors_compatibility_mode = bool(
             endpoint_cfg.get("errors_compatibility_mode", True)
         )
-        peer_resources_cfg = endpoint_cfg.get("peer_resources")
-        peer_resources_cfg = peer_resources_cfg if isinstance(peer_resources_cfg, dict) else {}
-        self._peer_resources_auth_mode = str(peer_resources_cfg.get("auth_mode") or "disabled").strip().lower()
-        if self._peer_resources_auth_mode not in {"disabled", "endpoint"}:
-            self._peer_resources_auth_mode = "disabled"
-        peer_tasks_cfg = endpoint_cfg.get("peer_tasks")
-        peer_tasks_cfg = peer_tasks_cfg if isinstance(peer_tasks_cfg, dict) else {}
-        self._peer_tasks_auth_mode = str(peer_tasks_cfg.get("auth_mode") or "disabled").strip().lower()
-        if self._peer_tasks_auth_mode not in {"disabled", "endpoint"}:
-            self._peer_tasks_auth_mode = "disabled"
+        self._peer_resources_auth_mode = self._peer_auth_mode(endpoint_cfg.get("peer_resources"))
+        self._peer_tasks_auth_mode = self._peer_auth_mode(endpoint_cfg.get("peer_tasks"))
         self._model_resolution_warnings_emitted: set[str] = set()
 
     def create_app(self, core) -> FastAPI:
@@ -136,37 +128,41 @@ class Endpoint_openaix(Endpoint_ollama):
             return self._peer_tasks_response(request)
 
         @app.get("/v1/providers/{provider_id}/models/{model_id:path}/queue-state")
-        async def openai_model_queue_state(provider_id: str, model_id: str, priority: int = 5):
+        async def openai_model_queue_state(provider_id: str, model_id: str, priority: int = 5, request: Request = None):
             return await self._model_queue_state_response(
                 protocol="openai",
                 provider_id=provider_id,
                 model_id=model_id,
                 priority=priority,
+                request=request,
             )
 
         @app.get("/v1/models/{model_id:path}/queue-state")
-        async def openai_model_only_queue_state(model_id: str, priority: int = 5):
+        async def openai_model_only_queue_state(model_id: str, priority: int = 5, request: Request = None):
             return await self._model_only_queue_state_response(
                 protocol="openai",
                 model_id=model_id,
                 priority=priority,
+                request=request,
             )
 
         @app.get("/api/providers/{provider_id}/models/{model_id:path}/queue-state")
-        async def ollama_model_queue_state(provider_id: str, model_id: str, priority: int = 5):
+        async def ollama_model_queue_state(provider_id: str, model_id: str, priority: int = 5, request: Request = None):
             return await self._model_queue_state_response(
                 protocol="ollama",
                 provider_id=provider_id,
                 model_id=model_id,
                 priority=priority,
+                request=request,
             )
 
         @app.get("/api/models/{model_id:path}/queue-state")
-        async def ollama_model_only_queue_state(model_id: str, priority: int = 5):
+        async def ollama_model_only_queue_state(model_id: str, priority: int = 5, request: Request = None):
             return await self._model_only_queue_state_response(
                 protocol="ollama",
                 model_id=model_id,
                 priority=priority,
+                request=request,
             )
 
         @app.get("/health")
@@ -1469,8 +1465,13 @@ class Endpoint_openaix(Endpoint_ollama):
         provider_id: str,
         model_id: str,
         priority: int,
+        request: Request | None = None,
     ) -> JSONResponse:
         """Return queue state for a provider/model pair."""
+        if request is not None:
+            unauthorized = self._authorize_request(request)
+            if unauthorized is not None:
+                return unauthorized
         if priority < 0:
             return self._error_response(
                 protocol=protocol,
@@ -1633,8 +1634,13 @@ class Endpoint_openaix(Endpoint_ollama):
         protocol: str,
         model_id: str,
         priority: int,
+        request: Request | None = None,
     ) -> JSONResponse:
         """Resolve external model id using inference routing rules and return queue state."""
+        if request is not None:
+            unauthorized = self._authorize_request(request)
+            if unauthorized is not None:
+                return unauthorized
         worker_id = self._resolve_worker_id({})
         route = self._resolve_model_route(model_id, worker_id)
         if route is None:

@@ -53,6 +53,7 @@ class Endpoint_ollama(BaseEndpoint):
     api = "ollama"
 
     def __init__(self, endpoint_cfg: dict) -> None:
+        super().__init__(endpoint_cfg)
         self.id = endpoint_cfg.get("id", "ollama")
         self._cfg = endpoint_cfg
         self._core: "Core | None" = None
@@ -300,44 +301,6 @@ class Endpoint_ollama(BaseEndpoint):
             )
 
         body["envid"] = requested_envid
-        return None
-
-    @staticmethod
-    def _extract_bearer_token(request: Request) -> str:
-        """Extract Bearer token from Authorization header."""
-        auth_header = request.headers.get("Authorization", "")
-        if not auth_header.startswith("Bearer "):
-            return ""
-        return auth_header[7:].strip()
-
-    @classmethod
-    def _extract_incoming_token(cls, request: Request) -> str:
-        """Return x-api-key or a Bearer token supplied by an incoming client."""
-        api_key = str(request.headers.get("x-api-key") or "").strip()
-        if api_key:
-            return api_key
-        return cls._extract_bearer_token(request)
-
-    def _find_api_user_by_token(self, token: str) -> dict | None:
-        """Find API user from users.items by matching token."""
-        users_cfg = self._core.config.get("users", {}) if self._core else {}
-        items = users_cfg.get("items") if isinstance(users_cfg, dict) else None
-
-        # Backward compatibility for legacy list format.
-        if isinstance(users_cfg, list):
-            items = users_cfg
-
-        if not isinstance(items, list):
-            return None
-
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            raw_token = item.get("token")
-            if not isinstance(raw_token, str):
-                continue
-            if hmac.compare_digest(raw_token, token):
-                return item
         return None
 
     @staticmethod
