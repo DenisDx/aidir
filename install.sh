@@ -549,6 +549,18 @@ set -a
 source "$ENV_FILE"
 set +a
 
+# A Redis instance exposed beyond loopback must not run without authentication.
+if [[ -z "${REDIS_PASSWORD:-}" ]]; then
+  case "${REDIS_HOST:-127.0.0.1}" in
+    127.*|localhost|::1) ;;
+    *)
+      REDIS_PASSWORD="$(generate_password)"
+      set_env_var "$ENV_FILE" "REDIS_PASSWORD" "$REDIS_PASSWORD"
+      info "REDIS_PASSWORD auto-generated because Redis is bound to ${REDIS_HOST}."
+      ;;
+  esac
+fi
+
 # Ensure nginx public port is configured before all listener ports are checked.
 if [[ -z "${NGINX_HTTP_PORT:-}" ]]; then
   NGINX_HTTP_PORT=8080
@@ -601,7 +613,7 @@ info "Waiting for Redis to be healthy…"
 REDIS_HOST="${REDIS_HOST:-127.0.0.1}"
 REDIS_PORT="${REDIS_PORT:-6379}"
 for i in $(seq 1 20); do
-  if docker exec aidir_redis redis-cli ping 2>/dev/null | grep -q PONG; then
+  if docker exec -e REDISCLI_AUTH="${REDIS_PASSWORD:-}" aidir_redis redis-cli ping 2>/dev/null | grep -q PONG; then
     info "Redis is up"
     break
   fi

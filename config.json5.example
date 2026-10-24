@@ -700,7 +700,8 @@
       "ollama_chat":     ${WEBUI_TIMEOUT_OLLAMA_CHAT:-120},   // ollama /api/chat test
       "mcp_proxy":       ${WEBUI_TIMEOUT_MCP_PROXY:-60},      // MCP endpoint proxy
       "model_list":      ${WEBUI_TIMEOUT_MODEL_LIST:-20},     // list models from endpoint
-      "agent_test":      ${WEBUI_TIMEOUT_AGENT_TEST:-45}      // test agent request
+      "agent_test":      ${WEBUI_TIMEOUT_AGENT_TEST:-45},     // test agent request
+      "agent_test_max":  ${WEBUI_TIMEOUT_AGENT_TEST_MAX:-300} // client timeout cap for test agent
     }
   },
   "users": {

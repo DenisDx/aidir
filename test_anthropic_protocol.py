@@ -120,6 +120,22 @@ class MessagesRequestConversionTests(unittest.TestCase):
         self.assertEqual(assistant["reasoning_content"], "reason")
         self.assertEqual(assistant["anthropic_blocks"][0]["signature"], "sig")
 
+    def test_signed_thinking_round_trip_preserves_signature(self) -> None:
+        """Keep a native thinking signature through response conversion."""
+        data = {
+            "id": "msg_1",
+            "model": "claude",
+            "content": [
+                {"type": "thinking", "thinking": "reason", "signature": "sig"},
+                {"type": "text", "text": "answer"},
+            ],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 2},
+        }
+        internal = messages_response_to_internal(data)
+        payload = internal_result_to_messages(internal, model="claude", include_thinking=True)
+        self.assertEqual(payload["content"][0], {"type": "thinking", "thinking": "reason", "signature": "sig"})
+
     def test_invalid_requests_are_rejected(self) -> None:
         """Reject missing model, max_tokens, and malformed messages."""
         for body in (
@@ -230,6 +246,25 @@ class MessagesStreamingTests(unittest.TestCase):
         self.assertEqual([event["type"] for event in final], ["content_block_stop", "message_delta", "message_stop"])
         self.assertEqual(final[1]["delta"]["stop_reason"], "max_tokens")
         self.assertEqual(final[1]["usage"]["output_tokens"], 2)
+
+    def test_encoder_emits_signature_delta_before_closing_thinking(self) -> None:
+        """Emit the signature for the open thinking block before its stop event."""
+        encoder = AnthropicStreamEncoder(model="m", message_id="msg_1", include_thinking=True)
+        encoder.feed({"message": {"thinking": "reason"}, "done": False})
+        events = encoder.feed({"message": {"thinking_signature": "sig"}, "done": True})
+        self.assertEqual(events[0]["delta"], {"type": "signature_delta", "signature": "sig"})
+        self.assertEqual(events[1]["type"], "content_block_stop")
+        self.assertEqual(events[-1]["type"], "message_stop")
+
+    def test_decoder_emits_thinking_signature_chunk(self) -> None:
+        """Surface an upstream signature delta so a synthesized stream can retain it."""
+        decoder = AnthropicStreamDecoder()
+        decoder.feed({"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": ""}})
+        decoder.feed({"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "reason"}})
+        delta = decoder.feed({"type": "content_block_delta", "index": 0, "delta": {"type": "signature_delta", "signature": "sig"}})
+        self.assertEqual(delta["message"]["thinking_signature"], "sig")
+        decoder.feed({"type": "content_block_stop", "index": 0})
+        self.assertEqual(decoder.result()["message"]["anthropic_blocks"][0]["signature"], "sig")
 
     def test_encoder_tool_call(self) -> None:
         """Emit a complete tool_use block for an internal tool call."""

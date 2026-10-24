@@ -678,6 +678,12 @@ def _check_compose(context: Context) -> CheckResult:
     return result
 
 
+def _redis_host_is_loopback(host: str) -> bool:
+    """Whether a Redis hostname keeps the port on the local machine."""
+    normalized = str(host or "").strip().lower()
+    return normalized in {"localhost", "::1", "[::1]"} or normalized.startswith("127.")
+
+
 @_register("redis")
 def _check_redis(context: Context) -> CheckResult:
     """Redis on the host, in the container, and the mapping between them.
@@ -699,11 +705,20 @@ def _check_redis(context: Context) -> CheckResult:
     published = _compose_published_port(context, "redis", 6379)
     container = _compose_container(context, "redis")
     details: list[str] = []
+    unprotected = not _redis_host_is_loopback(host) and not password
+    if unprotected:
+        details.append(f"Redis is bound to {host} without a password")
     if published is not None and published != port:
         details.append(f"the container publishes {published}, the configuration says {port}")
     elif published is None:
         details.append("the container's published port is unknown (docker compose port failed)")
     if reachable:
+        if unprotected:
+            result = CheckResult("redis", "warn", f"{host}:{port} answers without authentication", details=details)
+            result.recommendation = (
+                "set REDIS_PASSWORD in .env and recreate Redis, or bind it to 127.0.0.1"
+            )
+            return result
         if not details or published == port:
             return CheckResult("redis", "ok", f"{host}:{port} answers")
         result = CheckResult("redis", "warn",
@@ -1007,7 +1022,7 @@ def _check_ports(context: Context) -> CheckResult:
 
 @_register("logs")
 def _check_logs(context: Context) -> CheckResult:
-    """The log directory must accept a write."""
+    """The log directory must accept a write and stay private to its owner."""
     directory = context.root / "logs"
     if not directory.is_dir():
         if (context.fix or context.fix_all) and not context.dry_run:
@@ -1022,7 +1037,25 @@ def _check_logs(context: Context) -> CheckResult:
         result = CheckResult("logs", "fail", f"logs/ is not writable: {exc.strerror}")
         result.recommendation = "chmod u+w logs logs/audit"
         return result
-    return CheckResult("logs", "ok", "writable")
+
+    mode = directory.stat().st_mode & 0o777
+    if mode != 0o700:
+        if (context.fix or context.fix_all) and not context.dry_run:
+            try:
+                directory.chmod(0o700)
+            except OSError as exc:
+                result = CheckResult("logs", "fail", f"cannot restrict logs/: {exc.strerror}")
+                result.recommendation = "chmod 700 logs"
+                return result
+        else:
+            result = CheckResult(
+                "logs", "warn", f"writable but mode is {mode:03o}, not 700",
+                details=["logs/ contains request and response bodies"],
+            )
+            result.recommendation = "chmod 700 logs"
+            result.fixes.append({"action": "restrict logs/ to its owner", "class": SAFE})
+            return result
+    return CheckResult("logs", "ok", "writable and private")
 
 
 @_register("auth")

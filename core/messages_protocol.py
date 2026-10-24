@@ -7,8 +7,11 @@ dependencies so both endpoints and workers can use them.
 from __future__ import annotations
 
 import json
+import logging
 import math
 import uuid
+
+logger = logging.getLogger(__name__)
 
 ANTHROPIC_VERSION = "2023-06-01"
 DEFAULT_MAX_TOKENS = 4096
@@ -634,7 +637,7 @@ def _stop_reason_to_finish_reason(stop_reason: object) -> str:
     return _STOP_REASONS_ANTHROPIC_TO_INTERNAL.get(str(stop_reason or "").strip().lower(), "stop")
 
 
-def messages_response_to_internal(data: dict, *, streaming: bool = False) -> dict:
+def messages_response_to_internal(data: dict) -> dict:
     """Convert one Anthropic response or final message to the Ollama-shaped result."""
     if not isinstance(data, dict):
         raise ValueError("Anthropic response must be a JSON object")
@@ -717,7 +720,13 @@ def internal_result_to_messages(
         if text:
             content.append({"type": "text", "text": text})
         if include_thinking and message.get("thinking"):
-            content.append({"type": "thinking", "thinking": str(message["thinking"]), "signature": ""})
+            block = {"type": "thinking", "thinking": str(message["thinking"])}
+            signature = message.get("thinking_signature") or message.get("signature")
+            if isinstance(signature, str) and signature:
+                block["signature"] = signature
+            else:
+                logger.warning("Dropping Anthropic thinking signature because the turn was rewritten")
+            content.append(block)
         for call in message.get("tool_calls") or []:
             if not isinstance(call, dict):
                 continue
@@ -803,9 +812,12 @@ class AnthropicStreamDecoder:
                     self.thinking_parts.append(text)
                     return {"message": {"role": "assistant", "thinking": text}, "done": False}
             if delta_type == "signature_delta":
+                signature = str(delta.get("signature") or "")
                 block = self._open_blocks.get(index)
                 if isinstance(block, dict):
-                    block["signature"] = str(delta.get("signature") or "")
+                    block["signature"] = signature
+                if signature:
+                    return {"message": {"role": "assistant", "thinking_signature": signature}}
             if delta_type == "input_json_delta":
                 block = self._open_blocks.get(index)
                 if isinstance(block, dict):
@@ -887,6 +899,8 @@ class AnthropicStreamEncoder:
         self.stop_sequence: str | None = None
         self._tool_calls: dict[str, dict] = {}
         self._open_tool_call_id: str | None = None
+        self._thinking_signature = ""
+        self._thinking_signature_sent = False
 
     def _message_start(self) -> dict:
         """Build and mark the initial message_start event."""
@@ -909,16 +923,22 @@ class AnthropicStreamEncoder:
         """Close the currently open content block when present."""
         if self.open_block is None:
             return []
-        event = {"type": "content_block_stop", "index": self.block_index}
+        events: list[dict] = []
+        if self.open_block == "thinking" and self._thinking_signature and not self._thinking_signature_sent:
+            events.append({"type": "content_block_delta", "index": self.block_index, "delta": {"type": "signature_delta", "signature": self._thinking_signature}})
+            self._thinking_signature_sent = True
+        events.append({"type": "content_block_stop", "index": self.block_index})
         self.open_block = None
         self._open_tool_call_id = None
-        return [event]
+        return events
 
     def _start_block(self, block_type: str, content_block: dict) -> list[dict]:
         """Close the previous block and start a new one."""
         events = self._close_block()
         self.block_index += 1
         self.open_block = block_type
+        self._thinking_signature = ""
+        self._thinking_signature_sent = False
         events.append({"type": "content_block_start", "index": self.block_index, "content_block": content_block})
         return events
 
@@ -944,6 +964,20 @@ class AnthropicStreamEncoder:
             if self.open_block != "thinking":
                 events.extend(self._start_block("thinking", {"type": "thinking", "thinking": ""}))
             events.append({"type": "content_block_delta", "index": self.block_index, "delta": {"type": "thinking_delta", "thinking": thinking}})
+        signature = message.get("thinking_signature")
+        if not isinstance(signature, str) or not signature:
+            blocks = message.get("anthropic_blocks")
+            if isinstance(blocks, list):
+                for block in reversed(blocks):
+                    if isinstance(block, dict) and str(block.get("type") or "") == "thinking":
+                        candidate = block.get("signature")
+                        if isinstance(candidate, str) and candidate:
+                            signature = candidate
+                        break
+        if self.open_block == "thinking" and isinstance(signature, str) and signature and not self._thinking_signature_sent:
+            events.append({"type": "content_block_delta", "index": self.block_index, "delta": {"type": "signature_delta", "signature": signature}})
+            self._thinking_signature = signature
+            self._thinking_signature_sent = True
         for call in message.get("tool_calls") or []:
             if not isinstance(call, dict):
                 continue

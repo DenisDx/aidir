@@ -152,3 +152,44 @@ the same affinity record regardless of where the request came from.
 The fingerprint hash is `HMAC-SHA256(secret, "kv2\0kind\0prefix")` and the store
 is global with one LRU. `max_entries_per_alias` and `honor_prompt_cache_key` are
 accepted for configuration compatibility but deprecated and ignored.
+
+## 7. Security, observability and protocol fixes
+
+- The log WebSocket authenticates with the `aidir_token` session cookie only.
+  The query-string token is no longer accepted, so tokens cannot leak into
+  access logs.
+- Logout reads the session token with the same Bearer-first rule as the
+  authentication dependency and deletes that session, not only the cookie one.
+- `/api/test/agent` clamps a client-supplied `_timeout` to
+  `[1, webui.request_timeouts.agent_test_max]`; the default maximum is 300
+  seconds.
+- `logs/` is created or tightened to mode `0700`. New audit journal files use
+  `0600`. The doctor reports a different directory mode and can fix it.
+- A Redis bind outside loopback must have a password. The installer generates
+  one when the bind is widened, Compose health checks authenticate, and the
+  doctor reports an unprotected widened bind.
+- Audit `durable` enqueue and receipt waits are bounded. A failure raises
+  `TimeoutError` and marks health unhealthy. `best_effort` still drops on queue
+  overflow, and `dropped_recent` is visible in the execution-health line.
+- Emergency audit retention may delete today's partition when it is the only
+  daily partition left and the emergency limit is exceeded. The deletion is
+  logged at warning level.
+- Upstream error responses preserve `retry-after`, `request-id`, `x-request-id`
+  and the `x-ratelimit-*` family. Other upstream headers are dropped.
+- Anthropic signed thinking blocks keep their signature through conversion. The
+  stream encoder emits `signature_delta` before closing the thinking block; a
+  rewritten turn with no signature warns and omits the signature instead of
+  inventing an empty one.
+- `logging.logs` and its legacy alias `logging.log_overrides` are declared in
+  the descriptor as open maps of bounded per-file maintenance settings.
+- `messages_response_to_internal` no longer accepts an unused `streaming`
+  keyword.
+
+## 8. Test LLM endpoint selection
+
+`POST /api/test/llm` does not require an endpoint whose `api` is exactly
+`ollama`. It uses the first chat-capable endpoint (`ollama` or `openaix`) that
+has a port, and prefers an endpoint whose `worker` matches the `worker` field in
+the request. The request is always sent to that endpoint's `/api/chat`. This
+lets the Test LLM dialog exercise the shipped `openaix` endpoint, including
+`call_llama_cpp` and other workers.

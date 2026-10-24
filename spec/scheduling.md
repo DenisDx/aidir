@@ -1052,5 +1052,5 @@ known inconsistency.
 | 13 | The peer capability cache is per-process and only negative-definitive |
 | 14 | The availability commands are trusted shell |
 | 15 | The `estimated` capacity path is recomputed on every call |
-| 16 | `upstream_error_response` restores only `content-type`; the other upstream headers (rate limits, `retry-after`) are dropped |
+| 16 | Resolved: `upstream_error_response` restores `content-type` and the allowlisted `retry-after`, `request-id`, `x-request-id` and `x-ratelimit-*` headers |
 | 17 | The request-body limit is enforced per endpoint and the middleware buffers the whole body in memory |

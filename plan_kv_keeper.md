@@ -2,7 +2,7 @@
 
 ## Status
 
-Implemented and verified. Full suite: 663 tests pass. W15 made the
+Implemented and verified. Full suite: 679 tests pass. W15 made the
 affinity identity context-only and removed the per-alias partition.
 
 Source specification: `proposal_kv_keeper.md`.
@@ -104,7 +104,7 @@ Status: complete.
 
 Completed: `test_kv_affinity`, `test_kv_affinity_routing` and
 `test_session_resources` added; `README.md`, `TEST.md` and `DOCUMENTS.MD`
-updated. The full unittest discovery run passes (663 tests).
+updated. The full unittest discovery run passes (679 tests).
 
 ## Important Notes Discovered During Work
 

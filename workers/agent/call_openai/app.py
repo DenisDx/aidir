@@ -117,6 +117,7 @@ class CallOpenAIWorker(OpenAIxWorker):
                 await self._finalize_llm_call(task, history_entry, status="http_error", http_status=response.status_code, error_code="UPSTREAM_ERROR", response_body=raw_response, response_content_type=self._response_content_type(response, "application/octet-stream"))
             return WorkerResult(ok=False, error=build_upstream_error(
                 response.status_code, raw_response, self._response_content_type(response, "application/octet-stream"),
+                response.headers,
             ))
         try:
             data = self._openai_response_to_ollama(response.json())
@@ -158,6 +159,7 @@ class CallOpenAIWorker(OpenAIxWorker):
                     await self._finalize_llm_call(task, history_entry, status="http_error", http_status=response.status_code, error_code="UPSTREAM_ERROR", response_body=raw_response, response_content_type=self._response_content_type(response, "application/octet-stream"))
                 return WorkerResult(ok=False, error=build_upstream_error(
                     response.status_code, raw_response, self._response_content_type(response, "application/octet-stream"),
+                    response.headers,
                 ))
             audit_log = getattr(self._core, "audit_log", None)
             response_spool = audit_log.open_body_spool() if task is not None and audit_log is not None else None
@@ -198,7 +200,7 @@ class CallOpenAIWorker(OpenAIxWorker):
                             response_content_type=self._response_content_type(response, "text/event-stream"),
                         )
                     return WorkerResult(ok=False, error=build_upstream_error(
-                        status_code, raw, "application/json",
+                        status_code, raw, "application/json", response.headers,
                     ))
                 chunk = self._openai_response_to_ollama(data, streaming=True)
                 message = chunk.get("message") if isinstance(chunk.get("message"), dict) else {}

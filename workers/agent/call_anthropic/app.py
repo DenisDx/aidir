@@ -66,8 +66,13 @@ class CallAnthropicWorker(CallOpenAIWorker):
     @staticmethod
     def _final_stream_chunk(final: dict) -> dict:
         """Return a terminal chunk without replaying already-streamed content."""
+        message = final.get("message") if isinstance(final.get("message"), dict) else {}
+        final_message = {"role": "assistant", "content": ""}
+        blocks = message.get("anthropic_blocks")
+        if isinstance(blocks, list) and blocks:
+            final_message["anthropic_blocks"] = blocks
         return {
-            "message": {"role": "assistant", "content": ""},
+            "message": final_message,
             "done": True,
             "done_reason": final.get("done_reason"),
             "stop_reason": final.get("stop_reason"),
@@ -95,7 +100,7 @@ class CallAnthropicWorker(CallOpenAIWorker):
                 if isinstance(history_entry, dict):
                     history_entry["raw_response"] = response.text
                 await self._finalize_llm_call(task, history_entry, status="http_error", http_status=response.status_code, error_code="UPSTREAM_ERROR", response_body=raw_response, response_content_type=content_type)
-            return WorkerResult(ok=False, error=build_upstream_error(response.status_code, raw_response, content_type))
+            return WorkerResult(ok=False, error=build_upstream_error(response.status_code, raw_response, content_type, response.headers))
         try:
             data = messages_response_to_internal(response.json())
         except (ValueError, TypeError, KeyError) as exc:
@@ -135,7 +140,7 @@ class CallAnthropicWorker(CallOpenAIWorker):
                     if isinstance(history_entry, dict):
                         history_entry["raw_response"] = raw_response.decode("utf-8", errors="replace")
                     await self._finalize_llm_call(task, history_entry, status="http_error", http_status=response.status_code, error_code="UPSTREAM_ERROR", response_body=raw_response, response_content_type=content_type)
-                return WorkerResult(ok=False, error=build_upstream_error(response.status_code, raw_response, content_type))
+                return WorkerResult(ok=False, error=build_upstream_error(response.status_code, raw_response, content_type, response.headers))
             audit_log = getattr(self._core, "audit_log", None)
             response_spool = audit_log.open_body_spool() if task is not None and audit_log is not None else None
             if task is not None:

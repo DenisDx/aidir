@@ -223,7 +223,8 @@ services:
 ```
 
 The `--requirepass` flag is added only when `REDIS_PASSWORD` is non-empty. The host
-bind defaults to loopback.
+bind defaults to loopback. If the bind is widened, `install.sh` generates
+`REDIS_PASSWORD`; the container health check authenticates with it.
 
 **The nginx container reaches the WebUI backend through `host.docker.internal`**
 (the host gateway). The backend is not a container — it is a uvicorn server inside
@@ -315,7 +316,7 @@ In execution order:
 | 10 | `redis` | The multi-layer Redis diagnosis (below) | start / recreate / `chown` / restart Docker |
 | 11 | `nginx` | The nginx container runs | `docker compose up -d nginx` (safe) |
 | 12 | `ports` | The WebUI / OpenAIx / MCP / nginx ports are free or owned by aidir | — |
-| 13 | `logs` | `logs/` exists and accepts a write probe | — |
+| 13 | `logs` | `logs/` exists, accepts a write probe, and has mode `0700` | restrict the directory to its owner (safe) |
 | 14 | `ollama` | `GET {baseUrl}/api/tags` answers | — (the doctor never starts Ollama) |
 | 15 | `systemd` | The unit's state, the restart count, the crash-loop detection | stop / start (privileged) |
 
@@ -352,6 +353,7 @@ Redis is diagnosed per layer, because each layer has a different fix:
 | `redis inside the container: pong`, but the host still times out | The host port mapping is broken (a WSL/Docker proxy problem) | Restart Docker (privileged) |
 | `redis inside the container: not answering` | Redis is down | Read the log |
 | `address already in use` | A **host** process owns the port | Free it, or move `REDIS_PORT` with `./install.sh` |
+| A non-loopback bind without `REDIS_PASSWORD` | The data and the instance id are unprotected | Set `REDIS_PASSWORD`, or bind to loopback |
 
 The report names the port holder (`docker-proxy (pid N)`, `redis-server (pid N)`, or
 "pid not visible"). When a foreign process holds the port, `--fix-all` does **not**
@@ -524,8 +526,8 @@ There is no rename/size rotation. Retention is by age and by size:
 
 Per-file overrides are read from `logging.logs` (or `logging.log_overrides`), keyed
 by the file name or its stem: `wipe_period`, `wipe_max_age`, `trim_period`,
-`max_log_size`. **That map is not declared in the descriptor**, so it cannot be set
-through the settings editor.
+`max_log_size`. Both maps are declared in the descriptor, so the settings editor
+can set them.
 
 ---
 
@@ -566,11 +568,13 @@ A partition is removed when:
 - its age is at least `max(2, retention_days)`;
 - the total exceeds `max_total_bytes` **and** the partition is at least two days
   old;
-- the emergency limit is exceeded **and** the partition is not today.
+- the emergency limit is exceeded **and** the partition is not today;
+- the emergency limit is still exceeded when today's partition is the only daily
+  partition left. This removal is logged prominently and is the last resort.
 
-**Today is never deleted.** The deletion state is persisted before the filesystem
-is touched, so an interrupted deletion is resumed by `reconcile_partitions()` and
-the events of a `deleting` partition are hidden from the lookups.
+The deletion state is persisted before the filesystem is touched, so an
+interrupted deletion is resumed by `reconcile_partitions()` and the events of a
+`deleting` partition are hidden from the lookups.
 
 An `ENOSPC` during a write triggers the forced emergency retention immediately.
 
@@ -582,11 +586,12 @@ The writer runs on its own thread (`aidir-audit-writer`) with a bounded queue
 | Policy | Behavior |
 |---|---|
 | `best_effort` (default) | A full queue **drops** the event. The drop is counted, kept in a 300-second window, and turns the health status into `warning` (or `error` from ten drops) |
-| `durable` | The caller blocks until the writer persists the event; a writer exception is re-raised in the caller |
+| `durable` | The caller waits for queue capacity (2 s) and for the receipt (10 s). A timeout raises `TimeoutError`, marks health unhealthy, and is re-raised in the caller |
 
 Every event gets a receipt. The terminal task record is written only after all of
 that task's receipts have settled, so the terminal record never references an event
-that was not persisted.
+that was not persisted. Recent audit drops are shown in the WebUI execution-health
+line.
 
 ### 7.4 The SSE normalization
 

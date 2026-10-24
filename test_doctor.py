@@ -181,6 +181,35 @@ class HostCheckTests(unittest.TestCase):
         self.assertEqual(check.status, "fail")
         self.assertIn(str(port), check.message)
 
+    def test_non_loopback_redis_without_a_password_is_reported(self):
+        """A widened Redis bind must be visible as an authentication warning."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(
+                Path(tmp),
+                env={"REDIS_HOST": "0.0.0.0", "REDIS_PASSWORD": ""},
+            )
+            with unittest.mock.patch.object(doctor, "_redis_ping", return_value=(True, None)), \
+                 unittest.mock.patch.object(doctor, "_compose_published_port", return_value=6379), \
+                 unittest.mock.patch.object(doctor, "_compose_container", return_value="aidir_redis"):
+                check = doctor.run(root=root, only=["redis"]).checks[0]
+        self.assertEqual(check.status, "warn")
+        self.assertIn("without authentication", check.message)
+        self.assertIn("REDIS_PASSWORD", check.recommendation)
+
+    def test_logs_directory_mode_is_reported_and_fixed(self):
+        """The task payload directory must not stay readable by every local user."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(Path(tmp))
+            logs = root / "logs"
+            logs.mkdir(mode=0o755)
+            logs.chmod(0o755)
+            check = doctor.run(root=root, only=["logs"]).checks[0]
+            self.assertEqual(check.status, "warn")
+            self.assertIn("700", check.message)
+            fixed = doctor.run(root=root, only=["logs"], fix=True).checks[0]
+            self.assertEqual(fixed.status, "ok")
+            self.assertEqual(logs.stat().st_mode & 0o777, 0o700)
+
     def test_the_store_lock_is_not_held(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = make_root(Path(tmp))

@@ -17,6 +17,16 @@ from zoneinfo import ZoneInfo
 _ROOT = Path(__file__).parent.parent
 
 
+def ensure_private_directory(directory: Path) -> Path:
+    """Create a log directory and keep its contents readable by its owner only."""
+    directory.mkdir(parents=True, exist_ok=True)
+    try:
+        directory.chmod(0o700)
+    except OSError:
+        pass
+    return directory
+
+
 def logs_dir() -> Path:
     """Return the directory the log files are written to.
 
@@ -68,8 +78,14 @@ def _append(path: Path, line: str) -> None:
     ResourceWarning on every line and hides the ones that matter. It also costs
     more: the explicit block measured about 40% faster than the implicit close.
     """
+    created = not path.exists()
     with path.open("a", encoding="utf-8") as handle:
         handle.write(line)
+    if created:
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
 
 
 class CoreLogger:
@@ -79,7 +95,7 @@ class CoreLogger:
     """
 
     def __init__(self) -> None:
-        logs_dir().mkdir(parents=True, exist_ok=True)
+        ensure_private_directory(logs_dir())
         self._cfg = None
 
     def _config(self):

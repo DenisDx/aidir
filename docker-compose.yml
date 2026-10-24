@@ -6,12 +6,14 @@ services:
     command: >
       redis-server
       ${REDIS_PASSWORD:+--requirepass $REDIS_PASSWORD}
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
     ports:
       - "${REDIS_HOST:-127.0.0.1}:${REDIS_PORT:-6379}:6379"
     volumes:
       - ./docker/volumes/redis:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$${REDIS_PASSWORD}\" redis-cli ping | grep -q PONG"]
       interval: 10s
       timeout: 5s
       retries: 5

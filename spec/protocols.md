@@ -490,9 +490,9 @@ Error types:
 | 504 | `timeout_error` |
 
 **Thinking signatures.** A thinking block keeps its `signature` only while the
-corresponding assistant turn is unchanged. A context rewrite drops the signatures
-with a warning. The synthesized stream encoder never emits `signature_delta`, and a
-non-streaming result carries an **empty** thinking signature.
+corresponding assistant turn is unchanged. The stream encoder emits the preserved
+signature as `signature_delta` before the thinking block closes. A context rewrite
+drops the signature with a warning; it does not emit an empty one.
 
 ### 3.3 `POST /v1/messages/count_tokens`
 
@@ -712,15 +712,17 @@ Otherwise the request is **400**. Path traversal is structurally impossible.
 |---|---|---|
 | GET | `/api/workers/models` | The workers list plus the provider/model catalog |
 | GET | `/api/endpoints/info` | The configured endpoints plus their MCP tools |
-| POST | `/api/test/llm` | Proxy to the first `ollama` endpoint's `/api/chat` |
+| POST | `/api/test/llm` | Proxy to a configured `ollama` or `openaix` endpoint's `/api/chat` |
 | POST | `/api/test/mcp` | Proxy JSON-RPC to the selected `mcp` endpoint |
 | GET | `/api/test/agent/endpoints` | The chat-capable endpoints |
 | GET | `/api/test/agent/catalog` | The provider → models map plus the envid list |
 | GET | `/api/test/agent/models?endpoint_id=&protocol=` | A live model list from the endpoint |
 | POST | `/api/test/agent` | Proxy a chat request in the selected protocol |
 
-`/api/test/llm` is **hard-wired to the `ollama` API** — there is no endpoint
-selection. `/api/test/agent` does support selection and maps the protocol as follows:
+`/api/test/llm` uses the first chat-capable (`ollama` or `openaix`) endpoint and
+prefers one whose `worker` matches the `worker` in the request body. It always
+targets `/api/chat`. `/api/test/agent` supports explicit endpoint selection and
+maps the protocol as follows:
 
 | Protocol | Target |
 |---|---|
@@ -732,7 +734,8 @@ An `anthropic` endpoint with a non-Anthropic protocol is **422**, and an `mcp`
 endpoint is **422**.
 
 The timeouts come from `webui.request_timeouts` (`ollama_chat`, `mcp_proxy`,
-`model_list`, `agent_test`).
+`model_list`, `agent_test`). A client-supplied `_timeout` for the agent test is
+clamped to `[1, agent_test_max]`.
 
 ### 5.6 Settings routes
 

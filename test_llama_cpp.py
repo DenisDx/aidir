@@ -323,7 +323,12 @@ class TestLlamaCppErrorForwarding(unittest.IsolatedAsyncioTestCase):
 
     def test_http_routes_forward_context_error_unchanged(self) -> None:
         """Verify real HTTP chat routes return the original error in both request modes."""
-        error = build_upstream_error(400, self.body, "application/json")
+        error = build_upstream_error(
+            400,
+            self.body,
+            "application/json",
+            {"retry-after": "7", "x-ratelimit-remaining": "0", "x-secret": "drop"},
+        )
         routes = (
             (Endpoint_ollama, "/api/chat"),
             (Endpoint_openaix, "/api/chat"),
@@ -346,6 +351,9 @@ class TestLlamaCppErrorForwarding(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(response.content, self.body)
                     self.assertEqual(response.json(), self.payload)
                     self.assertEqual(response.headers["content-type"], "application/json")
+                    self.assertEqual(response.headers["retry-after"], "7")
+                    self.assertEqual(response.headers["x-ratelimit-remaining"], "0")
+                    self.assertNotIn("x-secret", response.headers)
 
     async def test_started_streams_emit_original_error(self) -> None:
         """Forward a late executor error without adding task IDs or losing fields."""

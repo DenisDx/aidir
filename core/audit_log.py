@@ -23,6 +23,8 @@ from typing import Any, Mapping
 
 _ROOT = Path(__file__).parent.parent
 _DEFAULT_DIRECTORY = _ROOT / "logs" / "audit"
+_DURABLE_ENQUEUE_TIMEOUT_SECONDS = 2.0
+_DURABLE_RECEIPT_TIMEOUT_SECONDS = 10.0
 _JOURNALS = {
     "client_request": "raw_client_requests",
     "client_response": "raw_client_responses",
@@ -96,6 +98,8 @@ class AuditLog:
     ) -> None:
         """Create an audit writer rooted at the given directory or the default path."""
         self.directory = Path(directory) if directory is not None else _DEFAULT_DIRECTORY
+        from core.logger import ensure_private_directory
+        ensure_private_directory(self.directory)
         self._lock = threading.RLock()
         self._health = {
             "status": "ok", "write_failures": 0, "dropped_events": 0,
@@ -349,13 +353,23 @@ class AuditLog:
                 candidates.setdefault(match.group(1), []).append(path)
         removed: list[str] = []
         total = self.disk_usage_bytes()
-        for day in sorted(candidates):
+        ordered_days = sorted(candidates)
+        for day in ordered_days:
             partition_date = datetime.strptime(day, "%Y-%m-%d").date()
             age_eligible = (today - partition_date).days >= max(2, retention_days)
             quota_eligible = total > max_total_bytes and (today - partition_date).days >= 2
-            emergency_eligible = (force_emergency or total > emergency_max_total_bytes) and partition_date < today
+            emergency_pressure = force_emergency or total > emergency_max_total_bytes
+            emergency_eligible = emergency_pressure and (
+                partition_date < today
+                or (len(ordered_days) == 1 and day == ordered_days[-1])
+            )
             if not age_eligible and not quota_eligible and not emergency_eligible:
                 continue
+            if partition_date == today and emergency_eligible:
+                logging.getLogger(__name__).warning(
+                    "Audit emergency retention is deleting today's active partition to stay within %s bytes",
+                    emergency_max_total_bytes,
+                )
             files = candidates[day]
             bytes_removed = self._partition_usage_bytes(day, files)
             self._set_partition_state(day, "deleting")
@@ -382,7 +396,8 @@ class AuditLog:
 
     def reconcile_partitions(self, max_spool_age_seconds: int = 86400) -> list[str]:
         """Resume interrupted partition deletion and remove stale temporary spools."""
-        self.directory.mkdir(parents=True, exist_ok=True)
+        from core.logger import ensure_private_directory
+        ensure_private_directory(self.directory)
         recovered: list[str] = []
         with closing(self._connect()) as connection:
             deleting = [row[0] for row in connection.execute("SELECT partition_date FROM partitions WHERE state = 'deleting'")]
@@ -674,8 +689,16 @@ class AuditLog:
         item = (journal_stem, day, record, completion, failures, receipt)
         try:
             if policy == "durable":
-                writer_queue.put(item)
-                completion.wait()
+                try:
+                    writer_queue.put(item, timeout=_DURABLE_ENQUEUE_TIMEOUT_SECONDS)
+                except queue.Full as exc:
+                    self._record_drop(receipt, durable=True)
+                    raise TimeoutError("Audit durable queue enqueue timed out") from exc
+                if not completion.wait(timeout=_DURABLE_RECEIPT_TIMEOUT_SECONDS):
+                    timeout = TimeoutError("Audit durable write receipt timed out")
+                    self._record_failure(timeout)
+                    self._complete_receipt(receipt, "failed")
+                    raise timeout
                 if failures:
                     raise failures[0]
             else:
@@ -691,7 +714,9 @@ class AuditLog:
         relative_path = journal_path.name
 
         with self._lock:
-            self.directory.mkdir(parents=True, exist_ok=True)
+            from core.logger import ensure_private_directory
+            ensure_private_directory(self.directory)
+            created = not journal_path.exists()
             with journal_path.open("ab") as handle:
                 offset = handle.tell()
                 handle.write(encoded)
@@ -700,6 +725,11 @@ class AuditLog:
             with closing(self._connect()) as connection:
                 self._insert_index(connection, record, relative_path, offset, len(encoded))
                 connection.commit()
+        if created:
+            try:
+                journal_path.chmod(0o600)
+            except OSError:
+                pass
         if receipt is not None:
             self._complete_receipt(receipt, "persisted")
         return record
@@ -714,8 +744,8 @@ class AuditLog:
                     self._terminal_records.pop(task_id, None)
             receipt["completed"].set()
 
-    def _record_drop(self, receipt: dict[str, Any]) -> None:
-        """Record a best-effort queue overflow without delaying task execution."""
+    def _record_drop(self, receipt: dict[str, Any], durable: bool = False) -> None:
+        """Record a queue overflow without delaying best-effort task execution."""
         now = time.monotonic()
         with self._lock:
             self._drop_times.append(now)
@@ -724,7 +754,12 @@ class AuditLog:
             self._health["dropped_events"] += 1
             self._health["dropped_recent"] = len(self._drop_times)
             self._health["last_drop_at"] = datetime.now().astimezone().isoformat(timespec="milliseconds")
-            self._health["status"] = "error" if len(self._drop_times) >= 10 else "warning"
+            if durable:
+                self._health["status"] = "error"
+                self._health["write_failures"] += 1
+                self._health["last_error"] = "Audit durable queue enqueue timed out"
+            else:
+                self._health["status"] = "error" if len(self._drop_times) >= 10 else "warning"
         logging.getLogger(__name__).warning("Audit writer queue overflow; event was dropped")
         self._complete_receipt(receipt, "dropped")
 
@@ -1044,7 +1079,8 @@ class AuditLog:
 
     def _initialize_index(self) -> None:
         """Create the SQLite index schema when it does not already exist."""
-        self.directory.mkdir(parents=True, exist_ok=True)
+        from core.logger import ensure_private_directory
+        ensure_private_directory(self.directory)
         with closing(self._connect()) as connection:
             connection.execute(
                 """

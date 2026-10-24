@@ -411,6 +411,90 @@
             ui: { placeholder: "1048576" },
           },
 
+          logs: {
+            type: "object",
+            apply: "live",
+            description: "Per-file maintenance overrides keyed by log file name or stem",
+            key_pattern: "^[A-Za-z0-9._-]+$",
+            additional_children: {
+              type: "object",
+              apply: "live",
+              description: "Overrides for one log file",
+              children: {
+                wipe_period: {
+                  type: "int",
+                  minimum: 0,
+                  maximum: 31536000,
+                  apply: "live",
+                  description: "Seconds between wipe runs for this file; 0 disables wiping",
+                },
+                wipe_max_age: {
+                  type: "int",
+                  minimum: 0,
+                  maximum: 315360000,
+                  apply: "live",
+                  description: "Delete this file's lines older than this many seconds; 0 keeps them",
+                },
+                trim_period: {
+                  type: "int",
+                  minimum: 0,
+                  maximum: 31536000,
+                  apply: "live",
+                  description: "Seconds between size checks for this file; 0 disables trimming",
+                },
+                max_log_size: {
+                  type: "int",
+                  minimum: 0,
+                  maximum: 1073741824,
+                  apply: "live",
+                  description: "Size limit in bytes for this file; 0 means unlimited",
+                },
+              },
+            },
+          },
+
+          log_overrides: {
+            type: "object",
+            apply: "live",
+            description: "Legacy alias of logging.logs; prefer logging.logs for new configurations",
+            key_pattern: "^[A-Za-z0-9._-]+$",
+            additional_children: {
+              type: "object",
+              apply: "live",
+              description: "Overrides for one log file",
+              children: {
+                wipe_period: {
+                  type: "int",
+                  minimum: 0,
+                  maximum: 31536000,
+                  apply: "live",
+                  description: "Seconds between wipe runs for this file; 0 disables wiping",
+                },
+                wipe_max_age: {
+                  type: "int",
+                  minimum: 0,
+                  maximum: 315360000,
+                  apply: "live",
+                  description: "Delete this file's lines older than this many seconds; 0 keeps them",
+                },
+                trim_period: {
+                  type: "int",
+                  minimum: 0,
+                  maximum: 31536000,
+                  apply: "live",
+                  description: "Seconds between size checks for this file; 0 disables trimming",
+                },
+                max_log_size: {
+                  type: "int",
+                  minimum: 0,
+                  maximum: 1073741824,
+                  apply: "live",
+                  description: "Size limit in bytes for this file; 0 means unlimited",
+                },
+              },
+            },
+          },
+
           // Both maps are keyed by the subsystem name the logger passes in, so
           // they are open: any subsystem may add its own key.
           levels: {
@@ -1373,6 +1457,15 @@
                 description: "Timeout of the agent test request",
                 env: { allowed: true, convert: "int" },
                 ui: { placeholder: "45" },
+              },
+              agent_test_max: {
+                type: "int",
+                minimum: 1,
+                maximum: 3600,
+                apply: "reload",
+                description: "Maximum client-supplied timeout for the agent test request",
+                env: { allowed: true, convert: "int" },
+                ui: { placeholder: "300" },
               },
             },
           },

@@ -15,6 +15,7 @@ import base64
 import heapq
 import hmac
 import json
+import math
 import secrets
 import shlex
 import shutil
@@ -135,6 +136,35 @@ def _repair_user_crontab() -> dict[str, str]:
 
 
 # ── Auth helpers ──────────────────────────────────────────────────────────────
+
+def _select_chat_endpoint(endpoints: Any, worker: str | None = None) -> dict[str, Any] | None:
+    """Pick the configured ollama/openaix endpoint that should serve a Test LLM call."""
+    candidates = [
+        endpoint for endpoint in (endpoints if isinstance(endpoints, list) else [])
+        if isinstance(endpoint, dict)
+        and endpoint.get("api") in {"ollama", "openaix"}
+        and endpoint.get("port")
+    ]
+    if worker:
+        for endpoint in candidates:
+            if endpoint.get("worker") == worker:
+                return endpoint
+    return candidates[0] if candidates else None
+
+
+def _bounded_timeout(value: Any, *, default: float, maximum: float) -> float:
+    """Clamp a client-supplied timeout to the configured positive range."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(number):
+        return default
+    upper = float(maximum)
+    if not math.isfinite(upper) or upper < 1:
+        upper = default
+    return min(max(number, 1.0), upper)
+
 
 def _constant_eq(a: str, b: str) -> bool:
     """Constant-time string comparison (prevents timing attacks)."""
@@ -737,21 +767,21 @@ async def _get_session(core: "Core", token: str) -> dict | None:
         return None
 
 
+def _request_session_token(request: Request, cookie: str | None = None) -> str:
+    """Return the Bearer token when present, otherwise the session cookie."""
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        return auth_header[7:]
+    return cookie or ""
+
+
 async def _require_session(
     request: Request,
     aidir_token: str | None = Cookie(default=None),
 ) -> dict:
     """FastAPI dependency: extract and validate session from cookie or Bearer header."""
     core: "Core" = request.app.state.core
-
-    # Check Bearer header first, then cookie
-    auth_header = request.headers.get("Authorization", "")
-    token = ""
-    if auth_header.startswith("Bearer "):
-        token = auth_header[7:]
-    elif aidir_token:
-        token = aidir_token
-
+    token = _request_session_token(request, aidir_token)
     session = await _get_session(core, token)
     if session is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
@@ -890,12 +920,17 @@ def create_app(
 
     @app.post("/api/auth/logout")
     async def logout(
+        request: Request,
         response: Response,
         session: dict = Depends(_require_session),
         aidir_token: str | None = Cookie(default=None),
     ):
-        if aidir_token:
-            await core.redis.delete(f"{_session_prefix(core)}{aidir_token}")
+        tokens = {
+            token for token in (_request_session_token(request, aidir_token), aidir_token)
+            if token
+        }
+        for token in tokens:
+            await core.redis.delete(f"{_session_prefix(core)}{token}")
         response.delete_cookie("aidir_token")
         return {"ok": True}
 
@@ -1327,12 +1362,9 @@ def create_app(
     async def ws_logs(
         websocket: WebSocket,
         file: str = "all",
-        token: str = "",
     ):
-        """Stream new log lines over WebSocket. Auth via query token or session cookie."""
-        # Prefer query param token; fall back to cookie
-        effective_token = token or websocket.cookies.get("aidir_token", "")
-        session = await _get_session(core, effective_token)
+        """Stream new log lines over WebSocket using the session cookie."""
+        session = await _get_session(core, websocket.cookies.get("aidir_token", ""))
         if session is None:
             await websocket.close(code=4001)
             return
@@ -1444,14 +1476,11 @@ def create_app(
         body = await request.json()
 
         endpoints_cfg = core.config.get("endpoints") or []
-        ollama_port: int | None = None
-        for ep in (endpoints_cfg if isinstance(endpoints_cfg, list) else []):
-            if isinstance(ep, dict) and ep.get("api") == "ollama":
-                ollama_port = ep.get("port")
-                break
-
-        if not ollama_port:
-            raise HTTPException(status_code=503, detail="No ollama endpoint configured")
+        requested_worker = str(body.get("worker") or "").strip() or None
+        chat_endpoint = _select_chat_endpoint(endpoints_cfg, requested_worker)
+        if chat_endpoint is None:
+            raise HTTPException(status_code=503, detail="No ollama or openaix endpoint configured")
+        ollama_port = chat_endpoint.get("port")
 
         timeout = float(core.config.get("webui.request_timeouts.ollama_chat") or 120)
         try:
@@ -1718,12 +1747,11 @@ def create_app(
         if user_token:
             headers["Authorization"] = f"Bearer {user_token}"
 
-        # Use timeout from request if specified, otherwise use config default
+        # A client-supplied timeout is bounded by the configured maximum.
         request_timeout = body.pop("_timeout", None)
-        if request_timeout is not None:
-            timeout = float(request_timeout)
-        else:
-            timeout = float(core.config.get("webui.request_timeouts.agent_test") or 45)
+        default_timeout = float(core.config.get("webui.request_timeouts.agent_test") or 45)
+        maximum_timeout = float(core.config.get("webui.request_timeouts.agent_test_max") or 300)
+        timeout = _bounded_timeout(request_timeout, default=default_timeout, maximum=maximum_timeout)
         
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:

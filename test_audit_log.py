@@ -5,6 +5,7 @@ import json
 import errno
 import hashlib
 import os
+import queue
 import tempfile
 import threading
 import time
@@ -21,6 +22,16 @@ from core.task import STATUS_COMPLETED, Task
 
 class AuditLogTests(unittest.TestCase):
     """Verify JSONL audit records remain usable when the index is rebuilt."""
+
+    def test_audit_directory_and_new_journal_are_private(self):
+        """Audit payloads are created with owner-only permissions."""
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory) / "audit"
+            audit_log = AuditLog(directory)
+            audit_log.record_client_request(task_id="task-1", data={"prompt": "secret"})
+            journal = next(directory.glob("raw_client_requests-*.jsonl"))
+            self.assertEqual(directory.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(journal.stat().st_mode & 0o777, 0o600)
 
     def test_records_event_and_reads_it_through_index(self):
         """Write one request event and read the identical record by its event ID."""
@@ -480,6 +491,35 @@ class AuditLogTests(unittest.TestCase):
                 release.set()
                 audit_log.stop_writer()
 
+    def test_durable_writer_queue_enqueue_is_bounded(self):
+        """Raise and mark health unhealthy when a durable enqueue cannot make progress."""
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            audit_log = AuditLog(temporary_directory)
+            audit_log._writer_queue = queue.Queue(maxsize=1)
+            audit_log._writer_queue.put(None)
+            audit_log._overflow_policy = "durable"
+            with patch("core.audit_log._DURABLE_ENQUEUE_TIMEOUT_SECONDS", 0.01):
+                with self.assertRaises(TimeoutError):
+                    audit_log.record_client_request(task_id="task-1", data={"sequence": 1})
+            health = audit_log.health()
+            self.assertEqual(health["status"], "error")
+            self.assertEqual(health["dropped_events"], 1)
+            self.assertEqual(health["write_failures"], 1)
+
+    def test_durable_writer_receipt_is_bounded(self):
+        """Raise when a durable queue accepts an event but its receipt never arrives."""
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            audit_log = AuditLog(temporary_directory)
+            audit_log._writer_queue = queue.Queue(maxsize=2)
+            audit_log._overflow_policy = "durable"
+            with patch("core.audit_log._DURABLE_RECEIPT_TIMEOUT_SECONDS", 0.01):
+                with self.assertRaises(TimeoutError):
+                    audit_log.record_client_request(task_id="task-1", data={"sequence": 1})
+            health = audit_log.health()
+            self.assertEqual(health["status"], "error")
+            self.assertEqual(health["write_failures"], 1)
+            self.assertIn("receipt timed out", health["last_error"])
+
     def test_terminal_record_waits_for_confirmed_task_event_receipts(self):
         """Reference accepted queued events only after the writer has persisted them."""
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -618,6 +658,23 @@ class AuditLogTests(unittest.TestCase):
             self.assertEqual(removed, [closed_day])
             self.assertFalse(closed_journal.exists())
             self.assertTrue(active_journal.exists())
+
+    def test_emergency_retention_removes_today_when_it_is_the_only_partition(self):
+        """One oversized active day must not wait until tomorrow to be reclaimed."""
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            audit_log = AuditLog(temporary_directory)
+            today = datetime.now().astimezone().date().isoformat()
+            active_journal = audit_log.directory / f"raw_client_requests-{today}.jsonl"
+            active_journal.write_bytes(b"x" * 4096)
+
+            removed = audit_log.retain_partitions(
+                retention_days=365,
+                max_total_bytes=10**9,
+                emergency_max_total_bytes=0,
+            )
+
+            self.assertEqual(removed, [today])
+            self.assertFalse(active_journal.exists())
 
     def test_forced_emergency_retention_stops_after_reaching_target(self):
         """Avoid deleting later closed partitions after one deletion meets the emergency target."""

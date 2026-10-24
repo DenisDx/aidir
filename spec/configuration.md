@@ -724,7 +724,7 @@ reference reader must use a parser the service does not use.
 | 5 | `endpoints[].request_timeout` and `endpoints[].tools` are declared although the code ignores them, so old local configurations keep loading — but they also hide typos. |
 | 6 | `endpoints[].peer_resources` is read by the endpoint and documented in the README but **not declared** — adding it to a configuration file is a startup error. |
 | 7 | `envids.check_period_minutes` and `envids.store_duration_minutes` are declared and shipped but read by nobody. |
-| 8 | `logging.logs` / `logging.log_overrides` is read by the cron job but not declared, so it cannot be set through the editor. |
+| 8 | Resolved: `logging.logs` and the legacy alias `logging.log_overrides` are declared as open maps of per-file maintenance settings. |
 | 9 | `config.json5` is git-ignored at **any** depth, so a *new* worker `config.json5` would be silently ignored by `git add`. The six existing ones are tracked. |
 | 10 | `reload_config` only refreshes the cache — it does not re-resolve the workers, the resources or the endpoints. |
 | 11 | The browser acceptance pass (TEST.md 7.1) is still open. Everything an HTTP client can verify is a test, but the rendered page must be opened **through nginx**. |

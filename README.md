@@ -656,7 +656,8 @@ Native Anthropic responses and SSE streams are returned byte for byte when the
 upstream also speaks Messages. Cross-protocol requests are converted, including
 system prompts, images, tool use and tool results, usage, stop reasons, and
 errors. Thinking blocks keep their signatures only while the corresponding
-assistant turn is unchanged; a context rewrite drops them with a warning.
+assistant turn is unchanged; the stream preserves the signature, and a context
+rewrite drops it with a warning.
 
 `count_tokens` is a deterministic local estimate and does not create a task or
 call a model.

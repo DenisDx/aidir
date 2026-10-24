@@ -293,26 +293,29 @@ function renderSystemHealth(health) {
     : `Last success ${timestamp} (${age}; threshold ${threshold}s)`;
 }
 
-function renderExecutionHealth(execution) {
+function renderExecutionHealth(execution, audit) {
   const indicator = $('health-execution-indicator');
   const detail = $('health-execution-detail');
   const reasons = $('health-execution-reasons');
   if (!indicator || !detail || !reasons) return;
 
   const data = execution || {};
+  const auditData = audit || {};
   const deferred = data.deferred || {};
   const waiting = Number(deferred.count) || 0;
   const orphaned = Number(data.orphaned_tasks) || 0;
   const startupErrors = data.provider_startup_errors || {};
   const failedProviders = Object.keys(startupErrors).length;
+  const droppedAudit = Number(auditData.dropped_recent) || 0;
 
-  const problems = waiting + orphaned + failedProviders;
+  const problems = waiting + orphaned + failedProviders + droppedAudit;
   indicator.classList.toggle('alert', problems > 0);
 
   const parts = [];
   parts.push(waiting ? `${waiting} task(s) waiting` : 'no task is waiting');
   if (orphaned) parts.push(`${orphaned} orphaned task(s)`);
   if (failedProviders) parts.push(`${failedProviders} provider(s) failed to start`);
+  if (droppedAudit) parts.push(`${droppedAudit} audit event(s) dropped recently`);
   detail.textContent = parts.join(', ');
 
   reasons.innerHTML = '';
@@ -447,7 +450,7 @@ async function loadTasks() {
     }
   if (status) {
     renderSystemHealth(status.health);
-    renderExecutionHealth(status.health && status.health.execution);
+    renderExecutionHealth(status.health && status.health.execution, status.health && status.health.audit);
   }
   if (!data) return;
 

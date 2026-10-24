@@ -34,9 +34,9 @@ Priority meaning:
 | W3 | Security | P2 | WebUI authentication stores plaintext passwords and has no login rate limiting; deferred to ROADMAP | U22 |
 | W4 | Security | P2 | `web_fetch` has no SSRF guard: a loopback, private or metadata address is reachable | U23 |
 | W5 | Security | P2 | `exec_cmd` remains writable through the settings editor, and a write is a command-execution chain | U27 |
-| W6 | Security | P3 | The log WebSocket accepts the session token in the query string, where it lands in the access log | U28 |
+| W6 | Security | P3 | Closed: the log WebSocket authenticates only with the session cookie | U28 |
 | W7 | Security | P2 | There is no CSRF token anywhere | U20 |
-| W8 | Security | P2 | Logout deletes only the cookie's session; a session established with the `Authorization` header stays alive | U21 |
+| W8 | Security | P2 | Closed: logout deletes the Bearer token session too | U21 |
 | W9 | Security | P2 | Closed: the legacy session namespace is no longer accepted | V9 |
 | W10 | Routing | P2 | The scheduler's router cannot probe the OpenAI-family providers, so their candidates are classified `provider_down` | U6, V11 (the OpenAI-family half) |
 | W11 | Routing | P2 | The affinity store is process-local; there is no Redis mirror | U7, V11 |
@@ -50,10 +50,10 @@ Priority meaning:
 | W19 | Scheduling | P3 | Equal-priority tasks are ordered by task id, not by arrival time | U15 |
 | W20 | Task model | P2 | The retry and fallback state is not fully persisted in the task hash | U16, V20 |
 | W21 | Task model | P2 | The envid contexts in Redis never expire | U2 |
-| W22 | Observability | P2 | The audit writer drops events under the default `best_effort` policy | U29 |
+| W22 | Observability | P2 | Closed: durable waits are bounded and recent drops are shown in the health panel | U29 |
 | W23 | Observability | P2 | `cleanup_stale_tasks` is an empty stub | U31 |
-| W24 | Observability | P3 | The upstream error response restores only `content-type` | U33 |
-| W25 | Protocol | P2 | The Anthropic stream encoder never emits `signature_delta` | U34 |
+| W24 | Observability | P3 | Closed: allowlisted rate-limit and request-id headers are restored | U33 |
+| W25 | Protocol | P2 | Closed: thinking signatures survive conversion and are emitted as `signature_delta` | U34 |
 | W26 | Protocol | P3 | `count_tokens` is a `chars/4` heuristic | U35 |
 | W27 | Interface | P2 | A task that waits on a remote cannot be canceled where it actually is | V13 |
 | W28 | Interface | P3 | Closed: the orphan count is already rendered by the existing health card | V15 |
@@ -66,13 +66,13 @@ Priority meaning:
 | W35 | Documentation | P3 | The README references `prod.json5.example`, which does not exist | U43 |
 | W36 | Documentation | P3 | The plan documents quote stale test counts | U44 |
 | W37 | Documentation | P3 | The proposal status lines are stale | U45 |
-| W38 | Configuration | P3 | `logging.logs` / `logging.log_overrides` is read but not declared | U3 |
-| W39 | Security | P3 | `/api/test/agent` accepts an unbounded client-supplied timeout | U24 |
-| W40 | Security | P3 | The log directory is world-readable and holds the task payloads | U25 |
-| W41 | Security | P3 | Redis has no password by default | U26 |
-| W42 | Observability | P3 | The audit retention never deletes today's partition | U30 |
+| W38 | Configuration | P3 | Closed: both per-file log override maps are declared | U3 |
+| W39 | Security | P3 | Closed: `_timeout` is clamped by `webui.request_timeouts.agent_test_max` | U24 |
+| W40 | Security | P3 | Closed: log directories are `0700`, new journals are `0600`, and the doctor checks the mode | U25 |
+| W41 | Security | P3 | Closed: a non-loopback bind gets a generated password, and the doctor warns when unprotected | U26 |
+| W42 | Observability | P3 | Closed: emergency retention may remove today when it is the sole partition | U30 |
 | W43 | Observability | P3 | The cron health check only pings Redis | U32 |
-| W44 | Protocol | P3 | `messages_response_to_internal` accepts a `streaming` keyword that is never used | U36 |
+| W44 | Protocol | P3 | Closed: the unused keyword is removed | U36 |
 | W45 | Routing | P3 | The remote probe has no cache and no in-flight deduplication | `proposal_aidir_smart_router.md` phase 3 |
 | W46 | Protocol | P2 | The retry/fallback wait budget after the first execution is undefined | `spec_timeouts.md` TBD |
 | W47 | Acceptance | P2 | The browser acceptance of the generated editor has not been done | `plan_aiset_integration.md`, `TEST.md` 7.1 |
@@ -174,13 +174,13 @@ previous round:
 | W3 | The WebUI passwords are plaintext and there is no login rate limiting | `webui/backend/app.py` | Deferred. The planned replacement derives a signing key pair in the browser from the password and a per-user salt; the server stores only the public key. The browser signs a fresh challenge, so the password never leaves the client. Rate limiting remains required. See [ROADMAP.md](ROADMAP.md) for the threat model, migration and recovery questions. |
 | W4 | `web_fetch` has no SSRF guard | `workers/tool/web_fetch/app.py` | Deferred. Reject a loopback, private or link-local target, and re-check after every redirect. See [ROADMAP.md](ROADMAP.md). |
 | W5 | `exec_cmd` is writable through the settings editor | `config.descriptor.json5` | Deferred. Either a dedicated permission, or move it out of the editable document into the environment. See [ROADMAP.md](ROADMAP.md). |
-| W6 | The log WebSocket accepts the token in the query string | `webui/backend/app.py` | The cookie is enough; the query parameter lands in the access log. |
+| W6 | The log WebSocket accepts the token in the query string | `webui/backend/app.py` | Closed: only the session cookie is accepted; the query parameter is gone. |
 | W7 | There is no CSRF token | `webui/backend/app.py` | Deferred. A double-submit token on every state-changing request. The only protection today is `samesite=strict`. See [ROADMAP.md](ROADMAP.md). |
-| W8 | Logout deletes only the cookie's session | `webui/backend/app.py` | Delete the session the header names too. |
+| W8 | Logout deletes only the cookie's session | `webui/backend/app.py` | Closed: the Bearer token is resolved with the same helper as authentication and its session is deleted. |
 | W9 | The old session namespace is still accepted | `webui/backend/app.py` | Closed: the legacy fallback is removed; only the instance-scoped key is accepted. |
-| W39 | `/api/test/agent` accepts an unbounded client-supplied timeout | `webui/backend/app.py:1729` | Clamp `_timeout` to a maximum. |
-| W40 | The log directory is world-readable | `logs/` | The directory and the files inside it hold the request and response bodies of every task. Create them with `0700` and have the doctor report the mode. |
-| W41 | Redis has no password by default | `.env.example`, `docker-compose.yml` | The Redis port is published on loopback by default, but the instance id and the data are unprotected if the bind is widened. Generate a password when the bind is not loopback, and have the doctor report it. |
+| W39 | `/api/test/agent` accepts an unbounded client-supplied timeout | `webui/backend/app.py` | Closed: `_timeout` is constrained to `[1, webui.request_timeouts.agent_test_max]`. |
+| W40 | The log directory is world-readable | `logs/` | Closed: log directories are created or tightened to `0700`, new journals use `0600`, and the doctor reports and fixes the mode. |
+| W41 | Redis has no password by default | `.env.example`, `docker-compose.yml` | Closed: the installer generates a password for a non-loopback bind, the Compose health check authenticates, and the doctor warns about an unprotected widened bind. |
 
 ### 3.2 Routing and scheduling
 
@@ -204,19 +204,19 @@ previous round:
 |---|---|---|---|
 | W20 | The retry state is not fully persisted | `core/task.py` | Closed: `fallbacks`, `next_retry_at` and `on_reject` now survive a Redis round trip, together with the already-persisted `fallback_index` and `retry_attempt`. |
 | W21 | The envid contexts never expire | `core/envid.py` | The declared `store_duration_minutes` is read by nobody, and no cron job prunes `{ns}:ctx:*`. |
-| W22 | The audit writer drops events | `core/audit_log.py` | Under the default `best_effort` the event is dropped and the caller does not see it. Bound the `durable` wait, and show the drop count in the health panel. |
+| W22 | The audit writer drops events | `core/audit_log.py` | Closed: `durable` enqueue and receipt waits are bounded, and `dropped_recent` is shown in the execution-health line. `best_effort` still drops visibly. |
 | W23 | `cleanup_stale_tasks` is a stub | `core/cron.py` | A worker heartbeat, then a task whose worker is gone is failed. |
-| W24 | The upstream error response restores only `content-type` | `core/upstream_errors.py` | Carry `retry-after` and the `x-ratelimit-*` family. |
-| W42 | The retention never deletes today's partition | `core/audit_log.py` | The age and the quota rules need two days; the emergency rule excludes today. One huge day can exceed `max_total_bytes` until the next day. |
+| W24 | The upstream error response restores only `content-type` | `core/upstream_errors.py` | Closed: `retry-after`, `request-id`, `x-request-id` and `x-ratelimit-*` are captured and restored. |
+| W42 | The retention never deletes today's partition | `core/audit_log.py` | Closed: emergency retention may remove today when it is the only partition left, with a warning. The ordinary age and quota rules still require two days. |
 | W43 | The health check only pings Redis | `core/cron.py` | Add an HTTP check of the OpenAIx and the MCP routes. The port is known from the configuration. |
 
 ### 3.4 The protocol
 
 | # | Problem | Where | Note |
 |---|---|---|---|
-| W25 | The Anthropic thinking signature is never emitted | `core/messages_protocol.py` | Keep the signature through the conversion and emit the `signature_delta`. |
+| W25 | The Anthropic thinking signature is never emitted | `core/messages_protocol.py` | Closed: signed thinking blocks survive conversion and the encoder emits `signature_delta` before closing the thinking block. |
 | W26 | `count_tokens` is a `chars/4` heuristic | `core/messages_protocol.py` | Count the images, and say that it is an estimate. |
-| W44 | The unused `streaming` keyword | `core/messages_protocol.py:637` | Remove it, or implement the distinction it implies. |
+| W44 | The unused `streaming` keyword | `core/messages_protocol.py` | Closed: removed. |
 | W46 | The retry/fallback wait budget is undefined | `spec_timeouts.md` | The open question of the normative document: if a task executed once, failed and was re-queued, should the later wait be governed by the remaining run budget, or is there a separate retry-wait budget? No additional timeout type was introduced, and the decision is not recorded. |
 
 ### 3.5 The operator's view
@@ -239,7 +239,7 @@ previous round:
 | W35 | The README references `prod.json5.example` | `README.md` — the file does not exist, and `./install.sh prod` fails on it |
 | W36 | The plan documents quote stale test counts | `plan_kv_keeper.md`, `plan_aiset_integration.md` |
 | W37 | The proposal status lines are stale | `proposal_kv_keeper.md`, `proposal_searxng.md`, `_proposal_embedding.md` |
-| W38 | `logging.logs` / `logging.log_overrides` is read but not declared | `config.descriptor.json5` — the cron job reads it, so the editor cannot set it |
+| W38 | `logging.logs` / `logging.log_overrides` is read but not declared | `config.descriptor.json5` — Closed: both maps are declared with bounded per-file settings. |
 | W47 | The browser acceptance of the generated editor has not been done | `plan_aiset_integration.md`, `TEST.md` 7.1 — the step that needs a human, through nginx |
 | W48 | The example configurations and the installation scripts | `TODO.md` — several `<name>.json5.example` configurations selectable at install time, and the installation scripts for a configuration set (aidir + sndbx + ollama) |
 | W49 | The security analysis has no recorded resolution | `_proposal_update_1.md` F1–F13 — the findings were never closed, and a reader cannot tell which of them the later rounds answered. Record, per finding, the item that closed it or the item that still carries it. |

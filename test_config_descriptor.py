@@ -84,6 +84,7 @@ TEST_ENV = {
     "WEBUI_TIMEOUT_OLLAMA_CHAT": "120",
     "WEBUI_TIMEOUT_MCP_PROXY": "60",
     "WEBUI_TIMEOUT_MODEL_LIST": "20",
+    "WEBUI_TIMEOUT_AGENT_TEST_MAX": "300",
     "WEBUI_TIMEOUT_AGENT_TEST": "45",
     "SEARXNG_HOST": "127.0.0.1",
     "SEARXNG_PORT": "18080",
@@ -304,6 +305,29 @@ class LegacyFieldTests(unittest.TestCase):
         # TEST_ENV sets REQUEST_TIMEOUT=100; an unquoted placeholder must become
         # a number, not the string "100".
         self.assertEqual(int(value), 100)
+
+
+class LogOverrideDescriptorTests(unittest.TestCase):
+    """The per-file log overrides must be editable through the declared schema."""
+
+    def test_logs_and_legacy_alias_load(self):
+        """Accept both the current and the legacy per-file override maps."""
+        import tempfile
+
+        text = ROOT_CONFIG.read_text(encoding="utf-8")
+        marker = '  "logging": {\n'
+        self.assertIn(marker, text, "the logging block moved; update this fixture")
+        extra = (
+            '    "logs": {"system.log": {"wipe_period": 10, "max_log_size": 1024}},\n'
+            '    "log_overrides": {"system": {"trim_period": 5}},\n'
+        )
+        with tempfile.TemporaryDirectory(prefix="aidir-log-overrides-") as tmp:
+            path = Path(tmp) / "config.json5"
+            path.write_text(text.replace(marker, marker + extra, 1), encoding="utf-8")
+            service = _build_service("main", ROOT_DESCRIPTOR, path)
+            result = service.load("main", principal=Principal.demo())
+        self.assertFalse(result.invalid_on_disk, result.reason)
+        self.assertEqual([], result.issues)
 
 
 class InvalidDocumentReportTests(unittest.TestCase):
