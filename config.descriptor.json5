@@ -94,6 +94,20 @@
         },
       },
 
+      // ── Security ───────────────────────────────────────────────────────
+      default_auth_mode: {
+        type: "string",
+        min_length: 1,
+        pattern: "^(disabled|endpoint)(\\s+(disabled|endpoint))*$",
+        apply: "restart",
+        description: "Default authentication mode for peer surfaces; endpoint requires a token, disabled publishes on a trusted network",
+        env: { allowed: true, convert: "string" },
+        ui: {
+          placeholder: "endpoint",
+          help: "A whitespace-separated keyword list. The current keywords are disabled and endpoint; endpoint wins when both are present. Explicit peer_tasks.auth_mode and peer_resources.auth_mode override it.",
+        },
+      },
+
       // ── Routing ────────────────────────────────────────────────────────
       routing: {
         type: "object",
@@ -196,7 +210,7 @@
                 minimum: 1,
                 maximum: 1000000,
                 apply: "reload",
-                description: "Maximum affinity records kept for one requested model alias",
+                description: "Deprecated and ignored; affinity is global because the identity is the request context",
               },
               max_entries: {
                 type: "int",
@@ -255,7 +269,7 @@
               honor_prompt_cache_key: {
                 type: "bool",
                 apply: "reload",
-                description: "Use prompt_cache_key or X-Aidir-KV-Key as an additional affinity key",
+                description: "Deprecated and ignored; affinity depends only on the request context",
               },
             },
           },
@@ -861,7 +875,7 @@
                   type: "string",
                   enum: ["disabled", "endpoint"],
                   apply: "restart",
-                  description: "disabled (default) publishes task summaries on a trusted network; endpoint requires the normal bearer token and envid checks",
+                  description: "Overrides default_auth_mode for task summaries: disabled publishes on a trusted network; endpoint requires the normal bearer token and envid checks",
                 },
               },
             },
@@ -874,7 +888,7 @@
                   type: "string",
                   enum: ["disabled", "endpoint"],
                   apply: "restart",
-                  description: "disabled (default) publishes the resource inventory on a trusted network; endpoint requires the normal bearer token and envid checks",
+                  description: "Overrides default_auth_mode for the resource inventory: disabled publishes on a trusted network; endpoint requires the normal bearer token and envid checks",
                 },
               },
             },
@@ -1133,7 +1147,7 @@
                         type: "string",
                         enum: ["first_available", "direct"],
                         apply: "reload",
-                        description: "Model kind; first_available spreads requests over its items",
+                        description: "Model kind; first_available spreads requests over its items, direct requires exactly one",
                       },
                       embedding: {
                         type: "bool",
@@ -1228,7 +1242,7 @@
                       items: {
                         type: "array",
                         apply: "reload",
-                        description: "Upstream candidates of a first_available model, in preference order",
+                        description: "Upstream candidates in preference order; direct requires exactly one",
                         children: {
                           type: "provider_ref",
                           apply: "reload",

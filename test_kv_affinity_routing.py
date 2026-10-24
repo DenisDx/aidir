@@ -189,7 +189,7 @@ class AffinityRoutingTests(unittest.IsolatedAsyncioTestCase):
         resolution = await harness.router.resolve_route(harness.route(), request_payload=harness.payload())
         self.assertEqual((resolution.resolved_provider, resolution.resolved_model), ("p2", "m2"))
 
-    async def test_prompt_cache_key_is_part_of_the_identity(self):
+    async def test_prompt_cache_key_does_not_change_the_identity(self):
         harness = RouterHarness()
         first = harness.payload()
         first["prompt_cache_key"] = "session-a"
@@ -199,9 +199,20 @@ class AffinityRoutingTests(unittest.IsolatedAsyncioTestCase):
         harness.set_admission("p1", "m1", "concurrency", loaded=True)
         harness.queues[("p1", "m1")] = 5
         resolution = await harness.router.resolve_route(harness.route(), request_payload=second)
-        # A different key is a miss, so the normal first_available policy is used.
-        self.assertEqual((resolution.resolved_provider, resolution.resolved_model), ("p2", "m2"))
-        self.assertEqual(resolution.route["selection_reason"], "immediate")
+        self.assertEqual((resolution.resolved_provider, resolution.resolved_model), ("p1", "m1"))
+        self.assertEqual(resolution.route["selection_reason"], "affinity_wait_queue")
+
+    async def test_request_alias_does_not_change_the_identity(self):
+        harness = RouterHarness()
+        await harness.router.resolve_route(harness.route(), request_payload=harness.payload())
+        other_route = harness.route()
+        other_route["requested_model"] = "other_alias"
+        other_route["requested_alias"] = "other_alias"
+        harness.set_admission("p1", "m1", "concurrency", loaded=True)
+        harness.queues[("p1", "m1")] = 5
+        resolution = await harness.router.resolve_route(other_route, request_payload=harness.payload())
+        self.assertEqual((resolution.resolved_provider, resolution.resolved_model), ("p1", "m1"))
+        self.assertEqual(resolution.route["selection_reason"], "affinity_wait_queue")
 
 
 if __name__ == "__main__":
@@ -258,7 +269,6 @@ class SchedulerAffinityTests(unittest.IsolatedAsyncioTestCase):
             ],
         }
         fingerprint = store.fingerprint(
-            "smart_gemma-4-26B",
             {"model": "smart_gemma-4-26B", "messages": payload["messages"]},
         )
         store.remember(fingerprint, provider="ollama_remote", model="gemma-remote", cache_group="gemma-remote")
@@ -343,7 +353,6 @@ class SchedulerAffinityTests(unittest.IsolatedAsyncioTestCase):
             {"role": "user", "content": "one"},
         ]
         fingerprint = store.fingerprint(
-            "smart_gemma-4-26B",
             {"model": "smart_gemma-4-26B", "messages": messages},
         )
         store.remember(fingerprint, provider="ollama_remote", model="gemma-remote", cache_group="gemma-remote")

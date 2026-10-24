@@ -389,6 +389,23 @@ class ResponseTransparencyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(values["envid"], "")
         self.assertTrue(all(isinstance(value, str) for value in values.values()))
 
+    def test_task_hash_preserves_retry_and_fallback_state(self) -> None:
+        """Restore the retry delay, fallback list and rejection policy from Redis."""
+        task = Task_agent(payload={"model": "model", "messages": []})
+        task.next_retry_at = 1234.5
+        task.fallbacks = ["provider-a/model-a", "provider-b/model-b"]
+        task.fallback_index = 1
+        task.retry_attempt = 2
+        task.on_reject = {"provider-a/model-a": {"action": "fallback"}}
+
+        restored = Task.from_redis_hash(task.to_redis_hash())
+
+        self.assertEqual(restored.next_retry_at, 1234.5)
+        self.assertEqual(restored.fallbacks, task.fallbacks)
+        self.assertEqual(restored.fallback_index, 1)
+        self.assertEqual(restored.retry_attempt, 2)
+        self.assertEqual(restored.on_reject, task.on_reject)
+
     async def test_scheduler_preserves_upstream_error_when_fallback_requeue_fails(self) -> None:
         """Keep the real upstream failure when smart-fallback persistence fails."""
         redis = SimpleNamespace(hset=AsyncMock())

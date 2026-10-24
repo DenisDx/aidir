@@ -2,7 +2,10 @@
 
 ## Status
 
-Proposed, not implemented.
+Implemented. The per-alias parts of this design were superseded by W15 in
+`proposal_update4.md`: affinity now depends only on the request context, the
+store is global, and `max_entries_per_alias` / `honor_prompt_cache_key` are
+deprecated and ignored.
 
 Date: 2026-10-22
 
@@ -343,8 +346,8 @@ lets a conversation match at multiple stages of growth.
 
 ### Store bounds
 
-- maximum records per alias: `max_entries_per_alias` (default 256);
-- maximum records overall: `max_entries` (default 20000);
+- maximum records overall: `max_entries` (default 20000); the store is global
+  since W15, so there is no per-alias bound;
 - TTL: `ttl_seconds` (default 3600);
 - eviction: expired records first, then least recently used.
 
@@ -815,7 +818,6 @@ routing: {
 
     // store
     ttl_seconds: 3600,
-    max_entries_per_alias: 256,
     max_entries: 20000,
 
     // routing policy
@@ -829,8 +831,6 @@ routing: {
     resource_history_window_seconds: 600,
     resource_blocked_ratio: 0.5,
 
-    // optional client hint
-    honor_prompt_cache_key: true,
   },
 }
 ```
@@ -856,11 +856,10 @@ Field notes:
 - `resource_blocked_ratio` is the optional anti-flapping threshold over that
   window. `0` disables it; `0.5` means "divert if the preferred candidate spent
   at least half of the observed window resource-blocked and is blocked now".
-- `honor_prompt_cache_key` controls the optional client hint.
+- `honor_prompt_cache_key` was removed by W15; the client hint no longer affects
+  the identity.
 
-Per-alias opt-out can be added later as
-`models.providers.<smart>.models[].kv_affinity: false`; it is not required for
-v1.
+A per-alias opt-out is obsolete after W15: there is no per-alias partition.
 
 ### Session resources and parallel requests
 

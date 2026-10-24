@@ -74,9 +74,10 @@ The suite includes tests for:
 - scheduler priority, queue bypass, timeout diagnostics, restart recovery,
   shutdown, and task call counts;
 - resource monitoring, resource reuse, peer resources, and context overflow;
-- prefix-affinity routing, context fingerprints, resource-wait history, and
-  per-model parallel session admission (`test_kv_affinity`,
-  `test_kv_affinity_routing`, `test_session_resources`);
+- prefix-affinity routing, context fingerprints, context-only identity,
+  resource-wait history, per-model parallel session admission, and direct
+  smart routing (`test_kv_affinity`, `test_kv_affinity_routing`,
+  `test_session_resources`, `test_smart_router_direct`);
 - cron logging and repair, hooks, HTTP API workers, web search fallback, and
   WebUI live logs and task viewer search.
 
@@ -108,6 +109,7 @@ python -m unittest -v \
   test_context_overflow \
   test_kv_affinity \
   test_kv_affinity_routing \
+  test_smart_router_direct \
   test_session_resources
 
 # Endpoint, protocol, and WebUI behavior
@@ -116,7 +118,8 @@ python -m unittest -v \
   test_openaix_embeddings \
   test_response_transparency \
   test_viewer_search \
-  test_webui_live_logs
+  test_webui_live_logs \
+  test_webui_sessions
 
 # Settings subsystem (descriptors and the aiset host adapter)
 python -m unittest -v \

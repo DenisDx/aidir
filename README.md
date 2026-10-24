@@ -407,11 +407,13 @@ timeouts and transport failures are retried.
 ```
 
 On the peer's OpenAIx endpoint, `peer_resources.auth_mode` controls access to
-`/v1/resources` and `/api/resources`. The default `disabled` mode permits
-read-only resource discovery on a trusted network; `endpoint` requires the
-normal bearer-token and environment authorization checks. With `endpoint` the
-reading side needs the credentials: give the provider an `auth` block with the
-token the peer knows (see "Peer task visibility" below).
+`/v1/resources` and `/api/resources`. An explicit value wins; otherwise the root
+`default_auth_mode` applies. The root default is `endpoint`; the shipped
+configuration sets `disabled` so existing deployments keep working. `disabled`
+permits read-only resource discovery on a trusted network; `endpoint` requires
+the normal bearer-token and environment authorization checks. With `endpoint`
+the reading side needs the credentials: give the provider an `auth` block with
+the token the peer knows (see "Peer task visibility" below).
 
 ### Peer task visibility
 
@@ -420,15 +422,14 @@ local task queue. Rows from another instance show their source instance, worker,
 and resolved model; their actions are read-only. The peer endpoint serves
 `GET /v1/tasks`, returning only active task summaries without request or
 response bodies. `peer_tasks.auth_mode` on the peer's `openaix` endpoint controls
-that route: **`disabled` (the default) publishes it on a trusted network**,
-while `endpoint` requires the normal bearer-token and environment authorization
-checks. Both the local and remote instances must run a version that provides
-this route.
+that route: an explicit value wins; otherwise the root `default_auth_mode`
+applies. The root default is `endpoint`, while the shipped configuration sets
+`disabled` so an existing deployment needs no extra configuration. `endpoint`
+requires the normal bearer-token and environment authorization checks. Both the
+local and remote instances must run a version that provides this route.
 
-Because the peer publishes its state without a token by default, an existing
-deployment needs no extra configuration. When `endpoint` is selected, **the
-reading side must carry a token**: give the provider an `auth` block with the
-token the peer knows in its `users.items`:
+When `endpoint` is selected, **the reading side must carry a token**: give the
+provider an `auth` block with the token the peer knows in its `users.items`:
 
 ```json5
 "remote_aidir_110": {
@@ -522,8 +523,10 @@ For Ollama resources, `keep_alive` is counted from the last real model use. Peri
 ### Prefix-affinity smart routing and parallel sessions
 
 Smart `first_available` models keep requests with the same context head on the
-same concrete executor. This preserves the provider's KV cache across the turns
-of a harness conversation. The default behaviour is enabled in `routing`:
+same concrete executor. A smart `direct` model has exactly one candidate and
+routes to it under the same admission rules. Affinity depends only on the request
+context, not on the alias or client. The default behaviour is enabled in
+`routing`:
 
 ```json5
 routing: {

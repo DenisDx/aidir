@@ -1,7 +1,7 @@
 # aidir — The configuration subsystem
 
-> Satellite document of [SPEC_NEW.md](../SPEC_NEW.md). See
-> [§9 Configuration](../SPEC_NEW.md#9-configuration) there for the overview.
+> Satellite document of [SPEC.md](../SPEC.md). See
+> [§9 Configuration](../SPEC.md#9-configuration) there for the overview.
 >
 > This document describes the `aiset` integration, the descriptor format, the
 > document model, the worker-local configuration, the generated settings editor and
@@ -257,7 +257,7 @@ never disagree.
 | `http_connector` | object | One authenticated remote service plus its operations |
 | `mcp_server` | object | One remote MCP server (http / sse / stdio) plus its auth |
 | `search_provider` | object | One outbound search/fetch provider (brave / searxng / duckduckgo / tavily) |
-| `provider_ref` | object | One upstream candidate of a `first_available` model |
+| `provider_ref` | object | One upstream candidate of a smart model |
 | `env_context_workspace` | object | One workspace reachable from an environment's tasks |
 | `worker_entry` | object | The flat worker entry used by `workers.items.<id>` |
 | `worker_agent` | object | The agent family (`openaix`) |
@@ -319,7 +319,7 @@ typo.
 ### 4.1 The main document
 
 `config.json5` has 19 top-level sections. See
-[§9.2](../SPEC_NEW.md#92-top-level-sections-of-configjson5) for the table.
+[§9.2](../SPEC.md#92-top-level-sections-of-configjson5) for the table.
 
 ### 4.2 Worker-local documents
 

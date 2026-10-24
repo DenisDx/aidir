@@ -44,7 +44,6 @@ _LOGS_DIR     = Path(__file__).parent.parent.parent / "logs"
 # The sessions belong to one instance. A shared prefix would let a session
 # created on one instance open another one.
 _SESSION_PREFIX = "aidir:session:"
-_LEGACY_SESSION_PREFIX = "aidir:session:"
 _ROOT = _LOGS_DIR.parent
 _CRON_MARKER = "# aidir-cron"
 _LOG_FILE_SUFFIXES = frozenset({".log", ".jsonl"})
@@ -726,16 +725,10 @@ async def _create_session(core: "Core", user: dict) -> str:
 
 
 async def _get_session(core: "Core", token: str) -> dict | None:
-    """Return session data for token, or None if invalid/expired.
-
-    A session written before the instance-scoped prefix was introduced is still
-    accepted, so an upgrade does not log every operator out.
-    """
+    """Return session data for token, or None if invalid/expired."""
     if not token:
         return None
     raw = await core.redis.get(f"{_session_prefix(core)}{token}")
-    if raw is None:
-        raw = await core.redis.get(f"{_LEGACY_SESSION_PREFIX}{token}")
     if raw is None:
         return None
     try:

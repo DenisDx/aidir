@@ -89,12 +89,10 @@ class KvAffinityStoreTests(unittest.TestCase):
     def test_lookup_matches_a_growing_conversation_at_the_old_anchor(self):
         store = self._store()
         first = store.fingerprint(
-            "smart_test",
             _chat({"role": "system", "content": "rules"}, {"role": "user", "content": "one"}),
         )
         store.remember(first, provider="a", model="m1", cache_group="m1")
         grown = store.fingerprint(
-            "smart_test",
             _chat(
                 {"role": "system", "content": "rules"},
                 {"role": "user", "content": "one"},
@@ -109,7 +107,6 @@ class KvAffinityStoreTests(unittest.TestCase):
     def test_shorter_context_does_not_reuse_a_longer_stored_anchor(self):
         store = self._store()
         long_fp = store.fingerprint(
-            "smart_test",
             _chat(
                 {"role": "system", "content": "rules"},
                 {"role": "user", "content": "one"},
@@ -119,15 +116,14 @@ class KvAffinityStoreTests(unittest.TestCase):
         )
         store.remember(long_fp, provider="a", model="m1")
         short_fp = store.fingerprint(
-            "smart_test",
             _chat({"role": "system", "content": "rules"}, {"role": "user", "content": "one"}),
         )
         self.assertIsNone(store.lookup(short_fp))
 
     def test_forget_candidate_removes_every_prefix(self):
         store = self._store()
-        first = store.fingerprint("smart_test", _chat({"role": "user", "content": "one"}))
-        second = store.fingerprint("smart_test", _chat({"role": "user", "content": "two"}))
+        first = store.fingerprint(_chat({"role": "user", "content": "one"}))
+        second = store.fingerprint(_chat({"role": "user", "content": "two"}))
         store.remember(first, provider="a", model="m1")
         store.remember(second, provider="a", model="m1")
         store.forget_candidate("a", "m1")
@@ -137,19 +133,25 @@ class KvAffinityStoreTests(unittest.TestCase):
     def test_ttl_expires_records(self):
         now = [0.0]
         store = KvAffinityStore(policy=AnchorPolicy(short_fraction=1.0), ttl_seconds=10, clock=lambda: now[0])
-        fp = store.fingerprint("smart_test", _chat({"role": "user", "content": "one"}))
+        fp = store.fingerprint(_chat({"role": "user", "content": "one"}))
         store.remember(fp, provider="a", model="m1")
         now[0] = 11.0
         self.assertIsNone(store.lookup(fp))
 
-    def test_per_alias_limit_evicts_the_oldest_record(self):
-        store = self._store(max_entries_per_alias=1)
-        first = store.fingerprint("smart_test", _chat({"role": "user", "content": "one"}))
-        second = store.fingerprint("smart_test", _chat({"role": "user", "content": "two"}))
+    def test_global_limit_evicts_the_oldest_record(self):
+        store = self._store(max_entries=1)
+        first = store.fingerprint(_chat({"role": "user", "content": "one"}))
+        second = store.fingerprint(_chat({"role": "user", "content": "two"}))
         store.remember(first, provider="a", model="m1")
         store.remember(second, provider="a", model="m2")
         self.assertIsNone(store.lookup(first))
         self.assertIsNotNone(store.lookup(second))
+
+    def test_prompt_cache_key_does_not_change_the_context_identity(self):
+        store = self._store()
+        first = store.fingerprint(_chat({"role": "user", "content": "one"}, prompt_cache_key="a"))
+        second = store.fingerprint(_chat({"role": "user", "content": "one"}, prompt_cache_key="b"))
+        self.assertEqual(first.hash, second.hash)
 
 
 class ReadinessTrackerTests(unittest.TestCase):

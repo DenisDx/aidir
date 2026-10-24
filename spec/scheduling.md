@@ -1,8 +1,8 @@
 # aidir — Scheduling, resources and smart routing
 
-> Satellite document of [SPEC_NEW.md](../SPEC_NEW.md). See
-> [§6.4 Scheduler](../SPEC_NEW.md#64-scheduler) –
-> [§6.6 SmartRouter and KV affinity](../SPEC_NEW.md#66-smartrouter-and-kv-affinity)
+> Satellite document of [SPEC.md](../SPEC.md). See
+> [§6.4 Scheduler](../SPEC.md#64-scheduler) –
+> [§6.6 SmartRouter and KV affinity](../SPEC.md#66-smartrouter-and-kv-affinity)
 > there for the architecture context.
 >
 > This document describes the task lifecycle, the queue semantics, the scheduler
@@ -564,9 +564,10 @@ a model warm forever.
 
 ### 5.1 The strategies
 
-Only **`first_available`** is implemented. The descriptor also permits `direct`,
-which raises `SmartRouteError(code="UNSUPPORTED_ROUTING_STRATEGY", status_code=400)`
-at request time.
+Both **`first_available`** and **`direct`** are implemented. `direct` requires
+exactly one candidate and resolves to it under the normal admission rules. A
+different candidate count raises `SmartRouteError(code="INVALID_ROUTING_CONFIG",
+status_code=400)`.
 
 ### 5.2 The two factories
 
@@ -667,7 +668,7 @@ and `request_kind`.
 
 ### 6.1 The canonical context
 
-`canonical_context(payload, alias, request_kind)` builds an **append-stable line
+`canonical_context(payload, request_kind)` builds an **append-stable line
 stream**:
 
 1. The version tag `kv1` and the request kind.
@@ -712,7 +713,7 @@ rounded a 4 KiB context's 90 % anchor down to 50 %, which was too lossy.
 ### 6.3 The hash
 
 ```
-message = b"kv1\x00" + alias + b"\x00" + request_kind + b"\x00" + client_key + b"\x00" + prefix
+message = b"kv2\x00" + request_kind + b"\x00" + prefix
 digest  = HMAC-SHA256(secret, message)   if a secret is configured
         = SHA256(message)                otherwise
 return  = digest[:16].hex()              # 128 bits
@@ -722,8 +723,11 @@ The secret comes from `routing.kv_affinity._secret` or `AIDIR_KV_AFFINITY_SECRET
 Without a secret the store degrades to plain SHA-256 and is documented as
 internal-only.
 
-The **client key** is `payload["prompt_cache_key"]` or `payload["_aidir_kv_key"]`
-(the `X-Aidir-KV-Key` header), honoured only when `honor_prompt_cache_key` is true.
+The alias, endpoint and `prompt_cache_key` are **not** part of the identity.
+Affinity depends only on the request context, so the same context arriving
+through a different alias or client uses the same record. The
+`honor_prompt_cache_key` and `max_entries_per_alias` keys are deprecated and
+ignored.
 
 **The router never stores prompt text.** It stores a truncated HMAC and a byte
 length.
@@ -735,11 +739,10 @@ length.
 | Property | Default |
 |---|---|
 | `ttl_seconds` | 3600 |
-| `max_entries_per_alias` | 256 |
 | `max_entries` | 20000 |
 
-The keys are `(alias, anchor_bytes, hash)`; there is a per-alias LRU and a global
-LRU.
+The keys are `(anchor_bytes, hash)` in one global store; the LRU is global.
+`max_entries_per_alias` is accepted for compatibility and ignored.
 
 **Lookup** (`lookup(fingerprint)`): for every stored anchor length `a` that is
 ≤ `min(stored_len, current_anchor)`, the router recomputes the hash of the **first
@@ -759,8 +762,7 @@ quantized anchor; refresh `last_used`, `expires_at`, `cache_group`, `provider`,
 | `forget_candidate(provider, model)` | Removes every record pointing at that executor |
 | `forget_prefix(fingerprint)` | Removes exactly one record |
 
-`stats()` exposes only `{enabled, aliases, records, ttl_seconds}` — never prompt
-content.
+`stats()` exposes only `{enabled, records, ttl_seconds}` — never prompt content.
 
 ### 6.5 The readiness tracker
 
@@ -1035,7 +1037,7 @@ known inconsistency.
 
 | # | Limitation |
 |---|---|
-| 1 | Only `first_available` is implemented; `direct` produces HTTP 400 |
+| 1 | The affinity identity is context-only, so there is no per-alias opt-out; the deprecated keys are ignored |
 | 2 | The scheduler's router cannot probe the OpenAI-family providers, which spuriously forgets their affinity records |
 | 3 | The affinity store is process-local; there is no Redis mirror |
 | 4 | The 20-message trim in the `openaix` worker breaks conversational prefix reuse |

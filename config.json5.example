@@ -6,6 +6,8 @@
   "title": "aidir 1",
   "instance": "${AIDIR_INSTANCE:-aidir1}",
   "root": "${AIDIR_ROOT}",
+  // Peer surfaces default to endpoint auth; disabled keeps existing multi-instance deployments working.
+  "default_auth_mode": "disabled",
   "routing": {
     "max_hops": 8,
     "kv_affinity": {
@@ -20,7 +22,6 @@
       "medium_fraction": 0.50,
       "long_fraction": 0.10,
       "ttl_seconds": 3600,
-      "max_entries_per_alias": 256,
       "max_entries": 20000,
       "prefer_affinity_over_immediate": true,
       "max_queue_diff_len": 8,
@@ -28,8 +29,7 @@
       "resource_wait_timeout_seconds": 60,
       "cold_model_wait_timeout_seconds": 0,
       "resource_history_window_seconds": 600,
-      "resource_blocked_ratio": 0.5,
-      "honor_prompt_cache_key": true
+      "resource_blocked_ratio": 0.5
     }
   },
   "redis": {

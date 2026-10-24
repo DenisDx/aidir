@@ -1,7 +1,7 @@
 # aidir — Operations: installation, deployment, diagnostics
 
-> Satellite document of [SPEC_NEW.md](../SPEC_NEW.md). See
-> [§2.2 Runtime topology and ports](../SPEC_NEW.md#22-runtime-topology-and-ports)
+> Satellite document of [SPEC.md](../SPEC.md). See
+> [§2.2 Runtime topology and ports](../SPEC.md#22-runtime-topology-and-ports)
 > there for the architecture context.
 >
 > This document describes the installation, the systemd and Docker deployment, the
@@ -709,4 +709,4 @@ acceptance matrix are in [../TEST.md](../TEST.md).
 | A task sits in `queued` forever | No worker matches the task type, or the resources are insufficient | The scheduler's deferral warnings in `logs/core.log` |
 | The queue-state endpoint is slow | It is `O(queued tasks)` with one `HGETALL` per task | Reduce the retained task history (`tasks.external_task_live`) |
 | The worker log is missing | `logging.levels.workers` uses the plural while the logger type is `worker` | Rename the key to `worker`, or set a per-worker override |
-| An envid context never expires | `envids.store_duration_minutes` is declared but read by nobody | A known gap — see [§14](../SPEC_NEW.md#14-known-problems-open-tasks-and-development-directions) |
+| An envid context never expires | `envids.store_duration_minutes` is declared but read by nobody | A known gap — see [§14](../SPEC.md#14-known-problems-open-tasks-and-development-directions) |

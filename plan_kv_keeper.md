@@ -2,7 +2,8 @@
 
 ## Status
 
-Implemented and verified. Full suite: 574 tests pass.
+Implemented and verified. Full suite: 663 tests pass. W15 made the
+affinity identity context-only and removed the per-alias partition.
 
 Source specification: `proposal_kv_keeper.md`.
 
@@ -26,6 +27,9 @@ up while the specification is being applied. Update it after every phase.
 - Queue depth means queued tasks only; `active_count` is diagnostic.
 - Session field is `sessionResources` (same shape as `resources`).
 - Store is in-process in v1.
+- W15: affinity depends only on the request context; alias and client keys do
+  not partition the store. `max_entries_per_alias` and `honor_prompt_cache_key`
+  are deprecated and ignored.
 - Warm resource wait: configurable, default 60 s.
 - Cold resource wait: default 0 s (immediate diversion).
 - Availability sampling happens on candidate evaluation only.
@@ -100,7 +104,7 @@ Status: complete.
 
 Completed: `test_kv_affinity`, `test_kv_affinity_routing` and
 `test_session_resources` added; `README.md`, `TEST.md` and `DOCUMENTS.MD`
-updated. The full unittest discovery run passes (574 tests).
+updated. The full unittest discovery run passes (663 tests).
 
 ## Important Notes Discovered During Work
 

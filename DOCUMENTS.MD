@@ -3,16 +3,22 @@
 This index describes document responsibilities, not implementation status.
 Proposals may include both planned and completed work; consult each document.
 
+Document precedence: `SPEC_.md` is the editable overlay over `SPEC.md` and wins
+when they disagree. The user periodically merges it into `SPEC.md`. Only the
+highest-numbered `proposal_updateN.md` is open; older `proposal_update*` files
+are closed. Non-update proposals keep their own status. Deferred work lives in
+`ROADMAP.md`.
+
 ## Specifications
 
 | Document | Responsibility |
 |---|---|
-| [SPEC_NEW.md](SPEC_NEW.md) | **The main technical specification and the entry point for agents and developers**: purpose, architecture, domain model, component interfaces, implementation decisions, file system, configuration model, security, testing, known problems. |
+| [SPEC.md](SPEC.md) | **The base technical specification and the entry point for agents and developers**: purpose, architecture, domain model, component interfaces, implementation decisions, file system, configuration model, security, testing, known problems. Read-only for agents. |
+| [SPEC_.md](SPEC_.md) | Editable overlay over `SPEC.md`: approved changes, decisions and additions. Wins over `SPEC.md` until the user merges it and deletes the overlay. |
 | [spec/protocols.md](spec/protocols.md) | The complete HTTP surface: every route, the request and response contracts, the headers, the error envelopes, the streaming rules. |
 | [spec/scheduling.md](spec/scheduling.md) | The task lifecycle, the queue semantics, the scheduler algorithm, the resource model, the smart router, the KV affinity mechanism. |
 | [spec/configuration.md](spec/configuration.md) | The `aiset` integration, the descriptor format, the document model, the worker-local configuration, the generated settings editor, the configuration assistant. |
 | [spec/operations.md](spec/operations.md) | Installation, systemd, Docker/Compose, nginx, the doctor, the cron cycle, the logs, the audit retention, the operational test protocol. |
-| [SPEC.md](SPEC.md) | The original project specification; read-only for agents. Superseded by SPEC_NEW.md. |
 | [openaix_spec.md](openaix_spec.md) | OpenAIx protocol extensions and request/response contracts (normative). |
 | [spec_timeouts.md](spec_timeouts.md) | Queue, execution, outbound-call, and restart timeout semantics (normative). |
 | [aiset/SPEC_.md](aiset/SPEC_.md) | Complete editable aiset specification, maintained in the separately tracked/ignored aiset directory; finalized as SPEC.md later. |
@@ -25,6 +31,7 @@ Proposals may include both planned and completed work; consult each document.
 | [TEST.md](TEST.md) | Smoke, automated, regression, and manual acceptance test procedures. |
 | [AGENTS.md](AGENTS.md) | Agent workflow and maintenance rules; read-only for agents. |
 | [TODO.md](TODO.md) | Existing task notes and configuration reminders. |
+| [ROADMAP.md](ROADMAP.md) | Deferred work and ideas that need discussion before they become a proposal. |
 | [plan_aiset_integration.md](plan_aiset_integration.md) | Migration plan of the settings subsystem to the aiset library: phases, descriptor rules, risks, delivery state. |
 | [proposal_doctor.md](proposal_doctor.md) | Proposal for `core/app.py doctor`: library `doctor` for configuration documents plus host checks (aiset checkout, `.env`, directories, venv, Docker, Redis, nginx, ports), with fix classes and open questions. |
 | [config.descriptor.json5](config.descriptor.json5) | Schema of the root `config.json5`: every key, its type, constraints, secret flag, apply policy and editor help text. |
@@ -36,7 +43,9 @@ Proposals may include both planned and completed work; consult each document.
 | [test_aiset_class_inventory.js](test_aiset_class_inventory.js) | Dumps the library's `aiset.classes()` inventory, so coverage is checked against the contract and not against the library source. |
 | [test_settings_styles.py](test_settings_styles.py) | Every class the editor emits must be designed by the host, loaded after the library, with no library rule surviving the theme. |
 | [test_kv_affinity.py](test_kv_affinity.py) | Context fingerprint, anchor policy, bounded store, and readiness-history contract. |
-| [test_kv_affinity_routing.py](test_kv_affinity_routing.py) | Affinity selection, queue diversion, resource wait, scheduler refresh, and execution fallback. |
+| [test_kv_affinity_routing.py](test_kv_affinity_routing.py) | Affinity selection, context-only identity, queue diversion, resource wait, scheduler refresh, and execution fallback. |
+| [test_smart_router_direct.py](test_smart_router_direct.py) | Direct smart-model routing: one candidate only, normal admission and queueing, and configuration rejection. |
+| [test_webui_sessions.py](test_webui_sessions.py) | WebUI session namespace: instance-scoped keys and rejection of the removed legacy key. |
 | [test_session_resources.py](test_session_resources.py) | Model-aware parallel admission, base/session accounting, memory caps, and unload invalidation. |
 | [core/settings/agent.py](core/settings/agent.py) | The configuration assistant: the provider call, the bounded tool loop and the permission set that keeps it away from secrets and from writing. |
 | [doctor.sh](doctor.sh) | Wrapper: runs the doctor through `venv/bin/python core/app.py doctor` and forwards every argument, so `./doctor.sh --help` shows all options. |
@@ -66,10 +75,11 @@ Proposals may include both planned and completed work; consult each document.
 | [_proposal_log_refactoring.md](_proposal_log_refactoring.md) | Logging/audit storage and viewer refactoring. |
 | [_proposal_refactoring_1.md](_proposal_refactoring_1.md) | First refactoring plan and execution record. |
 | [_proposal_update_1.md](_proposal_update_1.md) | Proposed first security-update round. |
-| [before_tools_worker.md](before_tools_worker.md) | Pre-tool-call context-processing hook. Deferred; see SPEC_NEW.md §14.4. |
-| [proposal_update1.md](proposal_update1.md) | The current work list: the 45 confirmed defects and design gaps from SPEC_NEW.md §14, each with its evidence, the proposed modification and its validation. Excludes the two deferred tasks (the middleware chain and `before_tools`). |
+| [before_tools_worker.md](before_tools_worker.md) | Pre-tool-call context-processing hook. Deferred; see SPEC.md §14.4. |
+| [proposal_update1.md](proposal_update1.md) | Closed first work list: the 45 confirmed defects and design gaps from SPEC.md §14, each with its evidence, the proposed modification and its validation. |
+| [proposal_security_dashboard.md](proposal_security_dashboard.md) | Dashboard security panel, left of the system-health card, listing open security findings such as MCP without authentication. |
 | [proposal_update_3.md](proposal_update_3.md) | The defects found while investigating a managed llama.cpp server that hangs before opening its listener, and a task that stays `queued` after its execution was handed to a remote aidir. Items V1-V28; the applied ones are marked as fixed. |
-| [proposal_update4.md](proposal_update4.md) | **The complete ledger of the open work**: every item that survived the two previous rounds, each with its source. Items W1-W49, plus the record of the items that are closed. |
+| [proposal_update4.md](proposal_update4.md) | **The current open ledger**: every item that survived the two previous rounds, each with its source. Items W1-W49, plus the record of the items that are closed. It is the latest `proposal_update` and stays open until a higher-numbered proposal supersedes it. |
 | [proposal_aidir_smart_router.md](proposal_aidir_smart_router.md) | Resource-aware smart routing design. |
 | [proposal_kv_keeper.md](proposal_kv_keeper.md) | KV-affinity smart routing: prefix fingerprinting, sticky candidate selection, queue-imbalance diversion, and per-request session resources. |
 | [plan_kv_keeper.md](plan_kv_keeper.md) | Implementation plan and live state for KV-affinity routing and parallel session admission. |

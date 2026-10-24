@@ -102,7 +102,7 @@ class SmartRouter:
             )
 
         strategy = str(smart_model_cfg.get("type") or "first_available").strip() or "first_available"
-        if strategy != "first_available":
+        if strategy not in {"first_available", "direct"}:
             raise SmartRouteError(
                 code="UNSUPPORTED_ROUTING_STRATEGY",
                 status_code=400,
@@ -110,6 +110,12 @@ class SmartRouter:
             )
 
         items = smart_model_cfg.get("items")
+        if strategy == "direct" and (not isinstance(items, list) or len(items) != 1):
+            raise SmartRouteError(
+                code="INVALID_ROUTING_CONFIG",
+                status_code=400,
+                message=f"Direct smart model '{requested_model}' must have exactly one candidate",
+            )
         if not isinstance(items, list) or not items:
             raise SmartRouteError(
                 code="ROUTING_FAILED",
@@ -127,13 +133,10 @@ class SmartRouter:
             for provider_id, model_id in (excluded_candidates or set())
         }
         affinity_enabled = bool(self._kv_affinity is not None and self._kv_affinity.enabled)
-        requested_alias = str(
-            route.get("requested_alias") or route.get("requested_model") or requested_model
-        ).strip()
         fingerprint = None
         affinity_record = None
         if affinity_enabled:
-            fingerprint = self._kv_affinity.fingerprint(requested_alias, request_payload)
+            fingerprint = self._kv_affinity.fingerprint(request_payload)
             if fingerprint is not None:
                 affinity_record = self._kv_affinity.lookup(fingerprint)
 

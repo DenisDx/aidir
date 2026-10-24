@@ -63,13 +63,11 @@ _RESOURCE_BLOCK_REASONS = {"session_memory", "base_memory", "waiting_unload"}
 class KvFingerprint:
     """Canonical context identity used for one routing decision."""
 
-    alias: str
     request_kind: str
     total_bytes: int
     anchor_bytes: int
     hash: str
     text: bytes
-    client_key: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -229,15 +227,11 @@ def canonical_context(payload: dict | None, request_kind: str = "chat") -> bytes
     return b"\n".join(parts)
 
 
-def _prefix_hash(prefix: bytes, *, alias: str, request_kind: str, secret: str, client_key: str) -> str:
+def _prefix_hash(prefix: bytes, *, request_kind: str, secret: str) -> str:
     """Return a truncated HMAC-SHA256 of one anchor prefix."""
     message = (
-        b"kv1\x00"
-        + str(alias or "").encode("utf-8")
-        + b"\x00"
+        b"kv2\x00"
         + str(request_kind or "chat").encode("utf-8")
-        + b"\x00"
-        + str(client_key or "").encode("utf-8")
         + b"\x00"
         + prefix
     )
@@ -257,20 +251,15 @@ class KvAffinityStore:
         enabled: bool = True,
         policy: AnchorPolicy | None = None,
         ttl_seconds: int = 3600,
-        max_entries_per_alias: int = 256,
         max_entries: int = 20000,
-        honor_prompt_cache_key: bool = True,
         clock=time.time,
     ) -> None:
         self.enabled = bool(enabled)
         self.policy = policy or AnchorPolicy()
         self.ttl_seconds = max(1, int(ttl_seconds))
-        self.max_entries_per_alias = max(1, int(max_entries_per_alias))
         self.max_entries = max(1, int(max_entries))
-        self.honor_prompt_cache_key = bool(honor_prompt_cache_key)
         self._clock = clock
-        self._records: dict[str, OrderedDict[tuple[int, str], dict]] = {}
-        self._order: OrderedDict[tuple[str, int, str], None] = OrderedDict()
+        self._records: OrderedDict[tuple[int, str], dict] = OrderedDict()
 
     @classmethod
     def from_config(cls, full_config: dict | None, *, clock=time.time) -> "KvAffinityStore":
@@ -283,9 +272,7 @@ class KvAffinityStore:
             enabled=bool(cfg.get("enabled", True)),
             policy=AnchorPolicy.from_config(cfg),
             ttl_seconds=int(cfg.get("ttl_seconds", 3600) or 3600),
-            max_entries_per_alias=int(cfg.get("max_entries_per_alias", 256) or 256),
             max_entries=int(cfg.get("max_entries", 20000) or 20000),
-            honor_prompt_cache_key=bool(cfg.get("honor_prompt_cache_key", True)),
             clock=clock,
         )
         store._secret = secret
@@ -299,10 +286,9 @@ class KvAffinityStore:
     def _secret(self, value: str) -> None:
         self._secret_value = str(value or "")
 
-    def fingerprint(self, alias: str, payload: dict | None, request_kind: str = "chat") -> KvFingerprint | None:
+    def fingerprint(self, payload: dict | None, request_kind: str = "chat") -> KvFingerprint | None:
         """Build the canonical context fingerprint for one request."""
-        clean_alias = str(alias or "").strip()
-        if not self.enabled or not clean_alias:
+        if not self.enabled:
             return None
         text = canonical_context(payload, request_kind)
         total = len(text)
@@ -312,23 +298,12 @@ class KvAffinityStore:
         if anchor <= 0:
             return None
         kind = str(request_kind or "chat")
-        client_key = ""
-        if self.honor_prompt_cache_key and isinstance(payload, dict):
-            client_key = str(payload.get("prompt_cache_key") or payload.get("_aidir_kv_key") or "").strip()
         return KvFingerprint(
-            alias=clean_alias,
             request_kind=kind,
             total_bytes=total,
             anchor_bytes=anchor,
-            hash=_prefix_hash(
-                text[:anchor],
-                alias=clean_alias,
-                request_kind=kind,
-                secret=self._secret,
-                client_key=client_key,
-            ),
+            hash=_prefix_hash(text[:anchor], request_kind=kind, secret=self._secret),
             text=text,
-            client_key=client_key,
         )
 
     def lookup(self, fingerprint: KvFingerprint | None) -> dict | None:
@@ -336,22 +311,17 @@ class KvAffinityStore:
         if not self.enabled or fingerprint is None:
             return None
         now = self._clock()
-        records = self._records.get(fingerprint.alias)
-        if not records:
-            return None
-        self._prune_alias(fingerprint.alias, now)
+        self._prune(now)
         best: dict | None = None
         hashes: dict[int, str] = {}
-        for (length, stored_hash), record in list(records.items()):
+        for (length, stored_hash), record in list(self._records.items()):
             if length > fingerprint.anchor_bytes or length > fingerprint.total_bytes:
                 continue
             if length not in hashes:
                 hashes[length] = _prefix_hash(
                     fingerprint.text[:length],
-                    alias=fingerprint.alias,
                     request_kind=fingerprint.request_kind,
                     secret=self._secret,
-                    client_key=fingerprint.client_key,
                 )
             if hashes[length] != stored_hash:
                 continue
@@ -364,8 +334,7 @@ class KvAffinityStore:
         best["last_used"] = now
         best["hits"] = int(best.get("hits") or 0) + 1
         best_key = (int(best.get("anchor_bytes") or 0), str(best.get("hash") or ""))
-        records.move_to_end(best_key)
-        self._order.move_to_end((fingerprint.alias, best_key[0], best_key[1]))
+        self._records.move_to_end(best_key)
         out = dict(best)
         out["matched_anchor_bytes"] = int(best.get("anchor_bytes") or 0)
         return out
@@ -387,14 +356,12 @@ class KvAffinityStore:
         if not provider_id or not model_id:
             return
         now = self._clock()
-        self._prune_alias(fingerprint.alias, now)
-        records = self._records.setdefault(fingerprint.alias, OrderedDict())
+        self._prune(now)
         key = (fingerprint.anchor_bytes, fingerprint.hash)
-        record = records.get(key)
+        record = self._records.get(key)
         if record is None:
             record = {
-                "version": 1,
-                "alias": fingerprint.alias,
+                "version": 2,
                 "anchor_bytes": fingerprint.anchor_bytes,
                 "hash": fingerprint.hash,
                 "cache_group": str(cache_group or model_id),
@@ -405,8 +372,7 @@ class KvAffinityStore:
                 "hits": 0,
                 "last_reason": str(reason or ""),
             }
-            records[key] = record
-            self._order[(fingerprint.alias, key[0], key[1])] = None
+            self._records[key] = record
         else:
             record.update(
                 {
@@ -418,23 +384,14 @@ class KvAffinityStore:
                     "last_reason": str(reason or ""),
                 }
             )
-            self._order.move_to_end((fingerprint.alias, key[0], key[1]))
-        records.move_to_end(key)
-        self._enforce_bounds(fingerprint.alias)
+            self._records.move_to_end(key)
+        self._enforce_bounds()
 
     def forget_prefix(self, fingerprint: KvFingerprint | None) -> None:
         """Remove the exact record for one fingerprint."""
         if fingerprint is None:
             return
-        records = self._records.get(fingerprint.alias)
-        if not records:
-            return
-        key = (fingerprint.anchor_bytes, fingerprint.hash)
-        if key in records:
-            del records[key]
-            self._order.pop((fingerprint.alias, key[0], key[1]), None)
-        if not records:
-            self._records.pop(fingerprint.alias, None)
+        self._records.pop((fingerprint.anchor_bytes, fingerprint.hash), None)
 
     def forget_candidate(self, provider: str, model: str) -> None:
         """Invalidate every prefix routed to one concrete executor."""
@@ -442,54 +399,32 @@ class KvAffinityStore:
         model_id = str(model or "").strip()
         if not provider_id or not model_id:
             return
-        for alias, records in list(self._records.items()):
-            for key, record in list(records.items()):
-                if record.get("provider") == provider_id and record.get("model") == model_id:
-                    del records[key]
-                    self._order.pop((alias, key[0], key[1]), None)
-            if not records:
-                self._records.pop(alias, None)
+        for key, record in list(self._records.items()):
+            if record.get("provider") == provider_id and record.get("model") == model_id:
+                self._records.pop(key, None)
 
     def clear(self) -> None:
         """Drop every affinity record."""
         self._records.clear()
-        self._order.clear()
 
     def stats(self) -> dict:
         """Return a small diagnostic snapshot without prompt content."""
         return {
             "enabled": self.enabled,
-            "aliases": len(self._records),
-            "records": sum(len(records) for records in self._records.values()),
+            "records": len(self._records),
             "ttl_seconds": self.ttl_seconds,
         }
 
-    def _prune_alias(self, alias: str, now: float) -> None:
-        """Remove expired records for one alias."""
-        records = self._records.get(alias)
-        if not records:
-            return
-        for key, record in list(records.items()):
+    def _prune(self, now: float) -> None:
+        """Remove expired records."""
+        for key, record in list(self._records.items()):
             if float(record.get("expires_at") or 0) <= now:
-                del records[key]
-                self._order.pop((alias, key[0], key[1]), None)
-        if not records:
-            self._records.pop(alias, None)
+                self._records.pop(key, None)
 
-    def _enforce_bounds(self, alias: str) -> None:
-        """Apply per-alias and global LRU limits."""
-        records = self._records.get(alias)
-        if records is not None:
-            while len(records) > self.max_entries_per_alias:
-                key, _ = records.popitem(last=False)
-                self._order.pop((alias, key[0], key[1]), None)
-        while len(self._order) > self.max_entries:
-            (old_alias, length, digest), _ = self._order.popitem(last=False)
-            old_records = self._records.get(old_alias)
-            if old_records is not None:
-                old_records.pop((length, digest), None)
-                if not old_records:
-                    self._records.pop(old_alias, None)
+    def _enforce_bounds(self) -> None:
+        """Apply the global LRU limit."""
+        while len(self._records) > self.max_entries:
+            self._records.popitem(last=False)
 
 
 class ModelReadinessTracker:

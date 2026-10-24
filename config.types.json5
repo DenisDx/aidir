@@ -364,11 +364,11 @@
         },
       },
 
-      // One upstream candidate of a first_available model.
+      // One upstream candidate of a smart model.
       provider_ref: {
         typedef: "provider_ref",
         type: "object",
-        description: "One upstream candidate of a first_available model",
+        description: "One upstream candidate of a smart model",
         children: {
           provider: {
             type: "string",

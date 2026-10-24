@@ -115,18 +115,41 @@ class BaseEndpoint(ABC):
             status_code=401,
         )
 
-    def _peer_auth_mode(self, block: object) -> str:
+    def _default_peer_auth_mode(self) -> str:
+        """Return the configured default peer mode; unknown values fail closed."""
+        core = getattr(self, "_core", None)
+        raw = core.config.get("default_auth_mode", "endpoint") if core else "endpoint"
+        tokens = str(raw or "endpoint").strip().lower().split()
+        if "endpoint" in tokens:
+            return "endpoint"
+        if "disabled" in tokens:
+            return "disabled"
+        log(
+            "http",
+            "warning",
+            f"Invalid default_auth_mode {raw!r}; using endpoint",
+            self.id or None,
+        )
+        return "endpoint"
+
+    def _peer_auth_mode(self, block: object, default: str = "disabled") -> str:
         """Return the publication mode of a peer block.
 
-        `disabled` is the default: an existing multi-instance deployment keeps
-        publishing its read-only task list and resource inventory on a trusted
-        network. `endpoint` turns the token requirement on explicitly.
+        An explicit `auth_mode` wins. Otherwise the root `default_auth_mode`
+        applies. `disabled` publishes read-only state on a trusted network;
+        `endpoint` requires the normal token.
         """
         config = block if isinstance(block, dict) else {}
-        mode = str(config.get("auth_mode") or "disabled").strip().lower()
-        if mode not in {"disabled", "endpoint"}:
-            return "disabled"
-        return mode
+        mode = str(config.get("auth_mode") or default).strip().lower()
+        if mode in {"disabled", "endpoint"}:
+            return mode
+        log(
+            "http",
+            "warning",
+            f"Invalid peer auth_mode {mode!r}; using {default}",
+            self.id or None,
+        )
+        return default if default in {"disabled", "endpoint"} else "endpoint"
 
     @staticmethod
     def _normalize_utc(value: datetime | None) -> datetime | None:

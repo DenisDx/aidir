@@ -6,8 +6,10 @@ item that survived the two previous rounds
 ([proposal_update1.md](proposal_update1.md), [proposal_update_3.md](proposal_update_3.md))
 and every item that the older documents still carry.
 
-Constraint: this document is analysis + proposals only; no existing files are
-modified by it. Like every other proposal it is written once and then frozen.
+Constraint: this document is analysis + proposals only. It is the latest
+`proposal_update` and therefore stays open for status changes until a
+higher-numbered proposal supersedes it. Older `proposal_update*` documents are
+closed.
 
 Item numbering uses the `W` prefix so that it does not collide with the `U`
 items of `proposal_update1.md` or the `V` items of `proposal_update_3.md`. Every
@@ -28,25 +30,25 @@ Priority meaning:
 | # | Area | Pri | Item | Source |
 |---|---|---|---|---|
 | W1 | Security | P2 | The MCP endpoint, the queue-depth routes and the model lists can require a token, but the default stays off | U17, U18 (the auth half) |
-| W2 | Security | P2 | The peer task list and the peer resource inventory now need a token, which the reading side must carry | U19 |
-| W3 | Security | P2 | The WebUI passwords are plaintext and there is no login rate limiting | U22 |
+| W2 | Security | P2 | The peer task list and the peer resource inventory need a configurable default authentication mode | U19 |
+| W3 | Security | P2 | WebUI authentication stores plaintext passwords and has no login rate limiting; deferred to ROADMAP | U22 |
 | W4 | Security | P2 | `web_fetch` has no SSRF guard: a loopback, private or metadata address is reachable | U23 |
 | W5 | Security | P2 | `exec_cmd` remains writable through the settings editor, and a write is a command-execution chain | U27 |
 | W6 | Security | P3 | The log WebSocket accepts the session token in the query string, where it lands in the access log | U28 |
 | W7 | Security | P2 | There is no CSRF token anywhere | U20 |
 | W8 | Security | P2 | Logout deletes only the cookie's session; a session established with the `Authorization` header stays alive | U21 |
-| W9 | Security | P2 | The session namespace is now per instance, but the old sessions are still accepted | V9 |
+| W9 | Security | P2 | Closed: the legacy session namespace is no longer accepted | V9 |
 | W10 | Routing | P2 | The scheduler's router cannot probe the OpenAI-family providers, so their candidates are classified `provider_down` | U6, V11 (the OpenAI-family half) |
 | W11 | Routing | P2 | The affinity store is process-local; there is no Redis mirror | U7, V11 |
 | W12 | Routing | P2 | The context fingerprint is not forwarded across instances | U8 |
 | W13 | Routing | P3 | The 20-message trim breaks conversational prefix reuse | U11, V13 |
-| W14 | Routing | P3 | Only `first_available` is implemented, although the descriptor permits `direct` | U9 |
-| W15 | Routing | P3 | There is no per-alias affinity opt-out | U10 |
+| W14 | Routing | P3 | Both `first_available` and the single-candidate `direct` strategy are implemented | U9 |
+| W15 | Routing | P3 | Closed: affinity depends only on the context, so there is no per-alias partition | U10 |
 | W16 | Scheduling | P2 | The deferral loop is a busy poll | U13 |
 | W17 | Scheduling | P2 | `_select_worker` ignores the provider | U12 |
 | W18 | Scheduling | P3 | The admission lock is a single global lock | U14 |
 | W19 | Scheduling | P3 | Equal-priority tasks are ordered by task id, not by arrival time | U15 |
-| W20 | Task model | P2 | The retry state is not persisted in the task hash | U16, V20 |
+| W20 | Task model | P2 | The retry and fallback state is not fully persisted in the task hash | U16, V20 |
 | W21 | Task model | P2 | The envid contexts in Redis never expire | U2 |
 | W22 | Observability | P2 | The audit writer drops events under the default `best_effort` policy | U29 |
 | W23 | Observability | P2 | `cleanup_stale_tasks` is an empty stub | U31 |
@@ -54,7 +56,7 @@ Priority meaning:
 | W25 | Protocol | P2 | The Anthropic stream encoder never emits `signature_delta` | U34 |
 | W26 | Protocol | P3 | `count_tokens` is a `chars/4` heuristic | U35 |
 | W27 | Interface | P2 | A task that waits on a remote cannot be canceled where it actually is | V13 |
-| W28 | Interface | P3 | The orphan count is not a row of the health card | V15 |
+| W28 | Interface | P3 | Closed: the orphan count is already rendered by the existing health card | V15 |
 | W29 | Interface | P3 | The doctor reports a foreign namespace but does not remove it | V17 |
 | W30 | Tests | P2 | The envid registry, the MCP endpoint and the context workers have no direct coverage | U37 |
 | W31 | Tests | P2 | The OpenCode Go release gates are open | U38 |
@@ -77,9 +79,25 @@ Priority meaning:
 | W48 | Tooling | P3 | The example configurations and the installation scripts for a configuration set | `TODO.md` |
 | W49 | Documentation | P3 | The security analysis of `_proposal_update_1.md` has no recorded resolution | `_proposal_update_1.md` F1–F13 |
 
+### 1.1 Decisions of 2026-10-24
+
+| Item | Decision | State |
+|---|---|---|
+| W1 | `require_auth` keeps its default `false`, including the MCP API. The doctor `auth` check must report an MCP endpoint without a token. A dashboard security panel is a separate proposal. | Doctor coverage already exists; panel proposed in [proposal_security_dashboard.md](proposal_security_dashboard.md). |
+| W2 | Add root `default_auth_mode`. Its default is `endpoint`; the shipped configurations set `disabled` until peers carry tokens. An explicit peer `auth_mode` overrides it. | Implemented in this round. |
+| W9 | Remove the legacy session fallback now; only the instance-scoped key is valid. | Implemented in this round. |
+| W14 | Implement `direct` as a smart model with exactly one candidate, subject to normal admission. | Implemented in this round. |
+| W15 | Affinity depends only on the request context. Alias and client keys no longer affect the identity. | Implemented in this round; per-alias opt-out is obsolete. |
+| W3 | Replace the plaintext password login with a browser-side password-derived key pair. The server stores only a public key, salt and KDF parameters. The password is never sent to the server. | Deferred to [ROADMAP.md](ROADMAP.md); the interim `sha256$` scheme is withdrawn. |
+| W4 | `web_fetch` SSRF protection is in scope but deferred. | Moved to [ROADMAP.md](ROADMAP.md). |
+| W5 | `exec_cmd` through the settings editor is deferred; it changes the settings contract. | Moved to [ROADMAP.md](ROADMAP.md). |
+| W7 | CSRF protection is deferred; it needs a design that covers the settings editor, WebSockets and non-cookie clients. | Moved to [ROADMAP.md](ROADMAP.md). |
+| W20 | `fallback_index` and `retry_attempt` were already persisted. The missing fields are `fallbacks`, `next_retry_at` and `on_reject`. | Corrected and implemented in this round. |
+| W28 | The orphan count is already in the execution-health payload and the existing card renders it. A separate health-card row is not wanted. | Closed. |
+| W34, W37, W49 | The new lifecycle rules supersede the old freeze rule: older `proposal_update*` documents are closed, while non-update proposals keep their own status. The historical security analysis is not edited in place. | Resolved by policy; no content edits to closed documents. |
+
 **Deferred, unchanged:** the middleware chain and the `before_tools` extension.
-They are recorded in [SPEC_NEW.md](SPEC_NEW.md) §14.4 and need their own
-proposals.
+They are recorded in [SPEC.md](SPEC.md) §14.4 and need their own proposals.
 
 **Not ours:** the items of [aiset/proposal_improvement2.md](aiset/proposal_improvement2.md).
 `aiset` is a separate project with its own owner; nothing here blocks aidir.
@@ -151,15 +169,15 @@ previous round:
 
 | # | Problem | Where | Note |
 |---|---|---|---|
-| W1 | The MCP endpoint, the queue-depth routes and the model lists can require a token, but the default stays off | `core/endpoints/endpoint_mcp.py`, `core/endpoints/endpoint_openaix.py` | The MCP endpoint had **no** authentication at all, so requiring one closes a hole rather than changing a contract — which is why the shipped template turns it on. The inference traffic of the OpenAIx endpoint has always accepted an anonymous request, and flipping that default would break every deployment without a token. Decide whether the default of `require_auth` should become `true` for the `mcp` api, and what a fresh install without a token should do. The doctor check `auth` reports every open surface with the exact configuration to add. |
-| W2 | The peer task list and the peer resource inventory now need a token, which the reading side must carry | `core/endpoints/endpoint_openaix.py`, `webui/backend/app.py` | The reading side — the dashboard's peer fetch and the scheduler's peer probe — already sends the provider's `auth` headers. The configuration of the two `api: "openaix"` providers on the investigated machine carries **no** credentials, so those peers are currently unreadable. The README and the doctor say what to add. Decide whether a peer that answers `401` should fall back to the local estimation of its capacity. |
-| W3 | The WebUI passwords are plaintext and there is no login rate limiting | `webui/backend/app.py` | A hashed-password scheme (`sha256$…`) and a per-login counter with a short TTL. |
-| W4 | `web_fetch` has no SSRF guard | `workers/tool/web_fetch/app.py` | Reject a loopback, private or link-local target, and re-check after every redirect. |
-| W5 | `exec_cmd` is writable through the settings editor | `config.descriptor.json5` | Either a dedicated permission, or move it out of the editable document into the environment. |
+| W1 | The MCP endpoint, the queue-depth routes and the model lists can require a token, but the default stays off | `core/endpoints/endpoint_mcp.py`, `core/endpoints/endpoint_openaix.py` | The MCP endpoint had **no** authentication at all, so requiring one closes a hole rather than changing a contract. The inference traffic of the OpenAIx endpoint has always accepted an anonymous request, and flipping that default would break every deployment without a token. Decision: keep `require_auth` at `false` for every API, including `mcp`. The doctor check `auth` reports every open surface with the exact configuration to add. The dashboard security panel is a separate proposal. |
+| W2 | The peer task list and the peer resource inventory need a configurable default authentication mode | `core/endpoints/endpoint_openaix.py`, `webui/backend/app.py` | The reading side — the dashboard's peer fetch and the scheduler's peer probe — already sends the provider's `auth` headers. The configuration of the two `api: "openaix"` providers on the investigated machine carries **no** credentials, so those peers are currently unreadable. Decision: the root `default_auth_mode` key controls the default for every peer surface. It defaults to `endpoint`; the shipped configurations set `disabled` until the reading side carries tokens. An explicit peer `auth_mode` overrides it. A peer that answers `401` keeps the existing local-estimation fallback. |
+| W3 | The WebUI passwords are plaintext and there is no login rate limiting | `webui/backend/app.py` | Deferred. The planned replacement derives a signing key pair in the browser from the password and a per-user salt; the server stores only the public key. The browser signs a fresh challenge, so the password never leaves the client. Rate limiting remains required. See [ROADMAP.md](ROADMAP.md) for the threat model, migration and recovery questions. |
+| W4 | `web_fetch` has no SSRF guard | `workers/tool/web_fetch/app.py` | Deferred. Reject a loopback, private or link-local target, and re-check after every redirect. See [ROADMAP.md](ROADMAP.md). |
+| W5 | `exec_cmd` is writable through the settings editor | `config.descriptor.json5` | Deferred. Either a dedicated permission, or move it out of the editable document into the environment. See [ROADMAP.md](ROADMAP.md). |
 | W6 | The log WebSocket accepts the token in the query string | `webui/backend/app.py` | The cookie is enough; the query parameter lands in the access log. |
-| W7 | There is no CSRF token | `webui/backend/app.py` | A double-submit token on every state-changing request. The only protection today is `samesite=strict`. |
+| W7 | There is no CSRF token | `webui/backend/app.py` | Deferred. A double-submit token on every state-changing request. The only protection today is `samesite=strict`. See [ROADMAP.md](ROADMAP.md). |
 | W8 | Logout deletes only the cookie's session | `webui/backend/app.py` | Delete the session the header names too. |
-| W9 | The old session namespace is still accepted | `webui/backend/app.py` | A grace period is right; a removal date should be written down. |
+| W9 | The old session namespace is still accepted | `webui/backend/app.py` | Closed: the legacy fallback is removed; only the instance-scoped key is accepted. |
 | W39 | `/api/test/agent` accepts an unbounded client-supplied timeout | `webui/backend/app.py:1729` | Clamp `_timeout` to a maximum. |
 | W40 | The log directory is world-readable | `logs/` | The directory and the files inside it hold the request and response bodies of every task. Create them with `0700` and have the doctor report the mode. |
 | W41 | Redis has no password by default | `.env.example`, `docker-compose.yml` | The Redis port is published on loopback by default, but the instance id and the data are unprotected if the bind is widened. Generate a password when the bind is not loopback, and have the doctor report it. |
@@ -172,8 +190,8 @@ previous round:
 | W11 | The affinity store is process-local | `core/kv_affinity.py` | A Redis mirror, with the in-process cache as the hot path. A restart currently loses every mapping. |
 | W12 | The fingerprint is not forwarded across instances | `core/endpoints/endpoint_ollama.py` | An `X-Aidir-KV-Fingerprint` header next to the route trace. Without it the receiver recomputes the hash from a possibly different view of the payload. |
 | W13 | The 20-message trim breaks prefix reuse | `workers/agent/openaix/app.py` | The hash must describe the payload the executor actually receives, and the trim must apply in every transport, not only in `openaix`. |
-| W14 | Only `first_available` is implemented | `core/smart_router.py` | Either implement `direct` or remove it from the descriptor. The descriptor promises it and the runtime answers HTTP 400. |
-| W15 | There is no per-alias affinity opt-out | `core/kv_affinity.py` | `proposal_kv_keeper.md` deferred it explicitly. |
+| W14 | The descriptor promised `direct`, but only `first_available` was implemented | `core/smart_router.py` | Closed: `direct` requires exactly one candidate and resolves under the normal admission rules. A different count is HTTP 400. |
+| W15 | The affinity identity was partitioned by alias, with no opt-out | `core/kv_affinity.py` | Closed by making the identity context-only: alias and client keys no longer partition the store, so a per-alias switch is unnecessary. `max_entries_per_alias` and `honor_prompt_cache_key` are deprecated and ignored. |
 | W16 | The deferral loop is a busy poll | `core/scheduler.py` | An adaptive interval, and one probe per candidate shared by the blocked tasks. |
 | W17 | `_select_worker` ignores the provider | `core/scheduler.py` | Verify that the selected worker can serve the resolved model; today a task pinned to a worker whose provider cannot serve the model reaches that worker and fails there. |
 | W18 | The admission lock is a single global lock | `core/resources.py` | A per-resource or striped lock. |
@@ -184,7 +202,7 @@ previous round:
 
 | # | Problem | Where | Note |
 |---|---|---|---|
-| W20 | The retry state is not persisted | `core/task.py` | `fallbacks`, `fallback_index`, `retry_attempt`, `next_retry_at` and `on_reject` are lost when a task round-trips through Redis, so a restored task starts its fallback chain from the beginning. |
+| W20 | The retry state is not fully persisted | `core/task.py` | Closed: `fallbacks`, `next_retry_at` and `on_reject` now survive a Redis round trip, together with the already-persisted `fallback_index` and `retry_attempt`. |
 | W21 | The envid contexts never expire | `core/envid.py` | The declared `store_duration_minutes` is read by nobody, and no cron job prunes `{ns}:ctx:*`. |
 | W22 | The audit writer drops events | `core/audit_log.py` | Under the default `best_effort` the event is dropped and the caller does not see it. Bound the `durable` wait, and show the drop count in the health panel. |
 | W23 | `cleanup_stale_tasks` is a stub | `core/cron.py` | A worker heartbeat, then a task whose worker is gone is failed. |
@@ -206,7 +224,7 @@ previous round:
 | # | Problem | Where |
 |---|---|---|
 | W27 | A task that waits on a remote cannot be canceled where it is | The dashboard offers the remote instance for a task that waits on one, so a cancel reaches the holder. |
-| W28 | The orphan count is not a row of the health card | The count is in the status and the cron cycle publishes it; the card lists only the waiting tasks and the failed providers. |
+| W28 | The orphan count is not a row of the health card | Closed. The count is in the status and the existing card renders it; a separate row is not wanted. |
 | W29 | The doctor reports a foreign namespace but does not remove it | The data of another instance is the operator's decision, so the check only reports. A `--fix-all` repair would need the confirmation the other destructive repairs have. |
 
 ### 3.6 The tests and the documentation
@@ -232,11 +250,14 @@ previous round:
 
 | Round | Items | Why |
 |---|---|---|
-| **1** | W3, W4, W7, W8, W39, W40, W41 | The security items that do not change a contract: the password hashing, the SSRF guard, the CSRF token, the logout, the timeout clamp, the log permissions, the Redis password |
+| **1** | W4, W7, W8, W39, W40, W41 | The security items that do not change a contract: the SSRF guard, the CSRF token, the logout, the timeout clamp, the log permissions, the Redis password |
 | **2** | W10, W16, W17, W20, W21 | The routing and the task model, where a mistake costs capacity or a stuck task |
 | **3** | W30, W31, W32, W47 | The test coverage and the acceptance that needs a person |
 | **4** | W11, W12, W13, W14, W15, W45 | The affinity features, as one round: they change the routing semantics together |
-| **5** | W22, W23, W24, W25, W26, W27, W28, W29, W33–W38, W40–W49 | The remainder, in any order |
+| **5** | W22, W23, W24, W25, W26, W27, W28, W29, W33–W38, W42–W49 | The remainder, in any order |
+
+W3 is deferred to [ROADMAP.md](ROADMAP.md): it changes the authentication
+contract and needs a threat model, enrollment/migration and recovery design.
 
 Two rules that apply to every round:
 

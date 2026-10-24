@@ -467,7 +467,6 @@ class SchedulerDispatchTests(unittest.IsolatedAsyncioTestCase):
         task = _task()
         task.payload = payload
         fingerprint = store.fingerprint(
-            "local-only",
             {"model": "local-only", "messages": payload["messages"]},
         )
         store.remember(fingerprint, provider="remote_aidir_110", model="m-remote", cache_group="m-remote")

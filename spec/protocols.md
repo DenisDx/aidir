@@ -1,7 +1,7 @@
 # aidir — Protocol and API reference
 
-> Satellite document of [SPEC_NEW.md](../SPEC_NEW.md). See
-> [§5 Protocols and APIs](../SPEC_NEW.md#5-protocols-and-apis) there for the
+> Satellite document of [SPEC.md](../SPEC.md). See
+> [§5 Protocols and APIs](../SPEC.md#5-protocols-and-apis) there for the
 > architecture context.
 >
 > This document describes the complete HTTP surface: every route, the request and
@@ -385,9 +385,11 @@ credentials and the consumer list are never exposed.
 
 No request or response bodies are exposed.
 
-**`auth_mode`** on the peer's `openaix` endpoint governs both families:
-`disabled` (default) publishes them unauthenticated; `endpoint` requires the normal
-bearer-token and environment authorization checks.
+**`auth_mode`** on the peer's `openaix` endpoint governs both families. An
+explicit value wins; otherwise the root `default_auth_mode` applies. The root
+default is `endpoint`; the shipped configurations set `disabled` for existing
+deployments. `disabled` publishes the families unauthenticated; `endpoint`
+requires the normal bearer-token and environment authorization checks.
 
 ---
 

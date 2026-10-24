@@ -52,6 +52,13 @@ class Endpoint_openaix(Endpoint_ollama):
     def create_app(self, core) -> FastAPI:
         """Create FastAPI app exposing both ollama and openai chat endpoints."""
         self._core = core
+        default_auth_mode = self._default_peer_auth_mode()
+        self._peer_resources_auth_mode = self._peer_auth_mode(
+            self._cfg.get("peer_resources"), default_auth_mode
+        )
+        self._peer_tasks_auth_mode = self._peer_auth_mode(
+            self._cfg.get("peer_tasks"), default_auth_mode
+        )
         app = FastAPI(title=f"aidir-{self.id}", docs_url=None, redoc_url=None)
         app.add_middleware(
             RequestBodyLimitMiddleware,

@@ -106,9 +106,19 @@ class TestPeerResources(unittest.TestCase):
         endpoint = Endpoint_openaix({"id": "openaix", **endpoint_config})
         return TestClient(endpoint.create_app(_Core(config)))
 
-    def test_resources_are_public_by_default(self) -> None:
-        """An existing deployment keeps publishing its inventory without configuration."""
+    def test_resources_require_auth_by_default(self) -> None:
+        """The root default is endpoint, so an unconfigured peer is not public."""
         with self._client({}, {"http": {"max_request_size": 1024}}) as client:
+            response = client.get("/v1/resources/gpu")
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_resources_can_be_public_through_the_root_default(self) -> None:
+        """The shipped disabled default keeps an existing deployment public."""
+        with self._client(
+            {},
+            {"http": {"max_request_size": 1024}, "default_auth_mode": "disabled"},
+        ) as client:
             response = client.get("/v1/resources/gpu")
 
         self.assertEqual(response.status_code, 200)
@@ -181,15 +191,54 @@ class TestPeerResources(unittest.TestCase):
         self.assertEqual(response.json()["protocol_version"], 1)
         self.assertEqual(response.json()["data"][0]["id"], "gpu")
 
-    def test_peer_tasks_are_public_by_default(self) -> None:
-        """An existing deployment keeps publishing its task list without configuration."""
+    def test_peer_tasks_require_auth_by_default(self) -> None:
+        """The root default is endpoint, so an unconfigured task list is not public."""
         core = _Core({"http": {"max_request_size": 1024}, "instance": "remote-aidir"}, [])
         endpoint = Endpoint_openaix({"id": "openaix", "api": "openaix"})
 
         with TestClient(endpoint.create_app(core)) as client:
             response = client.get("/v1/tasks")
 
+        self.assertEqual(response.status_code, 401)
+
+    def test_peer_tasks_can_be_public_through_the_root_default(self) -> None:
+        """The shipped disabled default keeps an existing deployment public."""
+        core = _Core(
+            {
+                "http": {"max_request_size": 1024},
+                "instance": "remote-aidir",
+                "default_auth_mode": "disabled",
+            },
+            [],
+        )
+        endpoint = Endpoint_openaix({"id": "openaix", "api": "openaix"})
+
+        with TestClient(endpoint.create_app(core)) as client:
+            response = client.get("/v1/tasks")
+
         self.assertEqual(response.status_code, 200)
+
+    def test_root_default_parses_a_keyword_list_and_fails_closed(self) -> None:
+        """Whitespace-separated keywords work; an unknown value still requires auth."""
+        for value, expected in (
+            ("disabled endpoint", 401),
+            ("endpoint disabled", 401),
+            ("unexpected", 401),
+            ("disabled", 200),
+        ):
+            with self.subTest(value=value):
+                core = _Core(
+                    {
+                        "http": {"max_request_size": 1024},
+                        "instance": "remote-aidir",
+                        "default_auth_mode": value,
+                    },
+                    [],
+                )
+                endpoint = Endpoint_openaix({"id": "openaix", "api": "openaix"})
+                with TestClient(endpoint.create_app(core)) as client:
+                    response = client.get("/v1/tasks")
+                self.assertEqual(response.status_code, expected)
 
     def test_peer_tasks_are_public_by_default_and_omit_bodies(self) -> None:
         """Expose active task summaries without request or response payloads."""
