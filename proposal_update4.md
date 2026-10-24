@@ -1,17 +1,16 @@
 # Proposal: aidir Update Round 4
 
-Date: 2026-10-23. Status snapshot: 2026-10-24.
+Date: 2026-10-23. Closed: 2026-10-24.
 
 Scope: the complete Round 4 ledger. It collects every item that survived the two
 previous rounds ([proposal_update1.md](proposal_update1.md),
 [proposal_update_3.md](proposal_update_3.md)) and every item that the older
-documents still carried. The status snapshot in §1.1 lists the three items
-that remain.
+documents still carried. All 49 items are resolved; the three external,
+acceptance and tooling items were transferred to [ROADMAP.md](ROADMAP.md) at the
+user's request so that the Round 4 ledger can close.
 
-Constraint: this document is analysis + proposals only. It is the latest
-`proposal_update` and therefore stays open for status changes until a
-higher-numbered proposal supersedes it. Older `proposal_update*` documents are
-closed.
+Status: **closed**. Do not add new work here; open a new
+`proposal_update5.md` or a named proposal instead.
 
 Item numbering uses the `W` prefix so that it does not collide with the `U`
 items of `proposal_update1.md` or the `V` items of `proposal_update_3.md`. Every
@@ -61,7 +60,7 @@ Priority meaning:
 | W28 | Interface | P3 | Closed: the orphan count is already rendered by the existing health card | V15 |
 | W29 | Interface | P3 | Closed by decision: deleting another instance's data is the operator's action; the check reports only. |
 | W30 | Tests | P2 | Closed: `test_context_components.py` covers the registry, MCP and all three context workers | U37 |
-| W31 | Tests | P2 | Open: the OpenCode Go release gates include focused managed-session/redaction tests and a live smoke test that needs an external deployment | U38 |
+| W31 | Tests | P2 | Deferred to ROADMAP: the OpenCode Go release gates include focused managed-session/redaction tests and a live smoke test; release tracking stays in `proposal_opencode_go.md` | U38 |
 | W32 | Tests | P3 | Closed: renamed to `probe_context_overflow.py` and `probe_timeout_semantics_live.py`; `TEST.md` lists both probes. |
 | W33 | Documentation | P3 | Closed: the removed routes are gone from the table. |
 | W34 | Documentation | P3 | Closed by policy: older non-update proposals keep their own status and are not edited in place | U42 |
@@ -77,18 +76,17 @@ Priority meaning:
 | W44 | Protocol | P3 | Closed: the unused keyword is removed | U36 |
 | W45 | Routing | P3 | Closed: remote probes are cached for one second and concurrent probes for the same provider/model/priority share one in-flight call. |
 | W46 | Protocol | P2 | Closed by decision: each attempt gets the full run budget and inter-attempt waits are not charged to it | `spec_timeouts.md` TBD |
-| W47 | Acceptance | P2 | Open: the generated editor still needs a human browser acceptance through nginx | `plan_aiset_integration.md`, `TEST.md` 7.1 |
-| W48 | Tooling | P3 | Open (P3): several selectable `<name>.json5.example` sets and installation scripts for a full configuration set | `TODO.md` |
+| W47 | Acceptance | P2 | Deferred to ROADMAP: the generated editor still needs a human browser acceptance through nginx; the procedure stays in `TEST.md` 7.1 | `plan_aiset_integration.md`, `TEST.md` 7.1 |
+| W48 | Tooling | P3 | Deferred to ROADMAP: several selectable `<name>.json5.example` sets and installation scripts for a full configuration set | `TODO.md` |
 | W49 | Documentation | P3 | Closed by policy: the historical analysis is not rewritten; later rounds record their resolutions in their own ledgers | `_proposal_update_1.md` F1–F13 |
 
 ### 1.1 Status snapshot (2026-10-24)
 
-The Round 4 implementation and documentation pass is complete except for the
-three items below. Of the 49 ledger items, 42 are closed, 4 are deferred to
-[ROADMAP.md](ROADMAP.md) (W3, W4, W5, W7), and 3 remain open: W31 (external
-OpenCode Go release gates including a live smoke), W47 (human browser
-acceptance), and W48 (P3 example configurations and installation scripts).
-No other item is waiting for code or documentation changes.
+The Round 4 ledger is closed. Of the 49 items, 42 are closed and 7 are deferred
+to [ROADMAP.md](ROADMAP.md): W3, W4, W5, W7, W31, W47 and W48. No item remains
+open in this document. W31 also remains a release gate in
+[proposal_opencode_go.md](proposal_opencode_go.md), W47 remains an acceptance
+step in `TEST.md` 7.1, and W48 remains a tooling note in `TODO.md`.
 
 ### 1.2 Decisions of 2026-10-24
 
@@ -243,7 +241,7 @@ previous round:
 | # | Problem | Where |
 |---|---|---|
 | W30 | The envid registry, the MCP endpoint and the three context workers have no direct coverage | Closed: `test_context_components.py` covers the registry round trip, MCP health/initialize, and all three context workers. |
-| W31 | The seven OpenCode Go release gates are open | Open: `proposal_opencode_go.md` — the focused managed-session and redaction tests, the health-probe regression, the error-code normalization, and the redacted fixtures with a live smoke |
+| W31 | The seven OpenCode Go release gates are open | Deferred to `ROADMAP.md`: the focused managed-session and redaction tests, the health-probe regression, the error-code normalization, and the redacted fixtures with a live smoke. Release tracking stays in `proposal_opencode_go.md`. |
 | W32 | Two CLI probes match the `test_*.py` discovery glob | Closed: renamed to `probe_context_overflow.py` and `probe_timeout_semantics_live.py`; `TEST.md` lists both probes. |
 | W33 | The README's route table lists `/api/config*` | Closed: the removed routes are gone from the table. |
 | W34 | `proposal_hooks.md` says both bundled hooks ship disabled | Closed by policy: older non-update proposals keep their own status and are not edited in place. |
@@ -251,22 +249,23 @@ previous round:
 | W36 | The plan documents quote stale test counts | Closed: the plans no longer quote a fixed suite count. |
 | W37 | The proposal status lines are stale | Closed by policy: each non-update proposal owns its status line. |
 | W38 | `logging.logs` / `logging.log_overrides` is read but not declared | `config.descriptor.json5` — Closed: both maps are declared with bounded per-file settings. |
-| W47 | The browser acceptance of the generated editor has not been done | Open: `plan_aiset_integration.md`, `TEST.md` 7.1 — the step that needs a human, through nginx. |
-| W48 | The example configurations and the installation scripts | Open (P3): `TODO.md` — several `<name>.json5.example` configurations selectable at install time, and the installation scripts for a configuration set (aidir + sndbx + ollama). |
+| W47 | The browser acceptance of the generated editor has not been done | Deferred to `ROADMAP.md`: the step needs a human, through nginx; the procedure stays in `plan_aiset_integration.md` and `TEST.md` 7.1. |
+| W48 | The example configurations and the installation scripts | Deferred to `ROADMAP.md`: several `<name>.json5.example` configurations selectable at install time, and the installation scripts for a configuration set (aidir + sndbx + ollama). |
 | W49 | The security analysis has no recorded resolution | Closed by policy: the historical analysis is not rewritten; later rounds record their resolutions in their own ledgers. |
 
 ---
 
 ## 4. Outcome
 
-The Round 4 implementation and documentation pass is complete except for the
-items below. The closed items and their evidence are recorded in §1 and §3.
+Round 4 is closed. The closed items and their evidence are recorded in §1 and
+§3. The three items that could not be completed in this round were transferred
+to [ROADMAP.md](ROADMAP.md):
 
-| Item | Why it remains open | What closes it |
+| Item | Why it was transferred | Where it remains tracked |
 |---|---|---|
-| W31 | The OpenCode Go release gates need focused managed-session and redaction tests plus a live deployment | A focused test round and a live `/v1/models` + Chat Completions + SSE smoke against OpenCode Go |
-| W47 | The generated settings editor needs a person to accept it through nginx | A recorded browser acceptance pass in `TEST.md` 7.1 |
-| W48 | P3 tooling for several selectable configuration sets and their installation scripts | The example files and the installation scripts requested in `TODO.md` |
+| W31 | The OpenCode Go release gates need focused managed-session and redaction tests plus a live deployment | `ROADMAP.md`, `proposal_opencode_go.md` |
+| W47 | The generated settings editor needs a person to accept it through nginx | `ROADMAP.md`, `TEST.md` 7.1 |
+| W48 | P3 tooling for several selectable configuration sets and their installation scripts | `ROADMAP.md`, `TODO.md` |
 
 Two rules applied to every completed item:
 
@@ -274,4 +273,4 @@ Two rules applied to every completed item:
    commit.** The route tables, the descriptor and the apply policies are the
    contract; the code follows them.
 2. **No half-implemented promise.** Either an item is done and observable, or it
-   is recorded as open or deferred above.
+   is recorded as deferred above.

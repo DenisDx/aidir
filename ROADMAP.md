@@ -101,6 +101,44 @@ WebSocket routes and API clients that do not use cookies.
 
 Source: `proposal_update4.md` W7 / `proposal_update1.md` U20.
 
+## Deferred validation and tooling
+
+### W31: OpenCode Go release validation
+
+Status: deferred from `proposal_update4.md` when Round 4 closed.
+
+The provider transport, routing, session policy, health probe and configuration
+validation are implemented. The remaining release gates are the focused
+managed-session and redaction tests, the health-probe regression, the error-code
+normalization audit, and the redacted synchronous and streaming fixtures with a
+live `/v1/models` + Chat Completions + SSE smoke test against a real OpenCode Go
+deployment.
+
+Tracking: `proposal_opencode_go.md` remains the release-gate document.
+
+Source: `proposal_update4.md` W31 / `proposal_update1.md` U38.
+
+### W47: Browser acceptance of the generated editor
+
+Status: deferred from `proposal_update4.md` when Round 4 closed.
+
+The acceptance pass needs a person to open the generated settings editor through
+nginx, exercise the tree, field validation, apply policies, secret handling and
+the restart banner, and record the result. The procedure stays in `TEST.md` 7.1.
+
+Source: `proposal_update4.md` W47 / `plan_aiset_integration.md`.
+
+### W48: Example configuration sets and installation scripts
+
+Status: deferred from `proposal_update4.md` when Round 4 closed (P3).
+
+`install.sh` already accepts a template name resolved as
+`<name>.json5.example`. The remaining work is to add several selectable example
+sets and the installation scripts for a full configuration set (aidir + sndbx +
+ollama). The notes and the target sequence stay in `TODO.md`.
+
+Source: `proposal_update4.md` W48 / `TODO.md`.
+
 ## Deferred architecture
 
 - The middleware chain and the `before_tools` extension. They are recorded in
