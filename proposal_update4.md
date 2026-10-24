@@ -1,10 +1,12 @@
 # Proposal: aidir Update Round 4
 
-Date: 2026-10-23
-Scope: **the complete ledger of the work that is still open.** It collects every
-item that survived the two previous rounds
-([proposal_update1.md](proposal_update1.md), [proposal_update_3.md](proposal_update_3.md))
-and every item that the older documents still carry.
+Date: 2026-10-23. Status snapshot: 2026-10-24.
+
+Scope: the complete Round 4 ledger. It collects every item that survived the two
+previous rounds ([proposal_update1.md](proposal_update1.md),
+[proposal_update_3.md](proposal_update_3.md)) and every item that the older
+documents still carried. The status snapshot in §1.1 lists the three items
+that remain.
 
 Constraint: this document is analysis + proposals only. It is the latest
 `proposal_update` and therefore stays open for status changes until a
@@ -29,43 +31,43 @@ Priority meaning:
 
 | # | Area | Pri | Item | Source |
 |---|---|---|---|---|
-| W1 | Security | P2 | The MCP endpoint, the queue-depth routes and the model lists can require a token, but the default stays off | U17, U18 (the auth half) |
-| W2 | Security | P2 | The peer task list and the peer resource inventory need a configurable default authentication mode | U19 |
-| W3 | Security | P2 | WebUI authentication stores plaintext passwords and has no login rate limiting; deferred to ROADMAP | U22 |
-| W4 | Security | P2 | `web_fetch` has no SSRF guard: a loopback, private or metadata address is reachable | U23 |
-| W5 | Security | P2 | `exec_cmd` remains writable through the settings editor, and a write is a command-execution chain | U27 |
+| W1 | Security | P2 | Closed by decision: `require_auth` stays `false` for every API; the doctor reports every open surface and the dashboard panel is a separate proposal | U17, U18 (the auth half) |
+| W2 | Security | P2 | Closed: root `default_auth_mode` is implemented, and an explicit peer `auth_mode` overrides it | U19 |
+| W3 | Security | P2 | Deferred to ROADMAP: browser-derived credentials and login rate limiting | U22 |
+| W4 | Security | P2 | Deferred to ROADMAP: `web_fetch` has no SSRF guard | U23 |
+| W5 | Security | P2 | Deferred to ROADMAP: `exec_cmd` is writable through the settings editor | U27 |
 | W6 | Security | P3 | Closed: the log WebSocket authenticates only with the session cookie | U28 |
-| W7 | Security | P2 | There is no CSRF token anywhere | U20 |
+| W7 | Security | P2 | Deferred to ROADMAP: there is no CSRF token | U20 |
 | W8 | Security | P2 | Closed: logout deletes the Bearer token session too | U21 |
 | W9 | Security | P2 | Closed: the legacy session namespace is no longer accepted | V9 |
 | W10 | Routing | P2 | Closed: the scheduler passes `probe_openai_model_availability`, so OpenAI-family candidates are probed in the pre-dispatch refresh. |
-| W11 | Routing | P2 | The affinity store is process-local; there is no Redis mirror | U7, V11 |
+| W11 | Routing | P2 | Closed: the in-process store is the hot path and records are mirrored to Redis with their TTL | U7, V11 |
 | W12 | Routing | P2 | Closed: route metadata carries the full fingerprint, the OpenAIx worker sends `X-Aidir-KV-Fingerprint`, and the receiver records it. The `openaix` history trim was removed so both sides see the same payload. |
 | W13 | Routing | P3 | Closed: the unconditional 20-message trim is removed, so the executor receives the payload the router fingerprinted. Model context limits remain the provider's responsibility. |
-| W14 | Routing | P3 | Both `first_available` and the single-candidate `direct` strategy are implemented | U9 |
+| W14 | Routing | P3 | Closed: both `first_available` and the single-candidate `direct` strategy are implemented | U9 |
 | W15 | Routing | P3 | Closed: affinity depends only on the context, so there is no per-alias partition | U10 |
 | W16 | Scheduling | P2 | Closed: remote probes are cached by W45, concurrent local candidate probes share one in-flight evaluation, and the deferral loop still waits one second when it dispatches nothing. |
 | W17 | Scheduling | P2 | Closed: the worker named by the resolved route wins over an incompatible pinned worker. |
 | W18 | Scheduling | P3 | Closed: admission acquires one lock per touched resource in sorted order; an empty requirement set keeps the global lock. |
 | W19 | Scheduling | P3 | Closed: the queue score is priority-major and arrival-minor, so equal priorities are FIFO. |
-| W20 | Task model | P2 | The retry and fallback state is not fully persisted in the task hash | U16, V20 |
+| W20 | Task model | P2 | Closed: `fallbacks`, `next_retry_at` and `on_reject` survive a Redis round trip | U16, V20 |
 | W21 | Task model | P2 | Closed: the cron job `prune_envid_contexts` scans `{ns}:ctx:*`, compares `saved_at`, and deletes contexts older than `envids.store_duration_minutes`. |
 | W22 | Observability | P2 | Closed: durable waits are bounded and recent drops are shown in the health panel | U29 |
 | W23 | Observability | P2 | Closed: a running task older than its run timeout plus a 60-second safety margin is failed with `STALE_TASK`. |
 | W24 | Observability | P3 | Closed: allowlisted rate-limit and request-id headers are restored | U33 |
 | W25 | Protocol | P2 | Closed: thinking signatures survive conversion and are emitted as `signature_delta` | U34 |
 | W26 | Protocol | P3 | Closed: the estimate adds 1600 tokens per image block and the protocol document says that it is an estimate. |
-| W27 | Interface | P2 | A task that waits on a remote cannot be canceled where it actually is | V13 |
+| W27 | Interface | P2 | Closed: the dashboard forwards a remote cancel to the provider that holds the task | V13 |
 | W28 | Interface | P3 | Closed: the orphan count is already rendered by the existing health card | V15 |
 | W29 | Interface | P3 | Closed by decision: deleting another instance's data is the operator's action; the check reports only. |
-| W30 | Tests | P2 | The envid registry, the MCP endpoint and the context workers have no direct coverage | U37 |
-| W31 | Tests | P2 | The OpenCode Go release gates are open | U38 |
+| W30 | Tests | P2 | Closed: `test_context_components.py` covers the registry, MCP and all three context workers | U37 |
+| W31 | Tests | P2 | Open: the OpenCode Go release gates include focused managed-session/redaction tests and a live smoke test that needs an external deployment | U38 |
 | W32 | Tests | P3 | Closed: renamed to `probe_context_overflow.py` and `probe_timeout_semantics_live.py`; `TEST.md` lists both probes. |
 | W33 | Documentation | P3 | Closed: the removed routes are gone from the table. |
-| W34 | Documentation | P3 | `proposal_hooks.md` contradicts the shipped hook | U42 |
+| W34 | Documentation | P3 | Closed by policy: older non-update proposals keep their own status and are not edited in place | U42 |
 | W35 | Documentation | P3 | Closed: the README uses only the shipped `config.json5.example` and an explicit filename example. |
 | W36 | Documentation | P3 | Closed: the plans no longer quote a fixed suite count. |
-| W37 | Documentation | P3 | The proposal status lines are stale | U45 |
+| W37 | Documentation | P3 | Closed by policy: proposal status ownership stays with each non-update proposal | U45 |
 | W38 | Configuration | P3 | Closed: both per-file log override maps are declared | U3 |
 | W39 | Security | P3 | Closed: `_timeout` is clamped by `webui.request_timeouts.agent_test_max` | U24 |
 | W40 | Security | P3 | Closed: log directories are `0700`, new journals are `0600`, and the doctor checks the mode | U25 |
@@ -74,12 +76,21 @@ Priority meaning:
 | W43 | Observability | P3 | Closed: the cron health check also probes `/health` on every configured `openaix` and `mcp` endpoint. |
 | W44 | Protocol | P3 | Closed: the unused keyword is removed | U36 |
 | W45 | Routing | P3 | Closed: remote probes are cached for one second and concurrent probes for the same provider/model/priority share one in-flight call. |
-| W46 | Protocol | P2 | The retry/fallback wait budget after the first execution is undefined | `spec_timeouts.md` TBD |
-| W47 | Acceptance | P2 | The browser acceptance of the generated editor has not been done | `plan_aiset_integration.md`, `TEST.md` 7.1 |
-| W48 | Tooling | P3 | The example configurations and the installation scripts for a configuration set | `TODO.md` |
-| W49 | Documentation | P3 | The security analysis of `_proposal_update_1.md` has no recorded resolution | `_proposal_update_1.md` F1–F13 |
+| W46 | Protocol | P2 | Closed by decision: each attempt gets the full run budget and inter-attempt waits are not charged to it | `spec_timeouts.md` TBD |
+| W47 | Acceptance | P2 | Open: the generated editor still needs a human browser acceptance through nginx | `plan_aiset_integration.md`, `TEST.md` 7.1 |
+| W48 | Tooling | P3 | Open (P3): several selectable `<name>.json5.example` sets and installation scripts for a full configuration set | `TODO.md` |
+| W49 | Documentation | P3 | Closed by policy: the historical analysis is not rewritten; later rounds record their resolutions in their own ledgers | `_proposal_update_1.md` F1–F13 |
 
-### 1.1 Decisions of 2026-10-24
+### 1.1 Status snapshot (2026-10-24)
+
+The Round 4 implementation and documentation pass is complete except for the
+three items below. Of the 49 ledger items, 42 are closed, 4 are deferred to
+[ROADMAP.md](ROADMAP.md) (W3, W4, W5, W7), and 3 remain open: W31 (external
+OpenCode Go release gates including a live smoke), W47 (human browser
+acceptance), and W48 (P3 example configurations and installation scripts).
+No other item is waiting for code or documentation changes.
+
+### 1.2 Decisions of 2026-10-24
 
 | Item | Decision | State |
 |---|---|---|
@@ -117,13 +128,13 @@ be read in one place.
 | U5 | `core/app.py` | the reload re-initializes the workers, updates the resource registry in place and reports the structural sections; the SIGHUP handler schedules the coroutine instead of dropping it |
 | U40 | `test_logs.py` | the wipe and the trim run inside a test, against the log directory the logger actually uses |
 
-**Partially closed** — the mechanism exists, the decision is still open:
+**Closed after the Round 4 decisions:**
 
-| Source | Closed | Still open |
+| Source | Closed by | What changed |
 |---|---|---|
-| U17 | the MCP endpoint can require a token; the shipped template turns it on | W1 — whether the default should be on for the `mcp` api |
-| U18 | the queue-state aggregation is cached for a second, so the scan no longer runs per request | W1 — the authentication of the routes |
-| U19 | the peer surfaces default to `endpoint` | W2 — the reading side must carry the token |
+| U17 | W1 | the MCP endpoint can require a token; the default stays off and the doctor reports every open surface |
+| U18 | W1 | the queue-state aggregation is cached for a second, and the route authentication is left to `require_auth` |
+| U19 | W2 | the peer surfaces default to `endpoint`, the root `default_auth_mode` is configurable, and an explicit peer mode wins |
 
 Every other U item is open and is listed in §1 with its W number.
 
@@ -142,13 +153,13 @@ previous round:
 | V8 | `core/local_server_manager.py` | the managed server gets `stdin=DEVNULL` |
 | V9 | `core/scheduler.py` | a remote that cannot run the model is excluded and the route is re-resolved |
 | V10 | `core/scheduler.py` | the affinity no longer pins a task to a candidate that cannot run |
-| V11 | `core/smart_router.py` | a remote candidate is measured over the network. **The OpenAI-family half is still open: W10** |
+| V11 | `core/smart_router.py` | a remote candidate is measured over the network; the OpenAI-family half is closed by W10 |
 | V12 | the log thresholds and the health card | the deferral reasons reach the operator through the status and the health card, not only through the log |
-| V13 | the task summary | the waiting reason, the provider and the model travel with the task. **The remote-aware cancel is still open: W27** |
+| V13 | the task summary | the waiting reason, the provider and the model travel with the task; the remote-aware cancel is closed by W27 |
 | V14 | `core/queue_manager.py` | `terminate_task` reaches a task that only exists as a Redis hash |
-| V15 | `core/cron.py` | the cron cycle fails the orphans. **The health row is still open: W28** |
+| V15 | `core/cron.py` | the cron cycle fails the orphans; the health row is closed by the W28 decision |
 | V16 | `core/queue_manager.py` | a quarantined task is marked failed |
-| V17 | `webui/backend/app.py` | the sessions are namespaced by the instance. **The old sessions are still accepted: W9** |
+| V17 | `webui/backend/app.py` | the sessions are namespaced by the instance; the legacy fallback is removed by W9 |
 | V18 | `core/doctor.py`, `core/settings/runtime.py` | the settings runtime is isolated from the process environment, and the doctor resolves the inspected root's own `.env` |
 | V19 | `core/app.py` | a planned restart is an event, not a traceback |
 | V20 | `core/local_server_manager.py`, the health card | the startup errors of the providers are in the health card |
@@ -232,37 +243,35 @@ previous round:
 | # | Problem | Where |
 |---|---|---|
 | W30 | The envid registry, the MCP endpoint and the three context workers have no direct coverage | Closed: `test_context_components.py` covers the registry round trip, MCP health/initialize, and all three context workers. |
-| W31 | The seven OpenCode Go release gates are open | `proposal_opencode_go.md` — the focused tests, the health-probe regression, the audit of the session serialization, the error-code normalization, the documentation and the redacted fixtures with a live smoke |
+| W31 | The seven OpenCode Go release gates are open | Open: `proposal_opencode_go.md` — the focused managed-session and redaction tests, the health-probe regression, the error-code normalization, and the redacted fixtures with a live smoke |
 | W32 | Two CLI probes match the `test_*.py` discovery glob | Closed: renamed to `probe_context_overflow.py` and `probe_timeout_semantics_live.py`; `TEST.md` lists both probes. |
 | W33 | The README's route table lists `/api/config*` | Closed: the removed routes are gone from the table. |
-| W34 | `proposal_hooks.md` says both bundled hooks ship disabled | `proposal_hooks.md` — one of them has `ENABLED = True` |
+| W34 | `proposal_hooks.md` says both bundled hooks ship disabled | Closed by policy: older non-update proposals keep their own status and are not edited in place. |
 | W35 | The README references `prod.json5.example` | Closed: the README uses only the shipped `config.json5.example` and an explicit filename example. |
 | W36 | The plan documents quote stale test counts | Closed: the plans no longer quote a fixed suite count. |
-| W37 | The proposal status lines are stale | `proposal_kv_keeper.md`, `proposal_searxng.md`, `_proposal_embedding.md` |
+| W37 | The proposal status lines are stale | Closed by policy: each non-update proposal owns its status line. |
 | W38 | `logging.logs` / `logging.log_overrides` is read but not declared | `config.descriptor.json5` — Closed: both maps are declared with bounded per-file settings. |
-| W47 | The browser acceptance of the generated editor has not been done | `plan_aiset_integration.md`, `TEST.md` 7.1 — the step that needs a human, through nginx |
-| W48 | The example configurations and the installation scripts | `TODO.md` — several `<name>.json5.example` configurations selectable at install time, and the installation scripts for a configuration set (aidir + sndbx + ollama) |
-| W49 | The security analysis has no recorded resolution | `_proposal_update_1.md` F1–F13 — the findings were never closed, and a reader cannot tell which of them the later rounds answered. Record, per finding, the item that closed it or the item that still carries it. |
+| W47 | The browser acceptance of the generated editor has not been done | Open: `plan_aiset_integration.md`, `TEST.md` 7.1 — the step that needs a human, through nginx. |
+| W48 | The example configurations and the installation scripts | Open (P3): `TODO.md` — several `<name>.json5.example` configurations selectable at install time, and the installation scripts for a configuration set (aidir + sndbx + ollama). |
+| W49 | The security analysis has no recorded resolution | Closed by policy: the historical analysis is not rewritten; later rounds record their resolutions in their own ledgers. |
 
 ---
 
-## 4. Suggested implementation order
+## 4. Outcome
 
-| Round | Items | Why |
+The Round 4 implementation and documentation pass is complete except for the
+items below. The closed items and their evidence are recorded in §1 and §3.
+
+| Item | Why it remains open | What closes it |
 |---|---|---|
-| **1** | W4, W7, W8, W39, W40, W41 | The security items that do not change a contract: the SSRF guard, the CSRF token, the logout, the timeout clamp, the log permissions, the Redis password |
-| **2** | W10, W16, W17, W20, W21 | The routing and the task model, where a mistake costs capacity or a stuck task |
-| **3** | W30, W31, W32, W47 | The test coverage and the acceptance that needs a person |
-| **4** | W11, W12, W13, W14, W15, W45 | The affinity features, as one round: they change the routing semantics together |
-| **5** | W22, W23, W24, W25, W26, W27, W28, W29, W33–W38, W42–W49 | The remainder, in any order |
+| W31 | The OpenCode Go release gates need focused managed-session and redaction tests plus a live deployment | A focused test round and a live `/v1/models` + Chat Completions + SSE smoke against OpenCode Go |
+| W47 | The generated settings editor needs a person to accept it through nginx | A recorded browser acceptance pass in `TEST.md` 7.1 |
+| W48 | P3 tooling for several selectable configuration sets and their installation scripts | The example files and the installation scripts requested in `TODO.md` |
 
-W3 is deferred to [ROADMAP.md](ROADMAP.md): it changes the authentication
-contract and needs a threat model, enrollment/migration and recovery design.
+Two rules applied to every completed item:
 
-Two rules that apply to every round:
-
-1. **A round must not change a documented behavior without changing the document
-   in the same commit.** The route tables, the descriptor and the apply policies
-   are the contract; the code follows them.
-2. **A round must not leave a half-implemented promise.** Either the item is done
-   and observable, or it is not started.
+1. **A change to a documented behavior changes the document in the same
+   commit.** The route tables, the descriptor and the apply policies are the
+   contract; the code follows them.
+2. **No half-implemented promise.** Either an item is done and observable, or it
+   is recorded as open or deferred above.

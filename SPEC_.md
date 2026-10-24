@@ -229,3 +229,6 @@ lets the Test LLM dialog exercise the shipped `openaix` endpoint, including
   three context workers.
 - Concurrent local candidate probes now share one in-flight evaluation, and
   remote probes keep the one-second cache.
+- The Round 4 ledger is finalized in `proposal_update4.md`. The remaining items
+  are tracked in its §4: OpenCode Go release validation, a human browser
+  acceptance, and P3 example configuration/installation tooling.

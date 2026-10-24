@@ -799,14 +799,11 @@ class SmartRouter:
                 incoming_bearer_token=incoming_bearer_token,
             ))
             self._candidate_inflight[key] = task
-            owner = True
-        else:
-            owner = False
-        try:
-            candidate = await asyncio.shield(task)
-        finally:
-            if owner and task.done() and self._candidate_inflight.get(key) is task:
-                self._candidate_inflight.pop(key, None)
+            task.add_done_callback(
+                lambda finished, cache_key=key: self._candidate_inflight.pop(cache_key, None)
+                if self._candidate_inflight.get(cache_key) is finished else None
+            )
+        candidate = await asyncio.shield(task)
         result = copy.deepcopy(candidate)
         if isinstance(result, dict):
             result["index"] = index
