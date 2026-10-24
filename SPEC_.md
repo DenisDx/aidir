@@ -193,3 +193,39 @@ has a port, and prefers an endpoint whose `worker` matches the `worker` field in
 the request. The request is always sent to that endpoint's `/api/chat`. This
 lets the Test LLM dialog exercise the shipped `openaix` endpoint, including
 `call_llama_cpp` and other workers.
+
+## 9. Round 4 completion (2026-10-24)
+
+- The scheduler router now probes `openai`, `opencode-go` and `anthropic`
+  candidates through their model list, so those routes are no longer classified
+  `provider_down` before dispatch.
+- KV affinity keeps the in-process cache as the hot path and mirrors records to
+  Redis with their TTL. A local miss reads the mirror. The full fingerprint is
+  carried in route metadata and forwarded as `X-Aidir-KV-Fingerprint`.
+- The unconditional 20-message trim in the `openaix` worker is removed. The
+  executor receives the payload the router fingerprinted; provider context
+  limits remain authoritative.
+- `_select_worker` prefers the worker named by the resolved provider route over
+  an incompatible pinned worker. Admission uses per-resource locks acquired in
+  sorted order. Equal-priority tasks are FIFO through a priority-major,
+  arrival-minor queue score.
+- Envid contexts are pruned by cron using `envids.store_duration_minutes`.
+  Stale running tasks are failed with `STALE_TASK` after their run timeout plus
+  a 60-second margin. The cron health check probes `/health` on configured
+  OpenAIx and MCP endpoints.
+- Remote smart probes are cached for one second and concurrent probes for the
+  same provider/model/priority share one in-flight call.
+- The `openaix` and MCP peer surfaces accept a termination request; the
+  dashboard forwards a remote task cancel to the provider that holds it.
+- `count_tokens` adds 1600 tokens per image block and is documented as an
+  estimate.
+- The retry policy is recorded in `spec_timeouts.md`: every attempt gets the
+  full run budget, inter-attempt waits are not charged to it, and no separate
+  retry-wait timeout exists.
+- The two CLI probes no longer match test discovery, the README no longer lists
+  removed `/api/config*` routes or a missing `prod.json5.example`, and the plan
+  documents no longer quote a fixed test count.
+- Direct coverage was added for the envid registry, the MCP endpoint and the
+  three context workers.
+- Concurrent local candidate probes now share one in-flight evaluation, and
+  remote probes keep the one-second cache.

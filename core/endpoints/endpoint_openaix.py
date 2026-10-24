@@ -134,6 +134,17 @@ class Endpoint_openaix(Endpoint_ollama):
         async def openai_tasks(request: Request):
             return self._peer_tasks_response(request)
 
+        @app.post("/v1/tasks/{task_id}/terminate")
+        async def peer_terminate_task(task_id: str, request: Request):
+            auth_error = self._peer_access_error(request, self._peer_tasks_auth_mode, "peer tasks")
+            if auth_error is not None:
+                return auth_error
+            task_hash = await self._core.terminate_task(task_id) if self._core is not None else None
+            if task_hash is None:
+                return JSONResponse({"error": "task not found"}, status_code=404)
+            log("http", "warn", f"{self.id} peer termination task={task_id}", self.id)
+            return JSONResponse({"ok": True, "task_id": task_id})
+
         @app.get("/v1/providers/{provider_id}/models/{model_id:path}/queue-state")
         async def openai_model_queue_state(provider_id: str, model_id: str, priority: int = 5, request: Request = None):
             return await self._model_queue_state_response(

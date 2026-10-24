@@ -723,6 +723,7 @@ class Endpoint_ollama(BaseEndpoint):
             "visited_instances": visited_instances,
             "current_instance": self._current_instance_id(),
             "max_hops": self._route_trace_max_hops(),
+            "kv_fingerprint": str(headers.get("X-Aidir-KV-Fingerprint", "") or "").strip(),
         }
 
     @staticmethod

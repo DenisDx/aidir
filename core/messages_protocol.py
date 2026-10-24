@@ -79,14 +79,33 @@ def messages_error_type_for_code(code: str) -> str:
     return "api_error"
 
 
+_IMAGE_TOKEN_ESTIMATE = 1600
+
+
 def estimate_input_tokens(body: dict) -> int:
-    """Return a deterministic rough token estimate for a Messages request."""
+    """Return a deterministic rough estimate: text at chars/4 plus 1600 per image."""
     pieces: list[str] = []
+    images = 0
+
+    def account(blocks: object) -> None:
+        """Collect text pieces and image count from one content block list."""
+        nonlocal images
+        if not isinstance(blocks, list):
+            return
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "image":
+                images += 1
+            elif block.get("type") == "tool_result":
+                account(block.get("content"))
+
     system = body.get("system")
     if isinstance(system, str):
         pieces.append(system)
     elif isinstance(system, list):
         pieces.extend(_text_from_blocks(system))
+        account(system)
     messages = body.get("messages")
     if isinstance(messages, list):
         for message in messages:
@@ -97,11 +116,12 @@ def estimate_input_tokens(body: dict) -> int:
                 pieces.append(content)
             elif isinstance(content, list):
                 pieces.extend(_text_from_blocks(content))
+                account(content)
     tools = body.get("tools")
     if tools:
         pieces.append(json.dumps(tools, ensure_ascii=False, sort_keys=True))
     characters = sum(len(piece) for piece in pieces)
-    return max(1, int(math.ceil(characters / 4.0)))
+    return max(1, int(math.ceil(characters / 4.0)) + images * _IMAGE_TOKEN_ESTIMATE)
 
 
 def _text_from_blocks(blocks: object) -> list[str]:

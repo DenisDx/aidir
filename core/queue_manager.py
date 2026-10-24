@@ -63,6 +63,12 @@ class QueueManager:
     def _tk(self, task_id: str) -> str:
         return f"{self._ns}:task:{task_id}"
 
+    @staticmethod
+    def _queue_score(task: Task) -> float:
+        """Return priority-major, arrival-minor ordering for the ZSET."""
+        stamp = task.updated_at or task.created_at
+        return float(task.priority) * 1_000_000_000_000 + stamp.timestamp()
+
     # ── Public API ───────────────────────────────────────────────────────────
 
     async def add_task(self, task: Task, *, is_retry: bool = False) -> None:
@@ -70,7 +76,7 @@ class QueueManager:
         task.status = STATUS_QUEUED
         task.updated_at = datetime.now(timezone.utc)
         pipe = self._redis.pipeline(transaction=True)
-        pipe.zadd(self._q(task.type), {task.id: task.priority})
+        pipe.zadd(self._q(task.type), {task.id: self._queue_score(task)})
         pipe.hset(self._tk(task.id), mapping=task.to_redis_hash())
         await pipe.execute()
         self._tasks[task.id] = task
@@ -127,7 +133,7 @@ class QueueManager:
                     log("system", "warning", f"Quarantined orphaned persisted task {task_id}: {exc}")
                     continue
 
-                await self._redis.zadd(self._q(task.type), {task.id: task.priority})
+                await self._redis.zadd(self._q(task.type), {task.id: self._queue_score(task)})
                 self._tasks[task.id] = task
                 recovered += 1
                 log("system", "warning", f"Restored orphaned queued task {task_id}")

@@ -423,9 +423,9 @@ existing convention (all aidir tests live there).
 | 2 - runtime behind a flag | done | `core/settings/` (6 modules, no transport code of its own), `AIDIR_SETTINGS_BACKEND`, facade parity verified: 522 leaf values, zero differences against the legacy loader, and the same for the merged entries of all 15 workers |
 | 3 - WebUI settings tab | done | the library's ASGI application mounted twice, at `/api/settings` and at `/assets` (its assets live at the app root, not below the API prefix), session-to-principal resolver, generated tree editor with a document selector, `POST /api/settings/reload` |
 | 4 - dual run | done, automated half | `test_settings_parity.py` compares the backend against an independent reference reader over the same files: 522 leaf values and all 15 merged worker entries, zero differences. The half that needs a live instance under load is a manual step in `TEST.md` 7.1. |
-| 5 - cutover and deletion | done | the loader and its comment-preservation helpers are gone from `core/config.py`; `core/config.py` is now a 45-line address that owns nothing; the `AIDIR_SETTINGS_BACKEND` flag is gone with the last thing it selected; `/api/config`, `/api/config/raw` and `/api/config/fields` are removed; `smoke_test.py`, `test_context_overflow.py` and `core/workers_loader.py` read through the facade |
+| 5 - cutover and deletion | done | the loader and its comment-preservation helpers are gone from `core/config.py`; `core/config.py` is now a 45-line address that owns nothing; the `AIDIR_SETTINGS_BACKEND` flag is gone with the last thing it selected; `/api/config`, `/api/config/raw` and `/api/config/fields` are removed; `smoke_test.py`, `probe_context_overflow.py` and `core/workers_loader.py` read through the facade |
 
-Verification so far: **366 unit tests pass**, including the descriptor gate, the
+Verification so far: **the full suite passes**, including the descriptor gate, the
 host adapter and the parity suite. `test_task_priority_defaults` was failing
 before this work; the test was stale (commit `b063de4` retuned the priority
 scale from `5/10/20` to `0/5/10`) and is now aligned with the code.

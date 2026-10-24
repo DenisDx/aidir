@@ -59,11 +59,8 @@ Optional config template selection:
 # same as above
 ./install.sh config
 
-# uses prod.json5.example
-./install.sh prod
-
 # uses an explicit template filename
-./install.sh prod.json5.example
+./install.sh config.json5.example
 ```
 
 The script:
@@ -182,7 +179,7 @@ It is not tracked in git and may be replaced by `install.sh` from a template whe
 - `config.json5` is missing
 
 The tracked template shipped with the repository is `config.json5.example`.
-You can add more templates such as `prod.json5.example`, `lab.json5.example`, and select them at install time.
+You can add more templates in the repository root and select one by passing its filename to `install.sh`.
 
 JSON5 format (comments and trailing commas allowed). Uses `${VAR}` and `${VAR:-default}` substitution from `.env`. Contains no secrets or machine-specific paths directly.
 
@@ -731,7 +728,6 @@ WebUI backend: `http://HOST:${WEBUI_PORT}`
 |---|---|---|
 | `/api/auth/login`, `/api/auth/me`, `/api/auth/logout` | HTTP | Session management |
 | `/api/tasks`, `/api/status`, `/api/logs` | HTTP | Runtime state and logs |
-| `/api/config`, `/api/config/raw`, `/api/config/fields` | HTTP | Config read/write |
 | `/api/workers/models`, `/api/endpoints/info` | HTTP | Catalog and metadata |
 | `/api/test/llm`, `/api/test/mcp`, `/api/test/agent/*`, `/api/test/agent` | HTTP | UI-side test/proxy routes |
 | `/api/restart` | HTTP | Graceful restart request |

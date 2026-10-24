@@ -231,6 +231,11 @@ class InternalToMessagesTests(unittest.TestCase):
         self.assertEqual(messages_error_payload("invalid_request_error", "bad")["type"], "error")
         body = {"system": "x" * 8, "messages": [{"role": "user", "content": "y" * 8}]}
         self.assertEqual(estimate_input_tokens(body), 4)
+        with_image = {"messages": [{"role": "user", "content": [
+            {"type": "text", "text": "abcd"},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}},
+        ]}]}
+        self.assertEqual(estimate_input_tokens(with_image), 1 + 1600)
 
 
 class MessagesStreamingTests(unittest.TestCase):

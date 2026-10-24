@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 import httpx
 from fastapi import (
-    Cookie, Depends, FastAPI, HTTPException, Request,
+    Body, Cookie, Depends, FastAPI, HTTPException, Request,
     Response, WebSocket, WebSocketDisconnect, status,
 )
 from fastapi.responses import FileResponse, JSONResponse
@@ -1143,8 +1143,33 @@ def create_app(
         )
 
     @app.post("/api/tasks/{task_id}/terminate")
-    async def terminate_task(task_id: str, session: dict = Depends(_require_session)):
-        """Terminate one live task visible on the dashboard/task viewer."""
+    async def terminate_task(
+        task_id: str,
+        payload: dict = Body(default={}),
+        session: dict = Depends(_require_session),
+    ):
+        """Terminate a local task or forward the cancel to the peer that holds it."""
+        provider_id = str((payload or {}).get("provider") or "").strip()
+        if provider_id:
+            provider = (core.config.get("models.providers") or {}).get(provider_id) or {}
+            base_url = str(provider.get("baseUrl") or "").rstrip("/") if isinstance(provider, dict) else ""
+            if str(provider.get("api") or "") != "openaix" or not base_url:
+                raise HTTPException(status_code=400, detail="Unknown peer provider")
+            try:
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    response = await client.post(
+                        f"{base_url}/v1/tasks/{task_id}/terminate",
+                        headers=_peer_auth_headers(provider.get("auth")),
+                    )
+            except httpx.HTTPError as exc:
+                raise HTTPException(status_code=502, detail=f"Peer unreachable: {exc}") from exc
+            if response.status_code == 404:
+                raise HTTPException(status_code=404, detail="Task not found on the peer")
+            if not 200 <= response.status_code < 300:
+                raise HTTPException(status_code=502, detail=f"Peer answered HTTP {response.status_code}")
+            log("webui", "warn", f"Remote task termination requested by user {session['login']}: {provider_id}/{task_id}", "control")
+            return {"ok": True, "remote": True, "provider": provider_id}
+
         task_hash = await core.terminate_task(task_id)
         if task_hash is None:
             raise HTTPException(status_code=404, detail="Task not found")

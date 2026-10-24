@@ -12,7 +12,10 @@ import asyncio
 import json
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+import httpx
 
 _ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(_ROOT))
@@ -133,7 +136,7 @@ async def wipe_logs(redis: aioredis.Redis) -> None:
 
 
 async def health_check(redis: aioredis.Redis) -> None:
-    """Ping Redis and check that core service is reachable."""
+    """Ping Redis and probe the OpenAIx and MCP HTTP routes."""
     if not await _should_run(redis, "health_check", 300):
         return
 
@@ -143,7 +146,26 @@ async def health_check(redis: aioredis.Redis) -> None:
     except Exception as exc:
         log("system", "error", f"Health check FAIL: Redis unreachable: {exc}")
 
-    # TODO: add HTTP health checks for core endpoints when port is known
+    for endpoint in config.get("endpoints") or []:
+        if not isinstance(endpoint, dict) or endpoint.get("api") not in {"openaix", "mcp"}:
+            continue
+        endpoint_id = str(endpoint.get("id") or endpoint.get("api") or "endpoint")
+        port = _to_int(endpoint.get("port"), 0)
+        if port <= 0:
+            continue
+        host = str(endpoint.get("bindAddress") or "127.0.0.1")
+        if host in {"0.0.0.0", "::", ""}:
+            host = "127.0.0.1"
+        url = f"http://{host}:{port}/health"
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                response = await client.get(url)
+            if 200 <= response.status_code < 300:
+                log("system", "info", f"Health check OK: {endpoint_id} reachable")
+            else:
+                log("system", "error", f"Health check FAIL: {endpoint_id} returned HTTP {response.status_code}")
+        except httpx.HTTPError as exc:
+            log("system", "error", f"Health check FAIL: {endpoint_id} unreachable: {exc}")
 
 
 def _trim_log_file(log_file: Path, max_bytes: int) -> int:
@@ -235,10 +257,84 @@ async def retain_audit_logs(redis: aioredis.Redis) -> None:
 
 
 async def cleanup_stale_tasks(redis: aioredis.Redis) -> None:
-    """
-    Detect tasks stuck in 'running' state without a live worker and cancel them.
-    TODO: implement when task-worker heartbeat mechanism is added.
-    """
+    """Fail running tasks that outlived their run timeout by a safety margin."""
+    interval = max(10, _to_int(config.get("cron_period") or 60, 60))
+    if not await _should_run(redis, "cleanup_stale_tasks", interval):
+        return
+
+    ns = config.get("instance", "aidir")
+    now = time.time()
+    cursor = 0
+    removed = 0
+    while True:
+        cursor, keys = await redis.scan(cursor, match=f"{ns}:task:*", count=100)
+        for key in keys:
+            try:
+                status, started_at, run_timeout, task_id = await redis.hmget(
+                    key, "status", "started_at", "run_timeout", "id",
+                )
+                if status != "running" or not started_at:
+                    continue
+                started = datetime.fromisoformat(str(started_at).replace("Z", "+00:00"))
+                if started.tzinfo is None:
+                    started = started.replace(tzinfo=timezone.utc)
+                limit = _to_int(run_timeout, 0) + 60
+                if limit <= 60 or now - started.timestamp() <= limit:
+                    continue
+                stamp = datetime.fromtimestamp(now, timezone.utc).isoformat()
+                error = {
+                    "code": "STALE_TASK",
+                    "message": "The running task outlived its run timeout; its worker is gone",
+                }
+                await redis.hset(key, mapping={
+                    "status": "failed",
+                    "updated_at": stamp,
+                    "finished_at": stamp,
+                    "error": json.dumps(error),
+                    "error_code": error["code"],
+                })
+                removed += 1
+                log("system", "warning", f"Failed stale running task {task_id or key}")
+            except Exception as exc:
+                log("system", "warning", f"cleanup_stale_tasks: skip {key}: {exc}")
+        if cursor == 0:
+            break
+    if removed:
+        log("system", "info", f"Failed {removed} stale running task(s)")
+
+
+async def prune_envid_contexts(redis: aioredis.Redis) -> None:
+    """Delete stored envid contexts older than the configured retention."""
+    period_minutes = _to_int(config.get("envids.check_period_minutes") or 600, 600)
+    if not await _should_run(redis, "prune_envid_contexts", max(60, period_minutes * 60)):
+        return
+    retention_minutes = _to_int(config.get("envids.store_duration_minutes") or 0, 0)
+    if retention_minutes <= 0:
+        return
+
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=retention_minutes)
+    ns = config.get("instance", "aidir")
+    removed = 0
+    cursor = 0
+    while True:
+        cursor, keys = await redis.scan(cursor, match=f"{ns}:ctx:*", count=100)
+        for key in keys:
+            raw = await redis.get(key)
+            if raw is None:
+                continue
+            try:
+                payload = json.loads(raw)
+                saved_at = datetime.fromisoformat(str(payload.get("saved_at") or "").replace("Z", "+00:00"))
+                if saved_at.tzinfo is None:
+                    saved_at = saved_at.replace(tzinfo=timezone.utc)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if saved_at < cutoff:
+                removed += await redis.delete(key)
+        if cursor == 0:
+            break
+    if removed:
+        log("system", "info", f"Pruned {removed} expired envid context(s)")
 
 
 async def cleanup_expired_tasks(redis: aioredis.Redis) -> None:
@@ -498,6 +594,7 @@ async def run_cycle(redis: aioredis.Redis, core: Core | None = None) -> None:
         await _run_job("health_check", health_check(redis)),
         await _run_job("cleanup_stale_tasks", cleanup_stale_tasks(redis)),
         await _run_job("cleanup_expired_tasks", cleanup_expired_tasks(redis)),
+        await _run_job("prune_envid_contexts", prune_envid_contexts(redis)),
         await _run_job("keep_alive_ping", keep_alive_ping(redis)),
     ]
     if all(jobs_succeeded):

@@ -372,11 +372,15 @@ class Scheduler:
             self._idle.set()
 
     def _select_worker(self, task: Task) -> "BaseWorker | None":
-        """
-        Select a worker for the task.
-        Explicit worker_id in task takes priority; otherwise first match by type.
-        TODO: check resource availability (VRAM etc.) before selecting.
-        """
+        """Select the worker that can serve the resolved provider route."""
+        route = (task.config or {}).get("route") if isinstance(task.config, dict) else None
+        route = route if isinstance(route, dict) else {}
+        resolved_worker = str(route.get("resolved_worker") or "").strip()
+        if resolved_worker and resolved_worker in self._workers:
+            worker = self._workers[resolved_worker]
+            if worker.enabled:
+                return worker
+
         if task.worker_id and task.worker_id in self._workers:
             w = self._workers[task.worker_id]
             if w.enabled:
@@ -1103,6 +1107,7 @@ class Scheduler:
             check_resource_available_for_reuse=check_resource_available_for_reuse,
             probe_remote_model_queue_state=self._probe_remote_model_queue_state,
             probe_ollama_model_availability=self._probe_ollama_model_availability,
+            probe_openai_model_availability=self._probe_openai_model_availability,
             resolve_probe_timeout_ms=self._resolve_probe_timeout_ms,
             resolve_worker_id_for_route=self._resolve_worker_id_for_route,
             kv_affinity=self._kv_affinity,
@@ -1243,6 +1248,35 @@ class Scheduler:
             return None
 
         return None
+
+    async def _probe_openai_model_availability(
+        self,
+        provider_id: str,
+        model_id: str,
+        *,
+        timeout_ms: int,
+        incoming_bearer_token: str = "",
+    ) -> bool:
+        """Confirm an OpenAI-compatible provider lists the requested model."""
+        provider_cfg = self._provider_cfg(provider_id)
+        base_url = str(provider_cfg.get("baseUrl") or "").rstrip("/")
+        if base_url.endswith("/v1"):
+            base_url = base_url[:-3]
+        if not base_url:
+            return False
+        headers = self._resolve_probe_headers(provider_id, incoming_bearer_token)
+        if self._provider_api(provider_id) == "anthropic":
+            headers.setdefault("anthropic-version", str(provider_cfg.get("anthropic_version") or "2023-06-01"))
+        try:
+            async with httpx.AsyncClient(timeout=max(0.001, timeout_ms / 1000.0), headers=headers) as client:
+                response = await client.get(f"{base_url}/v1/models")
+            if not 200 <= response.status_code < 300:
+                return False
+            payload = response.json()
+        except (httpx.HTTPError, ValueError):
+            return False
+        items = payload.get("data") if isinstance(payload, dict) else None
+        return any(isinstance(item, dict) and str(item.get("id") or "") == model_id for item in items or [])
 
     async def _probe_ollama_model_availability(
         self,

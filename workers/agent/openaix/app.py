@@ -164,22 +164,6 @@ class OpenAIxWorker(BaseWorker):
         save_call = self._resolve_save_llm_request(task.payload or {})
         request_headers = self._resolve_request_headers(task, provider_id)
 
-        # Limit message history to prevent context overload
-        # Keep system + last N user/assistant messages
-        messages = list(payload.get("messages") or [])
-        if len(messages) > 20:  # Keep last 20 messages max
-            system_msgs = [m for m in messages if m.get("role") == "system"]
-            other_msgs = [m for m in messages if m.get("role") != "system"]
-            kept_messages = system_msgs + other_msgs[-18:]  # system + last 18
-            payload["messages"] = kept_messages
-            task.payload = payload
-            log(
-                "worker",
-                "info",
-                f"Task {task.id}: limited messages from {len(messages)} to {len(kept_messages)}",
-                "openaix",
-            )
-
         context_result = await self._apply_context_chain(task)
         if not context_result.ok:
             return context_result
@@ -670,11 +654,17 @@ class OpenAIxWorker(BaseWorker):
         if current_instance and current_instance not in outgoing_visited:
             outgoing_visited.append(current_instance)
 
+        route = task_cfg.get("route") if isinstance(task_cfg.get("route"), dict) else {}
+        affinity = route.get("kv_affinity") if isinstance(route.get("kv_affinity"), dict) else {}
+        fingerprint = str(affinity.get("fingerprint") or "").strip()
+
         headers: dict[str, str] = {}
         if route_id:
             headers["X-Aidir-Route-Id"] = route_id
         if outgoing_visited:
             headers["X-Aidir-Visited-Instances"] = ", ".join(outgoing_visited)
+        if fingerprint:
+            headers["X-Aidir-KV-Fingerprint"] = fingerprint
         return headers
 
     @staticmethod

@@ -106,7 +106,8 @@ python -m unittest -v \
   test_resource_reuse \
   test_peer_resources \
   test_scheduler_timeout_diagnostics \
-  test_context_overflow \
+  probe_context_overflow \
+  probe_timeout_semantics_live \
   test_kv_affinity \
   test_kv_affinity_routing \
   test_smart_router_direct \

@@ -461,7 +461,7 @@ async function loadTasks() {
   data.tasks.forEach(t => {
     const tr = document.createElement('tr');
     const isRemote = Boolean(t.remote);
-    const canTerminate = !isRemote && ['created', 'queued', 'running'].includes(String(t.status || '').toLowerCase());
+    const canTerminate = ['created', 'queued', 'running'].includes(String(t.status || '').toLowerCase());
     const timeoutField = t.status === 'queued' ? 'queue_timeout' : t.status === 'running' ? 'run_timeout' : '';
     const timeoutValue = timeoutField ? Number(t[timeoutField]) : NaN;
     const timeoutText = Number.isFinite(timeoutValue) ? `${timeoutValue}s` : '—';
@@ -514,7 +514,7 @@ async function loadTasks() {
     if (stepsBtn && !isRemote) stepsBtn.addEventListener('click', () => openTaskViewerSteps(t));
     const terminateBtn = tr.querySelector('[data-dashboard-terminate]');
     if (terminateBtn) {
-      terminateBtn.addEventListener('click', () => terminateDashboardTask(t.id, terminateBtn));
+      terminateBtn.addEventListener('click', () => terminateDashboardTask(t, terminateBtn));
     }
     const extendTimeoutBtn = tr.querySelector('[data-dashboard-extend-timeout]');
     if (extendTimeoutBtn) {
@@ -532,15 +532,18 @@ async function loadTasks() {
   }
 }
 
-async function terminateDashboardTask(taskId, buttonEl) {
+async function terminateDashboardTask(task, buttonEl) {
+  const taskId = task && task.id;
   if (!taskId) return;
 
-  const confirmed = window.confirm(`Terminate task ${taskId}?`);
+  const where = task.remote && task.instance ? ` on ${task.instance}` : '';
+  const confirmed = window.confirm(`Terminate task ${taskId}${where}?`);
   if (!confirmed) return;
 
   if (buttonEl) buttonEl.disabled = true;
 
-  const res = await apiPost(`/api/tasks/${encodeURIComponent(taskId)}/terminate`, {});
+  const body = task.remote && task.source_provider ? { provider: task.source_provider } : {};
+  const res = await apiPost(`/api/tasks/${encodeURIComponent(taskId)}/terminate`, body);
   if (!res.ok) {
     if (buttonEl) buttonEl.disabled = false;
     window.alert(res.data.detail || 'Failed to terminate task');

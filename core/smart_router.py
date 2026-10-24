@@ -2,10 +2,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import asyncio
+import copy
 import time
 from typing import Awaitable, Callable
 
 from core.kv_affinity import KvAffinityStore, KvFingerprint, ModelReadinessTracker
+
+
+_REMOTE_PROBE_CACHE_TTL_SECONDS = 1.0
 
 
 class SmartRouteError(Exception):
@@ -80,6 +85,9 @@ class SmartRouter:
         self._affinity_config = affinity_config if isinstance(affinity_config, dict) else {}
         self._get_model_queue_state = get_model_queue_state
         self._evaluate_model_admission = evaluate_model_admission
+        self._remote_probe_cache: dict[tuple[str, str, int], tuple[float, dict | None]] = {}
+        self._remote_probe_inflight: dict[tuple[str, str, int], asyncio.Task] = {}
+        self._candidate_inflight: dict[tuple[str, str, int], asyncio.Task] = {}
 
     async def resolve_route(
         self,
@@ -139,6 +147,8 @@ class SmartRouter:
             fingerprint = self._kv_affinity.fingerprint(request_payload)
             if fingerprint is not None:
                 affinity_record = self._kv_affinity.lookup(fingerprint)
+                if affinity_record is None:
+                    affinity_record = await self._kv_affinity.lookup_remote(fingerprint)
 
         candidates: list[dict] = []
         busy_candidates: list[dict] = []
@@ -160,7 +170,7 @@ class SmartRouter:
                         )
                     )
                     continue
-            candidate = await self.evaluate_candidate(
+            candidate = await self._evaluate_candidate_shared(
                 item,
                 request_priority=effective_priority,
                 index=index,
@@ -494,6 +504,7 @@ class SmartRouter:
                     "total_bytes": fingerprint.total_bytes,
                     "anchor_bytes": fingerprint.anchor_bytes,
                     "hash": fingerprint.hash[:8],
+                    "fingerprint": fingerprint.hash,
                 }
             )
         if isinstance(record, dict):
@@ -725,7 +736,7 @@ class SmartRouter:
                 "model_loaded": False,
             }
 
-        queue_state = await self._probe_remote_model_queue_state(
+        queue_state = await self._probe_remote_cached(
             provider_id,
             model_id,
             priority=request_priority,
@@ -766,6 +777,75 @@ class SmartRouter:
             "free": queue_state.get("free") or {},
             "needed": queue_state.get("needed") or {},
         }
+
+    async def _evaluate_candidate_shared(
+        self,
+        item: dict,
+        *,
+        request_priority: int,
+        index: int,
+        incoming_bearer_token: str = "",
+    ) -> dict | None:
+        """Share one in-flight candidate probe among tasks waiting together."""
+        provider_id = str((item or {}).get("provider") or "").strip()
+        model_id = str((item or {}).get("model") or "").strip()
+        key = (provider_id, model_id, int(request_priority))
+        task = self._candidate_inflight.get(key)
+        if task is None:
+            task = asyncio.create_task(self.evaluate_candidate(
+                item,
+                request_priority=request_priority,
+                index=index,
+                incoming_bearer_token=incoming_bearer_token,
+            ))
+            self._candidate_inflight[key] = task
+            owner = True
+        else:
+            owner = False
+        try:
+            candidate = await asyncio.shield(task)
+        finally:
+            if owner and task.done() and self._candidate_inflight.get(key) is task:
+                self._candidate_inflight.pop(key, None)
+        result = copy.deepcopy(candidate)
+        if isinstance(result, dict):
+            result["index"] = index
+        return result
+
+    async def _probe_remote_cached(
+        self,
+        provider_id: str,
+        model_id: str,
+        *,
+        priority: int,
+        timeout_ms: int,
+        incoming_bearer_token: str = "",
+    ) -> dict | None:
+        """Return a short-lived remote probe result, sharing an in-flight probe."""
+        key = (provider_id, model_id, int(priority))
+        now = time.monotonic()
+        cached = self._remote_probe_cache.get(key)
+        if cached is not None and cached[0] > now:
+            return copy.deepcopy(cached[1])
+
+        task = self._remote_probe_inflight.get(key)
+        if task is None:
+            task = asyncio.create_task(self._probe_remote_model_queue_state(
+                provider_id,
+                model_id,
+                priority=priority,
+                timeout_ms=timeout_ms,
+                incoming_bearer_token=incoming_bearer_token,
+            ))
+            self._remote_probe_inflight[key] = task
+        try:
+            result = await asyncio.shield(task)
+        finally:
+            if task.done() and self._remote_probe_inflight.get(key) is task:
+                self._remote_probe_inflight.pop(key, None)
+        result = copy.deepcopy(result) if isinstance(result, dict) else result
+        self._remote_probe_cache[key] = (time.monotonic() + _REMOTE_PROBE_CACHE_TTL_SECONDS, result)
+        return result
 
     def _build_resolution(
         self,

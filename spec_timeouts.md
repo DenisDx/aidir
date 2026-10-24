@@ -162,20 +162,17 @@ They do not stretch one LLM call to `TASK_RUN_TIMEOUT_SECONDS`.
 - `Task.to_redis_hash()` now persists `queue_timeout` and `run_timeout` for diagnostics.
 - Legacy per-request top-level payload field `timeout` is no longer used to override task lifecycle timeouts.
 
-## TBD
+## Retry and fallback semantics after first execution
 
-### Retry and fallback semantics after first execution
+Decision:
 
-Current implementation choice:
-
-- queue timeout is disabled forever after the first transition to `running`, even if the same task is later requeued because of retry or fallback logic
+- queue timeout is disabled forever after the first transition to `running`, even if the same task is later requeued because of retry or fallback logic;
+- every execution attempt gets the full `TASK_RUN_TIMEOUT_SECONDS` budget from its own start;
+- the delay between attempts (`retry_period` and `next_retry_at`) is not charged to the next run budget;
+- no separate retry-wait timeout is introduced. The number of attempts is bounded by `retry_count` and the fallback policy, and the task stays visible in the dashboard while it waits.
 
 Reason:
 
-- this matches the requirement that once a task managed to start, queue timeout must no longer kill it
-
-Open question:
-
-- if a task executes once, fails, and is requeued for a later retry, should the later wait be governed only by remaining run budget, or should there be a separate retry-wait budget in the future?
-
-No additional timeout type was introduced in this change.
+- once a task managed to start, queue timeout must no longer kill it;
+- a retry is a new execution attempt with the same per-attempt limits;
+- adding a fourth operational timeout would duplicate the attempt bound that `retry_count` already provides.

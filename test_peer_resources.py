@@ -328,6 +328,23 @@ class TestPeerResources(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["data"], [])
 
+    def test_peer_terminate_reaches_the_holding_core(self) -> None:
+        """Accept a peer termination request and terminate the local task."""
+        endpoint = Endpoint_openaix({"id": "openaix", "peer_tasks": {"auth_mode": "disabled"}})
+        core = _Core({"http": {"max_request_size": 1024}, "default_auth_mode": "disabled"})
+        terminated: list[str] = []
+
+        async def _terminate(task_id: str):
+            terminated.append(task_id)
+            return {"id": task_id}
+
+        core.terminate_task = _terminate
+        with TestClient(endpoint.create_app(core)) as client:
+            response = client.post("/v1/tasks/task-1/terminate")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(terminated, ["task-1"])
+
     def test_peer_client_caches_definitive_non_peer_but_retries_transient_failures(self) -> None:
         """Cache endpoint absence while allowing a later retry after an HTTP failure."""
         config = {

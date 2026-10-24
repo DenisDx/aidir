@@ -38,42 +38,42 @@ Priority meaning:
 | W7 | Security | P2 | There is no CSRF token anywhere | U20 |
 | W8 | Security | P2 | Closed: logout deletes the Bearer token session too | U21 |
 | W9 | Security | P2 | Closed: the legacy session namespace is no longer accepted | V9 |
-| W10 | Routing | P2 | The scheduler's router cannot probe the OpenAI-family providers, so their candidates are classified `provider_down` | U6, V11 (the OpenAI-family half) |
+| W10 | Routing | P2 | Closed: the scheduler passes `probe_openai_model_availability`, so OpenAI-family candidates are probed in the pre-dispatch refresh. |
 | W11 | Routing | P2 | The affinity store is process-local; there is no Redis mirror | U7, V11 |
-| W12 | Routing | P2 | The context fingerprint is not forwarded across instances | U8 |
-| W13 | Routing | P3 | The 20-message trim breaks conversational prefix reuse | U11, V13 |
+| W12 | Routing | P2 | Closed: route metadata carries the full fingerprint, the OpenAIx worker sends `X-Aidir-KV-Fingerprint`, and the receiver records it. The `openaix` history trim was removed so both sides see the same payload. |
+| W13 | Routing | P3 | Closed: the unconditional 20-message trim is removed, so the executor receives the payload the router fingerprinted. Model context limits remain the provider's responsibility. |
 | W14 | Routing | P3 | Both `first_available` and the single-candidate `direct` strategy are implemented | U9 |
 | W15 | Routing | P3 | Closed: affinity depends only on the context, so there is no per-alias partition | U10 |
-| W16 | Scheduling | P2 | The deferral loop is a busy poll | U13 |
-| W17 | Scheduling | P2 | `_select_worker` ignores the provider | U12 |
-| W18 | Scheduling | P3 | The admission lock is a single global lock | U14 |
-| W19 | Scheduling | P3 | Equal-priority tasks are ordered by task id, not by arrival time | U15 |
+| W16 | Scheduling | P2 | Closed: remote probes are cached by W45, concurrent local candidate probes share one in-flight evaluation, and the deferral loop still waits one second when it dispatches nothing. |
+| W17 | Scheduling | P2 | Closed: the worker named by the resolved route wins over an incompatible pinned worker. |
+| W18 | Scheduling | P3 | Closed: admission acquires one lock per touched resource in sorted order; an empty requirement set keeps the global lock. |
+| W19 | Scheduling | P3 | Closed: the queue score is priority-major and arrival-minor, so equal priorities are FIFO. |
 | W20 | Task model | P2 | The retry and fallback state is not fully persisted in the task hash | U16, V20 |
-| W21 | Task model | P2 | The envid contexts in Redis never expire | U2 |
+| W21 | Task model | P2 | Closed: the cron job `prune_envid_contexts` scans `{ns}:ctx:*`, compares `saved_at`, and deletes contexts older than `envids.store_duration_minutes`. |
 | W22 | Observability | P2 | Closed: durable waits are bounded and recent drops are shown in the health panel | U29 |
-| W23 | Observability | P2 | `cleanup_stale_tasks` is an empty stub | U31 |
+| W23 | Observability | P2 | Closed: a running task older than its run timeout plus a 60-second safety margin is failed with `STALE_TASK`. |
 | W24 | Observability | P3 | Closed: allowlisted rate-limit and request-id headers are restored | U33 |
 | W25 | Protocol | P2 | Closed: thinking signatures survive conversion and are emitted as `signature_delta` | U34 |
-| W26 | Protocol | P3 | `count_tokens` is a `chars/4` heuristic | U35 |
+| W26 | Protocol | P3 | Closed: the estimate adds 1600 tokens per image block and the protocol document says that it is an estimate. |
 | W27 | Interface | P2 | A task that waits on a remote cannot be canceled where it actually is | V13 |
 | W28 | Interface | P3 | Closed: the orphan count is already rendered by the existing health card | V15 |
-| W29 | Interface | P3 | The doctor reports a foreign namespace but does not remove it | V17 |
+| W29 | Interface | P3 | Closed by decision: deleting another instance's data is the operator's action; the check reports only. |
 | W30 | Tests | P2 | The envid registry, the MCP endpoint and the context workers have no direct coverage | U37 |
 | W31 | Tests | P2 | The OpenCode Go release gates are open | U38 |
-| W32 | Tests | P3 | Two CLI probes match the `test_*.py` discovery glob | U39 |
-| W33 | Documentation | P3 | The README's route table lists routes that were removed | U41 |
+| W32 | Tests | P3 | Closed: renamed to `probe_context_overflow.py` and `probe_timeout_semantics_live.py`; `TEST.md` lists both probes. |
+| W33 | Documentation | P3 | Closed: the removed routes are gone from the table. |
 | W34 | Documentation | P3 | `proposal_hooks.md` contradicts the shipped hook | U42 |
-| W35 | Documentation | P3 | The README references `prod.json5.example`, which does not exist | U43 |
-| W36 | Documentation | P3 | The plan documents quote stale test counts | U44 |
+| W35 | Documentation | P3 | Closed: the README uses only the shipped `config.json5.example` and an explicit filename example. |
+| W36 | Documentation | P3 | Closed: the plans no longer quote a fixed suite count. |
 | W37 | Documentation | P3 | The proposal status lines are stale | U45 |
 | W38 | Configuration | P3 | Closed: both per-file log override maps are declared | U3 |
 | W39 | Security | P3 | Closed: `_timeout` is clamped by `webui.request_timeouts.agent_test_max` | U24 |
 | W40 | Security | P3 | Closed: log directories are `0700`, new journals are `0600`, and the doctor checks the mode | U25 |
 | W41 | Security | P3 | Closed: a non-loopback bind gets a generated password, and the doctor warns when unprotected | U26 |
 | W42 | Observability | P3 | Closed: emergency retention may remove today when it is the sole partition | U30 |
-| W43 | Observability | P3 | The cron health check only pings Redis | U32 |
+| W43 | Observability | P3 | Closed: the cron health check also probes `/health` on every configured `openaix` and `mcp` endpoint. |
 | W44 | Protocol | P3 | Closed: the unused keyword is removed | U36 |
-| W45 | Routing | P3 | The remote probe has no cache and no in-flight deduplication | `proposal_aidir_smart_router.md` phase 3 |
+| W45 | Routing | P3 | Closed: remote probes are cached for one second and concurrent probes for the same provider/model/priority share one in-flight call. |
 | W46 | Protocol | P2 | The retry/fallback wait budget after the first execution is undefined | `spec_timeouts.md` TBD |
 | W47 | Acceptance | P2 | The browser acceptance of the generated editor has not been done | `plan_aiset_integration.md`, `TEST.md` 7.1 |
 | W48 | Tooling | P3 | The example configurations and the installation scripts for a configuration set | `TODO.md` |
@@ -186,58 +186,58 @@ previous round:
 
 | # | Problem | Where | Note |
 |---|---|---|---|
-| W10 | The scheduler's router cannot probe the OpenAI-family providers | `core/scheduler.py` | The scheduler builds its own router and does not pass `probe_openai_model_availability`, so a candidate on an `openai`, `opencode-go` or `anthropic` provider is classified `provider_down` in the pre-dispatch refresh, and its affinity record is forgotten. The endpoint's router probes them correctly. |
-| W11 | The affinity store is process-local | `core/kv_affinity.py` | A Redis mirror, with the in-process cache as the hot path. A restart currently loses every mapping. |
-| W12 | The fingerprint is not forwarded across instances | `core/endpoints/endpoint_ollama.py` | An `X-Aidir-KV-Fingerprint` header next to the route trace. Without it the receiver recomputes the hash from a possibly different view of the payload. |
-| W13 | The 20-message trim breaks prefix reuse | `workers/agent/openaix/app.py` | The hash must describe the payload the executor actually receives, and the trim must apply in every transport, not only in `openaix`. |
+| W10 | The scheduler's router cannot probe the OpenAI-family providers | `core/scheduler.py` | Closed: the scheduler passes `probe_openai_model_availability`, so OpenAI-family candidates are probed in the pre-dispatch refresh. |
+| W11 | The affinity store is process-local | `core/kv_affinity.py` | Closed: records are mirrored to Redis with their TTL; the in-process store stays the hot path and a local miss falls back to the mirror. |
+| W12 | The fingerprint is not forwarded across instances | `core/endpoints/endpoint_ollama.py` | Closed: route metadata carries the full fingerprint, the OpenAIx worker sends `X-Aidir-KV-Fingerprint`, and the receiver records it. The `openaix` history trim was removed so both sides see the same payload. |
+| W13 | The 20-message trim breaks prefix reuse | `workers/agent/openaix/app.py` | Closed: the unconditional 20-message trim is removed, so the executor receives the payload the router fingerprinted. Model context limits remain the provider's responsibility. |
 | W14 | The descriptor promised `direct`, but only `first_available` was implemented | `core/smart_router.py` | Closed: `direct` requires exactly one candidate and resolves under the normal admission rules. A different count is HTTP 400. |
 | W15 | The affinity identity was partitioned by alias, with no opt-out | `core/kv_affinity.py` | Closed by making the identity context-only: alias and client keys no longer partition the store, so a per-alias switch is unnecessary. `max_entries_per_alias` and `honor_prompt_cache_key` are deprecated and ignored. |
-| W16 | The deferral loop is a busy poll | `core/scheduler.py` | An adaptive interval, and one probe per candidate shared by the blocked tasks. |
-| W17 | `_select_worker` ignores the provider | `core/scheduler.py` | Verify that the selected worker can serve the resolved model; today a task pinned to a worker whose provider cannot serve the model reaches that worker and fails there. |
-| W18 | The admission lock is a single global lock | `core/resources.py` | A per-resource or striped lock. |
-| W19 | Equal-priority tasks are ordered by task id | `core/queue_manager.py` | A composite score, or a FIFO index per priority class. |
-| W45 | The remote probe has no cache and no in-flight deduplication | `core/smart_router.py` | The last two items of phase 3 of `proposal_aidir_smart_router.md`: a short-lived remote probe cache, and deduplication of the in-flight probes. The loop protection of phase 3 is done — the route trace rejects a loop and a hop overflow. |
+| W16 | The deferral loop is a busy poll | `core/scheduler.py` | Closed: remote probes are cached by W45, concurrent local candidate probes share one in-flight evaluation, and the deferral loop still waits one second when it dispatches nothing. |
+| W17 | `_select_worker` ignores the provider | `core/scheduler.py` | Closed: the worker named by the resolved route wins over an incompatible pinned worker. |
+| W18 | The admission lock is a single global lock | `core/resources.py` | Closed: admission acquires one lock per touched resource in sorted order; an empty requirement set keeps the global lock. |
+| W19 | Equal-priority tasks are ordered by task id | `core/queue_manager.py` | Closed: the queue score is priority-major and arrival-minor, so equal priorities are FIFO. |
+| W45 | The remote probe has no cache and no in-flight deduplication | `core/smart_router.py` | Closed: remote probes are cached for one second and concurrent probes for the same provider/model/priority share one in-flight call. |
 
 ### 3.3 The task model and the observability
 
 | # | Problem | Where | Note |
 |---|---|---|---|
 | W20 | The retry state is not fully persisted | `core/task.py` | Closed: `fallbacks`, `next_retry_at` and `on_reject` now survive a Redis round trip, together with the already-persisted `fallback_index` and `retry_attempt`. |
-| W21 | The envid contexts never expire | `core/envid.py` | The declared `store_duration_minutes` is read by nobody, and no cron job prunes `{ns}:ctx:*`. |
+| W21 | The envid contexts never expire | `core/envid.py` | Closed: the cron job `prune_envid_contexts` scans `{ns}:ctx:*`, compares `saved_at`, and deletes contexts older than `envids.store_duration_minutes`. |
 | W22 | The audit writer drops events | `core/audit_log.py` | Closed: `durable` enqueue and receipt waits are bounded, and `dropped_recent` is shown in the execution-health line. `best_effort` still drops visibly. |
-| W23 | `cleanup_stale_tasks` is a stub | `core/cron.py` | A worker heartbeat, then a task whose worker is gone is failed. |
+| W23 | `cleanup_stale_tasks` is a stub | `core/cron.py` | Closed: a running task older than its run timeout plus a 60-second safety margin is failed with `STALE_TASK`. |
 | W24 | The upstream error response restores only `content-type` | `core/upstream_errors.py` | Closed: `retry-after`, `request-id`, `x-request-id` and `x-ratelimit-*` are captured and restored. |
 | W42 | The retention never deletes today's partition | `core/audit_log.py` | Closed: emergency retention may remove today when it is the only partition left, with a warning. The ordinary age and quota rules still require two days. |
-| W43 | The health check only pings Redis | `core/cron.py` | Add an HTTP check of the OpenAIx and the MCP routes. The port is known from the configuration. |
+| W43 | The health check only pings Redis | `core/cron.py` | Closed: the cron health check also probes `/health` on every configured `openaix` and `mcp` endpoint. |
 
 ### 3.4 The protocol
 
 | # | Problem | Where | Note |
 |---|---|---|---|
 | W25 | The Anthropic thinking signature is never emitted | `core/messages_protocol.py` | Closed: signed thinking blocks survive conversion and the encoder emits `signature_delta` before closing the thinking block. |
-| W26 | `count_tokens` is a `chars/4` heuristic | `core/messages_protocol.py` | Count the images, and say that it is an estimate. |
+| W26 | `count_tokens` is a `chars/4` heuristic | `core/messages_protocol.py` | Closed: the estimate adds 1600 tokens per image block and the protocol document says that it is an estimate. |
 | W44 | The unused `streaming` keyword | `core/messages_protocol.py` | Closed: removed. |
-| W46 | The retry/fallback wait budget is undefined | `spec_timeouts.md` | The open question of the normative document: if a task executed once, failed and was re-queued, should the later wait be governed by the remaining run budget, or is there a separate retry-wait budget? No additional timeout type was introduced, and the decision is not recorded. |
+| W46 | The retry/fallback wait budget is undefined | `spec_timeouts.md` | Closed by decision: each attempt gets a full run-timeout budget, the wait between attempts is not charged to it, and no separate retry-wait timeout is introduced. |
 
 ### 3.5 The operator's view
 
 | # | Problem | Where |
 |---|---|---|
-| W27 | A task that waits on a remote cannot be canceled where it is | The dashboard offers the remote instance for a task that waits on one, so a cancel reaches the holder. |
+| W27 | A task that waits on a remote cannot be canceled where it is | Closed: the dashboard sends the provider id, the WebUI forwards the cancel to the peer `/v1/tasks/{id}/terminate`, and the holder terminates the task. |
 | W28 | The orphan count is not a row of the health card | Closed. The count is in the status and the existing card renders it; a separate row is not wanted. |
-| W29 | The doctor reports a foreign namespace but does not remove it | The data of another instance is the operator's decision, so the check only reports. A `--fix-all` repair would need the confirmation the other destructive repairs have. |
+| W29 | The doctor reports a foreign namespace but does not remove it | Closed by decision: deleting another instance's data is the operator's action; the check reports only. |
 
 ### 3.6 The tests and the documentation
 
 | # | Problem | Where |
 |---|---|---|
-| W30 | The envid registry, the MCP endpoint and the three context workers have no direct coverage | `core/envid.py`, `core/endpoints/endpoint_mcp.py`, `workers/context/*` |
+| W30 | The envid registry, the MCP endpoint and the three context workers have no direct coverage | Closed: `test_context_components.py` covers the registry round trip, MCP health/initialize, and all three context workers. |
 | W31 | The seven OpenCode Go release gates are open | `proposal_opencode_go.md` — the focused tests, the health-probe regression, the audit of the session serialization, the error-code normalization, the documentation and the redacted fixtures with a live smoke |
-| W32 | Two CLI probes match the `test_*.py` discovery glob | `test_context_overflow.py`, `test_timeout_semantics_live.py` — they contribute nothing to the suite and one of them is claimed by `TEST.md` as coverage |
-| W33 | The README's route table lists `/api/config*` | `README.md` |
+| W32 | Two CLI probes match the `test_*.py` discovery glob | Closed: renamed to `probe_context_overflow.py` and `probe_timeout_semantics_live.py`; `TEST.md` lists both probes. |
+| W33 | The README's route table lists `/api/config*` | Closed: the removed routes are gone from the table. |
 | W34 | `proposal_hooks.md` says both bundled hooks ship disabled | `proposal_hooks.md` — one of them has `ENABLED = True` |
-| W35 | The README references `prod.json5.example` | `README.md` — the file does not exist, and `./install.sh prod` fails on it |
-| W36 | The plan documents quote stale test counts | `plan_kv_keeper.md`, `plan_aiset_integration.md` |
+| W35 | The README references `prod.json5.example` | Closed: the README uses only the shipped `config.json5.example` and an explicit filename example. |
+| W36 | The plan documents quote stale test counts | Closed: the plans no longer quote a fixed suite count. |
 | W37 | The proposal status lines are stale | `proposal_kv_keeper.md`, `proposal_searxng.md`, `_proposal_embedding.md` |
 | W38 | `logging.logs` / `logging.log_overrides` is read but not declared | `config.descriptor.json5` — Closed: both maps are declared with bounded per-file settings. |
 | W47 | The browser acceptance of the generated editor has not been done | `plan_aiset_integration.md`, `TEST.md` 7.1 — the step that needs a human, through nginx |

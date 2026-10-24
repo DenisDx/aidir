@@ -352,11 +352,10 @@ the resource requirements and the worker id are updated.
 
 A `SmartRouteError` here is swallowed and the existing route is kept.
 
-**Known gap:** the scheduler's router is not given the OpenAI-family probe callback,
-so an `openai` / `opencode-go` / `anthropic` candidate is classified
-`provider_down` in this path. The route survives, but the candidate's affinity
-record is forgotten and its readiness history is polluted with `provider_down`
-transitions.
+The scheduler passes the OpenAI-family probe callback to its router, so
+`openai` / `opencode-go` / `anthropic` candidates are classified from their
+`/v1/models` response instead of `provider_down`. A failed probe still drops the
+candidate's affinity record and records a readiness transition.
 
 ### 3.11 Cancellation
 
@@ -851,7 +850,8 @@ is why `cold_model_wait_timeout_seconds` defaults to 0.
 There is **no background prober**. Every evaluated candidate is sampled on every
 routing decision. The scheduler's ~1 Hz deferral loop provides the sampling
 density. A task that sits in a busy fallback and is not re-resolved contributes no
-history.
+history. Concurrent tasks that evaluate the same candidate share one in-flight
+probe; remote probes are additionally cached for one second.
 
 ### 6.10 When affinity is dropped
 
@@ -1038,16 +1038,8 @@ known inconsistency.
 | # | Limitation |
 |---|---|
 | 1 | The affinity identity is context-only, so there is no per-alias opt-out; the deprecated keys are ignored |
-| 2 | The scheduler's router cannot probe the OpenAI-family providers, which spuriously forgets their affinity records |
-| 3 | The affinity store is process-local; there is no Redis mirror |
-| 4 | The 20-message trim in the `openaix` worker breaks conversational prefix reuse |
-| 5 | The 20-message trim applies only to `openaix` — the transports that override `execute()` do not apply it |
-| 6 | The readiness tracker samples only on candidate evaluation |
-| 7 | The affinity wait competes with the task's own `queue_timeout`: a waiting task can hit `QUEUE_TIMEOUT` first |
-| 8 | The admission lock is a single global `asyncio.Lock` |
-| 9 | The deferral loop is a busy poll that re-probes every candidate per second |
-| 10 | `_select_worker` ignores the provider |
-| 11 | Equal-priority tasks are ordered by task id, not by arrival time |
+| 3 | The readiness tracker samples only on candidate evaluation |
+| 4 | The affinity wait competes with the task's own `queue_timeout`: a waiting task can hit `QUEUE_TIMEOUT` first |
 | 12 | `force_unload_for` returns `False` if any unload failed, but the successfully unloaded models are already cleared from the ledger |
 | 13 | The peer capability cache is per-process and only negative-definitive |
 | 14 | The availability commands are trusted shell |

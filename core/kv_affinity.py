@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass
+import asyncio
 import hashlib
 import hmac
 import json
@@ -260,6 +261,8 @@ class KvAffinityStore:
         self.max_entries = max(1, int(max_entries))
         self._clock = clock
         self._records: OrderedDict[tuple[int, str], dict] = OrderedDict()
+        self._redis = None
+        self._namespace = "aidir"
 
     @classmethod
     def from_config(cls, full_config: dict | None, *, clock=time.time) -> "KvAffinityStore":
@@ -285,6 +288,105 @@ class KvAffinityStore:
     @_secret.setter
     def _secret(self, value: str) -> None:
         self._secret_value = str(value or "")
+
+    def attach_redis(self, redis, namespace: str = "aidir") -> None:
+        """Attach an optional Redis mirror while keeping the in-process store hot."""
+        self._redis = redis
+        self._namespace = str(namespace or "aidir")
+
+    def _mirror_key(self, record_hash: str) -> str:
+        """Return the Redis key for one affinity record."""
+        return f"{self._namespace}:kv_affinity:{record_hash}"
+
+    def _schedule_mirror(self, coroutine) -> None:
+        """Run one mirror write without blocking the routing hot path."""
+        if self._redis is None:
+            coroutine.close()
+            return
+        try:
+            asyncio.get_running_loop().create_task(coroutine)
+        except RuntimeError:
+            coroutine.close()
+
+    async def lookup_remote(self, fingerprint: KvFingerprint | None) -> dict | None:
+        """Return the most specific mirrored record for a fingerprint."""
+        if self._redis is None or not self.enabled or fingerprint is None:
+            return None
+        lengths = [step for step in self.policy.ladder if step <= fingerprint.anchor_bytes]
+        if fingerprint.anchor_bytes not in lengths:
+            lengths.append(fingerprint.anchor_bytes)
+        hashes = {
+            length: _prefix_hash(
+                fingerprint.text[:length],
+                request_kind=fingerprint.request_kind,
+                secret=self._secret,
+            )
+            for length in lengths
+        }
+        try:
+            raw_records = await self._redis.mget([self._mirror_key(value) for value in hashes.values()])
+        except Exception:
+            return None
+        best: dict | None = None
+        now = self._clock()
+        for length, raw in zip(lengths, raw_records):
+            if not raw:
+                continue
+            try:
+                record = json.loads(raw)
+                expires_at = float(record.get("expires_at") or 0)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if expires_at <= now:
+                continue
+            if best is None or length > int(best.get("anchor_bytes") or 0):
+                best = record
+        if best is None:
+            return None
+        best["matched_anchor_bytes"] = int(best.get("anchor_bytes") or 0)
+        key = (int(best.get("anchor_bytes") or 0), str(best.get("hash") or ""))
+        self._records[key] = dict(best)
+        self._records.move_to_end(key)
+        self._enforce_bounds()
+        return dict(best)
+
+    async def _write_mirror(self, record: dict) -> None:
+        """Write one record and add it to the mirror index."""
+        try:
+            pipe = self._redis.pipeline(transaction=False)
+            pipe.set(
+                self._mirror_key(str(record.get("hash") or "")),
+                json.dumps(record, ensure_ascii=False),
+                ex=max(1, int(record.get("expires_at") or self._clock() + self.ttl_seconds) - int(self._clock())),
+            )
+            pipe.sadd(f"{self._namespace}:kv_affinity:index", str(record.get("hash") or ""))
+            await pipe.execute()
+        except Exception:
+            return
+
+    async def _forget_candidate_mirror(self, provider_id: str, model_id: str) -> None:
+        """Delete mirrored records routed to one candidate."""
+        try:
+            index_key = f"{self._namespace}:kv_affinity:index"
+            hashes = await self._redis.smembers(index_key)
+            if not hashes:
+                return
+            raw_records = await self._redis.mget([self._mirror_key(value) for value in hashes])
+            stale = []
+            for raw in raw_records:
+                if not raw:
+                    continue
+                try:
+                    record = json.loads(raw)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                if record.get("provider") == provider_id and record.get("model") == model_id:
+                    stale.append(str(record.get("hash") or ""))
+            if stale:
+                await self._redis.delete(*[self._mirror_key(value) for value in stale])
+                await self._redis.srem(index_key, *stale)
+        except Exception:
+            return
 
     def fingerprint(self, payload: dict | None, request_kind: str = "chat") -> KvFingerprint | None:
         """Build the canonical context fingerprint for one request."""
@@ -386,6 +488,7 @@ class KvAffinityStore:
             )
             self._records.move_to_end(key)
         self._enforce_bounds()
+        self._schedule_mirror(self._write_mirror(dict(record)))
 
     def forget_prefix(self, fingerprint: KvFingerprint | None) -> None:
         """Remove the exact record for one fingerprint."""
@@ -402,6 +505,7 @@ class KvAffinityStore:
         for key, record in list(self._records.items()):
             if record.get("provider") == provider_id and record.get("model") == model_id:
                 self._records.pop(key, None)
+        self._schedule_mirror(self._forget_candidate_mirror(provider_id, model_id))
 
     def clear(self) -> None:
         """Drop every affinity record."""

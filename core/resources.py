@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Callable
 
 from core import log
@@ -42,8 +43,31 @@ class Resources:
         self._ns: str = "aidir"
         self._full_config: dict = {}
         self._admission_lock = asyncio.Lock()
+        self._admission_locks: dict[str, asyncio.Lock] = {}
         self._model_active: dict[tuple[str, str], int] = {}
         self._candidate_invalidator: Callable[[str, str], None] | None = None
+
+    @asynccontextmanager
+    async def _admission_guard(self, *requirement_sets: dict[str, dict[str, int]] | None):
+        """Serialize admission only for the resources a request touches."""
+        resource_ids = sorted({
+            resource_id
+            for requirements in requirement_sets
+            for resource_id in (requirements or {})
+            if resource_id in self._items
+        })
+        if not resource_ids:
+            async with self._admission_lock:
+                yield
+            return
+        locks = [self._admission_locks.setdefault(resource_id, asyncio.Lock()) for resource_id in resource_ids]
+        for lock in locks:
+            await lock.acquire()
+        try:
+            yield
+        finally:
+            for lock in reversed(locks):
+                lock.release()
 
     def apply_config(self, items: list[dict] | None = None) -> dict:
         """Update the registry in place from a new configuration.
@@ -459,7 +483,7 @@ class Resources:
         session = self.local_admission_requirements(session)
         if maximum <= 1:
             return None
-        async with self._admission_lock:
+        async with self._admission_guard(reqs, session):
             admission = self.evaluate_model_admission(reqs, model_id, provider_id)
             if not admission.get("admissible_now"):
                 return admission
@@ -498,7 +522,7 @@ class Resources:
         """Release one session and, when it was the last, return the base to soft tracking."""
         session = self._normalize_requirements(session_requirements)
         base = self._normalize_requirements(base_requirements)
-        async with self._admission_lock:
+        async with self._admission_guard(session, base):
             for resource_id, metrics in session.items():
                 resource = self._items.get(resource_id)
                 if resource is not None:
@@ -705,7 +729,7 @@ class Resources:
     ) -> bool:
         """Atomically check and reserve all requested resources for one consumer."""
         reqs = requirements or {}
-        async with self._admission_lock:
+        async with self._admission_guard(reqs):
             if not self.check_available(reqs):
                 return False
             await self.reserve_blind_for(
@@ -725,7 +749,7 @@ class Resources:
     ) -> bool:
         """Atomically reserve resources for a new or matching warm model."""
         reqs = requirements or {}
-        async with self._admission_lock:
+        async with self._admission_guard(reqs):
             reusable = bool(model_id) and self.check_available_for_reuse(
                 reqs,
                 str(model_id),

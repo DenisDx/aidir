@@ -240,6 +240,7 @@ class Core:
                 log("system", "info", f"Task recovery: {recovery}")
 
         # ── Envid registry ─────────────────────────────────────────────────
+        self.kv_affinity.attach_redis(self.redis, instance)
         self.envid_registry = EnvidRegistry(self.redis, instance)
         await self.envid_registry.load_from_redis()
         await self.envid_registry.merge_from_config(self.config.raw())

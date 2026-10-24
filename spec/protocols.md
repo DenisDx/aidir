@@ -504,8 +504,9 @@ required (the token must be valid).
 ```
 
 The estimate is `ceil(total_characters / 4)` over the system text, the message text
-and the serialized tool schemas. It is deterministic, local, creates **no task** and
-calls **no model**. Images are not counted.
+and the serialized tool schemas, plus a fixed 1600 tokens per image block. This is
+an estimate, not a tokenizer: it is deterministic, local, creates **no task** and
+calls **no model**.
 
 ### 3.4 `GET /v1/models`
 

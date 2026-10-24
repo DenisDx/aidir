@@ -1,6 +1,6 @@
 CHARS_PER_TOKEN = 4
-# Run: ./venv/bin/python test_context_overflow.py MODEL_NAME CONTEXT_TOKENS
-# Example: ./venv/bin/python test_context_overflow.py smart_glm-4.7 32000
+# Run: ./venv/bin/python probe_context_overflow.py MODEL_NAME CONTEXT_TOKENS
+# Example: ./venv/bin/python probe_context_overflow.py smart_glm-4.7 32000
 # The script checks /v1/models/{model}/queue-state and sends one /api/chat request only when can_run_now=true.
 
 import argparse

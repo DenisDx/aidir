@@ -1297,13 +1297,19 @@ class TestAidirRouteTrace(unittest.TestCase):
             "route_trace": {
                 "route_id": "route-1",
                 "visited_instances": ["node-a"],
-            }
+            },
+            "route": {
+                "kv_affinity": {
+                    "fingerprint": "0123456789abcdef0123456789abcdef",
+                }
+            },
         }
 
         headers = worker._resolve_request_headers(task, "remote_aidir")
 
         self.assertEqual(headers["X-Aidir-Route-Id"], "route-1")
         self.assertEqual(headers["X-Aidir-Visited-Instances"], "node-a, node-b")
+        self.assertEqual(headers["X-Aidir-KV-Fingerprint"], "0123456789abcdef0123456789abcdef")
 
 
 class TestOpenAIxGenerationParameters(unittest.TestCase):
