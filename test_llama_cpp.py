@@ -447,6 +447,18 @@ class TestLocalServerManager(unittest.IsolatedAsyncioTestCase):
             error = manager.startup_error("llama_local")
             self.assertEqual(error["code"], "LLAMA_CPP_START_FAILED")
             self.assertIn("exited with code", error["message"])
+            self.assertTrue(manager.startup_blocked("llama_local"))
+            self.assertFalse(manager.startup_blocked("llama_local", cooldown=0))
+
+            resources = Resources([{"id": "gpu", "type": "cuda", "limits": {"VRAM": 20}}])
+            resources.set_local_server_manager(manager)
+            self.assertTrue(resources.provider_startup_blocked("llama_local"))
+
+            with patch.object(LocalServerManager, "_is_healthy", AsyncMock(return_value=True)):
+                await manager.ensure_running("llama_local", "model")
+            self.assertIsNone(manager.startup_error("llama_local"))
+            self.assertFalse(manager.startup_blocked("llama_local"))
+            self.assertFalse(resources.provider_startup_blocked("llama_local"))
 
 
 class TestLlamaCppResourceRestore(unittest.TestCase):

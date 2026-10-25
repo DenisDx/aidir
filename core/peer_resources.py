@@ -24,6 +24,11 @@ class PeerResourceClient:
         self._full_config = full_config if isinstance(full_config, dict) else {}
         self._capabilities: dict[str, bool] = {}
 
+    def set_full_config(self, full_config: dict | None) -> None:
+        """Replace the provider configuration and retry peers that were cached as non-peers."""
+        self._full_config = full_config if isinstance(full_config, dict) else {}
+        self._capabilities.clear()
+
     def is_candidate(self, provider_id: str | None) -> bool:
         """Return whether a provider can be probed as an OpenAIx peer."""
         provider = self._provider_config(provider_id)
@@ -69,8 +74,10 @@ class PeerResourceClient:
                         return PeerResourceResult("failed", error=f"peer resource request failed: {exc}")
 
                     if response.status_code in {401, 403}:
-                        self._capabilities[normalized_provider_id] = False
-                        return PeerResourceResult("not_peer", error=f"peer authorization returned HTTP {response.status_code}")
+                        return PeerResourceResult(
+                            "failed",
+                            error=f"peer authorization returned HTTP {response.status_code}",
+                        )
                     if response.status_code == 404:
                         saw_not_found = True
                         continue

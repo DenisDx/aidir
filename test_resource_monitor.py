@@ -129,10 +129,12 @@ class TestResourceMonitor(unittest.IsolatedAsyncioTestCase):
 
         await monitor.poll_resource("gpu")
         self.assertFalse(resource.is_available({"VRAM": 1}))
+        self.assertFalse(resource.is_available_after_unload({"VRAM": 1}))
         self.assertEqual(resources.snapshot()[0]["availability"]["status"], "error")
 
         await monitor.poll_resource("gpu")
         self.assertTrue(resource.is_available({"VRAM": 15}))
+        self.assertTrue(resource.is_available_after_unload({"VRAM": 15}))
         self.assertEqual(resources.snapshot()[0]["availability"]["status"], "ok")
 
     async def test_peer_availability_updates_resource_capacity(self) -> None:
@@ -186,6 +188,75 @@ class TestResourceMonitor(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot["source"], "peer")
         self.assertEqual(snapshot["available"], {"VRAM": 9.0})
         self.assertEqual(resources.snapshot()[0]["telemetry"]["sensors"][0]["value"], 44)
+
+    async def test_dispatch_refresh_skips_peer_resources(self) -> None:
+        """Leave peer admission to the remote queue-state probe before forwarding a task."""
+        class _PeerClient:
+            """Count resource probes issued by the monitor."""
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def is_candidate(self, provider_id: str | None) -> bool:
+                """Accept the configured remote provider."""
+                return provider_id == "remote"
+
+            async def probe_resource(self, provider_id, resource_id, timeout_ms):
+                """Fail the probe so an accidental call is visible."""
+                self.calls += 1
+                return PeerResourceResult("failed", error="peer resource request timed out")
+
+        peer_client = _PeerClient()
+        resources = Resources([{
+            "id": "remote_gpu",
+            "type": "cuda",
+            "limits": {"VRAM": 20},
+            "units": {"VRAM": "MiB"},
+            "provider": "remote",
+            "availability": {"peer_resource_id": "gpu", "request_timeout_ms": 100},
+        }])
+        monitor = ResourceMonitor(resources, peer_client=peer_client)
+
+        self.assertTrue(await monitor.refresh_required_availability({"remote_gpu": {"VRAM": 20}}))
+        self.assertEqual(peer_client.calls, 0)
+
+    async def test_peer_error_is_cleared_when_provider_stops_publishing_resources(self) -> None:
+        """Do not keep an old peer error after the provider is classified as a non-peer."""
+        class _PeerClient:
+            """Fail once, then report that the provider has no resource endpoint."""
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def is_candidate(self, provider_id: str | None) -> bool:
+                """Accept the configured remote provider."""
+                return provider_id == "remote"
+
+            async def probe_resource(self, provider_id, resource_id, timeout_ms):
+                """Return a timeout first and then a non-peer outcome."""
+                self.calls += 1
+                if self.calls == 1:
+                    return PeerResourceResult("failed", error="peer resource request timed out")
+                return PeerResourceResult("not_peer", error="peer resource endpoint is unavailable")
+
+        resources = Resources([{
+            "id": "remote_gpu",
+            "type": "cuda",
+            "limits": {"VRAM": 20},
+            "units": {"VRAM": "MiB"},
+            "provider": "remote",
+            "availability": {"peer_resource_id": "gpu", "request_timeout_ms": 100},
+        }])
+        monitor = ResourceMonitor(resources, peer_client=_PeerClient())
+
+        self.assertFalse(await monitor.refresh_availability("remote_gpu"))
+        self.assertEqual(resources.snapshot()[0]["availability"]["status"], "error")
+
+        self.assertTrue(await monitor.refresh_availability("remote_gpu"))
+        snapshot = resources.snapshot()[0]["availability"]
+        self.assertEqual(snapshot["source"], "estimated")
+        self.assertEqual(snapshot["status"], "ok")
+        self.assertIsNone(snapshot["error"])
 
     async def test_telemetry_exports_only_whitelisted_sensor_state(self) -> None:
         """Expose selected sensor readings without exposing their executable commands."""

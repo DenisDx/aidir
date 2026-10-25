@@ -101,6 +101,21 @@ class Resource:
             "error": error,
         }
 
+    def clear_availability_failure(self, source: str | None = None) -> None:
+        """Return to estimated availability when a failed probe no longer applies."""
+        state = self._availability_state
+        if state.get("status") != "error":
+            return
+        if source is not None and state.get("source") != source:
+            return
+        self._availability_state = {
+            "source": "estimated",
+            "status": "ok",
+            "available": {},
+            "observed_at": None,
+            "error": None,
+        }
+
     def availability_snapshot(self) -> dict:
         """Return public availability state without executable configuration."""
         state = dict(self._availability_state)
@@ -290,7 +305,13 @@ class Resource:
         if not self.use:
             return False
         req = required or {}
-        if self.has_command_availability():
+        measured = self.has_command_availability() or self._availability_state.get("source") in {
+            "command",
+            "peer",
+        }
+        if measured:
+            if self._availability_state.get("status") != "ok":
+                return False
             soft = self._compute_soft_used()
             for key, amount in req.items():
                 need = int(amount)

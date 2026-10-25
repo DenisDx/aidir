@@ -138,6 +138,12 @@ class Resources:
         """Inject the manager used to stop locally owned llama.cpp servers."""
         self._local_server_manager = manager
 
+    def provider_startup_blocked(self, provider_id: str) -> bool:
+        """Return whether a recent local startup failure should keep routing away."""
+        manager = getattr(self, "_local_server_manager", None)
+        checker = getattr(manager, "startup_blocked", None)
+        return bool(checker(str(provider_id))) if callable(checker) else False
+
     def set_candidate_invalidator(self, callback: Callable[[str, str], None] | None) -> None:
         """Inject the callback that drops routing affinity for an unloaded model."""
         self._candidate_invalidator = callback

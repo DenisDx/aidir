@@ -31,6 +31,7 @@ class LocalServerManager:
         self._state_path = self._root / "logs" / "llama_cpp_servers.json"
         self._locks: dict[str, asyncio.Lock] = {}
         self._startup_errors: dict[str, dict[str, str]] = {}
+        self._startup_failed_at: dict[str, float] = {}
 
     async def ensure_running(self, provider_id: str, model_id: str = "") -> None:
         """Ensure a llama.cpp provider is healthy, starting it only when configured locally."""
@@ -41,9 +42,11 @@ class LocalServerManager:
                 "code": exc.code,
                 "message": str(exc),
             }
+            self._startup_failed_at[provider_id] = time.monotonic()
             raise
         else:
             self._startup_errors.pop(provider_id, None)
+            self._startup_failed_at.pop(provider_id, None)
 
     def startup_error(self, provider_id: str) -> dict[str, str] | None:
         """Return the latest failed startup result for a local provider."""
@@ -53,6 +56,13 @@ class LocalServerManager:
     def startup_errors(self) -> dict[str, dict[str, str]]:
         """Return the failed startup result of every local provider."""
         return {provider_id: dict(error) for provider_id, error in self._startup_errors.items()}
+
+    def startup_blocked(self, provider_id: str, cooldown: float = 60.0) -> bool:
+        """Return whether a recent startup failure should keep routing away from a provider."""
+        failed_at = self._startup_failed_at.get(provider_id)
+        if failed_at is None or provider_id not in self._startup_errors:
+            return False
+        return time.monotonic() - failed_at < max(0.0, cooldown)
 
     async def _ensure_running(self, provider_id: str, model_id: str = "") -> None:
         """Start and await a local llama.cpp provider without recording status."""

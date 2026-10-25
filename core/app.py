@@ -447,6 +447,9 @@ class Core:
         # running task holds is not thrown away.
         try:
             result["resources"] = self.resources.apply_config(after.get("resources") or [])
+            self.resources.set_full_config(after)
+            if self.resource_monitor is not None:
+                self.resource_monitor.apply_peer_config(after)
         except Exception as exc:
             log("system", "error", f"Config reload: the resources could not be updated: {exc}")
             result["resources_error"] = str(exc)

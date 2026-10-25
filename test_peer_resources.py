@@ -390,6 +390,60 @@ class TestPeerResources(unittest.TestCase):
         import asyncio
         asyncio.run(exercise())
 
+    def test_peer_client_retries_authorization_failure_with_reloaded_credentials(self) -> None:
+        """Do not cache a 401 as a non-peer, and use provider auth added by a config reload."""
+        config = {
+            "models": {
+                "providers": {
+                    "peer": {
+                        "api": "openaix",
+                        "baseUrl": "http://peer.example",
+                    }
+                }
+            }
+        }
+        auth_config = {
+            "models": {
+                "providers": {
+                    "peer": {
+                        "api": "openaix",
+                        "baseUrl": "http://peer.example",
+                        "auth": {"type": "bearer", "token": "peer-token"},
+                    }
+                }
+            }
+        }
+        payload = {
+            "id": "gpu",
+            "limits": {"VRAM": 20},
+            "availability": {"status": "ok", "available": {"VRAM": 12}},
+        }
+
+        async def exercise() -> None:
+            """Retry after a 401 and send the credential from the reloaded config."""
+            client = PeerResourceClient(config)
+            clients: list[_AsyncClient] = []
+
+            def factory(**kwargs):
+                status_code = 401 if not clients else 200
+                created = _AsyncClient([_Response(status_code, payload)], **kwargs)
+                clients.append(created)
+                return created
+
+            with patch("core.peer_resources.httpx.AsyncClient", side_effect=factory):
+                failed = await client.probe_resource("peer", "gpu", 100)
+                client.set_full_config(auth_config)
+                succeeded = await client.probe_resource("peer", "gpu", 100)
+
+            self.assertEqual(failed.status, "failed")
+            self.assertIn("HTTP 401", failed.error or "")
+            self.assertEqual(succeeded.status, "ok")
+            self.assertEqual(len(clients), 2)
+            self.assertEqual(clients[1].headers.get("Authorization"), "Bearer peer-token")
+
+        import asyncio
+        asyncio.run(exercise())
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

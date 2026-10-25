@@ -35,6 +35,15 @@ _SUPPORTED_TYPES = ("agent", "tool")  # TODO: extend with request, tts, stt…
 # task waits for its whole queue timeout and the client sees nothing.
 _MAX_REMOTE_REFUSALS = 5
 
+# A failed concrete candidate is rerouted to the next smart-route item when the
+# failure belongs to that provider rather than to the request itself.
+_SMART_FALLBACK_ERROR_CODES = {
+    "UPSTREAM_ERROR",
+    "UPSTREAM_UNREACHABLE",
+    "INVALID_EXEC_CMD",
+    "LLAMA_CPP_START_FAILED",
+}
+
 
 class Scheduler:
     """
@@ -598,7 +607,7 @@ class Scheduler:
         error: dict,
     ) -> bool:
         """Requeue a failed smart route on the next eligible concrete candidate."""
-        if str((error or {}).get("code") or "").upper() != "UPSTREAM_ERROR":
+        if str((error or {}).get("code") or "").upper() not in _SMART_FALLBACK_ERROR_CODES:
             return False
 
         route_cfg = (task.config or {}).get("route") if isinstance(task.config, dict) else None
@@ -1302,6 +1311,9 @@ class Scheduler:
                 response = await client.get(f"{base_url}/v1/models" if api_type == "llama-cpp" else f"{base_url}/api/tags")
         except httpx.HTTPError:
             if api_type == "llama-cpp" and str(provider_cfg.get("exec_cmd") or "").strip():
+                blocked = getattr(self._resources, "provider_startup_blocked", None)
+                if callable(blocked) and blocked(provider_id):
+                    return False
                 return True
             return False
 

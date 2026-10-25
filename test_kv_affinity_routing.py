@@ -430,3 +430,9 @@ class SchedulerAffinityTests(unittest.IsolatedAsyncioTestCase):
         record = store.lookup(fingerprint)
         self.assertIsNotNone(record)
         self.assertEqual(record["provider"], "ollama_local")
+
+        moved = await scheduler._fallback_smart_route_after_execution_failure(
+            task, "openaix", {"code": "LLAMA_CPP_START_FAILED"}
+        )
+        self.assertTrue(moved)
+        self.assertEqual(task.config["route"]["resolved_provider"], "ollama_remote")

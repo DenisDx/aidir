@@ -952,6 +952,10 @@ class Endpoint_ollama(BaseEndpoint):
                 response = await client.get(f"{base_url}/v1/models" if api_type == "llama-cpp" else f"{base_url}/api/tags")
         except httpx.HTTPError:
             if api_type == "llama-cpp" and str(provider_cfg.get("exec_cmd") or "").strip():
+                resources = getattr(self._core, "resources", None) if self._core is not None else None
+                blocked = getattr(resources, "provider_startup_blocked", None)
+                if callable(blocked) and blocked(provider_id):
+                    return False
                 return True
             return False
 

@@ -29,6 +29,12 @@ class ResourceMonitor:
         self._next_poll_at: dict[str, float] = {}
         self._last_reaction_at: dict[tuple[str, str], float] = {}
         self._configuration_errors: set[tuple[str, str, str]] = set()
+        self._availability_error_logged: dict[str, str] = {}
+
+    def apply_peer_config(self, full_config: dict | None) -> None:
+        """Refresh the provider credentials used by the peer resource client."""
+        if self._peer_client is not None:
+            self._peer_client.set_full_config(full_config)
 
     async def run(self) -> None:
         """Poll configured sensors until stop() is called."""
@@ -102,6 +108,7 @@ class ResourceMonitor:
             output = await self._run_command(str(config["command"]), timeout)
             value = self._parse_value(output, {})
             resource.record_observed_availability("command", {metric: value})
+            self._availability_error_logged.pop(resource.id, None)
             return True
         except (SensorCommandError, asyncio.TimeoutError, OSError) as exc:
             self._set_availability_error(resource, str(exc))
@@ -127,6 +134,8 @@ class ResourceMonitor:
             max(1, timeout_ms),
         )
         if result is None or result.status == "not_peer":
+            resource.clear_availability_failure("peer")
+            self._availability_error_logged.pop(resource.id, None)
             return True
         if result.status != "ok" or not isinstance(result.resource, dict):
             self._set_peer_availability_error(resource, result.error or "peer resource probe failed")
@@ -160,11 +169,15 @@ class ResourceMonitor:
             return False
         resource.record_observed_availability("peer", available)
         resource.record_peer_telemetry(result.resource.get("telemetry") or {})
+        self._availability_error_logged.pop(resource.id, None)
         return True
 
     async def refresh_required_availability(self, requirements: dict[str, dict[str, int]]) -> bool:
         """Refresh every command-backed required resource and return whether all probes succeed."""
         for resource_id in requirements:
+            resource = self._resources.get(resource_id)
+            if resource is not None and not resource.has_command_availability():
+                continue
             if not await self.refresh_availability(resource_id):
                 return False
         return True
@@ -297,17 +310,22 @@ class ResourceMonitor:
         })
         log("system", "warn", f"Resource sensor {resource.id}/{sensor_id}: {error}")
 
-    @staticmethod
-    def _set_availability_error(resource, error: str) -> None:
+    def _set_availability_error(self, resource, error: str) -> None:
         """Store and log a failed command availability observation."""
         resource.record_availability_error("command", error)
-        log("system", "warn", f"Resource availability {resource.id}: {error}")
+        self._log_availability_error(resource, f"Resource availability {resource.id}: {error}")
 
-    @staticmethod
-    def _set_peer_availability_error(resource, error: str) -> None:
+    def _set_peer_availability_error(self, resource, error: str) -> None:
         """Store and log a failed peer availability observation."""
         resource.record_availability_error("peer", error)
-        log("system", "warn", f"Peer resource availability {resource.id}: {error}")
+        self._log_availability_error(resource, f"Peer resource availability {resource.id}: {error}")
+
+    def _log_availability_error(self, resource, message: str) -> None:
+        """Log a changed availability error once instead of once per poll."""
+        if self._availability_error_logged.get(resource.id) == message:
+            return
+        self._availability_error_logged[resource.id] = message
+        log("system", "warn", message)
 
     def _log_configuration_error(self, resource_id: str, sensor_id: str, message: str) -> None:
         """Log each invalid sensor configuration once to avoid periodic log noise."""
