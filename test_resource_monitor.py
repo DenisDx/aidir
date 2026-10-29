@@ -258,6 +258,144 @@ class TestResourceMonitor(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot["status"], "ok")
         self.assertIsNone(snapshot["error"])
 
+    async def test_multi_gpu_output_is_filtered_to_the_configured_device(self) -> None:
+        """Keep only the selected GPU reading from a command that reports every GPU."""
+        resources = Resources([{
+            "id": "gpu1",
+            "type": "cuda",
+            "devices": [1],
+            "limits": {"VRAM": 2000},
+            "units": {"VRAM": "MiB"},
+            "availability": {
+                "command": "nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits",
+                "metric": "VRAM",
+                "unit": "MiB",
+            },
+            "telemetry": {"sensors": ["gpu_temperature"]},
+            "monitoring": {
+                "poll_interval": 10,
+                "sensors": [{
+                    "id": "gpu_temperature",
+                    "label": "GPU temperature",
+                    "unit": "C",
+                    "command": "nvidia-smi --query-gpu=index,temperature.gpu --format=csv,noheader,nounits",
+                }],
+            },
+        }])
+        monitor = ResourceMonitor(resources)
+        monitor._run_command = AsyncMock(side_effect=["0, 32495\n1, 1980", "0, 31\n1, 40"])  # type: ignore[method-assign]
+
+        await monitor.poll_resource("gpu1")
+
+        snapshot = resources.snapshot()[0]
+        self.assertEqual(snapshot["devices"], [1])
+        self.assertEqual(snapshot["availability"]["available"], {"VRAM": 1980.0})
+        self.assertEqual(snapshot["availability"]["devices"], [
+            {"device": 1, "available": {"VRAM": 1980.0}},
+        ])
+        sensor = snapshot["monitoring"]["sensors"][0]
+        self.assertEqual(sensor["value"], 40.0)
+        self.assertEqual(sensor["devices"], [
+            {"device": 1, "value": 40.0, "status": "ok", "alert": False},
+        ])
+
+    async def test_multi_device_resource_aggregates_free_memory_and_alerts_per_device(self) -> None:
+        """Sum free capacity on request and keep an alert on the device that crossed the threshold."""
+        resources = Resources([{
+            "id": "gpu_pool",
+            "type": "cuda",
+            "devices": [0, 1],
+            "limits": {"VRAM": 34000},
+            "units": {"VRAM": "MiB"},
+            "availability": {
+                "command": "nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits",
+                "metric": "VRAM",
+                "unit": "MiB",
+                "aggregate": "sum",
+            },
+            "monitoring": {
+                "poll_interval": 10,
+                "sensors": [{
+                    "id": "gpu_temperature",
+                    "unit": "C",
+                    "command": "nvidia-smi --query-gpu=index,temperature.gpu --format=csv,noheader,nounits",
+                    "threshold": {"operator": "above", "value": 35, "reactions": ["notify"]},
+                }],
+            },
+        }])
+        monitor = ResourceMonitor(resources)
+        monitor._run_command = AsyncMock(side_effect=["0, 32495\n1, 1980", "0, 31\n1, 40"])  # type: ignore[method-assign]
+
+        await monitor.poll_resource("gpu_pool")
+
+        snapshot = resources.snapshot()[0]
+        self.assertEqual(snapshot["availability"]["available"], {"VRAM": 34475.0})
+        self.assertEqual(snapshot["availability"]["devices"], [
+            {"device": 0, "available": {"VRAM": 32495.0}},
+            {"device": 1, "available": {"VRAM": 1980.0}},
+        ])
+        sensor = snapshot["monitoring"]["sensors"][0]
+        self.assertEqual(sensor["value"], 40.0)
+        self.assertTrue(sensor["alert"])
+        self.assertEqual([item["alert"] for item in sensor["devices"]], [False, True])
+
+    async def test_values_of_unselected_devices_are_not_parsed(self) -> None:
+        """Ignore a non-numeric reading from another GPU when only one device is selected."""
+        resources = Resources([{
+            "id": "gpu1",
+            "type": "cuda",
+            "devices": [1],
+            "limits": {"VRAM": 2000},
+            "units": {"VRAM": "MiB"},
+            "availability": {
+                "command": "nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits",
+                "metric": "VRAM",
+                "unit": "MiB",
+            },
+            "monitoring": {
+                "poll_interval": 10,
+                "sensors": [{
+                    "id": "gpu_fan_speed",
+                    "unit": "%",
+                    "command": "nvidia-smi --query-gpu=index,fan.speed --format=csv,noheader,nounits",
+                }],
+            },
+        }])
+        monitor = ResourceMonitor(resources)
+        monitor._run_command = AsyncMock(side_effect=["0, [N/A]\n1, 1980", "0, [N/A]\n1, 34"])  # type: ignore[method-assign]
+
+        await monitor.poll_resource("gpu1")
+
+        snapshot = resources.snapshot()[0]
+        self.assertEqual(snapshot["availability"]["available"], {"VRAM": 1980.0})
+        sensor = snapshot["monitoring"]["sensors"][0]
+        self.assertEqual(sensor["status"], "ok")
+        self.assertEqual(sensor["value"], 34.0)
+
+    async def test_missing_configured_device_is_a_sensor_error(self) -> None:
+        """Fail the probe when the command omits one of the configured devices."""
+        resources = Resources([{
+            "id": "gpu_pool",
+            "type": "cuda",
+            "devices": [0, 1],
+            "limits": {"VRAM": 34000},
+            "units": {"VRAM": "MiB"},
+            "availability": {
+                "command": "nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits",
+                "metric": "VRAM",
+                "unit": "MiB",
+            },
+            "monitoring": {"poll_interval": 10, "sensors": []},
+        }])
+        monitor = ResourceMonitor(resources)
+        monitor._run_command = AsyncMock(return_value="0, 32495")  # type: ignore[method-assign]
+
+        await monitor.poll_resource("gpu_pool")
+
+        availability = resources.snapshot()[0]["availability"]
+        self.assertEqual(availability["status"], "error")
+        self.assertIn("no reading for device 1", availability["error"])
+
     async def test_telemetry_exports_only_whitelisted_sensor_state(self) -> None:
         """Expose selected sensor readings without exposing their executable commands."""
         resources = Resources([{

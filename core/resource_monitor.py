@@ -106,8 +106,14 @@ class ResourceMonitor:
         try:
             timeout = self._availability_command_timeout(resource.id, resource.monitoring, config)
             output = await self._run_command(str(config["command"]), timeout)
-            value = self._parse_value(output, {})
-            resource.record_observed_availability("command", {metric: value})
+            readings = self._parse_values(output, {}, resource.devices)
+            value = self._aggregate_availability(readings, config)
+            device_available = [
+                {"device": device, "available": {metric: reading}}
+                for device, reading in readings
+                if device is not None
+            ]
+            resource.record_observed_availability("command", {metric: value}, device_available)
             self._availability_error_logged.pop(resource.id, None)
             return True
         except (SensorCommandError, asyncio.TimeoutError, OSError) as exc:
@@ -167,7 +173,29 @@ class ResourceMonitor:
         if not available:
             self._set_peer_availability_error(resource, "peer resource has no matching available metrics")
             return False
-        resource.record_observed_availability("peer", available)
+        device_available: list[dict] = []
+        remote_devices = availability.get("devices")
+        if isinstance(remote_devices, list):
+            for item in remote_devices:
+                if not isinstance(item, dict) or "device" not in item:
+                    continue
+                try:
+                    device = int(item["device"])
+                except (TypeError, ValueError):
+                    continue
+                if resource.devices and device not in resource.devices:
+                    continue
+                device_values: dict[str, float] = {}
+                for metric, value in (item.get("available") or {}).items():
+                    if metric not in available:
+                        continue
+                    try:
+                        device_values[str(metric)] = float(value)
+                    except (TypeError, ValueError):
+                        continue
+                if device_values:
+                    device_available.append({"device": device, "available": device_values})
+        resource.record_observed_availability("peer", available, device_available)
         resource.record_peer_telemetry(result.resource.get("telemetry") or {})
         self._availability_error_logged.pop(resource.id, None)
         return True
@@ -196,22 +224,47 @@ class ResourceMonitor:
         try:
             timeout = self._command_timeout(resource.id, sensor_id, resource.monitoring, sensor)
             output = await self._run_command(command, timeout)
-            value = self._parse_value(output, sensor)
-            await self._record_value(resource, sensor, value)
+            readings = self._parse_values(output, sensor, resource.devices)
+            await self._record_value(resource, sensor, readings)
         except (SensorCommandError, asyncio.TimeoutError, OSError) as exc:
             self._set_error(resource, sensor_id, str(exc))
         except Exception as exc:
             self._set_error(resource, sensor_id, f"unexpected monitoring error: {exc}")
             log("system", "error", f"Resource sensor {resource.id}/{sensor_id} failed unexpectedly: {exc}")
 
-    async def _record_value(self, resource, sensor: dict, value: float) -> None:
-        """Store a sensor reading and invoke configured reactions when it crosses a threshold."""
+    async def _record_value(
+        self,
+        resource,
+        sensor: dict,
+        readings: list[tuple[int | None, float]],
+    ) -> None:
+        """Store sensor readings and invoke configured reactions when a threshold is crossed."""
         sensor_id = str(sensor["id"])
         threshold = sensor.get("threshold")
-        alert = self._threshold_exceeded(value, threshold)
+        device_states: list[dict] = []
+        alert_devices: list[int] = []
+        alert = False
+        for device, value in readings:
+            device_alert = self._threshold_exceeded(value, threshold)
+            alert = alert or device_alert
+            if device is None:
+                continue
+            device_states.append({
+                "device": device,
+                "value": value,
+                "status": "alert" if device_alert else "ok",
+                "alert": device_alert,
+            })
+            if device_alert:
+                alert_devices.append(device)
+
+        values = [value for _, value in readings]
+        operator = str(threshold.get("operator") or "above") if isinstance(threshold, dict) else "above"
+        aggregate = min(values) if operator == "below" else max(values)
         state = {
             "status": "alert" if alert else "ok",
-            "value": value,
+            "value": aggregate,
+            "devices": device_states,
             "updated_at": datetime.now(timezone.utc).isoformat(),
             "error": None,
             "alert": alert,
@@ -228,9 +281,15 @@ class ResourceMonitor:
         if now - self._last_reaction_at.get(reaction_key, float("-inf")) < cooldown:
             return
         self._last_reaction_at[reaction_key] = now
-        await self._trigger_reactions(resource.id, sensor_id, threshold)
+        await self._trigger_reactions(resource.id, sensor_id, threshold, alert_devices)
 
-    async def _trigger_reactions(self, resource_id: str, sensor_id: str, threshold: object) -> None:
+    async def _trigger_reactions(
+        self,
+        resource_id: str,
+        sensor_id: str,
+        threshold: object,
+        alert_devices: list[int] | None = None,
+    ) -> None:
         """Log threshold notifications and release idle models when configured."""
         reactions = threshold.get("reactions", []) if isinstance(threshold, dict) else []
         if isinstance(reactions, str):
@@ -239,9 +298,12 @@ class ResourceMonitor:
             self._log_configuration_error(resource_id, sensor_id, "threshold reactions must be a list")
             return
 
+        device_detail = ""
+        if alert_devices:
+            device_detail = f" (devices {', '.join(str(item) for item in alert_devices)})"
         for reaction in reactions:
             if reaction == "notify":
-                log("system", "warn", f"Resource sensor threshold exceeded: {resource_id}/{sensor_id}")
+                log("system", "warn", f"Resource sensor threshold exceeded: {resource_id}/{sensor_id}{device_detail}")
             elif reaction == "release_resource":
                 result = await self._resources.force_release(resource_id)
                 if result is None:
@@ -273,37 +335,125 @@ class ResourceMonitor:
             raise SensorCommandError(f"command exited with {process.returncode}: {detail[:240] or 'no error output'}")
         return stdout.decode("utf-8", errors="replace")
 
-    @staticmethod
-    def _parse_value(output: str, sensor: dict) -> float:
-        """Extract one finite numeric sensor value from command output."""
+    @classmethod
+    def _parse_values(
+        cls,
+        output: str,
+        sensor: dict,
+        devices: list[int] | None = None,
+    ) -> list[tuple[int | None, float]]:
+        """Extract one finite numeric reading per configured device from command output."""
         pattern = sensor.get("pattern")
+        lines = [line.strip() for line in output.splitlines() if line.strip()]
+        if not lines:
+            raise SensorCommandError("command output is empty")
+
+        expected = list(devices or [])
         if pattern is None:
-            value_text = output.strip()
+            split = [cls._split_indexed_value(line) for line in lines]
+            indexed = [item for item in split if item[0] is not None]
+            unindexed = [item for item in split if item[0] is None]
+            if indexed and unindexed:
+                raise SensorCommandError("command output mixes indexed and unindexed values")
+            if expected and indexed:
+                by_device: dict[int, float] = {}
+                for device, value_text in indexed:
+                    if device not in expected:
+                        continue
+                    if device in by_device:
+                        raise SensorCommandError(f"command output repeats device {device}")
+                    by_device[device] = cls._parse_number(value_text)
+                selected: list[tuple[int | None, float]] = []
+                for device in expected:
+                    if device not in by_device:
+                        raise SensorCommandError(f"command output has no reading for device {device}")
+                    selected.append((device, by_device[device]))
+                return selected
+            readings = [(device, cls._parse_number(value_text)) for device, value_text in split]
         elif isinstance(pattern, str) and pattern:
-            match = re.search(pattern, output)
-            if match is None:
-                raise SensorCommandError("command output does not match sensor pattern")
             group = sensor.get("match_group", 1)
-            try:
-                value_text = match.group(group)
-            except (IndexError, KeyError) as exc:
-                raise SensorCommandError(f"sensor pattern group {group!r} is unavailable") from exc
+            readings = []
+            for line in lines:
+                match = re.search(pattern, line)
+                if match is None:
+                    raise SensorCommandError("command output does not match sensor pattern")
+                try:
+                    value_text = match.group(group)
+                except (IndexError, KeyError) as exc:
+                    raise SensorCommandError(f"sensor pattern group {group!r} is unavailable") from exc
+                readings.append((None, cls._parse_number(value_text)))
         else:
             raise SensorCommandError("sensor pattern must be a non-empty string")
 
+        if not expected:
+            if len(readings) != 1:
+                raise SensorCommandError(f"command output must contain one value, got {len(readings)}")
+            return readings
+
+        if len(expected) == 1 and len(readings) == 1:
+            return readings
+
+        if len(readings) != len(expected):
+            raise SensorCommandError(
+                f"command output has {len(readings)} values for {len(expected)} configured devices"
+            )
+        return list(zip(expected, [value for _, value in readings]))
+
+    @staticmethod
+    def _split_indexed_value(line: str) -> tuple[int | None, str]:
+        """Split one output line into an optional device index and a value."""
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) == 1:
+            return None, parts[0]
+        if len(parts) == 2:
+            try:
+                device = int(parts[0])
+            except ValueError as exc:
+                raise SensorCommandError(
+                    f"command output line must be 'value' or 'index,value': {line!r}"
+                ) from exc
+            if device < 0:
+                raise SensorCommandError(f"command output device index must be non-negative: {device}")
+            return device, parts[1]
+        raise SensorCommandError(
+            f"command output line must be 'value' or 'index,value': {line!r}"
+        )
+
+    @staticmethod
+    def _parse_number(value_text: object) -> float:
+        """Convert one output field to a finite float."""
         try:
-            value = float(value_text.strip())
+            value = float(str(value_text).strip())
         except (AttributeError, TypeError, ValueError) as exc:
             raise SensorCommandError(f"command output is not one number: {value_text!r}") from exc
         if not math.isfinite(value):
             raise SensorCommandError("command output must be a finite number")
         return value
 
+    @staticmethod
+    def _aggregate_availability(
+        readings: list[tuple[int | None, float]],
+        config: dict,
+    ) -> float:
+        """Combine per-device free capacity according to the configured policy."""
+        aggregate = str(config.get("aggregate") or "min").strip().lower()
+        values = [value for _, value in readings]
+        if not values:
+            raise SensorCommandError("availability command returned no readings")
+        if aggregate == "sum":
+            return float(sum(values))
+        if aggregate == "max":
+            return float(max(values))
+        if aggregate == "min":
+            return float(min(values))
+        raise SensorCommandError("availability aggregate must be 'min', 'max' or 'sum'")
+
     def _set_error(self, resource, sensor_id: str, error: str) -> None:
         """Store and log a sensor polling error without hiding the failed reading."""
         resource.set_sensor_state(sensor_id, {
             "status": "error",
             "value": None,
+            "devices": [],
             "updated_at": datetime.now(timezone.utc).isoformat(),
             "error": error,
             "alert": False,

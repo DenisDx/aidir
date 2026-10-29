@@ -34,10 +34,12 @@ class Resource:
         availability: dict | None = None,
         units: dict | None = None,
         telemetry: dict | None = None,
+        devices: list | None = None,
     ) -> None:
         self.id = rid
         self.type = rtype
         self.limits: dict[str, int] = {k: int(v) for k, v in (limits or {}).items()}
+        self.devices: list[int] = self.normalize_devices(devices)
         self.used: dict[str, int] = {k: 0 for k in self.limits}
         self.consumers: dict[str, dict[str, int]] = {}
         self.alive_time: int = int(alive_time)
@@ -57,6 +59,7 @@ class Resource:
             "source": "estimated",
             "status": "ok",
             "available": {},
+            "devices": [],
             "observed_at": None,
             "error": None,
         }
@@ -68,6 +71,21 @@ class Resource:
         self._soft_used: list[dict] = []
         self._lock = asyncio.Lock()
 
+    @staticmethod
+    def normalize_devices(devices: list | None) -> list[int]:
+        """Return unique non-negative device indices in their configured order."""
+        normalized: list[int] = []
+        for value in devices or []:
+            try:
+                index = int(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"device index must be an integer: {value!r}") from exc
+            if index < 0:
+                raise ValueError(f"device index must be non-negative: {index}")
+            if index not in normalized:
+                normalized.append(index)
+        return normalized
+
     def has_command_availability(self) -> bool:
         """Return whether this resource has a configured command availability probe."""
         return isinstance(self.availability.get("command"), str) and bool(self.availability["command"].strip())
@@ -76,7 +94,12 @@ class Resource:
         """Return the configured availability probe for internal execution."""
         return dict(self.availability)
 
-    def record_observed_availability(self, source: str, available: dict[str, int | float]) -> None:
+    def record_observed_availability(
+        self,
+        source: str,
+        available: dict[str, int | float],
+        devices: list[dict] | None = None,
+    ) -> None:
         """Store a successful availability observation and start its reservation generation."""
         self._availability_generation += 1
         self._availability_state = {
@@ -86,6 +109,17 @@ class Resource:
                 str(metric): float(value)
                 for metric, value in available.items()
             },
+            "devices": [
+                {
+                    "device": int(item["device"]),
+                    "available": {
+                        str(metric): float(value)
+                        for metric, value in (item.get("available") or {}).items()
+                    },
+                }
+                for item in (devices or [])
+                if isinstance(item, dict) and "device" in item
+            ],
             "observed_at": datetime.now(timezone.utc).isoformat(),
             "error": None,
         }
@@ -97,6 +131,7 @@ class Resource:
             "source": source,
             "status": "error",
             "available": dict(previous.get("available") or {}),
+            "devices": [dict(item) for item in (previous.get("devices") or []) if isinstance(item, dict)],
             "observed_at": previous.get("observed_at"),
             "error": error,
         }
@@ -112,6 +147,7 @@ class Resource:
             "source": "estimated",
             "status": "ok",
             "available": {},
+            "devices": [],
             "observed_at": None,
             "error": None,
         }
@@ -125,6 +161,21 @@ class Resource:
                 metric: max(0, int(limit) - int(self.used.get(metric, 0)) - int(soft.get(metric, 0)))
                 for metric, limit in self.limits.items()
             }
+        devices = [
+            {
+                "device": int(item.get("device", 0)),
+                "available": {
+                    str(metric): float(value)
+                    for metric, value in (item.get("available") or {}).items()
+                },
+            }
+            for item in state.get("devices") or []
+            if isinstance(item, dict)
+        ]
+        if devices:
+            state["devices"] = devices
+        else:
+            state.pop("devices", None)
         return state
 
     def telemetry_snapshot(self) -> dict:
@@ -152,7 +203,7 @@ class Resource:
             if sensor_config is None:
                 continue
             state = self._sensor_states.get(normalized_id, {})
-            readings.append({
+            reading = {
                 "id": normalized_id,
                 "label": str(sensor_config.get("label") or normalized_id),
                 "unit": str(sensor_config.get("unit") or ""),
@@ -160,7 +211,14 @@ class Resource:
                 "value": state.get("value"),
                 "updated_at": state.get("updated_at"),
                 "error": state.get("error"),
-            })
+            }
+            if state.get("devices"):
+                reading["devices"] = [
+                    dict(item)
+                    for item in state["devices"]
+                    if isinstance(item, dict)
+                ]
+            readings.append(reading)
         return {"sensors": readings}
 
     def record_peer_telemetry(self, telemetry: dict) -> None:
@@ -174,16 +232,25 @@ class Resource:
         if not configured_sensor_ids or not isinstance(remote_readings, list):
             self._peer_telemetry = {}
             return
-        self._peer_telemetry = {
-            "sensors": [
-                {
-                    key: reading.get(key)
-                    for key in ("id", "label", "unit", "status", "value", "updated_at", "error")
-                }
-                for reading in remote_readings
-                if isinstance(reading, dict) and str(reading.get("id") or "").strip() in configured_sensor_ids
-            ]
-        }
+        sensors: list[dict] = []
+        for reading in remote_readings:
+            if not isinstance(reading, dict) or str(reading.get("id") or "").strip() not in configured_sensor_ids:
+                continue
+            item = {
+                key: reading.get(key)
+                for key in ("id", "label", "unit", "status", "value", "updated_at", "error")
+            }
+            if isinstance(reading.get("devices"), list):
+                item["devices"] = [
+                    {
+                        key: device.get(key)
+                        for key in ("device", "value", "status", "alert")
+                    }
+                    for device in reading["devices"]
+                    if isinstance(device, dict)
+                ]
+            sensors.append(item)
+        self._peer_telemetry = {"sensors": sensors}
 
     def _observed_available_after_reservations(self, metric: str) -> float | None:
         """Return observed capacity less reservations created after that observation."""
@@ -415,6 +482,12 @@ class Resource:
                 "error": state.get("error"),
                 "alert": bool(state.get("alert")),
             }
+            if state.get("devices"):
+                item["devices"] = [
+                    dict(device)
+                    for device in state["devices"]
+                    if isinstance(device, dict)
+                ]
             if isinstance(threshold, dict):
                 item["threshold"] = {
                     "operator": str(threshold.get("operator") or "above"),
@@ -569,6 +642,7 @@ class Resource:
         return {
             "id": self.id,
             "type": self.type,
+            "devices": list(self.devices),
             "use": self.use,
             "limits": dict(self.limits),
             "units": dict(self.units),

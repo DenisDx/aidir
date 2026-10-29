@@ -1,6 +1,6 @@
 # SPEC Overlay
 
-Status: active. Date: 2026-10-24.
+Status: active. Date: 2026-10-29.
 
 This file is the editable overlay over [SPEC.md](SPEC.md). It records the
 changes and decisions that have been approved since the base specification was
@@ -232,3 +232,36 @@ lets the Test LLM dialog exercise the shipped `openaix` endpoint, including
 - The Round 4 ledger is closed in `proposal_update4.md`. The transferred items
   are tracked in `ROADMAP.md`: OpenCode Go release validation, a human browser
   acceptance, and P3 example configuration/installation tooling.
+
+## 10. Multi-GPU resources (2026-10-29)
+
+A resource may declare the hardware devices it includes with an optional
+`devices` array of non-negative indices. An absent or empty array keeps the
+previous single-value behavior.
+
+Command parsing for availability and sensor probes extends as follows:
+
+- The command may print one reading per line, either as `value` or as
+  `index,value`.
+- When `devices` is configured and the output is indexed, readings for devices
+  that are not listed are ignored before their values are parsed. Every listed
+  device must appear exactly once.
+- Indexed and unindexed lines must not be mixed.
+- With unindexed output, one value for one configured device remains unscoped;
+  N values for N configured devices are mapped in configured order.
+- A missing listed device, a duplicate device, or a value count mismatch is a
+  probe error and fails closed.
+
+For availability, `availability.aggregate` selects how per-device free capacity
+is combined: `min` (the default and fail-closed choice), `max`, or `sum`. A
+multi-device resource should use `sum` only when the provider actually splits a
+model across all listed devices; heterogeneous cards should be separate
+resources.
+
+Sensor thresholds are evaluated per device, and the sensor alerts when any
+device crosses its threshold. The public sensor and telemetry snapshots keep a
+`devices` list with per-device values, status, and alert state. The top-level
+sensor value remains the maximum reading for an `above` threshold and the
+minimum reading for a `below` threshold. Resource snapshots include the
+configured `devices` list, and peer telemetry forwards per-device readings for
+whitelisted sensors.

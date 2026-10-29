@@ -95,6 +95,7 @@
             "id":"local_machine",
             "type":"cuda",
             "arch": "nvidia",
+            "devices": [0], // Hardware GPU indices included in this resource
             "limits":{
                 "VRAM":10000, //Максимум можно использовать 10гб
             },
@@ -111,7 +112,7 @@
                         "id": "gpu_temperature",
                         "label": "GPU temperature",
                         "unit": "C",
-                        "command": "nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader,nounits",
+                        "command": "nvidia-smi --query-gpu=index,temperature.gpu --format=csv,noheader,nounits",
                         "threshold": {
                             "operator": "above",
                             "value": 85,
@@ -123,7 +124,7 @@
                         "id": "gpu_memory_free",
                         "label": "Free GPU memory",
                         "unit": "MiB",
-                        "command": "nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits",
+                        "command": "nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits",
                         "threshold": {
                             "operator": "below",
                             "value": 1000,

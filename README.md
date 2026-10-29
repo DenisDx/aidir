@@ -304,6 +304,7 @@ configuration.
 {
   id: "local_machine",
   type: "cuda",
+  devices: [0],
   limits: { VRAM: 10000 },
   monitoring: {
     poll_interval: 10,
@@ -334,11 +335,12 @@ configuration.
 }
 ```
 
-Without `pattern`, a command must write exactly one finite number to standard
-output. With `pattern`, its first capture group is parsed as the number; use
-`match_group` to select another numbered or named group. This accommodates
-motherboard and fan readings from `sensors`, SSD readings from a configured
-`smartctl` command, and any other executable probe.
+Without `pattern`, a command writes one finite number, or one reading per
+configured device on separate lines as `value` or `index,value`. With
+`pattern`, its first capture group is parsed as the number; use `match_group`
+to select another numbered or named group. This accommodates motherboard and
+fan readings from `sensors`, SSD readings from a configured `smartctl` command,
+and any other executable probe.
 
 A threshold uses `above` (strictly greater than) or `below` (strictly less
 than). `notify` records a visible alert and a warning in the system log.
@@ -347,6 +349,33 @@ only idle models, and reports that active tasks prevent release rather than
 interrupting them. Reactions run once on crossing a threshold, then no more
 often than `cooldown` seconds (300 seconds by default); a normal reading re-arms
 the sensor.
+
+### Multiple GPUs
+
+A resource may declare the hardware devices it owns:
+
+```json5
+{
+  id: "local_gpu1",
+  type: "cuda",
+  devices: [1],
+  limits: { VRAM: 2000 },
+  units: { VRAM: "MiB" }
+}
+```
+
+Sensor and availability commands may report every GPU and return one reading
+per line. Each line is either a plain value or `index,value`. When `devices` is
+set, indexed readings for other devices are ignored and every listed device
+must be present. A single unindexed value remains unscoped, so CPU and SSD
+sensors on a GPU resource are not labelled as GPU readings.
+
+For a resource that contains several devices, `availability.aggregate` chooses
+how free capacity is combined: `min` (the default and fail-closed choice),
+`max`, or `sum`. Use `sum` only when the provider really splits a model across
+all listed devices. Sensor thresholds are evaluated per device, and snapshots
+keep the per-device values. Cards with different capacity or purpose should
+normally be configured as separate resources.
 
 ### Resource availability commands
 
@@ -359,6 +388,7 @@ the resource is dispatched.
 {
   id: "local_machine",
   type: "cuda",
+  devices: [0],
   limits: { VRAM: 22000 },
   units: { VRAM: "MiB" },
   availability: {
@@ -372,7 +402,8 @@ the resource is dispatched.
 ```
 
 The command must write one finite numeric free-capacity value to standard
-output. `metric` must exist in `limits`. When both `availability.unit` and
+output, or one `index,value` line per configured device. `metric` must exist in
+`limits`. When both `availability.unit` and
 `units.<metric>` are set, they must match; an omitted unit is treated as an
 empty string and leaves unit consistency to the administrator. A failed
 pre-dispatch availability command fails closed for that resource, but periodic

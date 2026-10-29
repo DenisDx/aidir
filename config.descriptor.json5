@@ -633,6 +633,19 @@
               apply: "restart",
               description: "Accelerator architecture, used to pick the availability command",
             },
+            devices: {
+              type: "array",
+              apply: "reload",
+              description: "Hardware device indices included in this resource. Commands may return one reading per line as value or index,value; rows for devices not listed here are ignored. Omit the field for a single unindexed device.",
+              ui: { help: "Example: [0, 1] makes the resource read both GPUs. This selects monitoring and admission rows only; it does not bind the inference process to these devices." },
+              children: {
+                type: "int",
+                minimum: 0,
+                maximum: 1024,
+                apply: "reload",
+                description: "One device index",
+              },
+            },
             limits: {
               type: "object",
               apply: "restart",
@@ -667,11 +680,11 @@
                   type: "string",
                   min_length: 1,
                   apply: "live",
-                  description: "Shell command that prints the free amount of one metric",
+                  description: "Shell command that prints the free amount of one metric: one value, or one line per configured device as value or index,value",
                   ui: {
                     widget: "textarea",
                     rows: 2,
-                    placeholder: "nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits",
+                    placeholder: "nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits",
                   },
                 },
                 metric: {
@@ -685,6 +698,13 @@
                   min_length: 1,
                   apply: "live",
                   description: "Unit the command prints, for example MiB",
+                },
+                aggregate: {
+                  type: "string",
+                  enum: ["min", "max", "sum"],
+                  apply: "live",
+                  description: "How per-device free capacity is combined: min requires every device to fit (default), max uses the largest device, sum adds all devices. Use sum only when the inference server really splits a model across the listed devices.",
+                  ui: { help: "Default: min. For an NVLink or tensor-parallel pool that uses all listed GPUs, set sum." },
                 },
                 command_timeout: {
                   type: "int",

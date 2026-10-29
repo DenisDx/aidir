@@ -327,7 +327,11 @@ class Endpoint_openaix(Endpoint_ollama):
                     {
                         key: reading.get(key)
                         for key in ("id", "label", "unit", "status", "value", "updated_at", "error")
-                    }
+                    } | (
+                        {"devices": reading["devices"]}
+                        if isinstance(reading.get("devices"), list)
+                        else {}
+                    )
                     for reading in readings
                     if isinstance(reading, dict)
                 ]

@@ -38,6 +38,7 @@ class Resources:
                 availability=it.get("availability"),
                 units=it.get("units"),
                 telemetry=it.get("telemetry"),
+                devices=it.get("devices"),
             )
         self._redis: "aioredis.Redis | None" = None
         self._ns: str = "aidir"
@@ -99,6 +100,7 @@ class Resources:
                     availability=item.get("availability"),
                     units=item.get("units"),
                     telemetry=item.get("telemetry"),
+                    devices=item.get("devices"),
                 )
                 added.append(rid)
                 continue
@@ -119,6 +121,7 @@ class Resources:
                 else {}
             )
             existing.telemetry = dict(item.get("telemetry") or {})
+            existing.devices = Resource.normalize_devices(item.get("devices"))
             updated.append(rid)
 
         removed: list[str] = []
