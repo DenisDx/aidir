@@ -92,6 +92,9 @@
   margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border);
 }
 #cfg-aiset-lifecycle button { padding: 7px 12px; border-radius: 6px; font: inherit; font-size: 13px; cursor: pointer; }
+#cfg-save-btn    { background: var(--accent); border: none; color: #fff; font-weight: 600; }
+#cfg-save-btn:hover { opacity: .88; }
+#cfg-save-btn:disabled { opacity: .45; cursor: default; }
 #cfg-reload-btn  { background: var(--accent); border: none; color: #fff; }
 #cfg-reload-btn:hover { opacity: .88; }
 #cfg-restart-btn { background: transparent; border: 1px solid var(--border); color: var(--text); }

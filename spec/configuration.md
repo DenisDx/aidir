@@ -479,10 +479,10 @@ The stylesheet also styles what the library names but does not paint:
 
 | Group | What |
 |---|---|
-| The page chrome | `#cfg-aiset-status`, `#cfg-aiset-card .cfg-row`, `#cfg-document`, `.cfg-check`, `#cfg-aiset-lifecycle`, the two buttons |
+| The page chrome | `#cfg-aiset-status`, `#cfg-aiset-card .cfg-row`, `#cfg-document`, `.cfg-check`, `#cfg-aiset-lifecycle`, the three buttons |
 | The badges | The apply policy (`.type`, `.apply`), the access rules (`.req`, `.lock`, `.secret`), the staged-edit states (`.absent`, `.default`, `.unsupported`, `.dirty`, `.origin`, `.env`) |
 | The toggle | A 20×20 square, so the `+`/`-` glyphs do not shift the column |
-| The toolbar | The Apply / Reload / Revert buttons; Apply is the single primary control |
+| The toolbar | The Save / Reload / Revert buttons; Save is the single primary control |
 | The helper dialog | **Global rules** — the dialog is appended to `document.body`, not to the editor host, so those rules must not be scoped to `.aiset-tree-editor` |
 | The values | The readonly, secret, shape, union and placeholder treatments, and the per-node control-state colors |
 | The workspace | The two-pane grid (`minmax(0,1fr) minmax(320px,34%)`), the ≤1100 px stack, the two independent scrollers |
@@ -518,11 +518,11 @@ stylesheet must scope its rules to `.aiset-tree-editor` — that class has to be
 `#settings-tree`, or the rules silently stop applying and only the library's
 structure shows.
 
-### 6.5 The three buttons
+### 6.5 The commit controls
 
 | Button | Owner | Effect |
 |---|---|---|
-| **Apply** | the library toolbar | `POST /operations/validate` (a dry run), then `POST /operations` (one atomic batch). On a 409 the staged batch is **kept** and the user is told to press Reload |
+| **Save** | the library toolbar and the host lifecycle row | `POST /operations/validate` (a dry run), then `POST /operations` (one atomic batch). The host button is the same action, kept next to Reload settings so it stays visible. On a 409 the staged batch is **kept** and the user is told to press Reload |
 | **Reload** | the library toolbar | Confirm discarding the staged changes, then `GET /tree` |
 | **Revert all** | the library toolbar | **Purely client-side**: it clears the staged batch. No server call |
 
@@ -563,7 +563,7 @@ the editor header changed — a guess about another element's height is not a la
 An OpenAI-compatible assistant for the Settings page. **The model never writes the
 configuration.** It reads authorized nodes through the `aiset` service, proposes
 operations, and hands them back for the browser to stage; the user reviews the
-batch and presses **Apply**.
+batch and presses **Save**.
 
 The provider call is made in the backend, so the API key never reaches the browser.
 The assistant uses **this project's own OpenAI-compatible endpoint**, so it needs no
@@ -660,13 +660,13 @@ The assistant scrubs `api_key` out of any logged tool arguments.
 
 1. The assistant returns `staged_operations` in the chat response.
 2. The front end calls `settingsEditor.stageOperations(staged, 'assistant')` and
-   tells the user to review the changes and press Apply.
+   tells the user to review the changes and press Save.
 3. The editor validates (`POST /operations/validate`) and commits the whole batch
    with one `POST /operations`.
 4. The write is validated against the descriptor and committed atomically under the
    store lock.
 
-So the assistant's operations reach disk **only** when the user presses Apply.
+So the assistant's operations reach disk **only** when the user presses Save.
 
 ---
 

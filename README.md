@@ -239,7 +239,7 @@ the only implementation:
   configuration in plain language and proposes changes. It reads authorised nodes
   and returns validated operations, which arrive in the tree as a staged batch:
   the assistant never writes the file, and a change reaches disk only when you
-  press **Apply**. It uses this project's own OpenAI-compatible endpoint, so it
+  press **Save**. It uses this project's own OpenAI-compatible endpoint, so it
   needs no second provider and no second set of credentials;
 - the `ai` section of `config.json5` configures the assistant. `ai.model`
   defaults to `local-only`, a model that answers from this machine or from
@@ -258,7 +258,7 @@ the only implementation:
   theme;
 - the previous raw whole-file editor and the seven-field logging form are gone.
   Each node can still be edited as raw source, and a change is staged until
-  **Apply** commits the whole batch.
+  **Save** commits the whole batch.
 
 There is no endpoint that returns the whole resolved configuration any more:
 it included every substituted credential. Use the tree snapshot, which honours

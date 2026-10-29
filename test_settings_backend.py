@@ -471,7 +471,7 @@ class WebUIMountTests(unittest.TestCase):
         page = (ROOT / "webui" / "frontend" / "index.html").read_text(encoding="utf-8")
         for element_id in ("page-settings", "settings-tree", "cfg-document",
                            "cfg-show-absent", "cfg-values-as-text",
-                           "cfg-reload-btn", "cfg-restart-btn", "cfg-aiset-status"):
+                           "cfg-save-btn", "cfg-reload-btn", "cfg-restart-btn", "cfg-aiset-status"):
             self.assertIn(f'id="{element_id}"', page, f"{element_id} is missing")
 
     def test_the_settings_api_requires_a_session(self):

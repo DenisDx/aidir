@@ -1348,8 +1348,21 @@ function bindSettingsUi() {
   $('cfg-values-as-text').addEventListener('change', () => {
     if (settingsEditor) settingsEditor.setValuesAsText($('cfg-values-as-text').checked);
   });
+  $('cfg-save-btn').addEventListener('click', saveSettings);
   $('cfg-reload-btn').addEventListener('click', reloadSettings);
   $('cfg-restart-btn').addEventListener('click', restartAidir);
+}
+
+// Commit the staged batch through the editor's own Apply action.
+function saveSettings() {
+  if (!settingsEditor || typeof settingsEditor.applyPending !== 'function') return;
+  settingsEditor.applyPending();
+}
+
+// The library labels this control Apply; the page calls the same action Save.
+function renameSettingsApplyButton() {
+  const button = document.querySelector('#settings-tree .aiset-tree-apply');
+  if (button) button.textContent = 'Save';
 }
 
 // The editor owns both view options, and search may switch show-absent on by
@@ -1454,7 +1467,7 @@ function sendChatMessage(message) {
       const staged = data.staged_operations || [];
       if (staged.length && settingsEditor) {
         settingsEditor.stageOperations(staged, 'assistant');
-        chatEntry('staged', staged.length + ' change(s) staged. Review them in the tree and press Apply.');
+        chatEntry('staged', staged.length + ' change(s) staged. Review them in the tree and press Save.');
       }
     })
     .catch(error => chatEntry('error', String((error && error.message) || error)))
@@ -1555,6 +1568,7 @@ function mountSettingsEditor(documentId) {
     showAbsent: $('cfg-show-absent').checked,
     valuesAsText: $('cfg-values-as-text').checked,
   });
+  renameSettingsApplyButton();
 
   settingsEditor.on('status', event => {
     const node = $('cfg-aiset-status');
