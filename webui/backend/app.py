@@ -50,6 +50,9 @@ _CRON_MARKER = "# aidir-cron"
 _LOG_FILE_SUFFIXES = frozenset({".log", ".jsonl"})
 _LIVE_LOG_INITIAL_LINES = 200
 _LIVE_LOG_INITIAL_BYTES = 256 * 1024
+# The tasks page polls peers every few seconds. Warn once per peer instead of
+# writing the same authentication complaint into webui.log on every poll.
+_PEER_AUTH_WARNED: set[str] = set()
 
 
 class CronRepairError(RuntimeError):
@@ -613,6 +616,9 @@ async def _fetch_peer_tasks(core: "Core") -> list[dict[str, Any]]:
             # The peer publishes its task list only with a token, and this
             # instance sends none. Say it once, instead of silently showing an
             # empty peer list.
+            if provider_id in _PEER_AUTH_WARNED:
+                continue
+            _PEER_AUTH_WARNED.add(provider_id)
             log(
                 "webui",
                 "warning",
@@ -624,6 +630,7 @@ async def _fetch_peer_tasks(core: "Core") -> list[dict[str, Any]]:
                 "tasks",
             )
             continue
+        _PEER_AUTH_WARNED.discard(provider_id)
         if response.status_code != 200:
             continue
         try:

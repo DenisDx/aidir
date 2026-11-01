@@ -102,7 +102,7 @@ def load_workers(config: dict, workers_cfg: dict[str, dict] | None = None) -> di
         # Check enabled flag (main config wins over local config.json5)
         cfg_override = resolved_cfg.get(worker_id, {})
         if not cfg_override.get("enabled", True):
-            log("system", "info", f"Worker {worker_id} disabled, skipping")
+            log("system", "debug", f"Worker {worker_id} disabled, skipping")
             continue
 
         app_file = worker_dir / "app.py"
@@ -115,7 +115,7 @@ def load_workers(config: dict, workers_cfg: dict[str, dict] | None = None) -> di
             instance: BaseWorker = module.worker  # required export
             instance.id = worker_id
             workers[worker_id] = instance
-            log("system", "info", f"Worker {worker_id} loaded (type={instance.task_type})")
+            log("system", "debug", f"Worker {worker_id} loaded (type={instance.task_type})")
         except AttributeError:
             log("system", "error",
                 f"Worker {worker_id}: app.py must expose a module-level `worker` object")

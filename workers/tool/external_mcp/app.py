@@ -55,8 +55,13 @@ class ExternalMcpWorker(BaseToolWorker):
         self._tools_cache = {}
         self._cache_time = 0.0
 
-        # Build the initial tool list before any context injection runs.
-        await self.refresh_tools_if_due(reason="startup", force=True)
+        # Build the initial tool list before any context injection runs. The
+        # cron process must not force a refresh every minute; it uses the shared
+        # TTL and startup marker instead.
+        if self._mark_startup:
+            await self.refresh_tools_if_due(reason="startup", force=True)
+        else:
+            await self.refresh_tools_if_due(reason="cron")
 
         if self._mark_startup and self._redis is not None:
             await self._redis.set(self._startup_key(), str(self._startup_time))
@@ -84,12 +89,15 @@ class ExternalMcpWorker(BaseToolWorker):
             return 0.0
 
     async def _get_startup_time(self) -> float:
-        """Return the latest known startup time for this worker."""
-        if self._redis is None:
-            return self._startup_time
+        """Return the latest known service startup time for this worker.
 
-        shared = await self._get_shared_timestamp(self._startup_key())
-        return shared or self._startup_time
+        The cron process initializes the worker too. Its own initialize time is
+        not a service startup and must not force a refresh every minute, so only
+        a shared marker (or a worker that owns one) counts.
+        """
+        if self._redis is not None:
+            return await self._get_shared_timestamp(self._startup_key())
+        return self._startup_time if self._mark_startup else 0.0
 
     async def _get_last_refresh_time(self) -> float:
         """Return the latest successful tools refresh timestamp."""
@@ -120,10 +128,11 @@ class ExternalMcpWorker(BaseToolWorker):
             return True
         return await self._needs_shared_refresh(now)
 
-    async def _refresh_tools(self) -> None:
+    async def _refresh_tools(self, *, verbose: bool = False) -> None:
         """Fetch tool lists from all servers and update cache."""
         tools: dict[str, dict[str, Any]] = {}
         now = time.time()
+        level = "info" if verbose else "debug"
 
         for srv_name, srv in self._servers.items():
             if srv.get("type") != "http":
@@ -133,7 +142,7 @@ class ExternalMcpWorker(BaseToolWorker):
             if not url:
                 continue
 
-            log("worker", "info", f"Reading tools list from server={srv_name} url={url}", self.id)
+            log("worker", level, f"Reading tools list from server={srv_name} url={url}", self.id)
             try:
                 auth_cfg = self._resolve_auth_config(self._worker_auth, srv.get("auth"))
                 headers = self._build_auth_headers(auth_cfg)
@@ -165,7 +174,7 @@ class ExternalMcpWorker(BaseToolWorker):
                         tools[alias] = aliased
                         log(
                             "worker",
-                            "info",
+                            level,
                             f"Duplicate remote tool name preserved via alias original={tool_name} alias={alias} server={srv_name}",
                             self.id,
                         )
@@ -180,7 +189,7 @@ class ExternalMcpWorker(BaseToolWorker):
         self._tools_cache = tools
         await self._set_last_refresh_time(now)
         tool_names = sorted(tools.keys())
-        log("worker", "info", f"Tools list build finished; tools={tool_names}", self.id)
+        log("worker", level, f"Tools list build finished; tools={tool_names}", self.id)
 
     async def refresh_tools_if_due(self, reason: str = "manual", force: bool = False) -> bool:
         """Refresh tools only when they were not updated after startup or TTL expired."""
@@ -189,8 +198,9 @@ class ExternalMcpWorker(BaseToolWorker):
             if not force and not await self._needs_shared_refresh(now):
                 return False
 
-            log("worker", "info", f"Tools refresh started reason={reason}", self.id)
-            await self._refresh_tools()
+            verbose = force or reason == "manual"
+            log("worker", "info" if verbose else "debug", f"Tools refresh started reason={reason}", self.id)
+            await self._refresh_tools(verbose=verbose)
             return True
 
     async def _get_tools(self) -> list[dict[str, Any]]:

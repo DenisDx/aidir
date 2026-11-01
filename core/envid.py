@@ -154,7 +154,7 @@ class EnvidRegistry:
             data = await self._redis.hgetall(self._item_key(eid))
             if data:
                 self._envids[eid] = Envid.from_redis_hash(data)
-        log("system", "info", f"EnvidRegistry: loaded {len(self._envids)} envid(s) from Redis")
+        log("system", "debug", f"EnvidRegistry: loaded {len(self._envids)} envid(s) from Redis")
 
     async def merge_from_config(self, config: dict) -> None:
         """
@@ -173,12 +173,12 @@ class EnvidRegistry:
             if envid_id in self._envids:
                 self._envids[envid_id].apply_config_override(cfg)
                 await self.save(self._envids[envid_id])
-                log("system", "info", f"EnvidRegistry: updated envid '{envid_id}' from config")
+                log("system", "debug", f"EnvidRegistry: updated envid '{envid_id}' from config")
             else:
                 envid = Envid.from_config(envid_id, cfg)
                 self._envids[envid_id] = envid
                 await self.save(envid)
-                log("system", "info", f"EnvidRegistry: added envid '{envid_id}' from config")
+                log("system", "debug", f"EnvidRegistry: added envid '{envid_id}' from config")
 
     def _resolve_config_inheritance(self, items: dict[str, dict]) -> dict[str, dict]:
         """Resolve envid parent chains using standard config merge rules."""

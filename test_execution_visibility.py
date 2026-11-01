@@ -98,6 +98,35 @@ class DeferralVisibilityTests(unittest.TestCase):
         scheduler._clear_deferral(task.id)
         self.assertEqual(scheduler.deferred_tasks_snapshot()["count"], 0)
 
+    def test_the_same_deferral_is_not_logged_on_every_retry(self):
+        """A long outage writes one line, not one line per scheduler tick."""
+        scheduler = self._scheduler()
+        task = Task_agent(payload={"model": "m", "messages": []})
+
+        with patch("core.scheduler.log") as mocked, patch(
+            "core.scheduler.time.monotonic", side_effect=[10.0, 11.0, 12.0]
+        ):
+            scheduler._log_deferral(task, "insufficient_resources", "Task delayed")
+            scheduler._log_deferral(task, "insufficient_resources", "Task delayed")
+            scheduler._log_deferral(task, "insufficient_resources", "Task delayed")
+
+        self.assertEqual(mocked.call_count, 1)
+
+    def test_a_repeated_deferral_is_logged_again_after_the_interval(self):
+        """The operator still gets a reminder, with the suppressed line count."""
+        scheduler = self._scheduler()
+        task = Task_agent(payload={"model": "m", "messages": []})
+
+        with patch("core.scheduler.log") as mocked, patch(
+            "core.scheduler.time.monotonic", side_effect=[10.0, 20.0, 80.0]
+        ):
+            scheduler._log_deferral(task, "insufficient_resources", "Task delayed")
+            scheduler._log_deferral(task, "insufficient_resources", "Task delayed")
+            scheduler._log_deferral(task, "insufficient_resources", "Task delayed")
+
+        self.assertEqual(mocked.call_count, 2)
+        self.assertIn("1 repeated deferral log", mocked.call_args_list[1].args[2])
+
 
 class QuarantineStatusTests(unittest.IsolatedAsyncioTestCase):
     """A quarantined task is terminal, not waiting."""

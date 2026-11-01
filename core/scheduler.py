@@ -35,6 +35,12 @@ _SUPPORTED_TYPES = ("agent", "tool")  # TODO: extend with request, tts, stt…
 # task waits for its whole queue timeout and the client sees nothing.
 _MAX_REMOTE_REFUSALS = 5
 
+# A waiting task is retried every second. Logging every retry fills the log
+# with identical lines during a long resource outage, so the same deferral
+# reason is written at most once per interval. The deferral snapshot remains
+# the live view for the UI.
+_DEFERRAL_LOG_INTERVAL_SECONDS = 60.0
+
 # A failed concrete candidate is rerouted to the next smart-route item when the
 # failure belongs to that provider rather than to the request itself.
 _SMART_FALLBACK_ERROR_CODES = {
@@ -89,6 +95,7 @@ class Scheduler:
         # level hides the deferral messages, so the operator would never learn
         # why a task is not running.
         self._deferred: dict[str, dict] = {}
+        self._deferral_log_state: dict[str, dict] = {}
 
     def notify_new_task(self) -> None:
         """Wake the scheduler loop when a new task is enqueued."""
@@ -127,8 +134,11 @@ class Scheduler:
                         # No compatible worker – re-enqueue and skip
                         deferred_tasks.append(task)
                         self._note_deferral(task, "no worker for this task type")
-                        log("system", "warn",
-                            f"No worker for task {task_id} (type={task_type}), re-queued")
+                        self._log_deferral(
+                            task,
+                            "no_worker",
+                            f"No worker for task {task_id} (type={task_type}), re-queued",
+                        )
                         task_id = await self._queue.pop_next(task_type)
                         continue
 
@@ -141,7 +151,11 @@ class Scheduler:
                         task.next_retry_at = time.time() + 1
                         deferred_tasks.append(task)
                         self._note_deferral(task, "the measured availability of a resource is unavailable")
-                        log("system", "warn", f"Task {task.id} delayed: resource availability probe failed")
+                        self._log_deferral(
+                            task,
+                            "resource_probe_unavailable",
+                            f"Task {task.id} delayed: resource availability probe failed",
+                        )
                         task_id = await self._queue.pop_next(task_type)
                         continue
                     remote_ok, remote_kind, remote_reason = await self._remote_route_status(
@@ -193,9 +207,13 @@ class Scheduler:
                         if not admission.get("admissible_now"):
                             task.next_retry_at = time.time() + 1
                             deferred_tasks.append(task)
-                            self._note_deferral(task, f"the model is not admissible: {admission.get('admission')}")
-                            log("system", "warning",
-                                f"Task {task.id} delayed: {admission.get('admission')} for model {requested_model_id}")
+                            admission_reason = str(admission.get('admission'))
+                            self._note_deferral(task, f"the model is not admissible: {admission_reason}")
+                            self._log_deferral(
+                                task,
+                                f"model_admission:{admission_reason}",
+                                f"Task {task.id} delayed: {admission_reason} for model {requested_model_id}",
+                            )
                             task_id = await self._queue.pop_next(task_type)
                             continue
                         model_admission = await self._resources.reserve_model_start(
@@ -208,7 +226,11 @@ class Scheduler:
                             task.next_retry_at = time.time() + 1
                             deferred_tasks.append(task)
                             self._note_deferral(task, "the resources changed during the admission")
-                            log("system", "warning", f"Task {task.id} delayed: resources changed during model admission")
+                            self._log_deferral(
+                                task,
+                                "resources_changed_model_admission",
+                                f"Task {task.id} delayed: resources changed during model admission",
+                            )
                             task_id = await self._queue.pop_next(task_type)
                             continue
                     elif local_reqs and self._resources:
@@ -232,8 +254,11 @@ class Scheduler:
                                     task.next_retry_at = time.time() + 5
                                     deferred_tasks.append(task)
                                     self._note_deferral(task, "the idle models did not free enough memory")
-                                    log("system", "warn",
-                                        f"Task {task.id} delayed: resource unload did not free enough space")
+                                    self._log_deferral(
+                                        task,
+                                        "unload_failed",
+                                        f"Task {task.id} delayed: resource unload did not free enough space",
+                                    )
                                     task_id = await self._queue.pop_next(task_type)
                                     continue
                                 # Fall through — resources are now available
@@ -242,7 +267,11 @@ class Scheduler:
                                 task.next_retry_at = time.time() + 1
                                 deferred_tasks.append(task)
                                 self._note_deferral(task, "insufficient resources")
-                                log("system", "warning", f"Task {task.id} delayed: insufficient resources")
+                                self._log_deferral(
+                                    task,
+                                    "insufficient_resources",
+                                    f"Task {task.id} delayed: insufficient resources",
+                                )
                                 task_id = await self._queue.pop_next(task_type)
                                 continue
 
@@ -255,8 +284,31 @@ class Scheduler:
                         if not reserved:
                             task.next_retry_at = time.time() + 1
                             deferred_tasks.append(task)
-                            self._note_deferral(task, "the resources changed during the admission")
-                            log("system", "warning", f"Task {task.id} delayed: resources changed during admission")
+                            if (
+                                requested_model_id
+                                and not self._resources.model_slot_available(
+                                    requested_provider_id, requested_model_id
+                                )
+                            ):
+                                self._note_deferral(
+                                    task,
+                                    "the model already has the maximum number of concurrent requests",
+                                )
+                                self._log_deferral(
+                                    task,
+                                    "model_concurrency",
+                                    (
+                                        f"Task {task.id} delayed: model {requested_model_id} "
+                                        "already has its maximum number of concurrent requests"
+                                    ),
+                                )
+                            else:
+                                self._note_deferral(task, "the resources changed during the admission")
+                                self._log_deferral(
+                                    task,
+                                    "resources_changed_admission",
+                                    f"Task {task.id} delayed: resources changed during admission",
+                                )
                             task_id = await self._queue.pop_next(task_type)
                             continue
                     bg_task = asyncio.create_task(
@@ -800,36 +852,40 @@ class Scheduler:
             task.next_retry_at = time.time() + 1
             deferred_tasks.append(task)
             self._note_deferral(task, f"waiting for the remote aidir '{provider_id}': {reason}")
-            log(
-                "system",
-                "warning",
-                f"Task {task.id} delayed: remote aidir provider '{provider_id}' is unreachable "
-                f"({reason}); the task waits for it or is re-routed",
+            self._log_deferral(
+                task,
+                f"remote_unreachable:{provider_id}",
+                (
+                    f"Task {task.id} delayed: remote aidir provider '{provider_id}' is unreachable "
+                    f"({reason}); the task waits for it or is re-routed"
+                ),
             )
             return
 
         attempts = self._remote_refusal_counts.get(task.id, 0) + 1
         self._remote_refusal_counts[task.id] = attempts
         if attempts >= _MAX_REMOTE_REFUSALS:
+            message = (
+                f"No candidate can run the task: the remote aidir provider "
+                f"'{provider_id}' cannot run '{model_id}' ({reason})"
+            )
             self._clear_remote_tracking(task.id)
             self._clear_deferral(task.id)
-            await self._queue.mark_failed(task, {
-                "code": "REMOTE_CANNOT_RUN",
-                "message": (
-                    f"No candidate can run the task: the remote aidir provider "
-                    f"'{provider_id}' cannot run '{model_id}' ({reason})"
-                ),
-            })
+            await self._queue.mark_failed(task, {"code": "REMOTE_CANNOT_RUN", "message": message})
+            log("system", "warning", f"Task {task.id} failed: {message}")
             return
 
         task.next_retry_at = time.time() + 1
         deferred_tasks.append(task)
         self._note_deferral(task, f"the remote aidir '{provider_id}' cannot run '{model_id}': {reason}")
-        log(
-            "system",
-            "warning",
-            f"Task {task.id} delayed: remote aidir provider '{provider_id}' cannot run "
-            f"'{model_id}' ({reason}), attempt {attempts}/{_MAX_REMOTE_REFUSALS}",
+        self._log_deferral(
+            task,
+            f"remote_capacity:{provider_id}:{model_id}:{attempts}",
+            (
+                f"Task {task.id} delayed: remote aidir provider '{provider_id}' cannot run "
+                f"'{model_id}' ({reason}), attempt {attempts}/{_MAX_REMOTE_REFUSALS}"
+            ),
+            level="warning" if attempts == 1 else "debug",
         )
 
     def _clear_remote_tracking(self, task_id: str) -> None:
@@ -850,9 +906,26 @@ class Scheduler:
         entry["model"] = str(route.get("resolved_model") or task.model_id or "")
         entry["worker"] = str(task.worker_id or "")
 
+    def _log_deferral(self, task: Task, reason: str, message: str, level: str = "warning") -> None:
+        """Log a deferral on change and at most once per interval, not every retry."""
+        now = time.monotonic()
+        state = self._deferral_log_state.get(task.id)
+        if state is not None and state.get("reason") == reason:
+            if now - float(state.get("last") or 0) < _DEFERRAL_LOG_INTERVAL_SECONDS:
+                state["suppressed"] = int(state.get("suppressed") or 0) + 1
+                return
+            suppressed = int(state.get("suppressed") or 0)
+        else:
+            suppressed = 0
+        self._deferral_log_state[task.id] = {"reason": reason, "last": now, "suppressed": 0}
+        if suppressed:
+            message = f"{message} ({suppressed} repeated deferral log(s) suppressed)"
+        log("system", level, message)
+
     def _clear_deferral(self, task_id: str) -> None:
         """Drop the deferral record of a task that is no longer waiting."""
         self._deferred.pop(task_id, None)
+        self._deferral_log_state.pop(task_id, None)
 
     def defer_reason_for(self, task_id: str) -> dict:
         """Return why one task waits, or an empty mapping when it does not wait."""

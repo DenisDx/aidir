@@ -248,7 +248,9 @@ class LocalServerManager:
                     pass
                 line = raw.decode("utf-8", "replace").rstrip("\r\n")
                 if line:
-                    log("system", "info", f"llama.cpp provider '{provider_id}': {line}", "llama_cpp")
+                    # The same line is already in the provider's own log file.
+                    # Keep system.log for aidir events, not the model's stdout.
+                    log("system", "debug", f"llama.cpp provider '{provider_id}': {line}", "llama_cpp")
         except asyncio.CancelledError:
             raise
         except Exception:

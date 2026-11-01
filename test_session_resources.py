@@ -90,6 +90,27 @@ class SessionResourcesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(admission["admission"], "concurrency")
         resources.mark_model_finished("p", "m")
 
+    async def test_single_request_model_holds_the_slot_until_the_task_releases_it(self):
+        """A second task cannot start while the first model is still loading."""
+        resources = _resources(_config(max_concurrent=None))
+        base = {"gpu": {"VRAM": 19000}}
+
+        first = await resources.reserve_if_available_or_reuse(
+            base, consumer_id="t1", model_id="m", provider_id="p"
+        )
+        second = await resources.reserve_if_available_or_reuse(
+            base, consumer_id="t2", model_id="m", provider_id="p"
+        )
+        self.assertTrue(first)
+        self.assertFalse(second)
+        self.assertEqual(resources.get("gpu").used["VRAM"], 19000)
+
+        await resources.release_for(base, consumer_id="t1", model_id="m", provider_id="p")
+        third = await resources.reserve_if_available_or_reuse(
+            base, consumer_id="t3", model_id="m", provider_id="p"
+        )
+        self.assertTrue(third)
+
     def test_parallel_mode_requires_session_resources_for_local_resources(self):
         config = _config(max_concurrent=2)
         model = config["models"]["providers"]["p"]["models"][0]

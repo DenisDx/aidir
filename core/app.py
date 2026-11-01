@@ -157,7 +157,8 @@ class Core:
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     async def start(self) -> None:
-        log("core", "info", "Core starting")
+        lifecycle_level = "debug" if self._loop_workers_only else "info"
+        log("core", lifecycle_level, "Core starting")
 
         unknown_thresholds = logger.warn_unknown_subsystems()
         if unknown_thresholds:
@@ -202,7 +203,7 @@ class Core:
         self.redis = aioredis.from_url(redis_url, decode_responses=True)
         try:
             await self.redis.ping()
-            log("core", "info", "Redis connected")
+            log("core", lifecycle_level, "Redis connected")
         except Exception as exc:
             host = redis_cfg.get("host", "127.0.0.1")
             port = redis_cfg.get("port", 6379)
@@ -299,34 +300,38 @@ class Core:
             )
 
         # ── Scheduler ─────────────────────────────────────────────────────
-        self.resource_monitor = ResourceMonitor(
-            self.resources,
-            peer_client=PeerResourceClient(self.config.raw()),
-        )
-        self.scheduler = Scheduler(
-            self.queue,
-            self.workers,
-            workers_cfg=workers_cfg,
-            resources=self.resources,
-            full_config=self.config.raw(),
-            hooks=self.hooks,
-            resource_monitor=self.resource_monitor,
-            kv_affinity=self.kv_affinity,
-            model_readiness=self.model_readiness,
-            affinity_config=self.config.get("routing.kv_affinity") or {},
-        )
+        # The cron process only needs the workers that expose loop(). A full
+        # scheduler and resource monitor would be created and stopped every
+        # minute, writing their lifecycle into the logs for no work.
         await self.hooks.load()
-        self._track_background_task(
-            asyncio.create_task(self.resource_monitor.run(), name="resource-monitor")
-        )
-        self._embedded_cron_enabled = bool(self.config.get("cron.embedded", False))
-        if self._embedded_cron_enabled:
-            self._track_background_task(
-                asyncio.create_task(self._run_embedded_cron(), name="embedded-cron")
+        if not self._loop_workers_only:
+            self.resource_monitor = ResourceMonitor(
+                self.resources,
+                peer_client=PeerResourceClient(self.config.raw()),
             )
-            log("core", "info", "Embedded cron enabled")
+            self.scheduler = Scheduler(
+                self.queue,
+                self.workers,
+                workers_cfg=workers_cfg,
+                resources=self.resources,
+                full_config=self.config.raw(),
+                hooks=self.hooks,
+                resource_monitor=self.resource_monitor,
+                kv_affinity=self.kv_affinity,
+                model_readiness=self.model_readiness,
+                affinity_config=self.config.get("routing.kv_affinity") or {},
+            )
+            self._track_background_task(
+                asyncio.create_task(self.resource_monitor.run(), name="resource-monitor")
+            )
+            self._embedded_cron_enabled = bool(self.config.get("cron.embedded", False))
+            if self._embedded_cron_enabled:
+                self._track_background_task(
+                    asyncio.create_task(self._run_embedded_cron(), name="embedded-cron")
+                )
+                log("core", "info", "Embedded cron enabled")
 
-        log("core", "info", "Core started")
+        log("core", lifecycle_level, "Core started")
 
     async def _run_embedded_cron(self) -> None:
         """Run maintenance cycles every minute while the Core process is active."""
@@ -341,14 +346,15 @@ class Core:
 
     async def stop(self) -> None:
         started_at = time.monotonic()
-        log("core", "info", "Core stopping")
+        lifecycle_level = "debug" if self._loop_workers_only else "info"
+        log("core", lifecycle_level, "Core stopping")
         if self.resource_monitor is not None:
             self.resource_monitor.stop()
 
         async def shutdown_step(name: str, awaitable, timeout: float) -> bool:
             """Run one shutdown action with a bounded wait and diagnostic logs."""
             step_started = time.monotonic()
-            log("core", "info", f"Shutdown step BEGIN: {name} timeout={timeout:.1f}s")
+            log("core", lifecycle_level, f"Shutdown step BEGIN: {name} timeout={timeout:.1f}s")
             try:
                 await asyncio.wait_for(awaitable, timeout=timeout)
             except asyncio.TimeoutError:
@@ -358,17 +364,17 @@ class Core:
             except Exception as exc:
                 log("system", "warn", f"Shutdown step FAILED: {name}: {exc}")
                 return False
-            log("core", "info", f"Shutdown step OK: {name} in {time.monotonic() - step_started:.2f}s")
+            log("core", lifecycle_level, f"Shutdown step OK: {name} in {time.monotonic() - step_started:.2f}s")
             return True
         
         cancel_started = time.monotonic()
         for task in list(self._background_tasks):
             task.cancel()
         cancel_elapsed = time.monotonic() - cancel_started
-        log("core", "info", f"Background task cancellation started in {cancel_elapsed:.2f}s")
+        log("core", lifecycle_level, f"Background task cancellation started in {cancel_elapsed:.2f}s")
         
         if self._background_tasks:
-            log("core", "info", f"Stopping background tasks: count={len(self._background_tasks)}")
+            log("core", lifecycle_level, f"Stopping background tasks: count={len(self._background_tasks)}")
             await shutdown_step(
                 "background tasks",
                 asyncio.gather(*self._background_tasks, return_exceptions=True),
@@ -376,18 +382,18 @@ class Core:
             )
         
         if self.scheduler:
-            log("core", "info", "Stopping scheduler")
+            log("core", lifecycle_level, "Stopping scheduler")
             sched_started = time.monotonic()
             self.scheduler.stop()
             sched_elapsed = time.monotonic() - sched_started
-            log("core", "info", f"Scheduler stopped in {sched_elapsed:.2f}s")
+            log("core", lifecycle_level, f"Scheduler stopped in {sched_elapsed:.2f}s")
 
         if self.audit_log:
             audit_started = time.monotonic()
-            log("core", "info", "Shutdown step BEGIN: audit writer timeout=3.0s")
+            log("core", lifecycle_level, "Shutdown step BEGIN: audit writer timeout=3.0s")
             stopped = self.audit_log.stop_writer(timeout=3.0)
             status = "OK" if stopped else "TIMEOUT"
-            log("core", "info", f"Shutdown step {status}: audit writer in {time.monotonic() - audit_started:.2f}s")
+            log("core", lifecycle_level, f"Shutdown step {status}: audit writer in {time.monotonic() - audit_started:.2f}s")
 
         if self._manage_local_servers:
             await shutdown_step(
@@ -404,13 +410,13 @@ class Core:
                 self.resources.clear_soft_consumers_for_providers(stopped_providers)
 
             await shutdown_step("llama.cpp servers", stop_local_servers(), 15.0)
-            log("core", "info", f"Inference resources released; stopped llama.cpp providers={stopped_providers}")
+            log("core", lifecycle_level, f"Inference resources released; stopped llama.cpp providers={stopped_providers}")
         
         if self.redis:
             await shutdown_step("Redis connection", self.redis.aclose(), 5.0)
         
         total_elapsed = time.monotonic() - started_at
-        log("core", "info", f"Core stopping completed in {total_elapsed:.3f}s")
+        log("core", lifecycle_level, f"Core stopping completed in {total_elapsed:.3f}s")
 
     async def reload_config(self) -> dict:
         """Re-read the configuration and re-apply the parts that may change at runtime.

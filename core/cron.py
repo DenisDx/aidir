@@ -142,7 +142,7 @@ async def health_check(redis: aioredis.Redis) -> None:
 
     try:
         await redis.ping()
-        log("system", "info", "Health check OK: Redis reachable")
+        log("system", "debug", "Health check OK: Redis reachable")
     except Exception as exc:
         log("system", "error", f"Health check FAIL: Redis unreachable: {exc}")
 
@@ -161,7 +161,7 @@ async def health_check(redis: aioredis.Redis) -> None:
             async with httpx.AsyncClient(timeout=5.0) as client:
                 response = await client.get(url)
             if 200 <= response.status_code < 300:
-                log("system", "info", f"Health check OK: {endpoint_id} reachable")
+                log("system", "debug", f"Health check OK: {endpoint_id} reachable")
             else:
                 log("system", "error", f"Health check FAIL: {endpoint_id} returned HTTP {response.status_code}")
         except httpx.HTTPError as exc:
@@ -520,7 +520,7 @@ async def keep_alive_ping(redis: aioredis.Redis) -> None:
                     ttl = max(keep_alive, 3600)
                     await redis.set(key, json.dumps(data), ex=ttl)
                     pinged += 1
-                    log("system", "info", f"llama.cpp keep-alive verified {model_id} via {provider_id}")
+                    log("system", "debug", f"llama.cpp keep-alive verified {model_id} via {provider_id}")
                     continue
                 if not base_url or api_type != "ollama":
                     continue
@@ -534,7 +534,7 @@ async def keep_alive_ping(redis: aioredis.Redis) -> None:
                 ttl = max(keep_alive, 3600)
                 await redis.set(key, json.dumps(data), ex=ttl)
                 pinged += 1
-                log("system", "info",
+                log("system", "debug",
                     f"keep_alive ping: {model_id} on {resource_id} (age={now - last_used:.0f}s)")
             except Exception as exc:
                 log("system", "warn", f"keep_alive_ping: error processing {key}: {exc}")
@@ -542,7 +542,7 @@ async def keep_alive_ping(redis: aioredis.Redis) -> None:
             break
 
     if pinged:
-        log("system", "info", f"keep_alive_ping: sent {pinged} ping(s)")
+        log("system", "debug", f"keep_alive_ping: sent {pinged} ping(s)")
 
 
 async def refresh_external_mcp_tools(redis: aioredis.Redis) -> None:

@@ -46,6 +46,11 @@ class Resources:
         self._admission_lock = asyncio.Lock()
         self._admission_locks: dict[str, asyncio.Lock] = {}
         self._model_active: dict[tuple[str, str], int] = {}
+        # Admission slots for models whose maxConcurrentRequests is 1. A slot is
+        # held from scheduler admission until the task releases its resources,
+        # so a second task cannot pass while the first model is still loading.
+        self._model_slots: dict[tuple[str, str], int] = {}
+        self._model_slot_consumers: dict[str, tuple[str, str]] = {}
         self._candidate_invalidator: Callable[[str, str], None] | None = None
 
     @asynccontextmanager
@@ -342,6 +347,39 @@ class Resources:
         else:
             self._model_active.pop(key, None)
         return remaining
+
+    def model_slot_available(self, provider_id: str, model_id: str) -> bool:
+        """Return whether a single-request model may take one more admission."""
+        maximum, _ = self.model_parallel_config(provider_id, model_id)
+        if maximum > 1:
+            return True
+        key = (str(provider_id or ""), str(model_id or ""))
+        held = int(self._model_slots.get(key, 0)) + self.model_active_count(provider_id, model_id)
+        return held < maximum
+
+    def _acquire_model_slot(self, provider_id: str, model_id: str, consumer_id: str) -> bool:
+        """Reserve the single-request admission slot of a model, or refuse it."""
+        maximum, _ = self.model_parallel_config(provider_id, model_id)
+        if maximum > 1:
+            return True
+        if not self.model_slot_available(provider_id, model_id):
+            return False
+        key = (str(provider_id or ""), str(model_id or ""))
+        self._model_slots[key] = int(self._model_slots.get(key, 0)) + 1
+        if consumer_id:
+            self._model_slot_consumers[consumer_id] = key
+        return True
+
+    def _release_model_slot(self, consumer_id: str) -> None:
+        """Release the admission slot held by one consumer, if any."""
+        key = self._model_slot_consumers.pop(consumer_id, None)
+        if key is None:
+            return
+        remaining = max(0, int(self._model_slots.get(key, 0)) - 1)
+        if remaining:
+            self._model_slots[key] = remaining
+        else:
+            self._model_slots.pop(key, None)
 
     def model_is_loaded(
         self,
@@ -759,12 +797,18 @@ class Resources:
         """Atomically reserve resources for a new or matching warm model."""
         reqs = requirements or {}
         async with self._admission_guard(reqs):
+            acquired_slot = False
+            if model_id and not self._acquire_model_slot(str(provider_id or ""), str(model_id), consumer_id):
+                return False
+            acquired_slot = bool(model_id)
             reusable = bool(model_id) and self.check_available_for_reuse(
                 reqs,
                 str(model_id),
                 str(provider_id or ""),
             )
             if not reusable and not self.check_available(reqs):
+                if acquired_slot:
+                    self._release_model_slot(consumer_id)
                 return False
             await self.reserve_blind_for(
                 reqs,
@@ -788,6 +832,7 @@ class Resources:
     ) -> None:
         """Release one reservation and optionally retain its model as loaded."""
         reqs = requirements or {}
+        self._release_model_slot(consumer_id)
         tracked_model_id = model_id if retain_model else None
         persistent = retain_model and self._provider_api_type(provider_id, self._full_config) == "llama-cpp"
         for rid, need in reqs.items():
