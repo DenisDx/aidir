@@ -305,6 +305,79 @@ class ViewerSearchTests(unittest.TestCase):
             self.assertEqual(tasks[task_id]["first_message_preview"], expected_preview)
         self.assertNotIn("data:image", tasks["openai"]["first_message_preview"])
 
+    def test_search_decodes_first_and_last_message_previews(self):
+        """Show the first and last messages for a multi-message request."""
+        timestamp = "2026-10-01T12:00:00+00:00"
+        payload = {
+            "model": "multi-model",
+            "messages": [
+                {"role": "system", "content": "System prompt"},
+                {"role": "user", "content": "First question"},
+                {"role": "assistant", "content": "Some answer"},
+                {"role": "user", "content": [{"type": "text", "text": "Last question"}]},
+            ],
+        }
+        hashes = {
+            "aidir:task:multi": {
+                **_summary("multi", timestamp, "multi-model"),
+                "payload": json.dumps(payload),
+            },
+            "aidir:task:single": {
+                **_summary("single", timestamp, "multi-model"),
+                "payload": json.dumps({
+                    "model": "multi-model",
+                    "messages": [{"role": "user", "content": "Only question"}],
+                }),
+            },
+        }
+        core = _Core(_Redis(hashes))
+
+        async def session(*args, **kwargs):
+            """Provide an authenticated Viewer session."""
+            return {"permissions": ["all"], "login": "test"}
+
+        with patch("webui.backend.app._get_session", session):
+            response = TestClient(create_app(core)).get("/api/tasks/viewer/search")
+
+        self.assertEqual(response.status_code, 200)
+        tasks = {task["id"]: task for task in response.json()["tasks"]}
+        self.assertEqual(tasks["multi"]["first_message_preview"], "System prompt")
+        self.assertEqual(tasks["multi"]["last_message_preview"], "Last question")
+        self.assertEqual(tasks["single"]["first_message_preview"], "Only question")
+        self.assertNotIn("last_message_preview", tasks["single"])
+
+    def test_dashboard_exposes_first_and_last_message_previews(self):
+        """Decode first and last messages for the dashboard task list."""
+        timestamp = "2026-10-01T12:00:00+00:00"
+        payload = {
+            "model": "dashboard-model",
+            "messages": [
+                {"role": "system", "content": "Dashboard first"},
+                {"role": "user", "content": "Dashboard last"},
+            ],
+        }
+        redis = _Redis({
+            "aidir:task:dashboard": {
+                **_summary("dashboard", timestamp, "dashboard-model"),
+                "status": "running",
+                "payload": json.dumps(payload),
+            },
+        })
+        core = _Core(redis)
+        core.queue.list_tasks.return_value = []
+
+        async def session(*args, **kwargs):
+            """Provide an authenticated Dashboard session."""
+            return {"permissions": ["all"], "login": "test"}
+
+        with patch("webui.backend.app._get_session", session):
+            response = TestClient(create_app(core)).get("/api/tasks")
+
+        self.assertEqual(response.status_code, 200)
+        task = response.json()["tasks"][0]
+        self.assertEqual(task["first_message_preview"], "Dashboard first")
+        self.assertEqual(task["last_message_preview"], "Dashboard last")
+
     def test_search_prefers_live_status_over_stale_redis_status(self):
         """Expose an active task's live status while its Redis hash is stale."""
         task_id = "active-task"

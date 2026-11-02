@@ -441,6 +441,15 @@ def _task_to_api_item(task: dict[str, Any], core: "Core | None" = None) -> dict[
         or ""
     )
     item["route_selection"] = str(route.get("selection") or "")
+    if isinstance(item.get("payload"), dict):
+        first_preview, last_preview = _request_previews(
+            str(item.get("type") or ""),
+            item["payload"],
+        )
+        if first_preview:
+            item["first_message_preview"] = first_preview
+            if last_preview:
+                item["last_message_preview"] = last_preview
     return item
 
 
@@ -482,36 +491,48 @@ def _clip_request_preview(value: str, max_length: int = 1000) -> str:
     return f"{normalized[:max_length - 1]}…"
 
 
-def _first_request_preview(task_type: str, raw_payload: Any) -> str:
-    """Decode a bounded first-input preview for agent, embedding, or tool tasks."""
+def _request_previews(task_type: str, raw_payload: Any) -> tuple[str, str]:
+    """Return bounded first and last input previews for agent, embedding, or tool tasks."""
     payload = _parse_json_field(raw_payload) if isinstance(raw_payload, str) else raw_payload
     if not isinstance(payload, dict):
-        return ""
+        return "", ""
 
     if task_type == "tool":
         tool_name = str(payload.get("tool") or "").strip()
         arguments = payload.get("arguments")
         if arguments not in (None, {}, []):
             arguments_text = json.dumps(arguments, ensure_ascii=False, separators=(",", ":"))
-            return _clip_request_preview(f"{tool_name} {arguments_text}".strip())
-        return _clip_request_preview(tool_name)
+            return _clip_request_preview(f"{tool_name} {arguments_text}".strip()), ""
+        return _clip_request_preview(tool_name), ""
 
     messages = payload.get("messages")
     if isinstance(messages, list) and messages:
         first_message = messages[0]
         if isinstance(first_message, dict):
-            preview = _preview_text(first_message.get("content"))
-            if preview:
-                return _clip_request_preview(preview)
+            first_preview = _preview_text(first_message.get("content"))
+            if first_preview:
+                last_preview = ""
+                if len(messages) > 1 and isinstance(messages[-1], dict):
+                    last_preview = _preview_text(messages[-1].get("content"))
+                return _clip_request_preview(first_preview), _clip_request_preview(last_preview)
 
     input_value = payload.get("input")
     if isinstance(input_value, list) and input_value:
-        input_value = input_value[0]
-    preview = _preview_text(input_value)
-    if preview:
-        return _clip_request_preview(preview)
+        first_input = input_value[0]
+        last_input = input_value[-1] if len(input_value) > 1 else None
+        first_preview = _preview_text(first_input)
+        if first_preview:
+            return (
+                _clip_request_preview(first_preview),
+                _clip_request_preview(_preview_text(last_input)),
+            )
 
-    return _clip_request_preview(_preview_text(payload.get("prompt")))
+    return _clip_request_preview(_preview_text(payload.get("prompt"))), ""
+
+
+def _first_request_preview(task_type: str, raw_payload: Any) -> str:
+    """Decode a bounded first-input preview for agent, embedding, or tool tasks."""
+    return _request_previews(task_type, raw_payload)[0]
 
 
 def _task_summary_from_hash(task_hash: dict[str, str], core: "Core | None" = None) -> dict[str, Any]:
@@ -1047,10 +1068,13 @@ def create_app(
         items.sort(reverse=True)
         tasks = []
         for _, _, task, raw_payload in items:
-            task["first_message_preview"] = _first_request_preview(
+            first_preview, last_preview = _request_previews(
                 str(task.get("type") or ""),
                 raw_payload,
             )
+            task["first_message_preview"] = first_preview
+            if last_preview:
+                task["last_message_preview"] = last_preview
             tasks.append(task)
         return {
             "tasks": tasks,
@@ -1083,10 +1107,13 @@ def create_app(
             if not raw:
                 raise HTTPException(status_code=404, detail="Task not found")
             task = _task_summary_from_hash(raw, core)
-        task["first_message_preview"] = _first_request_preview(
+        first_preview, last_preview = _request_previews(
             str(task.get("type") or ""),
             raw.get("payload"),
         )
+        task["first_message_preview"] = first_preview
+        if last_preview:
+            task["last_message_preview"] = last_preview
         audit_log = getattr(core, "audit_log", None)
         events = audit_log.list_task_events(task_id) if audit_log is not None else []
         terminal_audit = audit_log.task_terminal_snapshot(task_id) if audit_log is not None else None

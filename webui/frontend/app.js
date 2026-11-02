@@ -465,7 +465,7 @@ async function loadTasks() {
     const timeoutField = t.status === 'queued' ? 'queue_timeout' : t.status === 'running' ? 'run_timeout' : '';
     const timeoutValue = timeoutField ? Number(t[timeoutField]) : NaN;
     const timeoutText = Number.isFinite(timeoutValue) ? `${timeoutValue}s` : '—';
-    const requestPreview = escapeHtml(firstMessagePreview(t));
+    const requestPreview = messagePreviewHtml(t);
     const modelName = t.model_id || '—';
     const modelMeta = [];
     if (t.requested_model && t.requested_model !== t.model_id) modelMeta.push(`requested ${t.requested_model}`);
@@ -760,34 +760,60 @@ function requestPreviewText(value) {
   return '';
 }
 
-// Return a bounded request preview for task list columns.
-function firstMessagePreview(task, maxLength = 40) {
-  const persistedPreview = task && typeof task.first_message_preview === 'string'
-    ? task.first_message_preview
-    : task && typeof task.request_preview === 'string'
-      ? task.request_preview
-      : '';
+// Normalize and bound one message preview for task list columns.
+function clipPreviewText(value, maxLength) {
+  const normalized = String(value || '').replace(/\s+/g, ' ').trim();
+  if (!normalized) return '';
+  if (normalized.length <= maxLength) return normalized;
+  return `${normalized.slice(0, Math.max(0, maxLength - 1))}…`;
+}
+
+// Return the first and last message previews for a task.
+function messagePreviews(task, firstMaxLength = 60, lastMaxLength = 60) {
   const payload = task && typeof task.payload === 'object' ? task.payload : null;
   const messages = Array.isArray(payload && payload.messages) ? payload.messages : [];
-  const firstMessage = messages.length > 0 && messages[0] && typeof messages[0] === 'object' ? messages[0] : null;
-  let content = persistedPreview || requestPreviewText(firstMessage ? firstMessage.content : '');
-  if (!content && payload && payload.input !== undefined) {
-    const input = Array.isArray(payload.input) ? payload.input[0] : payload.input;
-    content = requestPreviewText(input);
+  let first = task && typeof task.first_message_preview === 'string' ? task.first_message_preview : '';
+  let last = task && typeof task.last_message_preview === 'string' ? task.last_message_preview : '';
+  if (!first && messages.length > 0) {
+    first = requestPreviewText(messages[0] && messages[0].content);
   }
-  if (!content && payload && payload.tool) {
+  if (!last && messages.length > 1) {
+    last = requestPreviewText(messages[messages.length - 1] && messages[messages.length - 1].content);
+  }
+  if (!first && payload && payload.input !== undefined) {
+    const input = Array.isArray(payload.input) ? payload.input[0] : payload.input;
+    first = requestPreviewText(input);
+  }
+  if (!first && payload && payload.tool) {
     const argumentsText = payload.arguments && Object.keys(payload.arguments).length
       ? ` ${JSON.stringify(payload.arguments)}`
       : '';
-    content = `${payload.tool}${argumentsText}`;
+    first = `${payload.tool}${argumentsText}`;
   }
-  if (!content && payload) {
-    content = requestPreviewText(payload.prompt);
+  if (!first && payload) {
+    first = requestPreviewText(payload.prompt);
   }
-  const normalized = content.replace(/\s+/g, ' ').trim();
-  if (!normalized) return '—';
-  if (normalized.length <= maxLength) return normalized;
-  return `${normalized.slice(0, Math.max(0, maxLength - 1))}…`;
+  if (!first && task && typeof task.request_preview === 'string') {
+    first = task.request_preview;
+  }
+  first = clipPreviewText(first, firstMaxLength);
+  last = clipPreviewText(last, lastMaxLength);
+  if (last === first) last = '';
+  return { first, last };
+}
+
+// Render first and last message previews as two bounded rows.
+function messagePreviewHtml(task) {
+  const { first, last } = messagePreviews(task);
+  if (!first && !last) return '—';
+  const lines = [];
+  if (first) {
+    lines.push(`<div class="msg-preview-line">${escapeHtml(first)}</div>`);
+  }
+  if (last) {
+    lines.push(`<div class="msg-preview-line msg-preview-last">${escapeHtml(last)}</div>`);
+  }
+  return `<div class="msg-preview">${lines.join('')}</div>`;
 }
 
 function normalizeTaskViewerDate(value) {
@@ -939,7 +965,7 @@ function renderTaskViewerRows(tasks) {
 
   tasks.forEach(task => {
     const tr = document.createElement('tr');
-    const requestPreview = escapeHtml(firstMessagePreview(task));
+    const requestPreview = messagePreviewHtml(task);
     const errorDetails = task.status === 'failed' ? task.error_details || '' : '';
     tr.innerHTML = `
       <td style="font-family:monospace;font-size:11px">${escapeHtml(task.id || '')}</td>

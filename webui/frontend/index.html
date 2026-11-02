@@ -184,6 +184,11 @@
   .badge-failed   { background: #5a2a2a; color: var(--err); }
   .badge-canceled { background: #3a3a3a; color: var(--muted); }
   .badge-created  { background: #3a3a2a; color: var(--warn); }
+  .msg-preview {
+    max-width: 360px; font-size: 12px; line-height: 1.35;
+    word-break: break-word; color: var(--text);
+  }
+  .msg-preview-last { color: var(--muted); margin-top: 2px; }
 
   /* ── Task viewer ── */
   .task-viewer-filters {
@@ -710,7 +715,7 @@
         <thead>
           <tr>
             <th>ID</th><th>Type</th><th>Status</th><th>Instance</th>
-            <th>Worker</th><th>Model</th><th>Created</th><th>Duration</th><th>Waiting for</th><th>Timeout</th><th>First message</th><th>LLM calls</th><th>JSON</th><th>Action</th>
+            <th>Worker</th><th>Model</th><th>Created</th><th>Duration</th><th>Waiting for</th><th>Timeout</th><th>First / last message</th><th>LLM calls</th><th>JSON</th><th>Action</th>
           </tr>
         </thead>
         <tbody id="tasks-body"></tbody>
@@ -832,7 +837,7 @@
             <th>Created</th>
             <th>Duration</th>
             <th>Waiting for</th>
-            <th>First message</th>
+            <th>First / last message</th>
             <th>LLM calls</th>
             <th>Last op</th>
             <th>JSON</th>
