@@ -785,6 +785,30 @@ Use `/v1/models/{model}` to inspect one model's state and the queue-state routes
 | `/stats` | GET | JSON service statistics |
 | `/metrics` | GET | Prometheus text metrics |
 
+##### Client label in `/health`
+
+Every task in `/health.tasks` carries a `client` label. Set it explicitly with
+the `X-Aidir-Client` header or a `client` field in the request body:
+
+```bash
+curl -s http://127.0.0.1:21434/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -H 'X-Aidir-Client: digest-worker' \
+  -d '{"model":"qwen3.5:0.8b","messages":[{"role":"user","content":"hi"}]}'
+```
+
+```bash
+curl -s http://127.0.0.1:21434/api/chat \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"qwen3.5:0.8b","client":"digest-worker","messages":[{"role":"user","content":"hi"}]}'
+```
+
+Precedence: `X-Aidir-Client` header, then the body `client` field, then the
+matched API user login, otherwise `anonymous`. The body field is removed before
+the request is sent upstream. Labels are trimmed to 64 printable characters.
+`/health.tasks[].client_source` reports `header`, `body`, `api_user`,
+`anonymous`, or `internal`.
+
 #### Chat response transparency
 
 For direct chat calls with matching client and executor protocols (OpenAI/OpenAI or Ollama/Ollama), aidir returns the executor's original response body and content type. Streaming preserves the original SSE or NDJSON events, including reasoning, unknown fields, IDs, timestamps, multiple choices, usage details, and stream terminators. Reasoning is not substituted for an empty answer.

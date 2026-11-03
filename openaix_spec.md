@@ -67,7 +67,10 @@ last-known availability, all telemetry readings, and `loaded_models` collected
 from local soft consumers, base reservations and the peer's resource response.
 `models` lists configured models that declare resources plus smart models whose
 candidates declare resources. `tasks` is the active task list and is always an
-array, empty when nothing is active. Provider
+array, empty when nothing is active. Each task includes `client`, `client_source`, `client_host`,
+`external`, `envid`, its `queue_timeout`/`run_timeout` in seconds,
+`wait_ms`/`run_ms`, and the remaining timeout budgets. `runtime.timeouts` reports
+the defaults. Provider
 `reachable`/`auth` values are last-known; a provider without a reading reports
 `null`.
 

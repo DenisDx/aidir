@@ -373,12 +373,42 @@ class Endpoint_openaix(Endpoint_ollama):
         """Return the active task list for the health snapshot without request bodies."""
         queue = getattr(self._core, "queue", None)
         tasks = queue.list_tasks() if queue is not None and hasattr(queue, "list_tasks") else []
+        now = datetime.now(timezone.utc)
+
+        def _aware(value):
+            """Return an aware UTC datetime for a task timestamp."""
+            if not isinstance(value, datetime):
+                return None
+            return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+
+        def _ms_between(start, end) -> int | None:
+            """Return a non-negative millisecond difference, or None."""
+            if not isinstance(start, datetime) or not isinstance(end, datetime):
+                return None
+            return max(0, int((end - start).total_seconds() * 1000))
+
+        def _remaining_ms(limit_seconds, elapsed_ms) -> int | None:
+            """Return the remaining budget in milliseconds, or None for no limit."""
+            if int(limit_seconds or 0) <= 0 or elapsed_ms is None:
+                return None
+            return max(0, int(limit_seconds) * 1000 - int(elapsed_ms))
+
         payload: list[dict] = []
         for task in tasks:
             status = str(getattr(task, "status", "") or "")
             if status not in {"created", "queued", "running"}:
                 continue
             provider_id, model_id, requested_model = self._task_route_info(task)
+            created_at = _aware(getattr(task, "created_at", None))
+            updated_at = _aware(getattr(task, "updated_at", None))
+            started_at = _aware(getattr(task, "started_at", None))
+            client = (getattr(task, "config", None) or {}).get("client") if isinstance(getattr(task, "config", None), dict) else None
+            client = client if isinstance(client, dict) else {}
+            external = bool(getattr(task, "external", False) or client.get("external"))
+            wait_ms = _ms_between(created_at, started_at or now)
+            run_ms = _ms_between(started_at, now) if status == "running" else None
+            queue_timeout = int(getattr(task, "queue_timeout", 0) or 0)
+            run_timeout = int(getattr(task, "run_timeout", 0) or 0)
 
             def _iso(value):
                 """Return an ISO timestamp or an empty string."""
@@ -393,9 +423,20 @@ class Endpoint_openaix(Endpoint_ollama):
                 "provider": provider_id,
                 "model": model_id,
                 "requested_model": requested_model,
-                "created_at": _iso(getattr(task, "created_at", None)),
-                "updated_at": _iso(getattr(task, "updated_at", None)),
-                "started_at": _iso(getattr(task, "started_at", None)),
+                "client": str(client.get("login") or ("internal" if not external else "anonymous")),
+                "client_source": str(client.get("source") or ("internal" if not external else "anonymous")),
+                "client_host": str(client.get("host") or ""),
+                "external": external,
+                "envid": str(getattr(task, "envid", "") or client.get("envid") or ""),
+                "created_at": _iso(created_at),
+                "updated_at": _iso(updated_at),
+                "started_at": _iso(started_at),
+                "wait_ms": wait_ms,
+                "run_ms": run_ms,
+                "queue_timeout": queue_timeout,
+                "run_timeout": run_timeout,
+                "queue_remaining_ms": _remaining_ms(queue_timeout, wait_ms),
+                "run_remaining_ms": _remaining_ms(run_timeout, run_ms),
             })
         payload.sort(key=lambda item: item.get("updated_at") or item.get("created_at") or "", reverse=True)
         return payload
@@ -413,12 +454,31 @@ class Endpoint_openaix(Endpoint_ollama):
             if amount:
                 target[str(metric)] = target.get(str(metric), 0) + amount
 
+    def _active_task_consumers(self) -> dict[str, tuple[str, str]]:
+        """Map active consumer ids to their provider/model pair."""
+        queue = getattr(self._core, "queue", None)
+        tasks = queue.list_tasks() if queue is not None and hasattr(queue, "list_tasks") else []
+        out: dict[str, tuple[str, str]] = {}
+        for task in tasks:
+            if str(getattr(task, "status", "")) != "running":
+                continue
+            provider_id, model_id, _requested = self._task_route_info(task)
+            if not provider_id or not model_id:
+                continue
+            worker_id = str(getattr(task, "worker_id", "") or "")
+            out[f"{getattr(task, 'id', '')}:{worker_id}"] = (provider_id, model_id)
+        return out
+
     def _model_used_on_resource(self, snapshot: dict, provider_id: str, model_id: str) -> dict:
         """Return the amount of one resource currently held by one model."""
         used: dict[str, int] = {}
         base_id = f"base:{provider_id}:{model_id}"
+        active = self._active_task_consumers()
         for consumer in snapshot.get("consumers") or []:
-            if isinstance(consumer, dict) and str(consumer.get("id") or "") == base_id:
+            if not isinstance(consumer, dict):
+                continue
+            consumer_id = str(consumer.get("id") or "")
+            if consumer_id == base_id or active.get(consumer_id) == (provider_id, model_id):
                 self._merge_usage(used, consumer.get("usage"))
         for entry in snapshot.get("soft_consumers") or []:
             if not isinstance(entry, dict):
@@ -719,23 +779,33 @@ class Endpoint_openaix(Endpoint_ollama):
                 "context_tokens": info["context_tokens"],
                 "quantization": info["quantization"],
             }
+        active = self._active_task_consumers()
         for consumer in snapshot.get("consumers") or []:
             if not isinstance(consumer, dict):
                 continue
             consumer_id = str(consumer.get("id") or "")
-            if not consumer_id.startswith("base:"):
-                continue
-            parts = consumer_id.split(":", 2)
-            if len(parts) != 3 or not parts[2]:
-                continue
-            provider_id, model_id = parts[1], parts[2]
+            if consumer_id.startswith("base:"):
+                parts = consumer_id.split(":", 2)
+                if len(parts) != 3 or not parts[2]:
+                    continue
+                provider_id, model_id = parts[1], parts[2]
+                source = active.get(consumer_id)
+                state = "loaded"
+                persistent = True
+            else:
+                source = active.get(consumer_id)
+                if source is None:
+                    continue
+                provider_id, model_id = source
+                state = "running"
+                persistent = False
             info = self._model_config_info(provider_id, model_id)
             entries[(provider_id, model_id)] = {
                 "id": model_id,
                 "provider": provider_id,
                 "resources": dict(consumer.get("usage") or {}),
-                "persistent": True,
-                "state": "loaded",
+                "persistent": persistent,
+                "state": state,
                 "context_tokens": info["context_tokens"],
                 "quantization": info["quantization"],
             }
@@ -919,6 +989,14 @@ class Endpoint_openaix(Endpoint_ollama):
         reader = getattr(self._core, "get_runtime_status", None)
         if callable(reader):
             runtime = reader()
+        tasks_cfg = self._config_get("tasks") or {}
+        if isinstance(tasks_cfg, dict):
+            runtime = dict(runtime)
+            runtime["timeouts"] = {
+                "queue_timeout_seconds": int(tasks_cfg.get("queue_timeout", 300) or 300),
+                "run_timeout_seconds": int(tasks_cfg.get("run_timeout", 300) or 300),
+                "restart_wait_timeout_seconds": int(tasks_cfg.get("restart_wait_timeout", 120) or 120),
+            }
         return {
             "status": "ok",
             "schema_version": 1,
@@ -1141,8 +1219,7 @@ class Endpoint_openaix(Endpoint_ollama):
             "request_preview": str(getattr(task, "request_preview", "") or "")[:300],
         }
 
-    @staticmethod
-    def _peer_resource_payload(snapshot: dict) -> dict:
+    def _peer_resource_payload(self, snapshot: dict) -> dict:
         """Build one minimal peer-safe resource response from a runtime snapshot."""
         telemetry = snapshot.get("telemetry")
         readings = telemetry.get("sensors") if isinstance(telemetry, dict) else None
@@ -1160,21 +1237,31 @@ class Endpoint_openaix(Endpoint_ollama):
                 "persistent": bool(entry.get("persistent")),
                 "state": "loaded",
             })
+        active = self._active_task_consumers()
         for consumer in snapshot.get("consumers") or []:
             if not isinstance(consumer, dict):
                 continue
             consumer_id = str(consumer.get("id") or "")
-            if not consumer_id.startswith("base:"):
-                continue
-            parts = consumer_id.split(":", 2)
-            if len(parts) != 3 or not parts[2]:
-                continue
+            if consumer_id.startswith("base:"):
+                parts = consumer_id.split(":", 2)
+                if len(parts) != 3 or not parts[2]:
+                    continue
+                provider_id, model_id = parts[1], parts[2]
+                state = "loaded"
+                persistent = True
+            else:
+                source = active.get(consumer_id)
+                if source is None:
+                    continue
+                provider_id, model_id = source
+                state = "running"
+                persistent = False
             loaded_models.append({
-                "id": parts[2],
-                "provider": parts[1],
+                "id": model_id,
+                "provider": provider_id,
                 "resources": dict(consumer.get("usage") or {}),
-                "persistent": True,
-                "state": "loaded",
+                "persistent": persistent,
+                "state": state,
             })
         return {
             "id": str(snapshot.get("id") or ""),
@@ -1546,6 +1633,12 @@ class Endpoint_openaix(Endpoint_ollama):
         payload = self._apply_generation_defaults(payload)
         worker_id = self._resolve_worker_id(payload)
         client_key = str(request.headers.get("x-aidir-kv-key") or "").strip() if request is not None else ""
+        explicit_client = ""
+        if request is not None:
+            raw_client = request.headers.get("x-aidir-client")
+            if not raw_client and isinstance(payload, dict):
+                raw_client = payload.get("client")
+            explicit_client = self._normalize_client_label(raw_client)
         route = self._resolve_model_route((payload or {}).get("model"), worker_id)
         if request_kind == "embed":
             self._ensure_embedding_route(route)
@@ -1565,6 +1658,9 @@ class Endpoint_openaix(Endpoint_ollama):
             self._ensure_embedding_route(route)
 
         task = self._create_task_for_payload(payload, stream, worker_id, route, request_kind=request_kind)
+        if isinstance(task.payload, dict) and "client" in task.payload:
+            # The label is aidir metadata, not an upstream request field.
+            task.payload = {key: value for key, value in task.payload.items() if key != "client"}
         if client_key:
             task.config = dict(task.config or {})
             task.config["kv_client_key"] = client_key
@@ -1575,7 +1671,30 @@ class Endpoint_openaix(Endpoint_ollama):
             task.config = dict(task.config or {})
             task.config["route_trace"] = dict(route_trace)
         if request is not None:
+            token = self._extract_incoming_token(request)
+            user = self._find_api_user_by_token(token) if token else None
+            task.config = dict(task.config or {})
+            login = explicit_client or str((user or {}).get("login") or ("anonymous" if not token else "api-user"))
+            if explicit_client:
+                source = "header" if request.headers.get("x-aidir-client") else "body"
+            elif user:
+                source = "api_user"
+            else:
+                source = "anonymous"
+            task.config["client"] = {
+                "login": login,
+                "source": source,
+                "host": request.client.host if request.client is not None else "",
+                "envid": str((payload or {}).get("envid") or ""),
+                "external": True,
+            }
             await self._attach_opencode_session_metadata(task, request)
+        else:
+            task.config = dict(task.config or {})
+            task.config.setdefault(
+                "client",
+                {"login": "internal", "source": "internal", "host": "", "envid": "", "external": False},
+            )
         return task
 
     def _create_task_for_payload(

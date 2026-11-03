@@ -522,22 +522,37 @@ peer entries are whatever the resource monitor recorded most recently.
   "tasks": [
     {"id": "...", "type": "agent", "status": "running", "worker_id": "openaix",
      "priority": 5, "provider": "llama_local", "model": "Qwen3.8-27b",
-     "requested_model": "Qwen3.8-27b", "created_at": "...", "updated_at": "...",
-     "started_at": "..."}
+     "requested_model": "Qwen3.8-27b",
+     "client": "api-test-user", "client_host": "192.168.1.50",
+     "external": true, "envid": "test-12345",
+     "created_at": "...", "updated_at": "...", "started_at": "...",
+     "wait_ms": 120, "run_ms": 3400,
+     "queue_timeout": 300, "run_timeout": 600,
+     "queue_remaining_ms": 299880, "run_remaining_ms": 596600}
   ],
-  "runtime": {"accepting_new_tasks": true, "active_tasks": 1}
+  "runtime": {"accepting_new_tasks": true, "active_tasks": 1,
+              "timeouts": {"queue_timeout_seconds": 300,
+                           "run_timeout_seconds": 600,
+                           "restart_wait_timeout_seconds": 120}}
 }
 ```
 
 `resources[].used` is the total occupied amount (active + idle soft); the split
 is in `active_used` and `soft_used`. `resources[].loaded_models` merges local
-soft consumers, active base reservations and the loaded-model list received
-from a resource peer.
+soft consumers, active base reservations, active task consumers (`state:
+"running"`), and the loaded-model list received from a resource peer. A model
+with an active task consumer reports `state.model_loaded: true`.
 `models` lists regular models that declare a non-empty `resources` map plus
 smart models whose candidates declare resources; a smart entry carries
 `resolved_provider`, `resolved_model`, the merged candidate resources and the
-`smart` block. `tasks` is the active task list (created, queued, running) and is
-an empty array when nothing is active.
+`smart` block. `tasks` is the active task list (created, queued, running) and is an empty array
+when nothing is active. Each entry carries its `queue_timeout` and `run_timeout`
+in seconds, the elapsed `wait_ms` / `run_ms`, the remaining budgets, the
+`client` label (`internal`, `anonymous`, an explicit label, or the matched API
+user login), `client_source`, `client_host`, `external` and `envid`. An explicit
+label comes from the `X-Aidir-Client` request header or the body `client` field;
+the header wins, and the body field is removed before the upstream request. `runtime.timeouts` gives the configured
+defaults.
 `external_providers` reports a peer's `reachable` and `auth` from the last
 resource-availability reading; a provider without such a reading reports `null`
 rather than an invented value.

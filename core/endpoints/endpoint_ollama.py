@@ -337,6 +337,12 @@ class Endpoint_ollama(BaseEndpoint):
         """Create Task_agent and resolve smart routes before queueing when needed."""
         worker_id = self._resolve_worker_id(payload)
         client_key = str(request.headers.get("x-aidir-kv-key") or "").strip() if request is not None else ""
+        explicit_client = ""
+        if request is not None:
+            raw_client = request.headers.get("x-aidir-client")
+            if not raw_client and isinstance(payload, dict):
+                raw_client = payload.get("client")
+            explicit_client = self._normalize_client_label(raw_client)
         route = self._resolve_model_route((payload or {}).get("model"), worker_id)
         if route is not None and self._provider_api(route["resolved_provider"]) == "smart":
             routing_payload = dict(payload)
@@ -350,6 +356,9 @@ class Endpoint_ollama(BaseEndpoint):
             )
 
         task = self._create_task_for_payload(payload, stream, worker_id, route)
+        if isinstance(task.payload, dict) and "client" in task.payload:
+            # The label is aidir metadata, not an upstream request field.
+            task.payload = {key: value for key, value in task.payload.items() if key != "client"}
         if client_key:
             task.config = dict(task.config or {})
             task.config["kv_client_key"] = client_key
@@ -360,8 +369,36 @@ class Endpoint_ollama(BaseEndpoint):
             task.config = dict(task.config or {})
             task.config["route_trace"] = dict(route_trace)
         if request is not None:
+            token = self._extract_incoming_token(request)
+            user = self._find_api_user_by_token(token) if token else None
+            task.config = dict(task.config or {})
+            login = explicit_client or str((user or {}).get("login") or ("anonymous" if not token else "api-user"))
+            if explicit_client:
+                source = "header" if request.headers.get("x-aidir-client") else "body"
+            elif user:
+                source = "api_user"
+            else:
+                source = "anonymous"
+            task.config["client"] = {
+                "login": login,
+                "source": source,
+                "host": request.client.host if request.client is not None else "",
+                "envid": str((payload or {}).get("envid") or ""),
+                "external": True,
+            }
             await self._attach_opencode_session_metadata(task, request)
+        else:
+            task.config = dict(task.config or {})
+            task.config.setdefault("client", {"login": "internal", "host": "", "envid": "", "external": False})
         return task
+
+    @staticmethod
+    def _normalize_client_label(value: object) -> str:
+        """Return a safe client label from a header or body value."""
+        if not isinstance(value, str):
+            return ""
+        cleaned = "".join(char for char in value if char.isprintable() and char not in "\r\n\t").strip()
+        return cleaned[:64]
 
     async def _attach_opencode_session_metadata(self, task: Task_agent, request: Request) -> None:
         """Store only protected OpenCode Go session metadata before task persistence."""

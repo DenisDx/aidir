@@ -373,3 +373,32 @@ differs from the configured id. Authentication is taken from the provider
 - The OpenCode Go `deepseek-v4-flash` upstream id was renamed to
   `deepseek-v4.1-flash`; the configured model id follows the upstream while the
   external alias `opencode-deepseek-v4-flash` is kept.
+
+## 17. Health task limits and client labels (2026-11-03)
+
+- `/health.tasks[]` now carries `queue_timeout` and `run_timeout` in seconds,
+  `wait_ms` (created to start), `run_ms` (start to now while running),
+  `queue_remaining_ms`, and `run_remaining_ms`.
+- Each task also carries `client` (`internal`, `anonymous`, or the matched API
+  user login), `client_host`, `external`, and `envid`, so callers can separate
+  their own tasks from other clients' tasks. The token itself is never exposed.
+- `/health.runtime.timeouts` reports the configured default queue, run, and
+  restart-wait limits. `by_priority` remains keyed by strings.
+
+## 18. Explicit client labels (2026-11-03)
+
+A task's `/health.tasks[].client` label can be set with the `X-Aidir-Client`
+request header or a `client` string field in the request body. The header wins.
+The label is trimmed to 64 printable characters and is never sent upstream; the
+body field is removed from the task payload. Precedence: header, body, matched
+API user login, `anonymous`; internal tasks use `internal`.
+`/health.tasks[].client_source` reports `header`, `body`, `api_user`,
+`anonymous`, or `internal`.
+
+## 19. Running tasks count as loaded models (2026-11-03)
+
+`model_loaded` and `loaded_models` now include active task consumers, not only
+base reservations and idle soft consumers. While a task runs, its consumer id
+is mapped back to the live task route, so `/v1/models/{model}` reports
+`state.model_loaded: true` and `/health.resources[].loaded_models` lists the
+model with `state: "running"`.

@@ -44,11 +44,18 @@ class _Task:
         self.priority = priority
         self.route_provider_id = provider
         self.model_id = model
-        self.config = {"route": {
-            "resolved_provider": provider,
-            "resolved_model": model,
-            "requested_model": requested,
-        }}
+        self.queue_timeout = 300
+        self.run_timeout = 600
+        self.envid = "test-env"
+        self.external = True
+        self.config = {
+            "route": {
+                "resolved_provider": provider,
+                "resolved_model": model,
+                "requested_model": requested,
+            },
+            "client": {"login": "api-test-user", "source": "api_user", "host": "127.0.0.1", "envid": "test-env", "external": True},
+        }
 
 
 def _core() -> SimpleNamespace:
@@ -147,6 +154,14 @@ class TestOpenaixHealthAndModels(unittest.TestCase):
         smart = next(item for item in payload["models"] if item["id"] == "smart-bound")
         self.assertEqual(smart["resolved_model"], "org/model")
         self.assertEqual(len(payload["tasks"]), 2)
+        task = payload["tasks"][0]
+        self.assertEqual(task["client"], "api-test-user")
+        self.assertEqual(task["client_source"], "api_user")
+        self.assertEqual(task["queue_timeout"], 300)
+        self.assertEqual(task["run_timeout"], 600)
+        self.assertIn("wait_ms", task)
+        self.assertIn("queue_remaining_ms", task)
+        self.assertEqual(payload["runtime"]["timeouts"]["queue_timeout_seconds"], 300)
         self.assertIn("telemetry", payload)
         remote = next(item for item in payload["external_providers"] if item["provider"] == "remote")
         self.assertEqual(remote["host"], "192.168.1.40")
@@ -208,6 +223,28 @@ class TestOpenaixHealthAndModels(unittest.TestCase):
         self.assertEqual(payload["state"]["admission"], "ready")
         self.assertEqual(payload["resolved_model"], "org/model")
 
+    def test_running_task_marks_the_model_as_loaded(self) -> None:
+        """An active task consumer makes model_loaded true before any soft release."""
+        core = _core()
+        resource = core.resources.get("gpu")
+        resource._soft_used.clear()
+        task = _Task(STATUS_RUNNING, "local", "org/model", "org/model")
+        task.id = "task-1"
+        task.worker_id = "openaix"
+        core.queue = SimpleNamespace(list_tasks=lambda: [task])
+        resource.consumers["task-1:openaix"] = {"VRAM": 500}
+
+        endpoint = Endpoint_openaix({"id": "openaix", "worker": "openaix"})
+        with TestClient(endpoint.create_app(core)) as client:
+            response = client.get("/v1/models/org/model")
+
+        self.assertEqual(response.status_code, 200)
+        state = response.json()["aidir"]["state"]
+        self.assertTrue(state["model_loaded"])
+        self.assertTrue(state["resource_ready"])
+        self.assertTrue(state["can_run_now"])
+        self.assertEqual(response.json()["aidir"]["resources"][0]["used_by_model"], {"VRAM": 500})
+
     def test_queue_state_for_model_with_slash_is_not_500(self) -> None:
         """Queue state for an encoded model id answers 200 with a schema version."""
         with self._client() as client:
@@ -233,3 +270,36 @@ class TestOpenaixHealthAndModels(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestClientLabel(unittest.IsolatedAsyncioTestCase):
+    """Verify the explicit client label sources and precedence."""
+
+    async def _task(self, payload: dict, headers: dict):
+        """Build one task through the real endpoint task-construction path."""
+        endpoint = Endpoint_openaix({"id": "openaix", "worker": "openaix"})
+        endpoint._core = _core()
+        request = SimpleNamespace(headers=headers, client=SimpleNamespace(host="192.168.1.50"))
+        return await endpoint._build_task_for_payload_async(payload, False, request=request)
+
+    async def test_header_wins_and_body_field_is_stripped(self) -> None:
+        """The X-Aidir-Client header overrides the body field and is not forwarded."""
+        task = await self._task(
+            {"model": "org/model", "client": "body-label", "messages": []},
+            {"x-aidir-client": "header-label"},
+        )
+
+        self.assertEqual(task.config["client"]["login"], "header-label")
+        self.assertEqual(task.config["client"]["source"], "header")
+        self.assertNotIn("client", task.payload)
+
+    async def test_body_label_is_used_without_a_header(self) -> None:
+        """The body client field is used when the header is absent."""
+        task = await self._task(
+            {"model": "org/model", "client": "body-label", "messages": []},
+            {},
+        )
+
+        self.assertEqual(task.config["client"]["login"], "body-label")
+        self.assertEqual(task.config["client"]["source"], "body")
+        self.assertNotIn("client", task.payload)
