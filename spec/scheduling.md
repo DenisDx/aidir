@@ -256,6 +256,10 @@ The result is cached back onto the task.
 
 ### 3.6 The two admission branches
 
+Both branches run when the task names a model, even when `local_reqs` is
+empty. Model concurrency is enforced without resource requirements; an empty
+requirement map only makes the resource-capacity checks trivially pass.
+
 #### Parallel models (`maxConcurrentRequests > 1`)
 
 1. `resources.evaluate_model_admission(reqs, model_id, provider_id)`.

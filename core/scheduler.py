@@ -177,14 +177,15 @@ class Scheduler:
                         continue
                     local_reqs = self._resources.local_admission_requirements(reqs) if self._resources else reqs
                     model_admission = None
+                    model_slot_acquired = False
                     model_max = 1
-                    if local_reqs and self._resources and requested_model_id:
+                    if self._resources and requested_model_id:
                         model_max, _ = self._resources.model_parallel_config(
                             requested_provider_id,
                             requested_model_id,
                         )
 
-                    if local_reqs and self._resources and model_max > 1:
+                    if self._resources and requested_model_id and model_max > 1:
                         admission = self._resources.evaluate_model_admission(
                             local_reqs,
                             requested_model_id,
@@ -233,7 +234,7 @@ class Scheduler:
                             )
                             task_id = await self._queue.pop_next(task_type)
                             continue
-                    elif local_reqs and self._resources:
+                    elif self._resources and (local_reqs or requested_model_id):
                         if not self._resources.check_available(local_reqs):
                             if requested_model_id and self._resources.check_available_for_reuse(
                                 local_reqs, requested_model_id, requested_provider_id
@@ -278,9 +279,11 @@ class Scheduler:
                         reserved = await self._resources.reserve_if_available_or_reuse(
                             local_reqs,
                             consumer_id=f"{task.id}:{worker.id}",
-                            model_id=(task.payload or {}).get("model") or None,
+                            model_id=requested_model_id or None,
                             provider_id=requested_provider_id,
                         )
+                        if reserved and requested_model_id:
+                            model_slot_acquired = True
                         if not reserved:
                             task.next_retry_at = time.time() + 1
                             deferred_tasks.append(task)
@@ -318,6 +321,7 @@ class Scheduler:
                             local_reqs,
                             resources_reserved=True,
                             model_admission=model_admission,
+                            model_slot_acquired=model_slot_acquired,
                         ),
                         name=f"task:{task.id}:{worker.id}",
                     )
@@ -530,6 +534,7 @@ class Scheduler:
         reserved_reqs: dict[str, dict[str, int]] | None = None,
         resources_reserved: bool = False,
         model_admission: dict | None = None,
+        model_slot_acquired: bool = False,
     ) -> None:
         """Execute one task; handle timeouts and exceptions."""
         log("worker", "info", f"Starting task {task.id}", worker.id)
@@ -639,9 +644,9 @@ class Scheduler:
                     base_requirements=model_admission.get("base_requirements") or reserved_reqs or {},
                     retain_base=not failed_local_server_start,
                 )
-            elif self._resources and reserved_reqs:
+            elif self._resources and (reserved_reqs or model_slot_acquired):
                 await self._resources.release_for(
-                    reserved_reqs,
+                    reserved_reqs or {},
                     consumer_id=consumer_id,
                     model_id=model_id,
                     provider_id=provider_id,

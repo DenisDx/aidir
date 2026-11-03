@@ -624,7 +624,8 @@ slots. Set `maxConcurrentRequests` and the incremental cost of one request in
 ```
 
 The scheduler reserves the base footprint once and one session per active
-request. The admitted count is the smaller of `maxConcurrentRequests` and the
+request. `maxConcurrentRequests` is enforced even for a model that declares
+no `resources` or `sessionResources`. The admitted count is the smaller of `maxConcurrentRequests` and the
 sessions that fit in free memory. For Ollama, keep `maxConcurrentRequests` in
 line with `OLLAMA_NUM_PARALLEL`; for llama.cpp, do not exceed `--parallel`. The
 default remains `1`, which is the previous single-request behaviour. Queue-state

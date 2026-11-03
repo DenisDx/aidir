@@ -27,6 +27,8 @@ Base URL (example): `http://127.0.0.1:21434`
 7. `GET /api/providers/{provider}/models/{model}/queue-state` and `GET /v1/providers/{provider}/models/{model}/queue-state` - read-only queue state for a provider/model pair
 8. `GET /health` - health check (`{"status":"ok"}`)
 9. `GET /api/resources`, `GET /v1/resources`, `GET /api/resources/{resource_id}`, and `GET /v1/resources/{resource_id}` - aidir peer resource availability extension
+10. `GET /stats` - JSON service statistics (`object`, `instance`, `uptime_seconds`, `tasks`, `workers`, `resources`)
+11. `GET /metrics` - the same counters in Prometheus text exposition format
 
 ## 3. Authentication and envid behavior
 

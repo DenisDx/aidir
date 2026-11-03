@@ -265,3 +265,35 @@ sensor value remains the maximum reading for an `above` threshold and the
 minimum reading for a `below` threshold. Resource snapshots include the
 configured `devices` list, and peer telemetry forwards per-device readings for
 whitelisted sensors.
+
+## 11. Model concurrency without resource requirements (2026-11-03)
+
+`maxConcurrentRequests` is enforced for every model, including a model whose
+resolved resource requirement map is empty. When a request names a model, the
+scheduler applies the model admission gate before dispatch even if the model
+declares no `resources` or `sessionResources`:
+
+- A model with `maxConcurrentRequests <= 1` holds one single-request admission
+  slot from dispatch until the task releases its resources.
+- A model with `maxConcurrentRequests > 1` counts one active session per
+  in-flight request and admits at most the configured maximum.
+- A request above the limit is deferred with the model-concurrency deferral
+  reason and retried when an active request finishes.
+
+The model admission counter is therefore a property of the model, not of the
+resource map.
+
+## 12. Monitoring compatibility routes (2026-11-03)
+
+The OpenAIx endpoint adds two unauthenticated monitoring routes that previously
+returned 404:
+
+- `GET /stats` returns a JSON snapshot: `object`, `instance`, `uptime_seconds`,
+  task counts (`total`, `active`, `by_status`), worker counts (`total`,
+  `enabled`), and resource count.
+- `GET /metrics` returns the same counters in Prometheus text exposition format
+  (`text/plain; version=0.0.4`), with `aidir_up`, `aidir_uptime_seconds`,
+  `aidir_tasks_total{status=...}`, `aidir_tasks_active`, `aidir_workers_total`,
+  `aidir_workers_enabled`, and `aidir_resources_total`.
+
+Neither route exposes task bodies, tokens, or configuration values.

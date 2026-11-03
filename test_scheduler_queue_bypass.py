@@ -90,6 +90,44 @@ class _BlockingWorker(_Worker):
         return WorkerResult(ok=True, data={})
 
 
+def _model_config(max_concurrent: int) -> dict:
+    """Build a config with one model that has no resource requirements."""
+    return {
+        "models": {
+            "providers": {
+                "p": {
+                    "api": "ollama",
+                    "models": [{
+                        "id": "m",
+                        "name": "m",
+                        "maxConcurrentRequests": max_concurrent,
+                    }],
+                },
+            },
+        },
+    }
+
+
+def _model_task(model_id: str, priority: int) -> Task_agent:
+    """Build an agent task routed to one concrete local model."""
+    task = Task_agent(payload={"model": model_id}, stream=False)
+    task.priority = priority
+    task.config = {
+        "route": {
+            "resolved_provider": "p",
+            "resolved_model": model_id,
+        },
+    }
+    return task
+
+
+async def _wait_for_count(items: list, expected: int, timeout: float = 3.0) -> None:
+    """Wait until a list reaches the expected length or the timeout expires."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while len(items) < expected and asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(0.02)
+
+
 class TestSchedulerQueueBypass(unittest.IsolatedAsyncioTestCase):
     """Verify independent work can pass a blocked queue head."""
 
@@ -206,6 +244,63 @@ class TestSchedulerQueueBypass(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(worker.executed, [task.id])
         self.assertEqual(monitor._run_command.await_count, 1)
+
+    async def test_single_request_model_without_resources_is_serialized(self) -> None:
+        """Enforce maxConcurrentRequests=1 even when the model has no resources."""
+        first = _model_task("m", priority=0)
+        second = _model_task("m", priority=1)
+        queue = _Queue([first, second])
+        config = _model_config(max_concurrent=1)
+        resources = Resources([])
+        resources.set_full_config(config)
+        worker = _BlockingWorker(expected_tasks=1)
+        scheduler = Scheduler(
+            queue=queue,
+            workers={worker.id: worker},
+            resources=resources,
+            full_config=config,
+        )
+
+        scheduler_task = asyncio.create_task(scheduler.run())
+        try:
+            await asyncio.wait_for(worker.started.wait(), timeout=1)
+            await asyncio.sleep(0.05)
+            self.assertEqual(worker.executed, [first.id])
+        finally:
+            worker.release.set()
+            await _wait_for_count(worker.executed, 2)
+            scheduler.stop()
+            await scheduler_task
+
+        self.assertCountEqual(worker.executed, [first.id, second.id])
+
+    async def test_parallel_model_without_resources_honors_the_limit(self) -> None:
+        """Run only maxConcurrentRequests tasks without resources and defer the rest."""
+        tasks = [_model_task("m", priority=index) for index in range(3)]
+        queue = _Queue(tasks)
+        config = _model_config(max_concurrent=2)
+        resources = Resources([])
+        resources.set_full_config(config)
+        worker = _BlockingWorker(expected_tasks=2)
+        scheduler = Scheduler(
+            queue=queue,
+            workers={worker.id: worker},
+            resources=resources,
+            full_config=config,
+        )
+
+        scheduler_task = asyncio.create_task(scheduler.run())
+        try:
+            await asyncio.wait_for(worker.started.wait(), timeout=1)
+            await asyncio.sleep(0.05)
+            self.assertEqual(len(worker.executed), 2)
+        finally:
+            worker.release.set()
+            await _wait_for_count(worker.executed, 3)
+            scheduler.stop()
+            await scheduler_task
+
+        self.assertEqual(len(worker.executed), 3)
 
     async def test_failed_command_availability_defers_dispatch(self) -> None:
         """Keep a task queued when its required command availability probe fails."""

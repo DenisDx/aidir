@@ -141,6 +141,8 @@ Once streaming has begun:
 | GET | `/v1/resources/{resource_id}` | peer auth | One peer resource |
 | GET | `/v1/tasks` | peer auth | Peer task list |
 | GET | `/health` | none | `{"status": "ok"}` |
+| GET | `/stats` | none | JSON service statistics |
+| GET | `/metrics` | none | Prometheus text metrics |
 
 The `{model_id}` path converter accepts slashes, so a model id may contain them.
 
@@ -390,6 +392,28 @@ explicit value wins; otherwise the root `default_auth_mode` applies. The root
 default is `endpoint`; the shipped configurations set `disabled` for existing
 deployments. `disabled` publishes the families unauthenticated; `endpoint`
 requires the normal bearer-token and environment authorization checks.
+
+### 2.9 `GET /stats` and `GET /metrics`
+
+Both routes are unauthenticated compatibility probes for monitoring clients.
+
+`GET /stats` returns JSON:
+
+```jsonc
+{
+  "object": "aidir.stats",
+  "instance": "aidir",
+  "uptime_seconds": 123.456,
+  "tasks": { "total": 3, "active": 1, "by_status": { "queued": 2, "running": 1 } },
+  "workers": { "total": 4, "enabled": 3 },
+  "resources": { "total": 1 }
+}
+```
+
+`GET /metrics` returns the same counters in Prometheus text exposition format
+(`text/plain; version=0.0.4`): `aidir_up`, `aidir_uptime_seconds`,
+`aidir_tasks_total{status="..."}`, `aidir_tasks_active`, `aidir_workers_total`,
+`aidir_workers_enabled`, and `aidir_resources_total`.
 
 ---
 

@@ -28,6 +28,10 @@ let serverWasDown = false;
 let pollSequence = 0;
 let serverDownSequence = 0;
 let cronHealth = null;
+// A USE toggle waits for a status poll that started after the POST. A poll
+// already in flight can carry the old value and must not flip the checkbox
+// back until the new value is confirmed.
+const pendingResourceUse = new Map();
 
 const SERVER_UNAVAILABLE_STATUSES = new Set([502, 503, 504]);
 let loginServerUnavailable = false;
@@ -568,6 +572,21 @@ async function extendDashboardTaskTimeout(taskId, buttonEl) {
   await loadTasks();
 }
 
+// Resolve a resource USE checkbox state against a pending toggle.
+function resolveResourceUse(resource) {
+  const id = resource && resource.id;
+  const serverUse = !(resource && resource.use === false);
+  if (!id || !pendingResourceUse.has(id)) {
+    return { use: serverUse, pending: false };
+  }
+  const desired = pendingResourceUse.get(id);
+  if (serverUse === desired) {
+    pendingResourceUse.delete(id);
+    return { use: serverUse, pending: false };
+  }
+  return { use: desired, pending: true };
+}
+
 function renderResources(resources) {
   const body = $('resources-body');
   if (!body) return;
@@ -652,12 +671,13 @@ function renderResources(resources) {
     }).join('');
     const consumersCell = consumers + softConsumers + startupErrors || '<span style="color:var(--muted)">—</span>';
     const sensorsCell = sensors + telemetry || '<span style="color:var(--muted)">—</span>';
+    const resourceUse = resolveResourceUse(r);
 
     const tr = document.createElement('tr');
     tr.innerHTML = `
       <td>${escapeHtml(r.id || '—')}</td>
       <td>${escapeHtml(r.type || '—')}${(r.devices || []).length ? `<div style="color:var(--muted)">GPU ${escapeHtml(r.devices.join(', '))}</div>` : ''}</td>
-      <td><input type="checkbox" data-resource-use ${r.use !== false ? 'checked' : ''} aria-label="Use resource ${escapeHtml(r.id || '')}"></td>
+      <td><input type="checkbox" data-resource-use ${resourceUse.use ? 'checked' : ''} ${resourceUse.pending ? 'disabled' : ''} aria-label="Use resource ${escapeHtml(r.id || '')}"></td>
       <td>${escapeHtml(usageParts.join(' | ') || '—')}</td>
       <td><div style="color:${availabilityColor}">${escapeHtml(availability.source || 'estimated')} / ${escapeHtml(availabilityStatus)}: <strong>${escapeHtml(availableValues)}</strong></div>${availabilityDevices ? `<div style="color:var(--muted)">${escapeHtml(availabilityDevices)}</div>` : ''}<div style="color:var(--muted)">${escapeHtml(fmtDateTime(availability.observed_at))}</div>${availabilityError}</td>
       <td>${consumersCell}</td>
@@ -675,10 +695,13 @@ async function setResourceUse(resourceId, checkbox) {
   if (!resourceId || !checkbox) return;
 
   const use = checkbox.checked;
+  pendingResourceUse.set(resourceId, use);
   checkbox.disabled = true;
   const res = await apiPost(`/api/resources/${encodeURIComponent(resourceId)}/use`, { use });
   if (!res.ok) {
+    pendingResourceUse.delete(resourceId);
     checkbox.checked = !use;
+    checkbox.disabled = false;
     window.alert(res.data.detail || 'Failed to update resource use');
   }
   await loadTasks();
@@ -769,7 +792,7 @@ function clipPreviewText(value, maxLength) {
 }
 
 // Return the first and last message previews for a task.
-function messagePreviews(task, firstMaxLength = 60, lastMaxLength = 60) {
+function messagePreviews(task, firstMaxLength = 50, lastMaxLength = 50) {
   const payload = task && typeof task.payload === 'object' ? task.payload : null;
   const messages = Array.isArray(payload && payload.messages) ? payload.messages : [];
   let first = task && typeof task.first_message_preview === 'string' ? task.first_message_preview : '';

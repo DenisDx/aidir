@@ -125,6 +125,7 @@ class Core:
         self._shutdown_lock = asyncio.Lock()
         self._manage_local_servers = manage_local_servers
         self._loop_workers_only = loop_workers_only
+        self.started_at = time.time()
 
     def _owns_task_recovery(self) -> bool:
         """Return whether this Core may terminalize tasks left by a previous run.

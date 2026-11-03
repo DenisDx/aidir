@@ -27,7 +27,7 @@ from core.endpoints.endpoint_ollama import Endpoint_ollama
 from core.generation_options import GENERATION_OPTION_FIELDS
 from core.request_limits import RequestBodyLimitMiddleware
 from core.smart_router import SmartRouteError, SmartRouter
-from core.task import STATUS_CANCELED, STATUS_COMPLETED, STATUS_FAILED
+from core.task import STATUS_CANCELED, STATUS_COMPLETED, STATUS_FAILED, STATUS_RUNNING
 from core.upstream_errors import upstream_error_payload, upstream_error_response
 from core.upstream_response import UpstreamChunk, original_chunk, original_payload, original_response
 
@@ -187,7 +187,95 @@ class Endpoint_openaix(Endpoint_ollama):
         async def health():
             return {"status": "ok"}
 
+        @app.get("/stats")
+        async def stats():
+            # Compatibility route for clients that probe service statistics.
+            return self._service_stats()
+
+        @app.get("/metrics")
+        async def metrics():
+            # Prometheus-compatible scrape target.
+            return Response(
+                content=self._prometheus_metrics(),
+                media_type="text/plain; version=0.0.4; charset=utf-8",
+            )
+
         return app
+
+    def _service_stats(self) -> dict:
+        """Return a JSON snapshot of service counters for the stats route."""
+        core = self._core
+        tasks = list(core.queue.list_tasks()) if getattr(core, "queue", None) else []
+        by_status: dict[str, int] = {}
+        for task in tasks:
+            status = str(getattr(task, "status", "unknown"))
+            by_status[status] = by_status.get(status, 0) + 1
+
+        scheduler = getattr(core, "scheduler", None)
+        active = (
+            scheduler.active_task_count()
+            if scheduler is not None
+            else by_status.get(STATUS_RUNNING, 0)
+        )
+        workers = getattr(core, "workers", {}) or {}
+        resources = core.resources.snapshot() if getattr(core, "resources", None) else []
+        started_at = getattr(core, "started_at", None)
+        uptime = max(0.0, time.time() - started_at) if started_at else 0.0
+
+        return {
+            "object": "aidir.stats",
+            "instance": str(core.config.get("instance", "aidir") or "aidir"),
+            "uptime_seconds": round(uptime, 3),
+            "tasks": {
+                "total": len(tasks),
+                "active": active,
+                "by_status": by_status,
+            },
+            "workers": {
+                "total": len(workers),
+                "enabled": sum(1 for worker in workers.values() if getattr(worker, "enabled", False)),
+            },
+            "resources": {"total": len(resources)},
+        }
+
+    @staticmethod
+    def _prometheus_escape(value: str) -> str:
+        """Escape a Prometheus label value."""
+        return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+    def _prometheus_metrics(self) -> str:
+        """Render the service counters in Prometheus text exposition format."""
+        stats = self._service_stats()
+        tasks = stats["tasks"]
+        lines = [
+            "# HELP aidir_up Whether the aidir endpoint is serving requests.",
+            "# TYPE aidir_up gauge",
+            "aidir_up 1",
+            "# HELP aidir_uptime_seconds Service uptime in seconds.",
+            "# TYPE aidir_uptime_seconds gauge",
+            f"aidir_uptime_seconds {stats['uptime_seconds']}",
+            "# HELP aidir_tasks_total Live tasks by status.",
+            "# TYPE aidir_tasks_total gauge",
+        ]
+        for status, count in sorted(tasks["by_status"].items()):
+            lines.append(
+                f'aidir_tasks_total{{status="{self._prometheus_escape(status)}"}} {count}'
+            )
+        lines.extend([
+            "# HELP aidir_tasks_active Tasks currently executing.",
+            "# TYPE aidir_tasks_active gauge",
+            f"aidir_tasks_active {tasks['active']}",
+            "# HELP aidir_workers_total Configured workers.",
+            "# TYPE aidir_workers_total gauge",
+            f"aidir_workers_total {stats['workers']['total']}",
+            "# HELP aidir_workers_enabled Enabled workers.",
+            "# TYPE aidir_workers_enabled gauge",
+            f"aidir_workers_enabled {stats['workers']['enabled']}",
+            "# HELP aidir_resources_total Configured resources.",
+            "# TYPE aidir_resources_total gauge",
+            f"aidir_resources_total {stats['resources']['total']}",
+        ])
+        return "\n".join(lines) + "\n"
 
     def _peer_resources_response(self, request: Request, resource_id: str | None = None) -> JSONResponse:
         """Return sanitized peer resource state after applying configured access policy."""
