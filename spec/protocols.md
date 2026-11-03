@@ -490,7 +490,7 @@ peer entries are whatever the resource monitor recorded most recently.
     {"id": "local_machine", "type": "cuda", "provider": "ollama_local",
      "host": "192.168.1.111", "devices": [0],
      "limits": {"VRAM": 32000}, "units": {"VRAM": "MiB"},
-     "used": {}, "soft_used": {"VRAM": 24100},
+     "used": {"VRAM": 24100}, "active_used": {}, "soft_used": {"VRAM": 24100},
      "availability": {"source": "peer", "status": "ok", "available": {"VRAM": 8668},
                       "observed_at": "...", "error": null},
      "telemetry": {"sensors": [{"id": "gpu_temperature", "value": 71, "unit": "C"}]},
@@ -529,8 +529,10 @@ peer entries are whatever the resource monitor recorded most recently.
 }
 ```
 
-`resources[].loaded_models` merges local soft consumers, active base
-reservations and the loaded-model list received from a resource peer.
+`resources[].used` is the total occupied amount (active + idle soft); the split
+is in `active_used` and `soft_used`. `resources[].loaded_models` merges local
+soft consumers, active base reservations and the loaded-model list received
+from a resource peer.
 `models` lists regular models that declare a non-empty `resources` map plus
 smart models whose candidates declare resources; a smart entry carries
 `resolved_provider`, `resolved_model`, the merged candidate resources and the

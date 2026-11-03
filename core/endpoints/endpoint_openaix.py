@@ -774,6 +774,12 @@ class Endpoint_openaix(Endpoint_ollama):
     def _health_resource(self, snapshot: dict) -> dict:
         """Build one health resource entry from a runtime snapshot."""
         provider_id = self._resource_provider(str(snapshot.get("id") or ""))
+        active_used = dict(snapshot.get("used") or {})
+        soft_used = dict(snapshot.get("soft_used") or {})
+        total_used = {
+            metric: int(active_used.get(metric, 0)) + int(soft_used.get(metric, 0))
+            for metric in set(active_used) | set(soft_used)
+        }
         return {
             "id": str(snapshot.get("id") or ""),
             "type": str(snapshot.get("type") or ""),
@@ -782,8 +788,9 @@ class Endpoint_openaix(Endpoint_ollama):
             "devices": list(snapshot.get("devices") or []),
             "limits": dict(snapshot.get("limits") or {}),
             "units": dict(snapshot.get("units") or {}),
-            "used": dict(snapshot.get("used") or {}),
-            "soft_used": dict(snapshot.get("soft_used") or {}),
+            "used": total_used,
+            "active_used": active_used,
+            "soft_used": soft_used,
             "availability": dict(snapshot.get("availability") or {}),
             "telemetry": {"sensors": self._all_sensor_readings(snapshot)},
             "loaded_models": self._snapshot_loaded_models(snapshot),
@@ -2947,7 +2954,12 @@ class Endpoint_openaix(Endpoint_ollama):
             message["tool_calls"] = tool_calls
 
         resp = {
-            **{key: value for key, value in data.items() if key not in {"message", "done", "done_reason", "created_at", "choices"}},
+            **{key: value for key, value in data.items() if key not in {
+                "message", "done", "done_reason", "created_at", "choices",
+                "total_duration", "load_duration",
+                "prompt_eval_count", "prompt_eval_duration",
+                "eval_count", "eval_duration",
+            }},
             "id": data.get("id") or f"chatcmpl-{task_id}",
             "object": "chat.completion",
             "created": data.get("created", int(time.time())),
@@ -2985,7 +2997,12 @@ class Endpoint_openaix(Endpoint_ollama):
         finish_reason = (chunk.get("done_reason") or ("tool_calls" if tool_calls else "stop")) if done else None
 
         response = {
-            **{key: value for key, value in chunk.items() if key not in {"message", "done", "done_reason", "created_at", "choices"}},
+            **{key: value for key, value in chunk.items() if key not in {
+                "message", "done", "done_reason", "created_at", "choices",
+                "total_duration", "load_duration",
+                "prompt_eval_count", "prompt_eval_duration",
+                "eval_count", "eval_duration",
+            }},
             "id": chunk.get("id") or f"chatcmpl-{task_id}",
             "object": "chat.completion.chunk",
             "created": chunk.get("created", int(time.time())),

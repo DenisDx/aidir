@@ -326,7 +326,7 @@ class Resource:
     ) -> dict | None:
         """Return active soft consumer for the same model when it satisfies required usage."""
         mid = str(model_id or "").strip()
-        if not self.alive_time or not mid:
+        if not mid:
             return None
 
         req = required or {}
@@ -433,11 +433,19 @@ class Resource:
         return True
 
     def get_active_soft_consumers(self) -> list[dict]:
-        """Return soft consumers still within their retention window."""
+        """Return soft consumers still within their retention window.
+
+        Persistent consumers (a managed llama.cpp base reservation) stay active
+        even on a resource that declares no alive_time or keep_alive window.
+        """
+        persistent = [entry for entry in self._soft_used if entry.get("persistent")]
         if not self.alive_time and not self.keep_alive:
-            return []
+            return persistent
         now = time.time()
-        return [entry for entry in self._soft_used if self._soft_entry_active(entry, now)]
+        return [
+            entry for entry in self._soft_used
+            if entry.get("persistent") or self._soft_entry_active(entry, now)
+        ]
 
     def has_reusable_soft_consumer(
         self,
@@ -626,7 +634,7 @@ class Resource:
             # Track soft consumer - Ollama keeps the model for keep_alive, otherwise alive_time.
             mid = (model_id or "").strip()
             pid = str(provider_id or "").strip()
-            if (self.alive_time > 0 or self.keep_alive > 0) and req and mid:
+            if (persistent or self.alive_time > 0 or self.keep_alive > 0) and req and mid:
                 now = time.time()
                 retention = max(self.alive_time, self.keep_alive)
                 # Refresh existing entry so timestamps reflect the latest release
@@ -652,6 +660,10 @@ class Resource:
             for cid, usage in sorted(self.consumers.items())
         ]
         soft = self._compute_soft_used()
+        total_used = {
+            metric: int(self.used.get(metric, 0)) + int(soft.get(metric, 0))
+            for metric in set(self.used) | set(soft)
+        }
         now = time.time()
         soft_consumers = []
         for entry in self.get_active_soft_consumers():
@@ -676,6 +688,7 @@ class Resource:
             "limits": dict(self.limits),
             "units": dict(self.units),
             "used": dict(self.used),
+            "total_used": total_used,
             "soft_used": soft,
             "consumers": consumers,
             "soft_consumers": soft_consumers,

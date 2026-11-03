@@ -487,6 +487,28 @@ class TestLlamaCppResourceRestore(unittest.TestCase):
         self.assertTrue(snapshot["soft_consumers"][0]["persistent"])
         self.assertIsNone(snapshot["soft_consumers"][0]["expires_in"])
 
+    def test_persistent_consumer_survives_on_a_resource_without_retention(self) -> None:
+        """A managed llama.cpp base reservation stays active without alive_time or keep_alive."""
+        resources = Resources([{"id": "gpu1", "type": "cuda", "limits": {"VRAM": 22}}])
+        config = {"models": {"providers": {"llama_local": {
+            "api": "llama-cpp",
+            "models": [{"id": "model", "resources": {"gpu1": {"VRAM": 22}}}],
+        }}}}
+
+        class _Manager:
+            """Test double returning one verified owned server record."""
+
+            @staticmethod
+            def owned_records() -> dict:
+                """Return one provider/model record retained across a restart."""
+                return {"llama_local": {"model_id": "model"}}
+
+        resources.restore_owned_llama_cpp_consumers(config, _Manager())
+
+        resource = resources.get("gpu1")
+        self.assertEqual(len(resource.get_active_soft_consumers()), 1)
+        self.assertTrue(resources.model_is_loaded({"gpu1": {"VRAM": 22}}, "model", "llama_local"))
+
     def test_snapshot_includes_relevant_local_startup_error(self) -> None:
         """Shows a failed local llama.cpp startup on the model's resource."""
         resources = Resources([{"id": "gpu", "type": "cuda", "limits": {"VRAM": 22}}])

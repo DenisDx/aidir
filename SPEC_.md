@@ -352,3 +352,24 @@ managed llama.cpp provider that declares `exec_cmd`, a successful
 `GET /v1/models` is therefore treated as availability even when the listed id
 differs from the configured id. Authentication is taken from the provider
 `auth` block and applies both to probes and to the worker request.
+
+## 16. Resource admission, occupancy and response normalization (2026-11-03)
+
+- Smart-route dispatch now resolves resource admission and warm-model reuse
+  with the concrete `resolved_model` (for example `Qwen3.8-Flash-Next`) instead
+  of the client-visible alias (`local-only`). This is what kept queued tasks
+  reporting `insufficient resources` while the model was already loaded.
+- A persistent `llama.cpp` base reservation is retained on every required
+  resource, even when that resource declares no `alive_time` or `keep_alive`.
+  Such consumers remain visible to `get_active_soft_consumers()` and
+  `model_is_loaded()`.
+- `/health.resources[].used` is now the total occupied amount; `active_used`
+  and `soft_used` expose the split. `Resource.snapshot()` also gained
+  `total_used`.
+- OpenAIx converts Ollama responses to OpenAI without leaking Ollama-only
+  timing/counter fields (`total_duration`, `load_duration`,
+  `prompt_eval_count`, `prompt_eval_duration`, `eval_count`, `eval_duration`);
+  the OpenAI `usage` block is always synthesized when the counters exist.
+- The OpenCode Go `deepseek-v4-flash` upstream id was renamed to
+  `deepseek-v4.1-flash`; the configured model id follows the upstream while the
+  external alias `opencode-deepseek-v4-flash` is kept.

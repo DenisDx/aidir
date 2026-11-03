@@ -159,8 +159,11 @@ class ResponseTransparencyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(converted["choices"][0]["message"]["vendor_message"], {"a": 1})
         self.assertEqual(converted["choices"][0]["finish_reason"], "length")
         self.assertEqual(converted["vendor_response"], {"enabled": True})
-        self.assertEqual(converted["total_duration"], 456)
+        self.assertNotIn("total_duration", converted)
+        self.assertNotIn("prompt_eval_count", converted)
         self.assertEqual(converted["usage"]["prompt_tokens"], 7)
+        self.assertEqual(converted["usage"]["completion_tokens"], 9)
+        self.assertEqual(converted["usage"]["total_tokens"], 16)
         task, _, _ = await self.sync_result(CallLlamaCppWorker(), self.openai)
         converted = json.loads((await endpoint._sync_response(task)).body)
         self.assertEqual(converted["message"]["content"], "")
@@ -197,6 +200,10 @@ class ResponseTransparencyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(converted["choices"][0]["delta"]["reasoning_content"], "model reasoning")
         self.assertEqual(converted["choices"][0]["finish_reason"], "length")
         self.assertEqual(converted["vendor_response"], {"enabled": True})
+        self.assertNotIn("total_duration", converted)
+        self.assertNotIn("prompt_eval_count", converted)
+        self.assertEqual(converted["usage"]["prompt_tokens"], 7)
+        self.assertEqual(converted["usage"]["completion_tokens"], 9)
         self.assertEqual(chunks[-1], b"data: [DONE]\n\n")
 
     async def test_openai_stream_to_ollama_keeps_reasoning_and_extensions(self) -> None:

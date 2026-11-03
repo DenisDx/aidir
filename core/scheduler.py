@@ -145,7 +145,14 @@ class Scheduler:
                     await self._refresh_smart_route_for_dispatch(task, worker.id)
 
                     reqs = self._resolve_resource_requirements(task, worker.id)
-                    requested_model_id = str(((task.payload or {}).get("model") or "")).strip()
+                    route_cfg = ((task.config or {}).get("route") or {}) if isinstance(task.config, dict) else {}
+                    # Resource admission and warm-model reuse must use the
+                    # concrete model behind a smart alias, not the alias itself.
+                    requested_model_id = str(
+                        (route_cfg.get("resolved_model") if isinstance(route_cfg, dict) else "")
+                        or (task.payload or {}).get("model")
+                        or ""
+                    ).strip()
                     requested_provider_id = self._resolve_task_provider_id(task, worker.id)
                     if reqs and self._resource_monitor and not await self._resource_monitor.refresh_required_availability(reqs):
                         task.next_retry_at = time.time() + 1

@@ -54,6 +54,23 @@ class TestResourceReuse(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(resource.is_available_after_unload({"VRAM": 12}))
         self.assertFalse(resource.is_available_after_unload({"VRAM": 16}))
 
+    async def test_persistent_release_keeps_a_consumer_without_retention(self) -> None:
+        """A llama.cpp base reservation survives on a resource with no alive_time."""
+        resource = Resource("gpu1", "cuda", {"VRAM": 10})
+        await resource.reserve_active({"VRAM": 10}, consumer_id="task:worker")
+        await resource.release(
+            {"VRAM": 10},
+            consumer_id="task:worker",
+            model_id="model",
+            provider_id="llama_local",
+            persistent=True,
+        )
+
+        consumers = resource.get_active_soft_consumers()
+        self.assertEqual(len(consumers), 1)
+        self.assertTrue(consumers[0]["persistent"])
+        self.assertEqual(consumers[0]["resources"], {"VRAM": 10})
+
     async def test_activity_restore_rebuilds_soft_consumer_after_restart(self) -> None:
         """Restore an idle Ollama model from its persisted keep-alive activity record."""
         now = time.time()
