@@ -130,7 +130,8 @@ Once streaming has begun:
 | POST | `/api/show` | none | Ollama-shaped model metadata |
 | POST | `/v1/chat/completions` | token | OpenAI-compatible chat |
 | POST | `/v1/embeddings` | token | OpenAI-compatible embeddings |
-| GET | `/v1/models` | none | OpenAI-shaped model list |
+| GET | `/v1/models` | none | OpenAI-shaped model list with aidir state |
+| GET | `/v1/models/{model_id}` | none | One model with aidir state |
 | GET | `/api/providers/{provider_id}/models/{model_id}/queue-state` | none | Queue state |
 | GET | `/v1/providers/{provider_id}/models/{model_id}/queue-state` | none | Queue state |
 | GET | `/api/models/{model_id}/queue-state` | none | Queue state, alias only |
@@ -140,7 +141,7 @@ Once streaming has begun:
 | GET | `/v1/resources` | peer auth | Peer resource list |
 | GET | `/v1/resources/{resource_id}` | peer auth | One peer resource |
 | GET | `/v1/tasks` | peer auth | Peer task list |
-| GET | `/health` | none | `{"status": "ok"}` |
+| GET | `/health` | none | Service, resources, models and telemetry |
 | GET | `/stats` | none | JSON service statistics |
 | GET | `/metrics` | none | Prometheus text metrics |
 
@@ -269,13 +270,65 @@ contacted.
              "modified_at": "<now>", "size": 0, "digest": "", "details": {}}]}
 
 // /v1/models
-{"object": "list", "data": [{"id": "alias-or-id", "real_id": "internal-id",
-                             "object": "model", "created": <ts>, "owned_by": "aidir"}]}
+{"object": "list", "schema_version": 1,
+ "data": [{"id": "alias-or-id", "object": "model", "created": <ts>,
+           "owned_by": "aidir", "schema_version": 1,
+           "aidir": {"schema_version": 1, "real_id": "internal-id", ...}}]}
 ```
 
-`real_id` is the internal model id selected by the current routing rules — an aidir
-extension over both upstream APIs. `size` is always `0` and `digest` always `""`;
-clients that rely on those fields for cache management will misbehave.
+`real_id` is the internal model id selected by the current routing rules. All
+aidir extensions over the OpenAI model shape live under the `aidir` key; nothing
+is added at the model object root beyond standard OpenAI fields and
+`schema_version`. `size` is always `0` and `digest` always `""`; clients that
+rely on those fields for cache management will misbehave.
+
+### 2.5.1 `GET /v1/models/{model_id}`
+
+The path converter accepts both a literal slash and its percent-encoded form
+(`org/model` and `org%2Fmodel`). An unknown model is **404 `model_not_found`**
+with `type: "invalid_request_error"`, matching the OpenAI SDK contract.
+The response is the standard OpenAI model object plus one `aidir` block:
+
+```jsonc
+{
+  "id": "local-only", "object": "model", "created": <ts>, "owned_by": "aidir",
+  "schema_version": 1,
+  "aidir": {
+    "schema_version": 1, "real_id": "local-only",
+    "requested_model": "local-only", "provider": "smart", "model": "local-only",
+    "resolved_provider": "llama_local_flash_next-1m",
+    "resolved_model": "Qwen3.8-Flash-Next",
+    "resources": [
+      {"id": "local_gpu1", "total": {"VRAM": 32000}, "free": {"VRAM": 8668},
+       "used_by_model": {"VRAM": 31000}, "needed": {"VRAM": 31000}}
+    ],
+    "state": {
+      "can_run_now": true, "resource_ready": true,
+      "resource_ready_after_unload": true, "model_loaded": true,
+      "admission": "ready", "active_count": 0, "max_concurrent_requests": 1,
+      "queue": {"active": 0, "queued": 0, "total": 0, "by_status": {}, "by_priority": {}}
+    },
+    "smart": {
+      "context_identification": true,
+      "fallback_route": {"provider": "llama_local_flash_next-1m", "model": "Qwen3.8-Flash-Next"},
+      "candidates": [{"provider": "...", "model": "...", "fallback_prio": 10,
+                      "can_run_now": true, "model_loaded": true, "resources": [], "queue": {}}]
+    }
+  }
+}
+```
+
+For a concrete model the `smart` block is absent and `resolved_model` equals
+`model`. For a smart model `resolved_model` and `resolved_provider` name the
+fallback candidate behind `smart.fallback_route`.
+
+A model that is already loaded owns its base memory, so `resource_ready` and
+`resource_ready_after_unload` stay `true` and `admission` becomes `ready`;
+`can_run_now` is then decided only by the concurrency limit, not by a second
+base-memory admission check.
+
+The state is computed from the configuration, the last resource snapshot and
+the in-memory task list; the route does not probe an executor or a peer.
 
 ### 2.6 `POST /api/show`
 
@@ -305,9 +358,12 @@ twins. The query parameter `priority` defaults to `5`; a negative value is **400
 
 ```jsonc
 {
+  "schema_version": 1,
   "provider": "ollama_local",
   "model": "llama3",
   "priority": 5,
+  "resources": [ {"id": "local_machine", "total": {...}, "free": {...},
+                  "used_by_model": {...}, "needed": {...}} ],
   "can_run_now": true,
   "queued_count_below_priority": 0,
   "queued_count_total": 3,
@@ -329,15 +385,20 @@ twins. The query parameter `priority` defaults to `5`; a negative value is **400
 When the resolved route differs from the requested one, `requested_provider` and
 `requested_model` are added.
 
-`provider_id: "default"` resolves through the alias rules; a smart provider is
-resolved asynchronously through the `SmartRouter`.
+`provider_id: "default"` resolves through the alias rules. A smart model is
+resolved to a concrete candidate when one is schedulable; when none is, the
+response reports the smart model as a whole (`provider: "smart"`, aggregate
+`queue`, `smart.context_identification`, `smart.fallback_route`, and
+`smart.candidates`) instead of raising an error.
 
 `can_run_now` requires **both** an admissible model **and**
 `blocked_by_same_or_higher == 0`, where `blocked = queued_count_total -
 queued_count_below_priority`.
 
-Unknown provider or model → **404 `INVALID_MODEL`**. Queue unavailable → **503
-`QUEUE_UNAVAILABLE`**.
+Unknown provider or model → **404 `model_not_found`** on `/v1/*` and
+**404 `INVALID_MODEL`** on `/api/*`. Queue unavailable or an
+internal queue-state failure → **503 `QUEUE_UNAVAILABLE` /
+`QUEUE_STATE_UNAVAILABLE`**; this route never returns 500.
 
 The counters are computed by scanning both ZSETs and issuing one `HGETALL` per
 queued task, so the endpoint is `O(queued tasks)` and is unauthenticated.
@@ -359,6 +420,8 @@ queued task, so the endpoint is `O(queued tasks)` and is unauthenticated.
       "units": { "VRAM": "MiB" },
       "availability": { "source": "command", "status": "ok",
                         "available": { "VRAM": 8000 }, "observed_at": <ts>, "error": null },
+      "loaded_models": [ { "id": "qwen3:9b", "provider": "ollama_local",
+                           "resources": { "VRAM": 16000 }, "state": "loaded" } ],
       "telemetry": { "sensors": [ { "id": "gpu_temperature", "label": "...",
                                     "unit": "C", "status": "ok", "value": 51.0,
                                     "updated_at": <ts>, "error": null } ] }
@@ -411,9 +474,71 @@ Both routes are unauthenticated compatibility probes for monitoring clients.
 ```
 
 `GET /metrics` returns the same counters in Prometheus text exposition format
-(`text/plain; version=0.0.4`): `aidir_up`, `aidir_uptime_seconds`,
+(`text/plain; version=0.0.4`): `aidir_schema_version`, `aidir_up`, `aidir_uptime_seconds`,
 `aidir_tasks_total{status="..."}`, `aidir_tasks_active`, `aidir_workers_total`,
 `aidir_workers_enabled`, and `aidir_resources_total`.
+
+### 2.10 `GET /health`
+
+Health is a last-known snapshot. It never probes an executor or a peer; the
+peer entries are whatever the resource monitor recorded most recently.
+
+```jsonc
+{
+  "status": "ok", "schema_version": 1, "instance": "aidir",
+  "resources": [
+    {"id": "local_machine", "type": "cuda", "provider": "ollama_local",
+     "host": "192.168.1.111", "devices": [0],
+     "limits": {"VRAM": 32000}, "units": {"VRAM": "MiB"},
+     "used": {}, "soft_used": {"VRAM": 24100},
+     "availability": {"source": "peer", "status": "ok", "available": {"VRAM": 8668},
+                      "observed_at": "...", "error": null},
+     "telemetry": {"sensors": [{"id": "gpu_temperature", "value": 71, "unit": "C"}]},
+     "loaded_models": [{"id": "Qwen3.8-Flash-Next", "provider": "llama_local_flash_next-1m",
+                        "resources": {"VRAM": 24100}, "persistent": true,
+                        "state": "loaded", "context_tokens": 262144}]}
+  ],
+  "models": [
+    {"id": "Qwen3.8-27b", "model": "Qwen3.8-27b", "provider": "llama_local",
+     "resources": {"local_machine": {"VRAM": 31000}},
+     "context_tokens": 262144, "loaded": true, "state": {"can_run_now": true}},
+    {"id": "local-only", "model": "local-only", "provider": "smart",
+     "resolved_provider": "llama_local_flash_next-1m",
+     "resolved_model": "Qwen3.8-Flash-Next",
+     "resources": {"local_gpu1": {"VRAM": 31000}}, "loaded": true,
+     "state": {"can_run_now": true}, "smart": {"fallback_route": {"...": "..."}}}
+  ],
+  "telemetry": [
+    {"resource": "local_machine", "provider": "ollama_local", "host": "192.168.1.111",
+     "sensors": [{"id": "fan1", "value": 1950, "unit": "RPM"}]}
+  ],
+  "external_providers": [
+    {"provider": "remote_aidir_040", "api": "openaix", "host": "192.168.1.40",
+     "kind": "peer", "reachable": true, "auth": "ok", "resources": ["remote_040"], "models": 4},
+    {"provider": "opencode_go", "api": "opencode-go", "host": "opencode.ai",
+     "kind": "external", "reachable": null, "auth": null, "resources": [], "models": 8}
+  ],
+  "queue": {"active": 1, "queued": 2, "total": 3, "by_status": {...}, "by_priority": {...}},
+  "tasks": [
+    {"id": "...", "type": "agent", "status": "running", "worker_id": "openaix",
+     "priority": 5, "provider": "llama_local", "model": "Qwen3.8-27b",
+     "requested_model": "Qwen3.8-27b", "created_at": "...", "updated_at": "...",
+     "started_at": "..."}
+  ],
+  "runtime": {"accepting_new_tasks": true, "active_tasks": 1}
+}
+```
+
+`resources[].loaded_models` merges local soft consumers, active base
+reservations and the loaded-model list received from a resource peer.
+`models` lists regular models that declare a non-empty `resources` map plus
+smart models whose candidates declare resources; a smart entry carries
+`resolved_provider`, `resolved_model`, the merged candidate resources and the
+`smart` block. `tasks` is the active task list (created, queued, running) and is
+an empty array when nothing is active.
+`external_providers` reports a peer's `reachable` and `auth` from the last
+resource-availability reading; a provider without such a reading reports `null`
+rather than an invented value.
 
 ---
 

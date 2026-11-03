@@ -23,12 +23,53 @@ Base URL (example): `http://127.0.0.1:21434`
 3. `GET /api/tags` - Ollama-compatible models listing
 4. `POST /v1/chat/completions` - OpenAI-compatible chat endpoint (with OpenAIx extensions)
 5. `POST /v1/embeddings` - OpenAI-compatible non-streaming embeddings
-6. `GET /v1/models` - OpenAI-compatible models listing
+6. `GET /v1/models` - OpenAI-compatible models listing with an `aidir` state block
+6a. `GET /v1/models/{model}` - one model by id, OpenAI shape plus an `aidir` block; a slash in the id may be literal or percent-encoded
 7. `GET /api/providers/{provider}/models/{model}/queue-state` and `GET /v1/providers/{provider}/models/{model}/queue-state` - read-only queue state for a provider/model pair
-8. `GET /health` - health check (`{"status":"ok"}`)
+8. `GET /health` - last-known service snapshot: resources, resource-bound models, telemetry, external provider statuses and queue counters
 9. `GET /api/resources`, `GET /v1/resources`, `GET /api/resources/{resource_id}`, and `GET /v1/resources/{resource_id}` - aidir peer resource availability extension
 10. `GET /stats` - JSON service statistics (`object`, `instance`, `uptime_seconds`, `tasks`, `workers`, `resources`)
 11. `GET /metrics` - the same counters in Prometheus text exposition format
+
+### 2.1 Model state extension
+
+`GET /v1/models` and `GET /v1/models/{model}` keep the OpenAI model shape and
+add all aidir data under one key, `aidir`, with `schema_version: 1`.
+
+`aidir` contains `real_id`, `resolved_provider`, `resolved_model`, `provider`,
+`model`, the resource figures (`total`, `free`, `used_by_model`, `needed`) and
+`state`. For a smart model `resolved_model` is the concrete fallback backend
+(for example `Qwen3.8-Flash-Next` for `local-only`).
+
+- `state.can_run_now`
+- `state.resource_ready`
+- `state.resource_ready_after_unload`
+- `state.model_loaded`
+- `state.admission`
+- `state.queue.active`, `state.queue.queued`, `state.queue.total`,
+  `state.queue.by_status`, `state.queue.by_priority`
+
+For a smart model the `aidir.smart` block reports
+`context_identification`, the `fallback_route` used when context identification
+does not match, and the per-candidate state. The response is built from the
+configuration, the last resource snapshot and the in-memory task list; it does
+not probe an executor or a peer. An unknown model is `404 INVALID_MODEL`.
+
+The queue-state routes never return 500. A smart model that cannot be resolved
+to a schedulable candidate answers the smart-model state instead. Unknown
+providers/models are `404`; queue failures are `503`.
+
+### 2.2 Health extension
+
+`GET /health` returns `schema_version`, `resources`, `models`, `telemetry`,
+`external_providers`, `queue`, `tasks` and `runtime`. Each resource carries its
+last-known availability, all telemetry readings, and `loaded_models` collected
+from local soft consumers, base reservations and the peer's resource response.
+`models` lists configured models that declare resources plus smart models whose
+candidates declare resources. `tasks` is the active task list and is always an
+array, empty when nothing is active. Provider
+`reachable`/`auth` values are last-known; a provider without a reading reports
+`null`.
 
 ## 3. Authentication and envid behavior
 

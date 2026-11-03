@@ -86,6 +86,7 @@ class TestOpenaixStats(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.headers["content-type"].startswith("text/plain"))
         body = response.text
+        self.assertIn("aidir_schema_version 1\n", body)
         self.assertIn("aidir_up 1\n", body)
         self.assertIn('aidir_tasks_total{status="queued"} 2\n', body)
         self.assertIn('aidir_tasks_total{status="running"} 1\n', body)

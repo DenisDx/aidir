@@ -45,6 +45,8 @@ are closed. Non-update proposals keep their own status. Deferred work lives in
 | [test_kv_affinity.py](test_kv_affinity.py) | Context fingerprint, anchor policy, bounded store, and readiness-history contract. |
 | [test_kv_affinity_routing.py](test_kv_affinity_routing.py) | Affinity selection, context-only identity, queue diversion, resource wait, scheduler refresh, and execution fallback. |
 | [test_smart_router_direct.py](test_smart_router_direct.py) | Direct smart-model routing: one candidate only, normal admission and queueing, and configuration rejection. |
+| [test_openaix_health_models.py](test_openaix_health_models.py) | OpenAIx health, model detail (including slash-containing ids), smart fallback metadata, and the no-500 queue-state contract. |
+| [test_openaix_stats.py](test_openaix_stats.py) | The `/stats` JSON snapshot and `/metrics` Prometheus exposition routes. |
 | [test_webui_sessions.py](test_webui_sessions.py) | WebUI session namespace: instance-scoped keys and rejection of the removed legacy key. |
 | [test_session_resources.py](test_session_resources.py) | Model-aware parallel admission, base/session accounting, memory caps, and unload invalidation. |
 | [core/settings/agent.py](core/settings/agent.py) | The configuration assistant: the provider call, the bounded tool loop and the permission set that keeps it away from secrets and from writing. |

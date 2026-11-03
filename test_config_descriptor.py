@@ -89,6 +89,7 @@ TEST_ENV = {
     "SEARXNG_HOST": "127.0.0.1",
     "SEARXNG_PORT": "18080",
     "BRAVE_APIKEY": "test-brave-key",
+    "STRATA_API_KEY": "test-strata-key",
     "CRYONET_API_BASE_URL": "https://groups.io/api/v1",
     "CRYONET_API_KEY": "test-cryonet-key",
     "OPENCODE_GO_BASE_URL": "https://opencode.ai/zen/go",

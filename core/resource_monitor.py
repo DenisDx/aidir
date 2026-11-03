@@ -197,6 +197,7 @@ class ResourceMonitor:
                     device_available.append({"device": device, "available": device_values})
         resource.record_observed_availability("peer", available, device_available)
         resource.record_peer_telemetry(result.resource.get("telemetry") or {})
+        resource.record_peer_loaded_models(result.resource.get("loaded_models") or [])
         self._availability_error_logged.pop(resource.id, None)
         return True
 

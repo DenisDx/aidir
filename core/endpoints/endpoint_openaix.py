@@ -13,10 +13,12 @@ import asyncio
 import base64
 import json
 import re
+import socket
 import struct
 import time
 from datetime import datetime, timezone
 from typing import AsyncGenerator
+from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -147,45 +149,81 @@ class Endpoint_openaix(Endpoint_ollama):
 
         @app.get("/v1/providers/{provider_id}/models/{model_id:path}/queue-state")
         async def openai_model_queue_state(provider_id: str, model_id: str, priority: int = 5, request: Request = None):
-            return await self._model_queue_state_response(
-                protocol="openai",
-                provider_id=provider_id,
-                model_id=model_id,
-                priority=priority,
-                request=request,
+            return await self._safe_queue_state(
+                "openai",
+                self._model_queue_state_response(
+                    protocol="openai",
+                    provider_id=provider_id,
+                    model_id=model_id,
+                    priority=priority,
+                    request=request,
+                ),
             )
 
         @app.get("/v1/models/{model_id:path}/queue-state")
         async def openai_model_only_queue_state(model_id: str, priority: int = 5, request: Request = None):
-            return await self._model_only_queue_state_response(
-                protocol="openai",
-                model_id=model_id,
-                priority=priority,
-                request=request,
+            return await self._safe_queue_state(
+                "openai",
+                self._model_only_queue_state_response(
+                    protocol="openai",
+                    model_id=model_id,
+                    priority=priority,
+                    request=request,
+                ),
             )
 
         @app.get("/api/providers/{provider_id}/models/{model_id:path}/queue-state")
         async def ollama_model_queue_state(provider_id: str, model_id: str, priority: int = 5, request: Request = None):
-            return await self._model_queue_state_response(
-                protocol="ollama",
-                provider_id=provider_id,
-                model_id=model_id,
-                priority=priority,
-                request=request,
+            return await self._safe_queue_state(
+                "ollama",
+                self._model_queue_state_response(
+                    protocol="ollama",
+                    provider_id=provider_id,
+                    model_id=model_id,
+                    priority=priority,
+                    request=request,
+                ),
             )
 
         @app.get("/api/models/{model_id:path}/queue-state")
         async def ollama_model_only_queue_state(model_id: str, priority: int = 5, request: Request = None):
-            return await self._model_only_queue_state_response(
-                protocol="ollama",
-                model_id=model_id,
-                priority=priority,
-                request=request,
+            return await self._safe_queue_state(
+                "ollama",
+                self._model_only_queue_state_response(
+                    protocol="ollama",
+                    model_id=model_id,
+                    priority=priority,
+                    request=request,
+                ),
             )
+
+        @app.get("/v1/models/{model_id:path}")
+        async def openai_model(model_id: str):
+            # Declared after the queue-state routes so that ".../queue-state"
+            # is never swallowed by the path converter.
+            try:
+                return self._openai_model_response(model_id)
+            except Exception as exc:
+                log("http", "error", f"Model state request failed: {exc}", self.id)
+                return self._error_response(
+                    protocol="openai",
+                    status_code=503,
+                    code="MODEL_STATE_UNAVAILABLE",
+                    message="Model state is temporarily unavailable",
+                )
 
         @app.get("/health")
         async def health():
-            return {"status": "ok"}
+            try:
+                return self._health_payload()
+            except Exception as exc:
+                log("http", "error", f"Health request failed: {exc}", self.id)
+                return self._error_response(
+                    protocol="openai",
+                    status_code=503,
+                    code="HEALTH_UNAVAILABLE",
+                    message="Health snapshot is temporarily unavailable",
+                )
 
         @app.get("/stats")
         async def stats():
@@ -201,6 +239,699 @@ class Endpoint_openaix(Endpoint_ollama):
             )
 
         return app
+
+    # ── Health, model state and queue state ───────────────────────────────────
+
+    @staticmethod
+    def _local_host() -> str:
+        """Return this host's LAN address, falling back to loopback."""
+        try:
+            addresses = socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)
+        except OSError:
+            addresses = []
+        for address in addresses:
+            ip = str(address[4][0])
+            if not ip.startswith("127."):
+                return ip
+        # A hostname that resolves only to loopback (the common /etc/hosts
+        # short-name case); ask the routing table instead.
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                sock.connect(("8.8.8.8", 80))
+                return str(sock.getsockname()[0])
+        except OSError:
+            return "127.0.0.1"
+
+    def _provider_host(self, provider_id: str) -> str:
+        """Return the host that serves one provider."""
+        provider = self._provider_cfg(provider_id)
+        base_url = str(provider.get("baseUrl") or "").strip()
+        if base_url:
+            host = (urlparse(base_url).hostname or "").strip()
+            if host and host not in {"127.0.0.1", "localhost", "0.0.0.0", "::1"}:
+                return host
+        return self._local_host()
+
+    def _resource_provider(self, resource_id: str) -> str:
+        """Return the provider configured for one resource, if any."""
+        resources = getattr(self._core, "resources", None)
+        getter = getattr(resources, "get", None)
+        if not callable(getter):
+            return ""
+        resource = getter(resource_id)
+        return str(getattr(resource, "provider", "") or "")
+
+    def _resource_snapshots(self) -> list[dict]:
+        """Return resource snapshots without triggering any probe."""
+        resources = getattr(self._core, "resources", None)
+        if resources is None or not hasattr(resources, "snapshot"):
+            return []
+        return [snap for snap in resources.snapshot() if isinstance(snap, dict)]
+
+    def _model_config_info(self, provider_id: str, model_id: str) -> dict:
+        """Return configured model metadata used by the health and model routes."""
+        model_cfg = self._find_provider_model_cfg(provider_id, model_id) or {}
+        context_tokens = (
+            model_cfg.get("contextWindow")
+            or model_cfg.get("context_tokens")
+            or model_cfg.get("max_context_tokens")
+        )
+        quantization = model_cfg.get("quantization") or model_cfg.get("quantization_level")
+        return {
+            "context_tokens": context_tokens,
+            "quantization": str(quantization) if quantization else "",
+        }
+
+    @staticmethod
+    def _task_route_info(task: object) -> tuple[str, str, str]:
+        """Return the provider, model and requested model of one live task."""
+        config = getattr(task, "config", None)
+        config = config if isinstance(config, dict) else {}
+        route = config.get("route") if isinstance(config.get("route"), dict) else {}
+        payload = getattr(task, "payload", None)
+        payload = payload if isinstance(payload, dict) else {}
+        provider_id = str(
+            getattr(task, "route_provider_id", "")
+            or route.get("resolved_provider")
+            or ""
+        )
+        model_id = str(
+            getattr(task, "model_id", "")
+            or route.get("resolved_model")
+            or payload.get("model")
+            or ""
+        )
+        requested = str(
+            route.get("requested_alias")
+            or route.get("requested_model")
+            or payload.get("model")
+            or ""
+        )
+        return provider_id, model_id, requested
+
+    def _task_queue_summary(
+        self,
+        provider_id: str | None = None,
+        model_id: str | None = None,
+        requested_model: str | None = None,
+    ) -> dict:
+        """Summarize live tasks for one model or the whole service from in-memory state."""
+        queue = getattr(self._core, "queue", None)
+        tasks = queue.list_tasks() if queue is not None and hasattr(queue, "list_tasks") else []
+        by_status: dict[str, int] = {}
+        by_priority: dict[str, int] = {}
+        for task in tasks:
+            task_provider, task_model, task_requested = self._task_route_info(task)
+            if provider_id is not None and task_provider != provider_id:
+                continue
+            if model_id is not None and task_model != model_id:
+                continue
+            if requested_model is not None and not (
+                task_requested == requested_model
+                or (task_provider == provider_id and task_model == model_id)
+            ):
+                continue
+            status = str(getattr(task, "status", "unknown"))
+            by_status[status] = by_status.get(status, 0) + 1
+            priority = str(getattr(task, "priority", ""))
+            by_priority[priority] = by_priority.get(priority, 0) + 1
+        active = by_status.get("running", 0)
+        queued = by_status.get("queued", 0) + by_status.get("created", 0)
+        live = sum(
+            count for status, count in by_status.items()
+            if status in {"created", "queued", "running"}
+        )
+        return {
+            "active": active,
+            "queued": queued,
+            "total": live,
+            "by_status": by_status,
+            "by_priority": by_priority,
+        }
+
+    def _health_tasks(self) -> list[dict]:
+        """Return the active task list for the health snapshot without request bodies."""
+        queue = getattr(self._core, "queue", None)
+        tasks = queue.list_tasks() if queue is not None and hasattr(queue, "list_tasks") else []
+        payload: list[dict] = []
+        for task in tasks:
+            status = str(getattr(task, "status", "") or "")
+            if status not in {"created", "queued", "running"}:
+                continue
+            provider_id, model_id, requested_model = self._task_route_info(task)
+
+            def _iso(value):
+                """Return an ISO timestamp or an empty string."""
+                return value.isoformat() if hasattr(value, "isoformat") else ""
+
+            payload.append({
+                "id": str(getattr(task, "id", "") or ""),
+                "type": str(getattr(task, "type", "") or ""),
+                "status": status,
+                "worker_id": str(getattr(task, "worker_id", "") or ""),
+                "priority": int(getattr(task, "priority", 0) or 0),
+                "provider": provider_id,
+                "model": model_id,
+                "requested_model": requested_model,
+                "created_at": _iso(getattr(task, "created_at", None)),
+                "updated_at": _iso(getattr(task, "updated_at", None)),
+                "started_at": _iso(getattr(task, "started_at", None)),
+            })
+        payload.sort(key=lambda item: item.get("updated_at") or item.get("created_at") or "", reverse=True)
+        return payload
+
+    @staticmethod
+    def _merge_usage(target: dict, usage: object) -> None:
+        """Add one usage mapping into a metric accumulator."""
+        if not isinstance(usage, dict):
+            return
+        for metric, value in usage.items():
+            try:
+                amount = int(value)
+            except (TypeError, ValueError):
+                continue
+            if amount:
+                target[str(metric)] = target.get(str(metric), 0) + amount
+
+    def _model_used_on_resource(self, snapshot: dict, provider_id: str, model_id: str) -> dict:
+        """Return the amount of one resource currently held by one model."""
+        used: dict[str, int] = {}
+        base_id = f"base:{provider_id}:{model_id}"
+        for consumer in snapshot.get("consumers") or []:
+            if isinstance(consumer, dict) and str(consumer.get("id") or "") == base_id:
+                self._merge_usage(used, consumer.get("usage"))
+        for entry in snapshot.get("soft_consumers") or []:
+            if not isinstance(entry, dict):
+                continue
+            if str(entry.get("model_id") or "") != model_id:
+                continue
+            entry_provider = str(entry.get("provider_id") or "")
+            if entry_provider and entry_provider != provider_id:
+                continue
+            self._merge_usage(used, entry.get("resources"))
+        return used
+
+    def _resource_usage_entries(
+        self,
+        provider_id: str,
+        model_id: str,
+        requirements: dict[str, dict[str, int]],
+        snapshots: list[dict] | None = None,
+    ) -> list[dict]:
+        """Return per-resource total/free/used-by-model/needed figures."""
+        snapshots = snapshots if snapshots is not None else self._resource_snapshots()
+        by_id = {str(snap.get("id") or ""): snap for snap in snapshots}
+        entries: list[dict] = []
+        for resource_id, needed in (requirements or {}).items():
+            snapshot = by_id.get(resource_id)
+            if not isinstance(snapshot, dict):
+                entries.append({
+                    "id": resource_id,
+                    "total": {},
+                    "free": {},
+                    "used_by_model": {},
+                    "needed": dict(needed or {}),
+                    "units": {},
+                    "model_loaded": False,
+                })
+                continue
+            limits = dict(snapshot.get("limits") or {})
+            used = dict(snapshot.get("used") or {})
+            soft = dict(snapshot.get("soft_used") or {})
+            availability = snapshot.get("availability") or {}
+            free = dict(availability.get("available") or {})
+            if not free:
+                free = {
+                    metric: max(0, int(limit) - int(used.get(metric, 0)) - int(soft.get(metric, 0)))
+                    for metric, limit in limits.items()
+                }
+            used_by_model = self._model_used_on_resource(snapshot, provider_id, model_id)
+            entries.append({
+                "id": resource_id,
+                "total": limits,
+                "free": free,
+                "used": used,
+                "soft_used": soft,
+                "used_by_model": used_by_model,
+                "needed": dict(needed or {}),
+                "units": dict(snapshot.get("units") or {}),
+                "model_loaded": bool(used_by_model),
+                "availability": {
+                    "source": availability.get("source"),
+                    "status": availability.get("status"),
+                    "observed_at": availability.get("observed_at"),
+                    "error": availability.get("error"),
+                },
+            })
+        return entries
+
+    def _concrete_model_state(
+        self,
+        provider_id: str,
+        model_id: str,
+        *,
+        requested_model: str | None = None,
+        requirements: dict[str, dict[str, int]] | None = None,
+        snapshots: list[dict] | None = None,
+    ) -> dict:
+        """Build the aidir extension payload for one concrete provider/model pair."""
+        if requirements is None:
+            requirements = self._resolve_model_resource_requirements(provider_id, model_id) or {}
+        resources = getattr(self._core, "resources", None)
+        evaluator = getattr(resources, "evaluate_model_admission", None)
+        admission = (
+            evaluator(requirements, model_id, provider_id)
+            if callable(evaluator)
+            else None
+        )
+        if not isinstance(admission, dict):
+            admission = {
+                "admission": "unknown",
+                "admissible_now": False,
+                "admissible_after_unload": False,
+                "model_loaded": False,
+                "resource_ready": False,
+                "resource_ready_after_unload": False,
+                "active_count": 0,
+                "max_concurrent_requests": 1,
+                "session_resources": {},
+            }
+        queue = self._task_queue_summary(provider_id, model_id)
+        usage = self._resource_usage_entries(provider_id, model_id, requirements, snapshots)
+        model_loaded = bool(admission.get("model_loaded")) or any(
+            entry.get("model_loaded") for entry in usage
+        )
+        active_count = int(admission.get("active_count") or 0)
+        max_concurrent = int(admission.get("max_concurrent_requests") or 1)
+        admission_value = admission.get("admission")
+        if model_loaded:
+            # A loaded model already owns its base memory. Admission can still
+            # report ``base_memory`` when its soft-consumer fingerprint does not
+            # match, but the model is present and can serve another request
+            # unless the concurrency limit is reached.
+            resource_ready = True
+            resource_ready_after_unload = True
+            can_run_now = active_count < max_concurrent
+            admission_value = "ready" if can_run_now else "concurrency"
+        else:
+            resource_ready = bool(admission.get("resource_ready"))
+            resource_ready_after_unload = bool(admission.get("resource_ready_after_unload"))
+            can_run_now = bool(admission.get("admissible_now")) and not queue["queued"]
+        return {
+            "schema_version": 1,
+            "requested_model": requested_model or model_id,
+            "provider": provider_id,
+            "model": model_id,
+            "resources": usage,
+            "state": {
+                "can_run_now": can_run_now,
+                "resource_ready": resource_ready,
+                "resource_ready_after_unload": resource_ready_after_unload,
+                "model_loaded": model_loaded,
+                "admission": admission_value,
+                "active_count": int(admission.get("active_count") or 0),
+                "max_concurrent_requests": int(admission.get("max_concurrent_requests") or 1),
+                "session_resources": admission.get("session_resources") or {},
+                "queue": queue,
+            },
+        }
+
+    def _context_identification_enabled(self) -> bool:
+        """Return whether smart models use context-based candidate identification."""
+        config = getattr(self._core, "config", None)
+        getter = getattr(config, "get", None)
+        affinity = getter("routing.kv_affinity") if callable(getter) else None
+        return bool(isinstance(affinity, dict) and affinity.get("enabled"))
+
+    def _smart_model_state(self, requested_model: str, smart_cfg: dict) -> dict:
+        """Build the aidir extension payload for one smart model without probing."""
+        items = smart_cfg.get("items") if isinstance(smart_cfg, dict) else None
+        items = [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+        snapshots = self._resource_snapshots()
+        candidates: list[dict] = []
+        aggregate_queue = {"active": 0, "queued": 0, "total": 0, "by_status": {}, "by_priority": {}}
+        for index, item in enumerate(items):
+            provider_id = str(item.get("provider") or "").strip()
+            model_id = str(item.get("model") or "").strip()
+            if not provider_id or not model_id:
+                continue
+            try:
+                fallback_prio = int(item.get("fallback_prio", index))
+            except (TypeError, ValueError):
+                fallback_prio = index
+            candidate = self._concrete_model_state(
+                provider_id,
+                model_id,
+                requested_model=requested_model,
+                snapshots=snapshots,
+            )
+            candidate["fallback_prio"] = fallback_prio
+            candidate["index"] = index
+            candidates.append(candidate)
+            for key in ("active", "queued", "total"):
+                aggregate_queue[key] += int(candidate["state"]["queue"].get(key, 0))
+            for status, count in candidate["state"]["queue"].get("by_status", {}).items():
+                aggregate_queue["by_status"][status] = (
+                    aggregate_queue["by_status"].get(status, 0) + int(count)
+                )
+            for priority, count in candidate["state"]["queue"].get("by_priority", {}).items():
+                aggregate_queue["by_priority"][priority] = (
+                    aggregate_queue["by_priority"].get(priority, 0) + int(count)
+                )
+
+        candidates.sort(key=lambda item: (item["fallback_prio"], item["index"]))
+        fallback = candidates[0] if candidates else {}
+        fallback_state = fallback.get("state") or {}
+        state = {
+            "can_run_now": any(item["state"].get("can_run_now") for item in candidates),
+            "resource_ready": any(item["state"].get("resource_ready") for item in candidates),
+            "resource_ready_after_unload": any(
+                item["state"].get("resource_ready_after_unload") for item in candidates
+            ),
+            "model_loaded": any(item["state"].get("model_loaded") for item in candidates),
+            "admission": fallback_state.get("admission"),
+            "active_count": sum(int(item["state"].get("active_count") or 0) for item in candidates),
+            "max_concurrent_requests": fallback_state.get("max_concurrent_requests", 1),
+            "session_resources": fallback_state.get("session_resources") or {},
+            "queue": aggregate_queue,
+        }
+        return {
+            "schema_version": 1,
+            "requested_model": requested_model,
+            "provider": "smart",
+            "model": requested_model,
+            "resolved_provider": fallback.get("provider"),
+            "resolved_model": fallback.get("model"),
+            "resources": fallback.get("resources") or [],
+            "state": state,
+            "smart": {
+                "context_identification": self._context_identification_enabled(),
+                "fallback_route": {
+                    "provider": fallback.get("provider"),
+                    "model": fallback.get("model"),
+                },
+                "candidates": [
+                    {
+                        "provider": item.get("provider"),
+                        "model": item.get("model"),
+                        "fallback_prio": item.get("fallback_prio"),
+                        "can_run_now": item["state"].get("can_run_now"),
+                        "resource_ready": item["state"].get("resource_ready"),
+                        "model_loaded": item["state"].get("model_loaded"),
+                        "resources": item.get("resources") or [],
+                        "queue": item["state"].get("queue"),
+                    }
+                    for item in candidates
+                ],
+            },
+        }
+
+    def _model_extension(self, requested_model: str) -> dict | None:
+        """Return the aidir extension payload for an externally visible model id."""
+        route = self._resolve_model_route(requested_model, self._resolve_worker_id({}))
+        if not isinstance(route, dict):
+            return None
+        provider_id = str(route.get("resolved_provider") or "")
+        model_id = str(route.get("resolved_model") or "")
+        if not provider_id or not model_id:
+            return None
+        if self._provider_api(provider_id) == "smart":
+            smart_cfg = self._find_provider_model_cfg(provider_id, model_id)
+            if not isinstance(smart_cfg, dict):
+                smart_cfg = self._find_provider_model_cfg(provider_id, requested_model) or {}
+            payload = self._smart_model_state(requested_model, smart_cfg)
+            payload["real_id"] = model_id
+            payload["resolved_provider"] = payload.get("resolved_provider") or provider_id
+            payload["resolved_model"] = payload.get("resolved_model") or model_id
+            return payload
+        payload = self._concrete_model_state(provider_id, model_id, requested_model=requested_model)
+        payload["real_id"] = model_id
+        payload["resolved_provider"] = provider_id
+        payload["resolved_model"] = model_id
+        payload["route"] = {
+            "selection": route.get("selection"),
+            "protocol": route.get("resolved_protocol"),
+            "requested_alias": route.get("requested_alias"),
+            "worker_preferred_provider": route.get("worker_preferred_provider"),
+        }
+        return payload
+
+    def _openai_model_response(self, model_id: str) -> Response:
+        """Return one model per the OpenAI models shape plus an aidir extension block."""
+        extension = self._model_extension(model_id)
+        if extension is None:
+            return JSONResponse(
+                self._openai_error_payload_with_type(
+                    "model_not_found",
+                    f"Unknown model: {model_id}",
+                    error_type="invalid_request_error",
+                    error_param="model",
+                ),
+                status_code=404,
+            )
+        return JSONResponse({
+            "id": model_id,
+            "object": "model",
+            "created": int(time.time()),
+            "owned_by": "aidir",
+            "schema_version": 1,
+            "aidir": extension,
+        })
+
+    def _snapshot_loaded_models(self, snapshot: dict) -> list[dict]:
+        """Return loaded models known for one resource, local and remote."""
+        entries: dict[tuple[str, str], dict] = {}
+        for item in snapshot.get("soft_consumers") or []:
+            if not isinstance(item, dict):
+                continue
+            model_id = str(item.get("model_id") or "").strip()
+            if not model_id:
+                continue
+            provider_id = str(item.get("provider_id") or "").strip()
+            key = (provider_id, model_id)
+            info = self._model_config_info(provider_id, model_id)
+            entries[key] = {
+                "id": model_id,
+                "provider": provider_id,
+                "resources": dict(item.get("resources") or {}),
+                "persistent": bool(item.get("persistent")),
+                "state": "loaded" if item.get("persistent") else "idle",
+                "context_tokens": info["context_tokens"],
+                "quantization": info["quantization"],
+            }
+        for consumer in snapshot.get("consumers") or []:
+            if not isinstance(consumer, dict):
+                continue
+            consumer_id = str(consumer.get("id") or "")
+            if not consumer_id.startswith("base:"):
+                continue
+            parts = consumer_id.split(":", 2)
+            if len(parts) != 3 or not parts[2]:
+                continue
+            provider_id, model_id = parts[1], parts[2]
+            info = self._model_config_info(provider_id, model_id)
+            entries[(provider_id, model_id)] = {
+                "id": model_id,
+                "provider": provider_id,
+                "resources": dict(consumer.get("usage") or {}),
+                "persistent": True,
+                "state": "loaded",
+                "context_tokens": info["context_tokens"],
+                "quantization": info["quantization"],
+            }
+        for item in snapshot.get("peer_loaded_models") or []:
+            if not isinstance(item, dict) or not item.get("id"):
+                continue
+            provider_id = str(item.get("provider") or "").strip()
+            model_id = str(item.get("id") or "").strip()
+            info = self._model_config_info(provider_id, model_id)
+            entries[(provider_id, model_id)] = {
+                "id": model_id,
+                "provider": provider_id,
+                "resources": dict(item.get("resources") or {}),
+                "persistent": bool(item.get("persistent")),
+                "state": str(item.get("state") or "loaded"),
+                "context_tokens": item.get("context_tokens") or info["context_tokens"],
+                "quantization": info["quantization"],
+            }
+        return list(entries.values())
+
+    def _all_sensor_readings(self, snapshot: dict) -> list[dict]:
+        """Merge monitoring and telemetry readings, preferring telemetry entries."""
+        readings: dict[str, dict] = {}
+        monitoring = snapshot.get("monitoring")
+        if isinstance(monitoring, dict):
+            for item in monitoring.get("sensors") or []:
+                if isinstance(item, dict) and item.get("id"):
+                    readings[str(item["id"])] = dict(item)
+        telemetry = snapshot.get("telemetry")
+        if isinstance(telemetry, dict):
+            for item in telemetry.get("sensors") or []:
+                if isinstance(item, dict) and item.get("id"):
+                    readings[str(item["id"])] = dict(item)
+        return list(readings.values())
+
+    def _health_resource(self, snapshot: dict) -> dict:
+        """Build one health resource entry from a runtime snapshot."""
+        provider_id = self._resource_provider(str(snapshot.get("id") or ""))
+        return {
+            "id": str(snapshot.get("id") or ""),
+            "type": str(snapshot.get("type") or ""),
+            "provider": provider_id,
+            "host": self._provider_host(provider_id) if provider_id else self._local_host(),
+            "devices": list(snapshot.get("devices") or []),
+            "limits": dict(snapshot.get("limits") or {}),
+            "units": dict(snapshot.get("units") or {}),
+            "used": dict(snapshot.get("used") or {}),
+            "soft_used": dict(snapshot.get("soft_used") or {}),
+            "availability": dict(snapshot.get("availability") or {}),
+            "telemetry": {"sensors": self._all_sensor_readings(snapshot)},
+            "loaded_models": self._snapshot_loaded_models(snapshot),
+        }
+
+    def _health_models(self, resources: list[dict]) -> list[dict]:
+        """Return configured models that declare resources, with their current state."""
+        loaded = {
+            (str(item.get("provider") or ""), str(item.get("id") or ""))
+            for resource in resources
+            for item in resource.get("loaded_models") or []
+        }
+        snapshots = self._resource_snapshots()
+        models: list[dict] = []
+        for provider_id, model_cfg in self._iter_provider_models():
+            requirements = model_cfg.get("resources")
+            if not isinstance(requirements, dict) or not requirements:
+                continue
+            model_id = self._model_id(model_cfg)
+            if not model_id:
+                continue
+            info = self._model_config_info(provider_id, model_id)
+            state = self._concrete_model_state(
+                provider_id,
+                model_id,
+                requirements=self._normalize_resource_requirements(requirements),
+                snapshots=snapshots,
+            )
+            models.append({
+                "id": self._external_model_id(model_cfg),
+                "model": model_id,
+                "provider": provider_id,
+                "resources": dict(requirements),
+                "context_tokens": info["context_tokens"],
+                "quantization": info["quantization"],
+                "loaded": (provider_id, model_id) in loaded,
+                "state": state["state"],
+            })
+
+        providers = self._config_get("models.providers") or {}
+        if isinstance(providers, dict):
+            for provider_id, provider in providers.items():
+                if not isinstance(provider, dict) or str(provider.get("api") or "") != "smart":
+                    continue
+                for model_cfg in provider.get("models") or []:
+                    if not isinstance(model_cfg, dict):
+                        continue
+                    model_id = self._model_id(model_cfg)
+                    if not model_id:
+                        continue
+                    candidate_resources: dict[str, dict[str, int]] = {}
+                    items = model_cfg.get("items") if isinstance(model_cfg.get("items"), list) else []
+                    for item in items:
+                        if not isinstance(item, dict):
+                            continue
+                        item_provider = str(item.get("provider") or "")
+                        item_model = str(item.get("model") or "")
+                        requirement = self._resolve_model_resource_requirements(
+                            item_provider,
+                            item_model,
+                        ) or {}
+                        for resource_id, metrics in requirement.items():
+                            bucket = candidate_resources.setdefault(resource_id, {})
+                            for metric, amount in metrics.items():
+                                bucket[metric] = max(bucket.get(metric, 0), int(amount))
+                    if not candidate_resources:
+                        continue
+                    state = self._smart_model_state(model_id, model_cfg)
+                    info = self._model_config_info(provider_id, model_id)
+                    models.append({
+                        "id": self._external_model_id(model_cfg),
+                        "model": model_id,
+                        "provider": provider_id,
+                        "resolved_provider": state.get("resolved_provider"),
+                        "resolved_model": state.get("resolved_model"),
+                        "resources": candidate_resources,
+                        "context_tokens": info["context_tokens"],
+                        "quantization": info["quantization"],
+                        "loaded": bool(state["state"].get("model_loaded")),
+                        "state": state["state"],
+                        "smart": state.get("smart"),
+                    })
+        return models
+
+    def _external_provider_statuses(self, resources: list[dict]) -> list[dict]:
+        """Return configured external providers with their last-known reachability."""
+        providers = self._config_get("models.providers") or {}
+        if not isinstance(providers, dict):
+            return []
+        statuses = []
+        for provider_id, provider in providers.items():
+            if not isinstance(provider, dict) or provider_id == "smart":
+                continue
+            api = str(provider.get("api") or "")
+            host = self._provider_host(str(provider_id))
+            local = host == self._local_host() and api in {"ollama", "llama-cpp"}
+            if local:
+                continue
+            related = [resource for resource in resources if resource.get("provider") == provider_id]
+            availability = [resource.get("availability") or {} for resource in related]
+            ok = any(item.get("status") == "ok" for item in availability)
+            failed = bool(availability) and not ok
+            auth_error = any(
+                "authoriz" in str(item.get("error") or "").lower()
+                or "401" in str(item.get("error") or "")
+                or "403" in str(item.get("error") or "")
+                for item in availability
+            )
+            statuses.append({
+                "provider": provider_id,
+                "api": api,
+                "host": host,
+                "kind": "peer" if api == "openaix" else "external",
+                "reachable": True if ok else (False if failed else None),
+                "auth": "ok" if ok else ("error" if auth_error else None),
+                "resources": [resource.get("id") for resource in related],
+                "models": len(provider.get("models") or []) if isinstance(provider.get("models"), list) else 0,
+            })
+        return statuses
+
+    def _health_payload(self) -> dict:
+        """Return the full service health snapshot with resources, models and telemetry."""
+        snapshots = self._resource_snapshots()
+        resources = [self._health_resource(snapshot) for snapshot in snapshots]
+        runtime = {}
+        reader = getattr(self._core, "get_runtime_status", None)
+        if callable(reader):
+            runtime = reader()
+        return {
+            "status": "ok",
+            "schema_version": 1,
+            "instance": str(self._core.config.get("instance", "aidir") or "aidir"),
+            "resources": resources,
+            "models": self._health_models(resources),
+            "telemetry": [
+                {
+                    "resource": resource.get("id"),
+                    "provider": resource.get("provider"),
+                    "host": resource.get("host"),
+                    "sensors": (resource.get("telemetry") or {}).get("sensors", []),
+                }
+                for resource in resources
+            ],
+            "external_providers": self._external_provider_statuses(resources),
+            "queue": self._task_queue_summary(),
+            "tasks": self._health_tasks(),
+            "runtime": runtime,
+        }
 
     def _service_stats(self) -> dict:
         """Return a JSON snapshot of service counters for the stats route."""
@@ -224,6 +955,7 @@ class Endpoint_openaix(Endpoint_ollama):
 
         return {
             "object": "aidir.stats",
+            "schema_version": 1,
             "instance": str(core.config.get("instance", "aidir") or "aidir"),
             "uptime_seconds": round(uptime, 3),
             "tasks": {
@@ -248,6 +980,9 @@ class Endpoint_openaix(Endpoint_ollama):
         stats = self._service_stats()
         tasks = stats["tasks"]
         lines = [
+            "# HELP aidir_schema_version Version of the aidir extension schema.",
+            "# TYPE aidir_schema_version gauge",
+            "aidir_schema_version 1",
             "# HELP aidir_up Whether the aidir endpoint is serving requests.",
             "# TYPE aidir_up gauge",
             "aidir_up 1",
@@ -404,12 +1139,43 @@ class Endpoint_openaix(Endpoint_ollama):
         """Build one minimal peer-safe resource response from a runtime snapshot."""
         telemetry = snapshot.get("telemetry")
         readings = telemetry.get("sensors") if isinstance(telemetry, dict) else None
+        loaded_models = []
+        for entry in snapshot.get("soft_consumers") or []:
+            if not isinstance(entry, dict):
+                continue
+            model_id = str(entry.get("model_id") or "").strip()
+            if not model_id:
+                continue
+            loaded_models.append({
+                "id": model_id,
+                "provider": str(entry.get("provider_id") or ""),
+                "resources": dict(entry.get("resources") or {}),
+                "persistent": bool(entry.get("persistent")),
+                "state": "loaded",
+            })
+        for consumer in snapshot.get("consumers") or []:
+            if not isinstance(consumer, dict):
+                continue
+            consumer_id = str(consumer.get("id") or "")
+            if not consumer_id.startswith("base:"):
+                continue
+            parts = consumer_id.split(":", 2)
+            if len(parts) != 3 or not parts[2]:
+                continue
+            loaded_models.append({
+                "id": parts[2],
+                "provider": parts[1],
+                "resources": dict(consumer.get("usage") or {}),
+                "persistent": True,
+                "state": "loaded",
+            })
         return {
             "id": str(snapshot.get("id") or ""),
             "type": str(snapshot.get("type") or ""),
             "limits": dict(snapshot.get("limits") or {}),
             "units": dict(snapshot.get("units") or {}),
             "availability": dict(snapshot.get("availability") or {}),
+            "loaded_models": loaded_models,
             "telemetry": {
                 "sensors": [
                     {
@@ -1536,18 +2302,30 @@ class Endpoint_openaix(Endpoint_ollama):
     def _openai_models_response(self) -> dict:
         """Build OpenAI-compatible models list response."""
         now = int(time.time())
+        data = []
+        for model_info in self._collect_model_entries():
+            extension = self._model_extension(model_info["id"])
+            if extension is None:
+                extension = {
+                    "schema_version": 1,
+                    "requested_model": model_info["id"],
+                    "provider": "",
+                    "model": model_info["real_id"],
+                    "resources": [],
+                    "state": {},
+                }
+            data.append({
+                "id": model_info["id"],
+                "object": "model",
+                "created": now,
+                "owned_by": "aidir",
+                "schema_version": 1,
+                "aidir": extension,
+            })
         return {
             "object": "list",
-            "data": [
-                {
-                    "id": model_info["id"],
-                    "real_id": model_info["real_id"],
-                    "object": "model",
-                    "created": now,
-                    "owned_by": "aidir",
-                }
-                for model_info in self._collect_model_entries()
-            ],
+            "schema_version": 1,
+            "data": data,
         }
 
     def _ollama_tags_response(self) -> dict:
@@ -1567,6 +2345,19 @@ class Endpoint_openaix(Endpoint_ollama):
                 for model_info in self._collect_model_entries()
             ]
         }
+
+    async def _safe_queue_state(self, protocol: str, operation) -> Response:
+        """Await one queue-state operation and never leak an internal 500."""
+        try:
+            return await operation
+        except Exception as exc:
+            log("http", "error", f"Queue-state request failed: {exc}", self.id)
+            return self._error_response(
+                protocol=protocol,
+                status_code=503,
+                code="QUEUE_STATE_UNAVAILABLE",
+                message="Queue state is temporarily unavailable",
+            )
 
     async def _model_queue_state_response(
         self,
@@ -1601,13 +2392,21 @@ class Endpoint_openaix(Endpoint_ollama):
             provider_id = str(resolved_route.get("resolved_provider") or provider_id)
             model_id = str(resolved_route.get("resolved_model") or model_id)
 
+        if self._provider_api(provider_id) == "smart":
+            smart_cfg = self._find_provider_model_cfg(provider_id, model_id)
+            if not isinstance(smart_cfg, dict):
+                smart_cfg = self._find_provider_model_cfg(provider_id, requested_model_id) or {}
+            return JSONResponse(self._smart_model_state(requested_model_id, smart_cfg))
+
         resolved = self._resolve_model_resource_requirements(provider_id, model_id)
         if resolved is None:
             return self._error_response(
                 protocol=protocol,
                 status_code=404,
-                code="INVALID_MODEL",
+                code="model_not_found" if protocol == "openai" else "INVALID_MODEL",
                 message=f"Unknown provider/model pair: {provider_id}/{model_id}",
+                error_type="invalid_request_error" if protocol == "openai" else None,
+                error_param="model" if protocol == "openai" else None,
             )
 
         if self._core.queue is None:
@@ -1624,7 +2423,22 @@ class Endpoint_openaix(Endpoint_ollama):
             if callable(getter):
                 queue_state = await getter(provider_id, model_id, priority=priority)
         if not isinstance(queue_state, dict):
-            queue_state = await self._core.queue.get_resource_queue_state(resolved, priority=priority)
+            getter = getattr(self._core.queue, "get_resource_queue_state", None)
+            if callable(getter):
+                queue_state = await getter(resolved, priority=priority)
+        if not isinstance(queue_state, dict):
+            summary = self._task_queue_summary(provider_id, model_id)
+            queue_state = {
+                "queued_count_total": int(summary.get("queued") or 0),
+                "queued_count_below_priority": 0,
+                "priority_counts": [
+                    {"priority": int(priority_name or 0), "count": count}
+                    for priority_name, count in sorted(
+                        (summary.get("by_priority") or {}).items(),
+                        key=lambda item: str(item[0]),
+                    )
+                ],
+            }
 
         local_filter = getattr(self._core.resources, "local_admission_requirements", None)
         local_resolved = (
@@ -1668,9 +2482,11 @@ class Endpoint_openaix(Endpoint_ollama):
         can_run_now = bool(can_run_now and blocked_by_same_or_higher == 0)
 
         payload = {
+            "schema_version": 1,
             "provider": provider_id,
             "model": model_id,
             "priority": priority,
+            "resources": self._resource_usage_entries(provider_id, model_id, resolved),
             "can_run_now": can_run_now,
             "queued_count_below_priority": queue_state["queued_count_below_priority"],
             "queued_count_total": queue_state["queued_count_total"],
@@ -1732,11 +2548,26 @@ class Endpoint_openaix(Endpoint_ollama):
         if self._provider_api(str(route.get("resolved_provider") or "")) != "smart":
             return route
 
-        return await self._resolve_smart_route(
-            route,
-            worker_id=worker_id,
-            payload={"model": route.get("requested_model") or normalized_model_id, "priority": priority},
-        )
+        # Resolve the smart alias when a candidate is schedulable. When none is,
+        # keep the smart route so the queue-state response can report the model
+        # as a whole instead of raising an internal error.
+        try:
+            return await self._resolve_smart_route(
+                route,
+                worker_id=worker_id,
+                payload={
+                    "model": route.get("requested_model") or normalized_model_id,
+                    "priority": priority,
+                },
+            )
+        except Exception as exc:
+            log(
+                "http",
+                "warning",
+                f"Smart queue-state resolution unavailable for {normalized_model_id}: {exc}",
+                self.id,
+            )
+            return route
 
     async def _model_only_queue_state_response(
         self,
@@ -1757,14 +2588,18 @@ class Endpoint_openaix(Endpoint_ollama):
             return self._error_response(
                 protocol=protocol,
                 status_code=404,
-                code="INVALID_MODEL",
+                code="model_not_found" if protocol == "openai" else "INVALID_MODEL",
                 message=f"Unknown model: {model_id}",
+                error_type="invalid_request_error" if protocol == "openai" else None,
+                error_param="model" if protocol == "openai" else None,
             )
 
+        provider_id = str(route.get("resolved_provider") or "")
+        resolved_model = str(route.get("resolved_model") or "")
         response = await self._model_queue_state_response(
             protocol=protocol,
-            provider_id=route["resolved_provider"],
-            model_id=route["resolved_model"],
+            provider_id=provider_id,
+            model_id=resolved_model,
             priority=priority,
         )
         try:

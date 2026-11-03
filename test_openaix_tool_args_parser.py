@@ -2005,18 +2005,13 @@ class TestOpenAIxModelRouting(unittest.TestCase):
 
         response = endpoint._openai_models_response()
 
-        self.assertEqual(
-            response["data"],
-            [
-                {
-                    "id": "smart_chat",
-                    "real_id": "fred-large",
-                    "object": "model",
-                    "created": response["data"][0]["created"],
-                    "owned_by": "aidir",
-                }
-            ],
-        )
+        self.assertEqual(len(response["data"]), 1)
+        item = response["data"][0]
+        self.assertEqual(item["id"], "smart_chat")
+        self.assertEqual(item["object"], "model")
+        self.assertEqual(item["owned_by"], "aidir")
+        self.assertEqual(item["aidir"]["real_id"], "fred-large")
+        self.assertEqual(item["aidir"]["schema_version"], 1)
 
     def test_ollama_tags_response_includes_real_id_for_alias(self) -> None:
         """Lists callable external id and resolved internal id in the Ollama tags response."""

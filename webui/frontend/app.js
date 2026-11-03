@@ -587,6 +587,40 @@ function resolveResourceUse(resource) {
   return { use: desired, pending: true };
 }
 
+function resourceSensors(resource) {
+  const merged = new Map();
+  const add = sensor => {
+    if (!sensor || !sensor.id) return;
+    const id = String(sensor.id);
+    merged.set(id, { ...(merged.get(id) || {}), ...sensor });
+  };
+  ((resource.monitoring || {}).sensors || []).forEach(add);
+  ((resource.telemetry || {}).sensors || []).forEach(add);
+  return Array.from(merged.values());
+}
+
+function renderResourceSensors(resource) {
+  const chips = resourceSensors(resource).map(sensor => {
+    const unit = sensor.unit ? ` ${sensor.unit}` : '';
+    const deviceValues = (sensor.devices || []).map(device => {
+      const deviceValue = device.value == null ? '—' : `${device.value}${unit}`;
+      return `GPU${device.device}: ${deviceValue}`;
+    }).join(', ');
+    const value = deviceValues || (sensor.value == null ? '—' : `${sensor.value}${unit}`);
+    const threshold = sensor.threshold && sensor.threshold.value != null
+      ? ` (${sensor.threshold.operator || 'above'} ${sensor.threshold.value}${unit})`
+      : '';
+    const detail = sensor.error ? `: ${sensor.error}` : threshold;
+    const state = sensor.status === 'alert' ? 'is-alert' : sensor.status === 'error' ? 'is-error' : '';
+    const label = sensor.label || sensor.id || 'sensor';
+    const title = `${label}: ${value}${detail}`;
+    return `<span class="sensor-chip ${state}" title="${escapeHtml(title)}">`
+      + `<span class="sensor-chip-label">${escapeHtml(label)}</span>`
+      + `<span class="sensor-chip-value">${escapeHtml(value)}</span></span>`;
+  });
+  return chips.length ? `<div class="resource-sensors">${chips.join('')}</div>` : '';
+}
+
 function renderResources(resources) {
   const body = $('resources-body');
   if (!body) return;
@@ -628,21 +662,6 @@ function renderResources(resources) {
       return `<div style="margin-bottom:2px;color:var(--red)"><span style="font-family:monospace">${escapeHtml(providerModel)}</span> ${escapeHtml(detail)}</div>`;
     }).join('');
 
-    const sensors = ((r.monitoring || {}).sensors || []).map(sensor => {
-      const unit = sensor.unit ? ` ${sensor.unit}` : '';
-      const deviceValues = (sensor.devices || []).map(device => {
-        const deviceValue = device.value == null ? '—' : `${device.value}${unit}`;
-        return `GPU${device.device}: ${deviceValue}`;
-      }).join(', ');
-      const value = deviceValues || (sensor.value == null ? '—' : `${sensor.value}${unit}`);
-      const threshold = sensor.threshold && sensor.threshold.value != null
-        ? ` (${sensor.threshold.operator || 'above'} ${sensor.threshold.value}${unit})`
-        : '';
-      const color = sensor.status === 'alert' ? 'var(--red)' : sensor.status === 'error' ? 'var(--yellow)' : 'var(--muted)';
-      const detail = sensor.error ? `: ${sensor.error}` : threshold;
-      return `<div style="margin-bottom:2px;color:${color}"><span>${escapeHtml(sensor.label || sensor.id || 'sensor')}</span> <strong>${escapeHtml(value)}</strong><span style="color:var(--muted)">${escapeHtml(detail)}</span></div>`;
-    }).join('');
-
     const availability = r.availability || {};
     const availableValues = Object.entries(availability.available || {}).map(([metric, value]) => {
       const unit = ((r.units || {})[metric] || '');
@@ -658,19 +677,8 @@ function renderResources(resources) {
     const availabilityStatus = availability.status || 'pending';
     const availabilityColor = availabilityStatus === 'error' ? 'var(--yellow)' : availabilityStatus === 'ok' ? 'var(--ok)' : 'var(--muted)';
     const availabilityError = availability.error ? `<div style="color:var(--yellow)">${escapeHtml(availability.error)}</div>` : '';
-    const telemetry = ((r.telemetry || {}).sensors || []).map(reading => {
-      const unit = reading.unit ? ` ${reading.unit}` : '';
-      const deviceValues = (reading.devices || []).map(device => {
-        const deviceValue = device.value == null ? '—' : `${device.value}${unit}`;
-        return `GPU${device.device}: ${deviceValue}`;
-      }).join(', ');
-      const value = deviceValues || (reading.value == null ? '—' : `${reading.value}${unit}`);
-      const color = reading.status === 'error' ? 'var(--yellow)' : 'var(--muted)';
-      const error = reading.error ? `: ${reading.error}` : '';
-      return `<div style="margin-bottom:2px;color:${color}"><span>${escapeHtml(reading.label || reading.id || 'sensor')}</span> <strong>${escapeHtml(value)}</strong><span style="color:var(--muted)">${escapeHtml(error)}</span></div>`;
-    }).join('');
     const consumersCell = consumers + softConsumers + startupErrors || '<span style="color:var(--muted)">—</span>';
-    const sensorsCell = sensors + telemetry || '<span style="color:var(--muted)">—</span>';
+    const sensorsCell = renderResourceSensors(r) || '<span style="color:var(--muted)">—</span>';
     const resourceUse = resolveResourceUse(r);
 
     const tr = document.createElement('tr');

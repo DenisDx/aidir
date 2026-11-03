@@ -66,6 +66,7 @@ class Resource:
         self._availability_generation = 0
         self._consumer_availability_generations: dict[str, int] = {}
         self._peer_telemetry: dict = {}
+        self._peer_loaded_models: list[dict] = []
         # Soft consumers: models still in memory after task release (within alive_time window).
         # Each entry: {consumer_id, resources, released_at, model_id, provider_id}
         self._soft_used: list[dict] = []
@@ -251,6 +252,34 @@ class Resource:
                 ]
             sensors.append(item)
         self._peer_telemetry = {"sensors": sensors}
+
+    def record_peer_loaded_models(self, models: object) -> None:
+        """Store already-sanitized loaded-model entries received from a peer."""
+        if not isinstance(models, list):
+            self._peer_loaded_models = []
+            return
+        sanitized: list[dict] = []
+        for item in models:
+            if not isinstance(item, dict):
+                continue
+            model_id = str(item.get("id") or item.get("model_id") or "").strip()
+            if not model_id:
+                continue
+            entry = {
+                "id": model_id,
+                "provider": str(item.get("provider") or item.get("provider_id") or "").strip(),
+                "resources": {
+                    str(metric): int(value)
+                    for metric, value in (item.get("resources") or {}).items()
+                    if isinstance(value, (int, float))
+                },
+                "persistent": bool(item.get("persistent")),
+                "state": str(item.get("state") or "loaded"),
+            }
+            if item.get("context_tokens") is not None:
+                entry["context_tokens"] = item.get("context_tokens")
+            sanitized.append(entry)
+        self._peer_loaded_models = sanitized
 
     def _observed_available_after_reservations(self, metric: str) -> float | None:
         """Return observed capacity less reservations created after that observation."""
@@ -653,4 +682,5 @@ class Resource:
             "monitoring": self.sensor_snapshot(),
             "availability": self.availability_snapshot(),
             "telemetry": self.telemetry_snapshot(),
+            "peer_loaded_models": [dict(item) for item in self._peer_loaded_models],
         }

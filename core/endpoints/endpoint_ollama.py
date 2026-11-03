@@ -971,6 +971,12 @@ class Endpoint_ollama(BaseEndpoint):
         if not isinstance(models, list):
             return False
 
+        if api_type == "llama-cpp" and str(provider_cfg.get("exec_cmd") or "").strip():
+            # A managed single-model llama.cpp server may expose an internal
+            # model id (Strata does), while it still accepts the configured
+            # alias. A successful model listing is enough for availability.
+            return True
+
         normalized_model_id = str(model_id or "").strip()
         for model in models:
             if not isinstance(model, dict):

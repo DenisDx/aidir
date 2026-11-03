@@ -297,3 +297,58 @@ returned 404:
   `aidir_workers_enabled`, and `aidir_resources_total`.
 
 Neither route exposes task bodies, tokens, or configuration values.
+
+## 13. Health, model state and queue-state extensions (2026-11-03)
+
+The OpenAIx `/health`, `/v1/models`, `/v1/models/{model}` and queue-state routes
+now share one `schema_version: 1` extension model.
+
+- `/health` is a last-known snapshot: resources (with availability, telemetry,
+  loaded models and host), configured models that declare resources,
+  telemetry grouped by executor, external provider statuses, queue counters and
+  runtime flags. It never probes an executor or peer.
+- Resource peer responses include `loaded_models`, so another aidir can see the
+  models a peer holds without asking again. Local resources also report the
+  four case fans (fan1-fan4) in the shipped configuration.
+- `/v1/models` and `/v1/models/{model}` keep the OpenAI model shape and put every
+  aidir field under one `aidir` key. The block reports `real_id`, provider,
+  resource totals/free/used-by-model/needed and `state` with `can_run_now`,
+  `resource_ready`, `model_loaded`, admission and queue counters. Smart models
+  add `aidir.smart` with `context_identification`, `fallback_route` and
+  candidate states.
+- Model ids containing `/` are accepted both literally and percent-encoded.
+  Unknown models remain `404 INVALID_MODEL`.
+- Queue-state accepts a smart model and reports the aggregate queue and
+  fallback route when no candidate is schedulable instead of returning 500.
+  Queue failures return `503`; the route never returns 500.
+
+## 14. Health and model-state corrections (2026-11-03)
+
+- A model already loaded on a resource reports `resource_ready: true` and
+  `resource_ready_after_unload: true`; `can_run_now` is then limited only by
+  the model's concurrency. The previous base-memory admission result could
+  report `base_memory` for a loaded model because its soft-consumer fingerprint
+  did not match.
+- OpenAI `/v1/*` model lookups return `404 model_not_found` with
+  `type: "invalid_request_error"`; Ollama `/api/*` keeps `INVALID_MODEL`.
+- The model extension adds `resolved_provider` and `resolved_model`. For a smart
+  model they name the concrete fallback backend; `aidir.smart.fallback_route`
+  remains available.
+- `/health.models` includes smart models whose candidates declare resources,
+  with merged candidate resources and the smart state.
+- `/health.tasks` is the active task list (created, queued, running). It is
+  always present and is an empty array when no task is active.
+
+## 15. Managed llama.cpp provider probe (2026-11-03)
+
+A `llama-cpp` provider remains the local-server type even when the server
+speaks the OpenAI wire protocol: `api: "llama-cpp"` owns `exec_cmd`,
+`LocalServerManager`, the `call_llama_cpp` worker and per-model resource
+lifecycle. Setting `api: "openai"` would remove the local start/stop path.
+
+Strata requires an API key and does not echo the configured model alias in
+`/v1/models`; it lists its internal id (`qwen3.8-flash-next-ista-iq3_s`). For a
+managed llama.cpp provider that declares `exec_cmd`, a successful
+`GET /v1/models` is therefore treated as availability even when the listed id
+differs from the configured id. Authentication is taken from the provider
+`auth` block and applies both to probes and to the worker request.
