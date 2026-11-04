@@ -10,6 +10,8 @@
   "default_auth_mode": "disabled",
   "routing": {
     "max_hops": 8,
+    // How long a remote capacity/concurrency refusal is retried before the task fails.
+    "remote_refusal_grace_seconds": 60,
     "kv_affinity": {
       "enabled": true,
       "min_anchor_bytes": 512,

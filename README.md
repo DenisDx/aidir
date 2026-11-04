@@ -558,6 +558,7 @@ context, not on the alias or client. The default behaviour is enabled in
 
 ```json5
 routing: {
+  remote_refusal_grace_seconds: 60,       // retry a busy remote before failing
   kv_affinity: {
     enabled: true,
     resource_wait_timeout_seconds: 60,     // wait for a warm model
@@ -577,13 +578,14 @@ a warm model has been blocked by resource memory for longer than the wait
 timeout. A cold model is not worth waiting for because its cache is already gone. The router never stores prompt text: it keeps a truncated HMAC of a
 context prefix and a byte length.
 
-A remote aidir that cannot run the resolved model — not enough free VRAM, for
-example — is **not** a reason to wait. Before a task is handed to a remote
-instance, aidir asks that instance whether the model can run; a refusal excludes
-that candidate and the route is resolved again, so a local candidate that is warm
-serves the request instead. The refusal is repeated at most a few times; after
-that the task fails with `REMOTE_CANNOT_RUN` and a message naming the provider,
-the model and the reason, instead of waiting for the whole queue timeout.
+Before a task is handed to a remote instance, aidir asks that instance whether
+the model can run. A refusal excludes that candidate for the route resolution, so
+a local candidate that is warm can serve the request instead. When no candidate
+is left, a `capacity` refusal (for example a temporarily busy model reporting
+`admission=concurrency`) is retried for `routing.remote_refusal_grace_seconds`
+before the task fails. Set it to `0` to restore immediate failure. After the
+grace window the task fails with `REMOTE_CANNOT_RUN` and a message naming the
+provider, the model and the reason.
 
 A remote that does **not** answer is a different case: it may be restarting. The
 candidate is skipped for that attempt only, the task is re-routed to any

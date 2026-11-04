@@ -361,6 +361,24 @@ The scheduler passes the OpenAI-family probe callback to its router, so
 `/v1/models` response instead of `provider_down`. A failed probe still drops the
 candidate's affinity record and records a readiness transition.
 
+### 3.10.1 Remote refusal policy
+
+A remote `openaix` candidate is probed through its queue-state route before
+dispatch.
+
+- `unreachable` (no answer): transient. The candidate is skipped for this attempt,
+  the task is re-routed when possible, otherwise it waits and retries until its
+  queue timeout.
+- `capacity` (the remote answers `can_run_now: false`): the candidate is excluded
+  for the route resolution. If no candidate is left, the task is retried for
+  `routing.remote_refusal_grace_seconds` (default 60, `0` disables). This covers a
+  remote that is briefly busy with `admission=concurrency`. After the grace
+  window the task fails with `REMOTE_CANNOT_RUN` after the bounded refusal
+  count.
+
+The grace start is kept per task and cleared on completion, re-route or failure.
+`Scheduler.apply_config` re-reads the value on SIGHUP.
+
 ### 3.11 Cancellation
 
 | Operation | Effect |

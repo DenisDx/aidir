@@ -427,3 +427,14 @@ matching the `--parallel 2` llama-server command. Each in-flight request declare
 stays at 30000 MiB per resource. The scheduler admits at most two active
 requests, the third is deferred with the model-concurrency reason. The limits
 are `apply: reload`, so SIGHUP applies them without stopping running tasks.
+
+## 22. Remote refusal grace window (2026-11-03)
+
+- Added `routing.remote_refusal_grace_seconds` (default 60, `0` disables).
+- A remote `capacity` refusal (for example `admission=concurrency` with empty
+  `free`/`needed`) is now retried for that window before the task fails with
+  `REMOTE_CANNOT_RUN`. This covers a remote that is only briefly busy.
+- `unreachable` keeps its existing behavior: the task waits, bounded by its queue
+  timeout.
+- The grace start is per task and is cleared on re-route, completion or failure.
+  `Scheduler.apply_config` reloads the value on SIGHUP.

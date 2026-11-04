@@ -455,6 +455,8 @@ class Core:
         try:
             result["resources"] = self.resources.apply_config(after.get("resources") or [])
             self.resources.set_full_config(after)
+            if self.scheduler is not None:
+                self.scheduler.apply_config(after)
             if self.resource_monitor is not None:
                 self.resource_monitor.apply_peer_config(after)
         except Exception as exc:

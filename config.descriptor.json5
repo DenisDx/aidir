@@ -121,6 +121,14 @@
             apply: "reload",
             description: "Maximum number of aidir instances a routed request may traverse",
           },
+          remote_refusal_grace_seconds: {
+            type: "int",
+            minimum: 0,
+            maximum: 86400,
+            apply: "reload",
+            description: "How long a task keeps retrying a remote capacity refusal before failing; 0 disables the grace window",
+            ui: { help: "A remote that answers admission=concurrency is often just briefly busy. The task waits for this window before it is failed." },
+          },
           kv_affinity: {
             type: "object",
             apply: "reload",

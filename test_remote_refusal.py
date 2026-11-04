@@ -72,9 +72,10 @@ class _Resources:
         return False
 
 
-def _config() -> dict:
+def _config(grace: int = 0) -> dict:
     """A smart model with a local candidate and a remote aidir candidate."""
     return {
+        "routing": {"remote_refusal_grace_seconds": grace},
         "models": {
             "providers": {
                 "smart": {
@@ -130,14 +131,14 @@ def _task() -> Task_agent:
     return task
 
 
-def _scheduler(queue: _Queue) -> Scheduler:
+def _scheduler(queue: _Queue, *, grace: int = 0) -> Scheduler:
     """A scheduler with the smart provider configured."""
     return Scheduler(
         queue=queue,
         workers={"openaix": _Worker()},
         workers_cfg={"openaix": {"provider": "smart"}},
         resources=_Resources(),
-        full_config=_config(),
+        full_config=_config(grace),
     )
 
 
@@ -249,6 +250,38 @@ class RemoteRefusalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(error["code"], "REMOTE_CANNOT_RUN")
         self.assertIn("remote_aidir_110", error["message"])
         self.assertIn("m-remote", error["message"])
+
+    async def test_a_capacity_refusal_waits_for_the_grace_window(self) -> None:
+        """A temporarily busy remote is retried instead of failing immediately."""
+        queue = _Queue()
+        scheduler = _scheduler(queue, grace=60)
+        task = _task()
+
+        async def fake_remote_probe(provider_id, model_id, *, priority, timeout_ms, incoming_bearer_token=""):
+            return {"can_run_now": False, "admission": "concurrency", "free": {}, "needed": {}}
+
+        async def fake_ollama_probe(provider_id, model_id, *, timeout_ms, incoming_bearer_token=""):
+            return False
+
+        scheduler._probe_remote_model_queue_state = fake_remote_probe
+        scheduler._probe_ollama_model_availability = fake_ollama_probe
+
+        deferred: list[Task_agent] = []
+        for _ in range(_MAX_REMOTE_REFUSALS):
+            await scheduler._handle_remote_refusal(
+                task,
+                _Worker(),
+                "remote_aidir_110",
+                "m-remote",
+                "capacity",
+                "the remote reports admission=concurrency",
+                deferred,
+            )
+
+        self.assertEqual(queue.failed, [])
+        self.assertEqual(len(deferred), _MAX_REMOTE_REFUSALS)
+        self.assertIn(task.id, scheduler._remote_refusal_grace_since)
+        self.assertIn("temporarily unavailable", scheduler.defer_reason_for(task.id)["reason"])
 
     async def test_a_refusal_before_the_limit_defers_the_task_once(self):
         """Before the limit the task waits, but only for a bounded number of rounds."""

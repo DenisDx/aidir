@@ -90,12 +90,29 @@ class Scheduler:
         # condition, so the task is re-routed instead of being deferred forever.
         self._remote_blocked_candidates: dict[str, set[tuple[str, str]]] = {}
         self._remote_refusal_counts: dict[str, int] = {}
+        self._remote_refusal_grace_since: dict[str, float] = {}
+        self._remote_refusal_grace_seconds = self._resolve_remote_refusal_grace(self._full_config)
         self._peer_auth_warned: set[str] = set()
         # Why every waiting task waits. The log is not enough: the default log
         # level hides the deferral messages, so the operator would never learn
         # why a task is not running.
         self._deferred: dict[str, dict] = {}
         self._deferral_log_state: dict[str, dict] = {}
+
+    @staticmethod
+    def _resolve_remote_refusal_grace(full_config: dict | None) -> float:
+        """Return how long a capacity refusal may be retried before the task fails."""
+        routing = (full_config or {}).get("routing") if isinstance(full_config, dict) else None
+        routing = routing if isinstance(routing, dict) else {}
+        try:
+            return max(0.0, float(routing.get("remote_refusal_grace_seconds", 60) or 0))
+        except (TypeError, ValueError):
+            return 60.0
+
+    def apply_config(self, full_config: dict | None) -> None:
+        """Apply the reloadable scheduler configuration."""
+        self._full_config = full_config if isinstance(full_config, dict) else {}
+        self._remote_refusal_grace_seconds = self._resolve_remote_refusal_grace(self._full_config)
 
     def notify_new_task(self) -> None:
         """Wake the scheduler loop when a new task is enqueued."""
@@ -874,6 +891,31 @@ class Scheduler:
             )
             return
 
+        grace = self._remote_refusal_grace_seconds
+        if grace > 0:
+            now = time.time()
+            since = self._remote_refusal_grace_since.get(task.id)
+            if since is None:
+                self._remote_refusal_grace_since[task.id] = now
+                since = now
+            if now - since < grace:
+                task.next_retry_at = now + 1
+                deferred_tasks.append(task)
+                self._note_deferral(
+                    task,
+                    f"the remote aidir '{provider_id}' is temporarily unavailable",
+                )
+                self._log_deferral(
+                    task,
+                    f"remote_capacity_grace:{provider_id}:{model_id}",
+                    (
+                        f"Task {task.id} delayed: remote aidir provider '{provider_id}' "
+                        f"cannot run '{model_id}' ({reason}); retrying for up to "
+                        f"{int(grace)}s before failing"
+                    ),
+                )
+                return
+
         attempts = self._remote_refusal_counts.get(task.id, 0) + 1
         self._remote_refusal_counts[task.id] = attempts
         if attempts >= _MAX_REMOTE_REFUSALS:
@@ -904,6 +946,7 @@ class Scheduler:
         """Drop the per-task remote refusal bookkeeping."""
         self._remote_blocked_candidates.pop(task_id, None)
         self._remote_refusal_counts.pop(task_id, None)
+        self._remote_refusal_grace_since.pop(task_id, None)
 
     def _note_deferral(self, task: Task, reason: str) -> None:
         """Record why a task waits, so the operator can see it in the status."""
