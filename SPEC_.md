@@ -402,3 +402,28 @@ base reservations and idle soft consumers. While a task runs, its consumer id
 is mapped back to the live task route, so `/v1/models/{model}` reports
 `state.model_loaded: true` and `/health.resources[].loaded_models` lists the
 model with `state: "running"`.
+
+## 20. Safe route switch before unload (2026-11-03)
+
+- A smart route whose affinity-preferred candidate is blocked by resources
+  (`session_memory`, `base_memory`, `waiting_unload`) now checks for an
+  alternative candidate that can start immediately before waiting or unloading.
+  When one exists, the route is diverted immediately
+  (`affinity_resource_diverted`). A cold model with a ready alternative is also
+  diverted instead of waiting.
+- `force_unload_for` refuses to stop a provider while the resource has active
+  consumers, so running tasks always finish first.
+- A successful managed `llama-cpp` unload stops the whole provider and clears
+  its persistent soft reservations from every resource, not only the resource
+  that triggered the unload.
+- `_compute_soft_used` includes persistent consumers even on a resource without
+  `alive_time`/`keep_alive`, so a switch can see the real occupancy.
+
+## 21. Parallel concurrency for llama_local_ii (2026-11-03)
+
+`llama_local_ii/Qwen3.8-27b-Q6_K_XL` runs with `maxConcurrentRequests: 2`,
+matching the `--parallel 2` llama-server command. Each in-flight request declares
+1024 MiB of session VRAM on `local_machine` and `local_gpu1`; the model base
+stays at 30000 MiB per resource. The scheduler admits at most two active
+requests, the third is deferred with the model-concurrency reason. The limits
+are `apply: reload`, so SIGHUP applies them without stopping running tasks.

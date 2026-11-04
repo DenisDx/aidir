@@ -530,7 +530,7 @@ has no positive `sessionResources` entry. `Core.start` turns that into a
 
 | Path | Trigger | Behavior |
 |---|---|---|
-| `force_unload_for(reqs, full_config, keep_model_id, keep_provider_id)` | The scheduler needs VRAM | For each required resource with `alive_time > 0`: iterate the active soft consumers, skip the model being kept, call the provider's unload API; on success, invalidate the affinity candidate and delete the Redis activity record; clear the soft entry. Returns `False` if any unload failed |
+| `force_unload_for(reqs, full_config, keep_model_id, keep_provider_id)` | The scheduler needs VRAM | For each required resource: **refuse** while active consumers exist; otherwise iterate the active soft consumers, skip the model being kept, call the provider's unload API. A managed `llama-cpp` unload stops the whole provider, so its soft entries are removed from every resource; other providers clear only the named model. Returns `False` if any unload was refused or failed |
 | `force_unload_all(full_config)` | The service shuts down | Unload every tracked idle model |
 | `force_release(rid)` | The WebUI "release resource", or the `release_resource` sensor reaction | **Refuse** when there are active consumers; otherwise unload the idle models and report which |
 | `clear_soft_consumers_for_providers(provider_ids)` | A managed server stopped | Remove the soft entries and invalidate the affinity |
@@ -804,12 +804,15 @@ A mismatch in the cache group forgets the record.
 |---|---|---|
 | `ready` | Keep it, unless the queue-imbalance test fires | `affinity` |
 | `concurrency` | Keep waiting on it, unless the queue-imbalance test fires | `affinity_wait_queue` |
-| `session_memory` / `base_memory` / `waiting_unload` | Keep waiting until the resource-wait timer expires | `affinity_wait_resource` |
+| `session_memory` / `base_memory` / `waiting_unload` | Use any alternative that can start now; otherwise keep waiting until the resource-wait timer expires | `affinity_resource_diverted` / `affinity_wait_resource` |
 | `provider_down` / `resource_disabled` | Treated as a miss; the record is forgotten | — |
 
 `prefer_affinity_over_immediate` (default `true`) decides whether the router may
-wait on a preferred candidate that cannot start immediately. When it is `false`, such
-a candidate is skipped entirely.
+wait on a preferred candidate that cannot start immediately **after** it has
+checked for an alternative that can start now. A ready alternative is always
+preferred over waiting on, or unloading, the warm candidate. When the flag is
+`false` and no alternative can start now, the preferred candidate is skipped
+entirely.
 
 ### 6.7 The queue-imbalance diversion
 
@@ -843,8 +846,10 @@ Divert when `blocked_for >= wait_limit`, **or** when
 observed span is at least `wait_limit`. The ratio rule is the anti-flap guard; a
 threshold ≤ 0 disables it.
 
-On expiry the router looks for an alternative that **can run now**. If there is
-none, it keeps the preferred candidate with the reason `affinity_wait_no_alternative`.
+Before the timer starts, and again on expiry, the router prefers an alternative
+that **can run now** with the reason `affinity_resource_diverted`. Only when no
+such alternative exists does it wait. If none appears on expiry, it keeps the
+preferred candidate with the reason `affinity_wait_no_alternative`.
 
 A **cold** model is not worth waiting for, because its cache is already gone. That
 is why `cold_model_wait_timeout_seconds` defaults to 0.

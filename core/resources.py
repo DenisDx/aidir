@@ -604,7 +604,11 @@ class Resources:
         all_unloaded = True
         for rid in reqs:
             res = self._items.get(rid)
-            if res is None or not res.alive_time:
+            if res is None:
+                continue
+            if res.consumers:
+                # Never stop a provider while a task still holds a reservation.
+                all_unloaded = False
                 continue
             for entry in res.get_active_soft_consumers():
                 model_id = entry.get("model_id") or ""
@@ -621,6 +625,11 @@ class Resources:
                         continue
                     self._invalidate_candidate(provider_id, model_id)
                     await self._clear_model_activity(rid, model_id, provider_id)
+                    if self._provider_api_type(provider_id, full_config) == "llama-cpp":
+                        # One managed server owns the whole provider, so its
+                        # soft consumers on every resource are now gone.
+                        self.clear_soft_consumers_for_providers([provider_id])
+                        break
                 res.clear_soft_consumer(model_id, entry_provider_id or None)
         return all_unloaded
 

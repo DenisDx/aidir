@@ -307,13 +307,15 @@ class Resource:
         return now - float(entry.get("released_at") or 0) < float(entry.get("alive_time") or 0)
 
     def _compute_soft_used(self) -> dict[str, int]:
-        """Sum resources held by soft consumers still within their retention window."""
-        if not self.alive_time and not self.keep_alive:
-            return {}
+        """Sum resources held by active soft consumers.
+
+        Persistent llama.cpp base reservations count even when the resource
+        declares no alive_time or keep_alive window.
+        """
         now = time.time()
         total: dict[str, int] = {}
         for entry in self._soft_used:
-            if self._soft_entry_active(entry, now):
+            if entry.get("persistent") or self._soft_entry_active(entry, now):
                 for k, v in entry["resources"].items():
                     total[k] = total.get(k, 0) + v
         return total

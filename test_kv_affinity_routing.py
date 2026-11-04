@@ -162,10 +162,19 @@ class AffinityRoutingTests(unittest.IsolatedAsyncioTestCase):
         resolution = await harness.router.resolve_route(harness.route(), request_payload=harness.payload())
         self.assertEqual((resolution.resolved_provider, resolution.resolved_model), ("p2", "m2"))
 
-    async def test_warm_resource_block_waits_and_then_times_out(self):
+    async def test_ready_alternative_is_used_before_unloading_the_warm_route(self):
         harness = RouterHarness()
         await harness.router.resolve_route(harness.route(), request_payload=harness.payload())
         harness.set_admission("p1", "m1", "session_memory", loaded=True)
+        resolution = await harness.router.resolve_route(harness.route(), request_payload=harness.payload())
+        self.assertEqual((resolution.resolved_provider, resolution.resolved_model), ("p2", "m2"))
+        self.assertEqual(resolution.route["selection_reason"], "affinity_resource_diverted")
+
+    async def test_warm_block_waits_when_no_alternative_can_start_now(self):
+        harness = RouterHarness()
+        await harness.router.resolve_route(harness.route(), request_payload=harness.payload())
+        harness.set_admission("p1", "m1", "session_memory", loaded=True)
+        harness.set_admission("p2", "m2", "concurrency", loaded=True)
         resolution = await harness.router.resolve_route(harness.route(), request_payload=harness.payload())
         self.assertEqual((resolution.resolved_provider, resolution.resolved_model), ("p1", "m1"))
         self.assertEqual(resolution.route["selection_reason"], "affinity_wait_resource")
@@ -180,7 +189,7 @@ class AffinityRoutingTests(unittest.IsolatedAsyncioTestCase):
         harness.set_admission("p1", "m1", "base_memory", loaded=False)
         resolution = await harness.router.resolve_route(harness.route(), request_payload=harness.payload())
         self.assertEqual((resolution.resolved_provider, resolution.resolved_model), ("p2", "m2"))
-        self.assertEqual(resolution.route["selection_reason"], "affinity_resource_timeout")
+        self.assertEqual(resolution.route["selection_reason"], "affinity_resource_diverted")
 
     async def test_probe_failure_drops_affinity(self):
         harness = RouterHarness()

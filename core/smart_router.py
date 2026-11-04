@@ -355,11 +355,15 @@ class SmartRouter:
             alternative = self._best_alternative(candidates, preferred)
             return (alternative, "affinity_queue_diverted") if alternative else (preferred, "affinity_wait_queue")
         if admission in {"session_memory", "base_memory", "waiting_unload"}:
+            # Never unload a warm model while another candidate can start now.
+            immediate_alternative = self._best_alternative(candidates, preferred, require_ready=True)
+            if immediate_alternative is not None:
+                return immediate_alternative, "affinity_resource_diverted"
             if not over_immediate:
                 return None
             if not self._resource_wait_expired(preferred):
                 return preferred, "affinity_wait_resource"
-            alternative = self._best_alternative(candidates, preferred, require_ready=True)
+            alternative = self._best_alternative(candidates, preferred)
             return (
                 (alternative, "affinity_resource_timeout")
                 if alternative

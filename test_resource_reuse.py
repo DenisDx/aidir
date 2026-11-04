@@ -70,6 +70,7 @@ class TestResourceReuse(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(consumers), 1)
         self.assertTrue(consumers[0]["persistent"])
         self.assertEqual(consumers[0]["resources"], {"VRAM": 10})
+        self.assertEqual(resource.snapshot()["soft_used"], {"VRAM": 10})
 
     async def test_activity_restore_rebuilds_soft_consumer_after_restart(self) -> None:
         """Restore an idle Ollama model from its persisted keep-alive activity record."""
@@ -240,6 +241,43 @@ class TestResourceReuse(unittest.IsolatedAsyncioTestCase):
         await resources.force_unload_for({"gpu": {"VRAM": 8}}, full_config={})
 
         self.assertEqual(unloaded, [("shared-model", "llama_local")])
+
+    async def test_force_unload_refuses_while_a_task_holds_the_resource(self) -> None:
+        """Do not stop a provider while an active task still has a reservation."""
+        resources = Resources(
+            [{"id": "gpu", "type": "cuda", "limits": {"VRAM": 20}, "alive_time": 300}]
+        )
+        await resources.get("gpu").reserve_active({"VRAM": 8}, consumer_id="task:worker")
+        resources.get("gpu").add_soft_consumer({"VRAM": 8}, "model-a", "llama_local", persistent=True)
+        resources._call_provider_unload = AsyncMock(return_value=True)
+
+        unloaded = await resources.force_unload_for({"gpu": {"VRAM": 8}}, full_config={})
+
+        self.assertFalse(unloaded)
+        resources._call_provider_unload.assert_not_awaited()
+        self.assertEqual(len(resources.get("gpu").get_active_soft_consumers()), 1)
+
+    async def test_force_unload_clears_provider_consumers_on_all_resources(self) -> None:
+        """Stopping a managed provider removes its occupancy from every resource."""
+        cfg = {"models": {"providers": {"llama_local": {"api": "llama-cpp"}}}}
+        resources = Resources([
+            {"id": "gpu0", "type": "cuda", "limits": {"VRAM": 20}, "alive_time": 300},
+            {"id": "gpu1", "type": "cuda", "limits": {"VRAM": 20}},
+        ])
+        await resources.release_for(
+            {"gpu0": {"VRAM": 8}, "gpu1": {"VRAM": 8}},
+            consumer_id="prev",
+            model_id="model-a",
+            provider_id="llama_local",
+            retain_model=True,
+        )
+        resources._call_provider_unload = AsyncMock(return_value=True)
+
+        unloaded = await resources.force_unload_for({"gpu0": {"VRAM": 8}}, full_config=cfg)
+
+        self.assertTrue(unloaded)
+        self.assertEqual(resources.get("gpu0").get_active_soft_consumers(), [])
+        self.assertEqual(resources.get("gpu1").get_active_soft_consumers(), [])
 
     async def test_force_release_unloads_idle_models_without_touching_active_tasks(self) -> None:
         """Releases every idle model on a resource but refuses while a task holds it."""
