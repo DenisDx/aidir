@@ -1079,6 +1079,42 @@ class Endpoint_ollama(BaseEndpoint):
         self._model_resolution_warnings_emitted.add(warning_key)
         log("http", "warning", message, self.id)
 
+    def _provider_model_is_loaded(self, provider_id: str, model_id: str) -> bool:
+        """Return whether a concrete provider/model is currently loaded or executing."""
+        resources = getattr(self._core, "resources", None) if self._core is not None else None
+        if resources is not None:
+            requirements = self._resolve_model_resource_requirements(provider_id, model_id)
+            loader = getattr(resources, "model_is_loaded", None)
+            if requirements and callable(loader):
+                try:
+                    if loader(requirements, model_id, provider_id):
+                        return True
+                except Exception:
+                    pass
+            base_id = f"base:{provider_id}:{model_id}"
+            for resource in (resources.all() if callable(getattr(resources, "all", None)) else []):
+                if base_id in getattr(resource, "consumers", {}):
+                    return True
+                getter = getattr(resource, "get_active_soft_consumers", None)
+                for entry in getter() if callable(getter) else []:
+                    if str(entry.get("model_id") or "") != model_id:
+                        continue
+                    entry_provider = str(entry.get("provider_id") or "")
+                    if not entry_provider or entry_provider == provider_id:
+                        return True
+        queue = getattr(self._core, "queue", None) if self._core is not None else None
+        tasks = queue.list_tasks() if callable(getattr(queue, "list_tasks", None)) else []
+        for task in tasks:
+            if str(getattr(task, "status", "")) != "running":
+                continue
+            config = getattr(task, "config", None)
+            route = config.get("route") if isinstance(config, dict) and isinstance(config.get("route"), dict) else {}
+            task_provider = str(getattr(task, "route_provider_id", "") or route.get("resolved_provider") or "")
+            task_model = str(getattr(task, "model_id", "") or route.get("resolved_model") or "")
+            if task_provider == provider_id and task_model == model_id:
+                return True
+        return False
+
     def _resolve_model_route(self, requested_model: object, worker_id: str) -> dict | None:
         """Resolve external model id to provider/model using alias-aware precedence."""
         requested = str(requested_model or "").strip()
@@ -1137,9 +1173,14 @@ class Endpoint_ollama(BaseEndpoint):
                 ),
             )
 
-        def _sort_key(item: dict) -> tuple[int, int, int]:
+        if len(matches) > 1:
+            for item in matches:
+                item["loaded"] = self._provider_model_is_loaded(item["provider"], item["model_id"])
+
+        def _sort_key(item: dict) -> tuple[int, int, int, int]:
+            loaded_penalty = 0 if item.get("loaded") else 1
             preferred_penalty = 0 if preferred_provider and item["provider"] == preferred_provider else 1
-            return int(item["rank"]), preferred_penalty, int(item["order"])
+            return loaded_penalty, int(item["rank"]), preferred_penalty, int(item["order"])
 
         selected = min(matches, key=_sort_key)
         return {

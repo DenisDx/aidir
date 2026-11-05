@@ -587,12 +587,15 @@ class Endpoint_openaix(Endpoint_ollama):
         if model_loaded:
             # A loaded model already owns its base memory. Admission can still
             # report ``base_memory`` when its soft-consumer fingerprint does not
-            # match, but the model is present and can serve another request
-            # unless the concurrency limit is reached.
+            # match, but a session may still be blocked by its own incremental
+            # memory cost (``session_memory``); that is a real refusal.
             resource_ready = True
             resource_ready_after_unload = True
-            can_run_now = active_count < max_concurrent
-            admission_value = "ready" if can_run_now else "concurrency"
+            if admission_value == "session_memory":
+                can_run_now = False
+            else:
+                can_run_now = active_count < max_concurrent
+                admission_value = "ready" if can_run_now else "concurrency"
         else:
             resource_ready = bool(admission.get("resource_ready"))
             resource_ready_after_unload = bool(admission.get("resource_ready_after_unload"))
@@ -2410,9 +2413,14 @@ class Endpoint_openaix(Endpoint_ollama):
                 ),
             )
 
-        def _sort_key(item: dict) -> tuple[int, int, int]:
+        if len(matches) > 1:
+            for item in matches:
+                item["loaded"] = self._provider_model_is_loaded(item["provider"], item["model_id"])
+
+        def _sort_key(item: dict) -> tuple[int, int, int, int]:
+            loaded_penalty = 0 if item.get("loaded") else 1
             preferred_penalty = 0 if preferred_provider and item["provider"] == preferred_provider else 1
-            return int(item["rank"]), preferred_penalty, int(item["order"])
+            return loaded_penalty, int(item["rank"]), preferred_penalty, int(item["order"])
 
         selected = min(matches, key=_sort_key)
         return {

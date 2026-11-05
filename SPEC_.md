@@ -438,3 +438,38 @@ are `apply: reload`, so SIGHUP applies them without stopping running tasks.
   timeout.
 - The grace start is per task and is cleared on re-route, completion or failure.
   `Scheduler.apply_config` reloads the value on SIGHUP.
+
+## 23. session_memory on a loaded parallel model (2026-11-05)
+
+A loaded model does not by itself prove that another session fits. For
+`maxConcurrentRequests > 1`, admission also checks `sessionResources` against
+the measured free VRAM. If the free amount is below the configured session
+cost, the admission is `session_memory` and the task waits; the model will not
+release its own base, so a session value larger than the permanent headroom
+makes the task wait until its queue timeout.
+
+The Q8 and Q6 `Qwen3.8-27B` llama.cpp models preallocate both `--parallel 2`
+slots at startup. Their `sessionResources` changed from 1024 MiB to 256 MiB per
+GPU to match the actual headroom. `/v1/models` now keeps `model_loaded: true`
+but reports `resource_ready: true`, `can_run_now: false` and
+`admission: "session_memory"` for this case instead of overriding it to `ready`.
+
+## 24. Q8 27B single-slot runtime (2026-11-05)
+
+`local_Qwen3.8-27B-UD-Q8_K_XL` now starts llama-server with `--parallel 1` and
+declares `maxConcurrentRequests: 1`, removing its per-session VRAM reservation.
+The change was made after a CUDA OOM during a very large prompt with two slots.
+The exec_cmd change takes effect when the provider or the service restarts.
+
+## 25. Ambiguous model ids and sticky routing (2026-11-05)
+
+- At startup aidir scans `models.providers` and logs one warning when several
+  provider models expose the same external id or alias, naming the providers.
+- When a request matches several provider/model pairs, `_resolve_model_route`
+  prefers a candidate whose concrete model is already loaded or has a running
+  task. A loaded or executing match outranks the normal alias/id rank.
+- Consequently an ambiguous external id sticks to the candidate that was loaded
+  first. This is intentional and documented; unique aliases are the way to make
+  the choice explicit.
+- This prevents the shared-port loop where a request for a plain id unloaded the
+  Strata server that another alias had just loaded.

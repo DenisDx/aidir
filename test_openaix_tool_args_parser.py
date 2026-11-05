@@ -1904,6 +1904,45 @@ class TestOpenAIxModelRouting(unittest.TestCase):
         self.assertEqual(task.config["route"]["resolved_provider"], "ollama_local")
         self.assertEqual(task.config["route"]["resolved_model"], "qwen3.5:9b")
 
+    def test_ambiguous_model_id_sticks_to_the_loaded_provider(self) -> None:
+        """A duplicate external id prefers the provider whose model is already loaded."""
+        class _LoadedResources:
+            def model_is_loaded(self, requirements, model_id, provider_id):
+                return provider_id == "p_loaded"
+
+            def all(self):
+                return []
+
+        endpoint = Endpoint_openaix({"id": "openaix", "worker": "openaix"})
+        endpoint._core = _FakeCore(
+            {
+                "workers": {"default": "openaix", "items": {"openaix": {"provider": "p_plain"}}},
+                "models": {"providers": {
+                    "p_plain": {
+                        "api": "ollama",
+                        "models": [{
+                            "id": "dup-model",
+                            "resources": {"gpu": {"VRAM": 1}},
+                        }],
+                    },
+                    "p_loaded": {
+                        "api": "ollama",
+                        "models": [{
+                            "id": "dup-model",
+                            "alias": "dup-loaded",
+                            "resources": {"gpu": {"VRAM": 1}},
+                        }],
+                    },
+                }},
+            },
+            resources=_LoadedResources(),
+        )
+
+        route = endpoint._resolve_model_route("dup-model", "openaix")
+
+        self.assertEqual(route["resolved_provider"], "p_loaded")
+        self.assertEqual(route["resolved_model"], "dup-model")
+
     def test_build_task_for_payload_resolves_alias_to_concrete_provider_and_model(self) -> None:
         """Resolves explicit alias before raw model ids and stores concrete route metadata."""
         endpoint = Endpoint_openaix({"id": "openaix", "worker": "openaix"})

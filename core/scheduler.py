@@ -224,6 +224,8 @@ class Scheduler:
                                 keep_model_id=requested_model_id or None,
                                 keep_provider_id=requested_provider_id or None,
                             )
+                            if self._resource_monitor is not None:
+                                await self._resource_monitor.refresh_required_availability(local_reqs)
                             admission = self._resources.evaluate_model_admission(
                                 local_reqs,
                                 requested_model_id,
@@ -274,6 +276,8 @@ class Scheduler:
                                     keep_model_id=requested_model_id or None,
                                     keep_provider_id=requested_provider_id or None,
                                 )
+                                if self._resource_monitor is not None:
+                                    await self._resource_monitor.refresh_required_availability(local_reqs)
                                 # Re-check actual soft reservations; a failed unload must keep its VRAM occupied.
                                 if not self._resources.check_available(local_reqs):
                                     task.next_retry_at = time.time() + 5

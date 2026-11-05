@@ -571,6 +571,19 @@ routing: {
 }
 ```
 
+### Duplicate model ids and sticky routing
+
+Several providers may expose the same external model id, for example different
+Strata configurations that share one port and one physical model. aidir writes a
+startup warning that names every ambiguous id and its providers.
+
+When a request matches more than one provider/model, routing prefers a candidate
+that is already loaded or executing. This keeps tasks on the model that was
+loaded first instead of stopping it to start an equivalent one, which previously
+caused a load/unload loop on a shared port. The behaviour is intentional: an
+ambiguous id **sticks** to the loaded candidate. Give each provider a unique
+alias (and use that alias from clients) when the choice must not be ambiguous.
+
 Affinity follows the selected executor. It is dropped when the executor fails
 or is known to have unloaded the model. It is also dropped when its queue is
 longer than the least loaded alternative by both configured thresholds, or when
@@ -633,6 +646,14 @@ line with `OLLAMA_NUM_PARALLEL`; for llama.cpp, do not exceed `--parallel`. The
 default remains `1`, which is the previous single-request behaviour. Queue-state
 responses expose `admission`, `model_loaded`, `active_count`,
 `max_concurrent_requests`, `session_resources`, and `memory_slots` when known.
+
+`sessionResources` is the measured headroom the next session needs, not the
+model's base footprint. A loaded model can still report `admission:
+"session_memory"` when the free VRAM left beside it is smaller than that value;
+the task then waits until memory is released. For a llama.cpp server that
+preallocates both `--parallel` slots at startup, set this value to the small
+incremental amount, not to the whole KV cache. Otherwise the second request can
+never be admitted even though the model is loaded and the server has a free slot.
 
 ### Anthropic Messages providers and endpoint
 

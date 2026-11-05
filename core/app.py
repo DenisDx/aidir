@@ -136,6 +136,50 @@ class Core:
         """
         return not self._loop_workers_only
 
+    def _warn_ambiguous_model_ids(self) -> None:
+        """Warn once when several provider models expose the same external name."""
+        providers = self.config.get("models.providers") or {}
+        if not isinstance(providers, dict):
+            return
+        exposure: dict[str, set[str]] = {}
+        for provider_id, provider in providers.items():
+            if not isinstance(provider, dict):
+                continue
+            for model in provider.get("models") or []:
+                if not isinstance(model, dict):
+                    continue
+                model_id = str(model.get("id") or model.get("name") or "").strip()
+                if not model_id:
+                    continue
+                names = {model_id}
+                alias = str(model.get("alias") or "").strip()
+                if alias:
+                    names.add(alias)
+                for name in names:
+                    exposure.setdefault(name, set()).add(f"{provider_id}/{model_id}")
+        conflicts = {
+            name: sorted(owners)
+            for name, owners in exposure.items()
+            if len(owners) > 1
+        }
+        if not conflicts:
+            return
+        details = "; ".join(
+            f"{name} -> {', '.join(owners[:6])}"
+            for name, owners in sorted(conflicts.items())[:12]
+        )
+        more = "" if len(conflicts) <= 12 else f"; and {len(conflicts) - 12} more"
+        log(
+            "system",
+            "warning",
+            (
+                "Ambiguous model routing: the same external id is exposed by several "
+                f"providers ({details}{more}). A request using an ambiguous id sticks to "
+                "the candidate that is already loaded; check the provider aliases if "
+                "that is not the intended model."
+            ),
+        )
+
     def _track_background_task(self, task: asyncio.Task) -> None:
         """Track a background task and log unexpected failures."""
         self._background_tasks.add(task)
@@ -160,6 +204,8 @@ class Core:
     async def start(self) -> None:
         lifecycle_level = "debug" if self._loop_workers_only else "info"
         log("core", lifecycle_level, "Core starting")
+        if not self._loop_workers_only:
+            self._warn_ambiguous_model_ids()
 
         unknown_thresholds = logger.warn_unknown_subsystems()
         if unknown_thresholds:

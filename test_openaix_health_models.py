@@ -245,6 +245,29 @@ class TestOpenaixHealthAndModels(unittest.TestCase):
         self.assertTrue(state["can_run_now"])
         self.assertEqual(response.json()["aidir"]["resources"][0]["used_by_model"], {"VRAM": 500})
 
+    def test_loaded_model_can_still_wait_for_session_memory(self) -> None:
+        """A loaded model reports session_memory when its next session does not fit."""
+        core = _core()
+        core.resources.evaluate_model_admission = lambda requirements, model, provider: {
+            "admission": "session_memory",
+            "admissible_now": False,
+            "admissible_after_unload": True,
+            "model_loaded": True,
+            "resource_ready": False,
+            "resource_ready_after_unload": True,
+            "active_count": 0,
+            "max_concurrent_requests": 2,
+            "session_resources": {"gpu": {"VRAM": 1024}},
+        }
+        endpoint = Endpoint_openaix({"id": "openaix", "worker": "openaix"})
+        endpoint._core = core
+        payload = endpoint._concrete_model_state("local", "org/model")
+
+        self.assertTrue(payload["state"]["model_loaded"])
+        self.assertTrue(payload["state"]["resource_ready"])
+        self.assertFalse(payload["state"]["can_run_now"])
+        self.assertEqual(payload["state"]["admission"], "session_memory")
+
     def test_queue_state_for_model_with_slash_is_not_500(self) -> None:
         """Queue state for an encoded model id answers 200 with a schema version."""
         with self._client() as client:
