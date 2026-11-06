@@ -45,8 +45,7 @@ class CallAnthropicWorker(CallOpenAIWorker):
         """Return the provider config mapping for the current task."""
         if self._core is None:
             return {}
-        value = self._core.config.get(f"models.providers.{provider_id}")
-        return value if isinstance(value, dict) else {}
+        return self._provider_config(provider_id)
 
     def _default_max_tokens(self, provider_id: str, model_id: str = "") -> int | None:
         """Return the model or provider fallback for Anthropic's required max_tokens."""

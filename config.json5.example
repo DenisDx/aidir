@@ -8,6 +8,9 @@
   "root": "${AIDIR_ROOT}",
   // Peer surfaces default to endpoint auth; disabled keeps existing multi-instance deployments working.
   "default_auth_mode": "disabled",
+  // Global default for internal tool injection. Absent or false: do not inject
+  // tools when the request has no tools field. Set true to preserve the old behavior.
+  "default_tool_injection": false,
   "routing": {
     "max_hops": 8,
     // How long a remote capacity/concurrency refusal is retried before the task fails.

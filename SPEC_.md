@@ -473,3 +473,16 @@ The exec_cmd change takes effect when the provider or the service restarts.
   the choice explicit.
 - This prevents the shared-port loop where a request for a plain id unloaded the
   Strata server that another alias had just loaded.
+
+## 26. Configurable internal tool injection (2026-11-05)
+
+- Added root `default_tool_injection` (bool, absent/false by default). It is the
+  global fallback for requests that carry no `tools` field.
+- Model-level `default_tool_injection` now applies to any route, smart or
+  concrete (`llama-cpp` included), not only smart models.
+- Added worker-level `workers.items.<worker_id>.default_tool_injection`. A
+  worker-level `false` is a hard off and wins over the model flag.
+- Resolution order: worker false, model flag, worker true, root flag, false.
+- `tools: []` / `tools: null` in the request disables injection for that call;
+  a non-empty caller `tools` list remains caller-owned.
+- To preserve the pre-2026-11-05 behaviour, set the root key to `true`.

@@ -1668,8 +1668,8 @@ class TestOpenAIxSmartDefaultToolInjection(unittest.TestCase):
 
         self.assertIs(policy, False)
 
-    def test_resolve_smart_default_tool_injection_defaults_true_when_omitted(self) -> None:
-        """Defaults to True when smart model does not define default_tool_injection."""
+    def test_resolve_smart_default_tool_injection_defaults_false_when_omitted(self) -> None:
+        """Defaults to False when neither the model nor the root enables injection."""
         worker = OpenAIxWorker()
         worker._provider_id = "ollama_local"
         worker._core = _FakeCore(
@@ -1700,7 +1700,62 @@ class TestOpenAIxSmartDefaultToolInjection(unittest.TestCase):
 
         policy = worker._resolve_smart_default_tool_injection(task, task.payload)
 
-        self.assertIs(policy, True)
+        self.assertIs(policy, False)
+
+    def test_root_default_tool_injection_true_enables_it(self) -> None:
+        """The root flag restores the previous automatic-injection behavior."""
+        worker = OpenAIxWorker()
+        worker._core = _FakeCore({
+            "default_tool_injection": True,
+            "models": {"providers": {"smart": {"api": "smart", "models": [{"id": "smart_chat"}]}}},
+        })
+        task = Task_agent(payload={"model": "resolved-model", "messages": []}, stream=False)
+        task.config = {"route": {
+            "requested_provider": "smart",
+            "requested_model": "smart_chat",
+            "resolved_provider": "ollama_local",
+            "resolved_model": "resolved-model",
+        }}
+
+        self.assertIs(worker._resolve_default_tool_injection(task, task.payload), True)
+
+    def test_worker_false_is_a_hard_off(self) -> None:
+        """A worker-level false wins even over an explicit model true."""
+        worker = OpenAIxWorker()
+        worker._core = _FakeCore({
+            "default_tool_injection": True,
+            "workers": {"items": {"openaix": {"default_tool_injection": False}}},
+            "models": {"providers": {"smart": {"api": "smart", "models": [
+                {"id": "smart_chat", "default_tool_injection": True},
+            ]}}},
+        })
+        task = Task_agent(payload={"model": "resolved-model", "messages": []}, stream=False)
+        task.worker_id = "openaix"
+        task.config = {"route": {
+            "requested_provider": "smart",
+            "requested_model": "smart_chat",
+            "resolved_provider": "ollama_local",
+            "resolved_model": "resolved-model",
+        }}
+
+        self.assertIs(worker._resolve_default_tool_injection(task, task.payload), False)
+
+    def test_concrete_model_false_disables_injection(self) -> None:
+        """The model flag works for a direct llama.cpp provider, not only smart models."""
+        worker = OpenAIxWorker()
+        worker._core = _FakeCore({
+            "default_tool_injection": True,
+            "models": {"providers": {"llama": {"api": "llama-cpp", "models": [
+                {"id": "local-model", "default_tool_injection": False},
+            ]}}},
+        })
+        task = Task_agent(payload={"model": "local-model", "messages": []}, stream=False)
+        task.config = {"route": {
+            "resolved_provider": "llama",
+            "resolved_model": "local-model",
+        }}
+
+        self.assertIs(worker._resolve_default_tool_injection(task, task.payload), False)
 
 
 class TestOpenAIxErrorMapping(unittest.TestCase):
@@ -3585,6 +3640,27 @@ class TestOllamaSmartRouting(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(task.payload["model"], "smart_chat")
         self.assertEqual(task.config["route"]["resolved_provider"], "remote_aidir")
         self.assertEqual(task.config["route"]["selection_reason"], "immediate")
+
+
+class TestDottedProviderConfig(unittest.TestCase):
+    """Provider ids containing dots must still resolve their auth and base URL."""
+
+    def test_worker_reads_auth_for_a_dotted_provider_id(self) -> None:
+        worker = OpenAIxWorker()
+        worker._core = _FakeCore({
+            "models": {"providers": {"local.Q4": {
+                "api": "llama-cpp",
+                "baseUrl": "http://127.0.0.1:8888",
+                "auth": {"type": "bearer", "token": "secret-key"},
+            }}},
+        })
+        task = Task_agent(payload={"model": "m"})
+
+        headers = worker._resolve_request_headers(task, "local.Q4")
+
+        self.assertEqual(headers["Authorization"], "Bearer secret-key")
+        self.assertEqual(worker._resolve_base_url("local.Q4"), "http://127.0.0.1:8888")
+        self.assertEqual(worker._provider_api("local.Q4"), "llama-cpp")
 
 
 if __name__ == "__main__":

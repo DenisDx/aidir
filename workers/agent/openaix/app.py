@@ -86,7 +86,7 @@ class OpenAIxWorker(BaseWorker):
         self._generation_defaults = dict(raw_generation_defaults) if isinstance(raw_generation_defaults, dict) else {}
 
         if core is not None:
-            base_url = core.config.get(f"models.providers.{provider_id}.baseUrl")
+            base_url = self._provider_config(provider_id).get("baseUrl")
             if base_url:
                 self._base_url = str(base_url).rstrip("/")
 
@@ -582,7 +582,7 @@ class OpenAIxWorker(BaseWorker):
             return None
 
         effective_provider_id = str(provider_id or self._provider_id or "").strip()
-        provider_models = self._core.config.get(f"models.providers.{effective_provider_id}.models") or []
+        provider_models = self._provider_config(effective_provider_id).get("models") or []
         if not isinstance(provider_models, list):
             return None
 
@@ -612,16 +612,14 @@ class OpenAIxWorker(BaseWorker):
         """Resolve provider base URL for the effective task provider."""
         if self._core is None:
             return self._base_url
-        base_url = self._core.config.get(f"models.providers.{provider_id}.baseUrl")
+        base_url = self._provider_config(provider_id).get("baseUrl")
         if not base_url:
             return self._base_url
         return str(base_url).rstrip("/")
 
     def _resolve_request_headers(self, task: Task, provider_id: str) -> dict[str, str]:
         """Resolve auth headers with provider override, incoming bearer fallback, or no auth."""
-        provider_auth = None
-        if self._core is not None:
-            provider_auth = self._core.config.get(f"models.providers.{provider_id}.auth")
+        provider_auth = self._provider_config(provider_id).get("auth")
         headers = self._build_auth_headers(provider_auth if isinstance(provider_auth, dict) else {})
         if not headers:
             task_cfg = task.config if isinstance(task.config, dict) else {}
@@ -637,7 +635,7 @@ class OpenAIxWorker(BaseWorker):
         """Return provider api type for the effective upstream provider."""
         if self._core is None:
             return ""
-        value = self._core.config.get(f"models.providers.{provider_id}.api")
+        value = self._provider_config(provider_id).get("api")
         return str(value or "").strip()
 
     def _build_route_trace_headers(self, task: Task) -> dict[str, str]:
@@ -726,8 +724,8 @@ class OpenAIxWorker(BaseWorker):
         request_has_tools_field = "tools" in request_payload
         request_tools_value = request_payload.get("tools") if request_has_tools_field else None
         requested_internal_tool_names = self._extract_requested_internal_tool_names(request_tools_value)
-        smart_default_injection_enabled = self._resolve_smart_default_tool_injection(task, request_payload)
-        skip_default_tools_injection = (smart_default_injection_enabled is False) and (not request_has_tools_field)
+        default_injection_enabled = self._resolve_default_tool_injection(task, request_payload)
+        skip_default_tools_injection = (default_injection_enabled is False) and (not request_has_tools_field)
         disable_internal_tools_injection = request_has_tools_field and (
             request_tools_value is None
             or (isinstance(request_tools_value, list) and len(request_tools_value) == 0)
@@ -740,7 +738,7 @@ class OpenAIxWorker(BaseWorker):
                 "worker",
                 "info",
                 (
-                    f"Task {task.id}: smart model default_tool_injection=false and request has no tools field; "
+                    f"Task {task.id}: default_tool_injection=false and request has no tools field; "
                     "internal tools injection disabled"
                 ),
                 "openaix",
@@ -870,27 +868,49 @@ class OpenAIxWorker(BaseWorker):
         payload["messages"] = messages
         task.payload = payload
 
-    def _resolve_smart_default_tool_injection(self, task: Task | None, payload: dict | None) -> bool | None:
-        """Return smart model default tool-injection policy for the request, when available."""
+    def _resolve_default_tool_injection(self, task: Task | None, payload: dict | None) -> bool:
+        """Resolve the default tool-injection policy for this task.
+
+        Order: a worker-level false is a hard off; then an explicit model-level
+        flag; then a worker-level true; then the root ``default_tool_injection``
+        (absent or false means no automatic injection).
+        """
         route_cfg = (task.config or {}).get("route") if isinstance(getattr(task, "config", None), dict) else None
-        if not isinstance(route_cfg, dict):
-            return None
+        route_cfg = route_cfg if isinstance(route_cfg, dict) else {}
 
-        requested_provider = str(route_cfg.get("requested_provider") or "").strip()
-        requested_model = str(route_cfg.get("requested_model") or "").strip()
-        if not requested_provider or not requested_model:
-            return None
-        if self._provider_api(requested_provider) != "smart":
-            return None
+        worker_id = str(getattr(task, "worker_id", "") or self.id or "").strip()
+        worker_cfg: dict = {}
+        if self._core is not None and worker_id:
+            raw_worker_cfg = self._core.config.get(f"workers.items.{worker_id}")
+            worker_cfg = raw_worker_cfg if isinstance(raw_worker_cfg, dict) else {}
+        worker_flag = worker_cfg.get("default_tool_injection") if "default_tool_injection" in worker_cfg else None
+        if worker_flag is False:
+            return False
 
-        smart_model_cfg = self._resolve_model_cfg(requested_model, provider_id=requested_provider)
-        if not isinstance(smart_model_cfg, dict):
-            return None
+        model_flag = None
+        candidates = [
+            (str(route_cfg.get("requested_provider") or "").strip(), str(route_cfg.get("requested_model") or "").strip()),
+            (str(route_cfg.get("resolved_provider") or "").strip(), str(route_cfg.get("resolved_model") or "").strip()),
+        ]
+        for provider_id, model_id in candidates:
+            if not provider_id or not model_id:
+                continue
+            model_cfg = self._resolve_model_cfg(model_id, provider_id=provider_id)
+            if isinstance(model_cfg, dict) and "default_tool_injection" in model_cfg:
+                model_flag = bool(model_cfg.get("default_tool_injection"))
+                break
+        if model_flag is not None:
+            return model_flag
 
-        raw_flag = smart_model_cfg.get("default_tool_injection")
-        if raw_flag is None:
-            return True
-        return bool(raw_flag)
+        if worker_flag is not None:
+            return bool(worker_flag)
+
+        root_flag = self._core.config.get("default_tool_injection") if self._core is not None else None
+        return bool(root_flag) if root_flag is not None else False
+
+    def _resolve_smart_default_tool_injection(self, task: Task | None, payload: dict | None) -> bool | None:
+        """Backward-compatible wrapper for the default tool-injection resolver."""
+        return self._resolve_default_tool_injection(task, payload)
 
     @staticmethod
     def _tool_payload_entry(tool_name: str, tool_spec: dict) -> dict:

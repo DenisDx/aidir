@@ -655,6 +655,30 @@ preallocates both `--parallel` slots at startup, set this value to the small
 incremental amount, not to the whole KV cache. Otherwise the second request can
 never be admitted even though the model is loaded and the server has a free slot.
 
+### Internal tool injection
+
+By default aidir does **not** inject its internal tools when the request has no
+`tools` field. The root key restores the previous behaviour:
+
+```json5
+default_tool_injection: true
+```
+
+The policy is resolved in this order:
+
+1. `workers.items.<worker_id>.default_tool_injection: false` — hard off for that
+   worker.
+2. The model's own `default_tool_injection` (`true` or `false`), for both smart
+   models and concrete providers such as `llama-cpp`.
+3. `workers.items.<worker_id>.default_tool_injection: true` — default for that
+   worker when the model does not decide.
+4. Root `default_tool_injection`; absent or `false` means no automatic
+   injection.
+
+A request that carries `tools: []` or `tools: null` disables injection for that
+call. A request with a non-empty `tools` list is caller-owned and is never
+replaced by the defaults.
+
 ### Anthropic Messages providers and endpoint
 
 Set an endpoint's `api` to `anthropic` to expose `POST /v1/messages`,

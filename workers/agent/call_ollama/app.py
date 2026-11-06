@@ -61,7 +61,7 @@ class CallOllamaWorker(BaseWorker):
             self._timeout = 100
 
         if core is not None:
-            base_url = core.config.get(f"models.providers.{provider_id}.baseUrl")
+            base_url = self._provider_config(provider_id).get("baseUrl")
             if base_url:
                 self._base_url = base_url.rstrip("/")
 
@@ -323,7 +323,7 @@ class CallOllamaWorker(BaseWorker):
             return None
 
         effective_provider_id = str(provider_id or self._provider_id or "").strip()
-        provider_models = self._core.config.get(f"models.providers.{effective_provider_id}.models") or []
+        provider_models = self._provider_config(effective_provider_id).get("models") or []
         if not isinstance(provider_models, list):
             return None
 
@@ -352,7 +352,7 @@ class CallOllamaWorker(BaseWorker):
         """Resolve provider base URL for the effective task provider."""
         if self._core is None:
             return self._base_url
-        base_url = self._core.config.get(f"models.providers.{provider_id}.baseUrl")
+        base_url = self._provider_config(provider_id).get("baseUrl")
         if not base_url:
             return self._base_url
         return str(base_url).rstrip("/")

@@ -58,6 +58,30 @@ class BaseWorker:
         """
         raise NotImplementedError(f"Worker {self.id} has no execute() implementation")
 
+    def _provider_config(self, provider_id: str) -> dict:
+        """Return one provider config, safe for ids that contain dots."""
+        config = getattr(self._core, "config", None) if self._core is not None else None
+        getter = getattr(config, "get", None)
+        if callable(getter):
+            try:
+                providers = getter("models.providers")
+            except Exception:
+                providers = None
+            if isinstance(providers, dict):
+                provider = providers.get(str(provider_id or "").strip())
+                return provider if isinstance(provider, dict) else {}
+        raw = getattr(config, "raw", None)
+        if callable(raw):
+            try:
+                data = raw()
+            except Exception:
+                data = None
+            providers = ((data or {}).get("models") or {}).get("providers") if isinstance(data, dict) else None
+            if isinstance(providers, dict):
+                provider = providers.get(str(provider_id or "").strip())
+                return provider if isinstance(provider, dict) else {}
+        return {}
+
     def bind_child_task(
         self,
         child_task: Task,

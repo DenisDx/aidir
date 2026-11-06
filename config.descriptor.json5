@@ -107,6 +107,14 @@
           help: "A whitespace-separated keyword list. The current keywords are disabled and endpoint; endpoint wins when both are present. Explicit peer_tasks.auth_mode and peer_resources.auth_mode override it.",
         },
       },
+      default_tool_injection: {
+        type: "bool",
+        apply: "reload",
+        description: "Global default for internal tool injection; absent or false disables automatic injection, true preserves the previous behavior",
+        ui: {
+          help: "A request with no tools field receives internal tools only when this is true and neither the worker nor the model overrides it. A worker-level false is a hard off.",
+        },
+      },
 
       // ── Routing ────────────────────────────────────────────────────────
       routing: {
