@@ -53,6 +53,15 @@ _LIVE_LOG_INITIAL_BYTES = 256 * 1024
 # The tasks page polls peers every few seconds. Warn once per peer instead of
 # writing the same authentication complaint into webui.log on every poll.
 _PEER_AUTH_WARNED: set[str] = set()
+_TASK_SUMMARY_FIELDS = (
+    "id", "type", "status", "worker_id", "created_at", "updated_at",
+    "started_at", "finished_at", "priority", "llm_call_count", "queue_timeout",
+    "run_timeout", "external", "request_preview", "route_provider_id", "model_id",
+    "envid", "error_code", "error",
+)
+# A finished task stays on the dashboard for a few polls so the operator sees
+# the terminal state instead of the row vanishing between two refreshes.
+_TERMINAL_TASK_VISIBILITY_SECONDS = 15.0
 
 
 class CronRepairError(RuntimeError):
@@ -195,6 +204,11 @@ def _parse_json_field(value: str | None) -> Any:
         return json.loads(value)
     except Exception:
         return value
+
+
+def _hmget_hash(fields: tuple[str, ...], values: list[Any]) -> dict[str, Any]:
+    """Build a task-hash fragment from an HMGET reply, omitting missing fields."""
+    return {field: value for field, value in zip(fields, values) if value is not None}
 
 
 def _list_log_files() -> list[str]:
@@ -684,11 +698,24 @@ async def _fetch_peer_tasks(core: "Core") -> list[dict[str, Any]]:
     return peers
 
 
+def _task_visible_on_dashboard(task_hash: dict[str, Any], now: datetime) -> bool:
+    """Return whether a task is still active or finished within the dashboard grace window."""
+    status = str(task_hash.get("status") or "").lower()
+    if status in {"created", "queued", "running"}:
+        return True
+    if status not in {"completed", "failed", "canceled"}:
+        return False
+    finished_at = _parse_dt(task_hash.get("finished_at"))
+    if finished_at is None:
+        return False
+    return (now - finished_at).total_seconds() <= _TERMINAL_TASK_VISIBILITY_SECONDS
+
+
 async def _list_active_tasks(core: "Core") -> list[dict[str, Any]]:
-    """Return active Redis-backed tasks, preferring current-process task state."""
-    active_statuses = {"created", "queued", "running"}
+    """Return active tasks plus recently finished ones, preferring live task state."""
     namespace = core.config.get("instance", "aidir")
     tasks: dict[str, dict[str, Any]] = {}
+    now = datetime.now(timezone.utc)
     cursor = 0
 
     while True:
@@ -702,7 +729,7 @@ async def _list_active_tasks(core: "Core") -> list[dict[str, Any]]:
             hashes = []
 
         for task_hash in hashes:
-            if not task_hash or str(task_hash.get("status") or "").lower() not in active_statuses:
+            if not task_hash or not _task_visible_on_dashboard(task_hash, now):
                 continue
             task_id = str(task_hash.get("id") or "")
             if task_id:
@@ -715,7 +742,7 @@ async def _list_active_tasks(core: "Core") -> list[dict[str, Any]]:
             break
 
     for task in core.queue.list_tasks():
-        if task.status in active_statuses:
+        if _task_visible_on_dashboard(task.to_redis_hash(), now):
             item = _task_to_api_item(_task_from_hash(task.to_redis_hash()), core)
             item["instance"] = str(namespace)
             item["remote"] = False
@@ -1008,7 +1035,7 @@ def create_app(
         _, task_routes = await _recent_task_routes(core) if routes else ([], {})
 
         ns = core.config.get("instance", "aidir")
-        items: list[tuple[str, int, dict[str, Any], Any]] = []
+        items: list[tuple[str, int, dict[str, Any], Any, Any]] = []
         matching_count = 0
         sequence = 0
         cursor = 0
@@ -1017,19 +1044,22 @@ def create_app(
             if keys:
                 pipeline = core.redis.pipeline(transaction=False)
                 for key in keys:
-                    pipeline.hgetall(key)
+                    pipeline.hmget(key, *_TASK_SUMMARY_FIELDS)
                 raw_items = await pipeline.execute()
             else:
                 raw_items = []
 
-            for raw in raw_items:
+            for key, values in zip(keys, raw_items):
+                raw = _hmget_hash(_TASK_SUMMARY_FIELDS, values)
                 if not raw:
                     continue
 
                 task_id = str(raw.get("id") or "")
+                live_payload = None
                 live_task = core.queue.get_task(task_id) if task_id and core.queue else None
                 if live_task is not None:
                     raw = live_task.to_redis_hash()
+                    live_payload = raw.get("payload")
                 task = _task_summary_from_hash(raw, core)
                 task_envid = str(task.get("envid") or "")
                 if envid and task_envid != envid:
@@ -1056,7 +1086,7 @@ def create_app(
                 matching_count += 1
                 sequence += 1
                 sort_key = task.get("last_operation_at") or task.get("created_at") or ""
-                candidate = (sort_key, sequence, task, raw.get("payload"))
+                candidate = (sort_key, sequence, task, key, live_payload)
                 if len(items) < limit:
                     heapq.heappush(items, candidate)
                 elif candidate[:2] > items[0][:2]:
@@ -1066,11 +1096,27 @@ def create_app(
                 break
 
         items.sort(reverse=True)
+        payloads = {
+            task_key: raw_payload
+            for _, _, _, task_key, raw_payload in items
+            if raw_payload is not None
+        }
+        missing_payload_keys = [
+            task_key for _, _, _, task_key, raw_payload in items
+            if raw_payload is None
+        ]
+        if missing_payload_keys:
+            pipeline = core.redis.pipeline(transaction=False)
+            for task_key in missing_payload_keys:
+                pipeline.hmget(task_key, "payload")
+            for task_key, values in zip(missing_payload_keys, await pipeline.execute()):
+                payloads[task_key] = values[0] if values else None
+
         tasks = []
-        for _, _, task, raw_payload in items:
+        for _, _, task, task_key, _ in items:
             first_preview, last_preview = _request_previews(
                 str(task.get("type") or ""),
-                raw_payload,
+                payloads.get(task_key),
             )
             task["first_message_preview"] = first_preview
             if last_preview:

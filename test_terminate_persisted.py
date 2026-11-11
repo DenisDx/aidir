@@ -9,22 +9,36 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 from core.app import Core
-from core.task import STATUS_CANCELED, STATUS_QUEUED
+from core.task import STATUS_CANCELED, STATUS_QUEUED, STATUS_RUNNING
 from core.task_types.task_agent import Task_agent
+
+
+class _Scheduler:
+    """Scheduler double that records every cancellation by task id."""
+
+    def __init__(self) -> None:
+        """Initialize the cancellation log."""
+        self.canceled: list[str] = []
+
+    async def cancel_task(self, task_id: str, timeout: float = 5.0) -> bool:
+        """Record the cancellation of one live run."""
+        self.canceled.append(task_id)
+        return True
 
 
 class _Queue:
     """Queue double whose in-memory registry is empty but whose hash exists."""
 
-    def __init__(self, persisted: Task_agent | None) -> None:
-        """Store the task that only exists as a persisted hash."""
+    def __init__(self, persisted: Task_agent | None, live: Task_agent | None = None) -> None:
+        """Store the task that only exists as a persisted hash and an optional live task."""
         self._persisted = persisted
+        self._live = live
         self.canceled: list[str] = []
         self.deleted: list[str] = []
 
     def get_task(self, task_id: str) -> Task_agent | None:
-        """Report that the task is not in the in-memory registry."""
-        return None
+        """Return the live task when one was seeded, otherwise report it as absent."""
+        return self._live if self._live is not None and self._live.id == task_id else None
 
     async def get_persisted_task(self, task_id: str) -> Task_agent | None:
         """Return the task that only exists as a Redis hash."""
@@ -69,6 +83,40 @@ class TerminatePersistedTaskTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNone(await core.terminate_task("no-such-task"))
         self.assertEqual(queue.canceled, [])
+
+    async def test_a_running_task_missing_from_memory_still_stops_its_run(self):
+        """A streamed task removed from the registry is canceled by its live run id."""
+        task = Task_agent(payload={"model": "m", "messages": []})
+        task.status = STATUS_RUNNING
+        queue = _Queue(task)
+        scheduler = _Scheduler()
+
+        core = Core.__new__(Core)
+        core.queue = queue
+        core.scheduler = scheduler
+
+        result = await core.terminate_task(task.id)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(scheduler.canceled, [task.id])
+        self.assertEqual(queue.canceled, [task.id])
+        self.assertEqual(queue.deleted, [task.id])
+
+    async def test_deleting_a_running_task_stops_its_run_first(self):
+        """Removing a running task must close its execution, not only its hash."""
+        task = Task_agent(payload={"model": "m", "messages": []})
+        task.status = STATUS_RUNNING
+        queue = _Queue(None, live=task)
+        scheduler = _Scheduler()
+
+        core = Core.__new__(Core)
+        core.queue = queue
+        core.scheduler = scheduler
+
+        await core.delete_task(task.id)
+
+        self.assertEqual(scheduler.canceled, [task.id])
+        self.assertEqual(queue.deleted, [task.id])
 
 
 if __name__ == "__main__":

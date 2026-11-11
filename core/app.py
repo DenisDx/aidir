@@ -774,8 +774,16 @@ class Core:
     async def delete_task(self, task_id: str) -> None:
         """
         Remove task from queue and memory.
+        A still-running execution is stopped first: the endpoint removes the task
+        when a streaming client disconnects, and the worker would otherwise keep
+        the upstream connection and its resources occupied with no task to reach.
         TODO: recursively delete child tasks.
         """
+        task = self.queue.get_task(task_id) if self.queue else None
+        if self.scheduler is not None and (
+            task is None or task.status in {STATUS_CREATED, STATUS_QUEUED, STATUS_RUNNING}
+        ):
+            await self.scheduler.cancel_task(task_id, timeout=5.0)
         await self.queue.delete_task(task_id)
 
     async def terminate_task(self, task_id: str) -> dict | None:
@@ -788,10 +796,18 @@ class Core:
             # The task is not in the in-memory registry. It may still exist as a
             # Redis hash - an orphaned task, one that no queue holds. A cancel
             # that silently does nothing leaves the task visible as queued
-            # forever, so the hash is terminated too.
+            # forever, so the hash is terminated too. The task may also be
+            # running while its registry entry is gone (a streaming client
+            # disconnect removes the entry), so the live run is canceled by id.
+            if self.scheduler is not None:
+                await self.scheduler.cancel_task(task_id, timeout=5.0)
             return await self._terminate_persisted_task(task_id)
 
         if task.status in {STATUS_CREATED, STATUS_QUEUED}:
+            # The scheduler may have popped the task while its status was still
+            # queued; cancel the already-dispatched run before finalizing it.
+            if self.scheduler is not None:
+                await self.scheduler.cancel_task(task.id, timeout=5.0)
             await self.queue.mark_canceled(task)
             await self.queue.delete_task(task.id)
             return task.to_redis_hash()

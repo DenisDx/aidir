@@ -387,6 +387,7 @@ The grace start is kept per task and cleared on completion, re-route or failure.
 | `wait_for_active_tasks(timeout)` | Waits on the idle event; logs the remaining labels on timeout |
 | `cancel_active_tasks(timeout=5.0)` | Cancels every task in `_active_runs`, gathers them, logs BEGIN/SUCCESS/TIMEOUT |
 | `cancel_task(task_id, timeout=5.0)` | Cancels one task, found by the `task:<id>:<worker>` name prefix |
+| `Core.terminate_task` / `Core.delete_task` | Cancels the live run by id even when the task is absent from the in-memory registry, then removes the hash |
 | `asyncio.CancelledError` inside `_run_task` | `mark_canceled(task)` and the exception is re-raised |
 
 ### 3.12 Diagnostics

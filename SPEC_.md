@@ -486,3 +486,18 @@ The exec_cmd change takes effect when the provider or the service restarts.
 - `tools: []` / `tools: null` in the request disables injection for that call;
   a non-empty caller `tools` list remains caller-owned.
 - To preserve the pre-2026-11-05 behaviour, set the root key to `true`.
+
+## 27. Termination of running tasks and dashboard terminal visibility (2026-11-07)
+
+- A task removed from the in-memory registry while its execution was still
+  running (the streaming client-disconnect path calls `delete_task`) is no
+  longer stranded: `Core.delete_task` cancels the live scheduler run first when
+  the task is `running`.
+- `Core.terminate_task` cancels the live run by task id even when the task is no
+  longer in the in-memory registry, then finalizes the persisted hash. A
+  terminated streaming task therefore closes its upstream connection instead of
+  finishing on the model after it disappears from the dashboard.
+- The dashboard task list shows terminal tasks (`completed`, `failed`,
+  `canceled`) for 15 seconds after `finished_at` in addition to the active ones,
+  so the operator sees the final state for several refresh cycles instead of the
+  row disappearing between polls.

@@ -793,7 +793,7 @@ the `Authorization` header stays alive in Redis.
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/api/tasks` | The active task list: local Redis + in-memory queue + the OpenAIx peers |
+| GET | `/api/tasks` | The dashboard task list: active tasks plus terminal tasks finished in the last 15 seconds, from local Redis, the in-memory queue and the OpenAIx peers |
 | GET | `/api/tasks/viewer/meta` | The filter vocabulary: statuses, workers, envids, recent routes |
 | GET | `/api/tasks/viewer/search` | The bounded filtered search |
 | GET | `/api/tasks/viewer/{task_id}` | The full task JSON (live memory, else Redis) |

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import unittest
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 from fastapi.testclient import TestClient
@@ -17,16 +18,32 @@ class _Pipeline:
         """Keep the Redis fake and requested keys."""
         self.redis = redis
         self.keys = []
+        self.fields = []
 
     def hgetall(self, key):
-        """Queue one hash read."""
+        """Queue one full hash read."""
         self.keys.append(key)
+        self.fields.append(None)
+        return self
+
+    def hmget(self, key, *fields):
+        """Queue one selected-field hash read."""
+        self.keys.append(key)
+        self.fields.append(tuple(fields))
         return self
 
     async def execute(self):
         """Return all requested hash values together."""
         self.redis.executed_batches.append(list(self.keys))
-        return [dict(self.redis.hashes.get(key, {})) for key in self.keys]
+        self.redis.requested_fields.extend(self.fields)
+        values = []
+        for key, fields in zip(self.keys, self.fields):
+            task_hash = self.redis.hashes.get(key, {})
+            if fields is None:
+                values.append(dict(task_hash))
+            else:
+                values.append([task_hash.get(field) for field in fields])
+        return values
 
 
 class _Redis:
@@ -37,6 +54,7 @@ class _Redis:
         self.hashes = hashes
         self.scan_calls = 0
         self.executed_batches = []
+        self.requested_fields = []
 
     async def scan(self, cursor, match, count):
         """Return all seeded task keys in one bounded page."""
@@ -119,6 +137,56 @@ class ViewerSearchTests(unittest.TestCase):
         self.assertEqual([task["id"] for task in tasks], [task_id])
         self.assertEqual(tasks[0]["status"], "running")
         self.assertEqual(tasks[0]["model_id"], "remote-model")
+
+    def test_dashboard_keeps_recently_finished_tasks_visible(self):
+        """A task that just completed stays on the dashboard for a few polls."""
+        task_id = "recent-done"
+        finished = (datetime.now(timezone.utc) - timedelta(seconds=3)).isoformat()
+        redis = _Redis({
+            f"aidir:task:{task_id}": {
+                **_summary(task_id, finished, "local-model"),
+                "status": "completed",
+                "finished_at": finished,
+            },
+        })
+        core = _Core(redis)
+        core.queue.list_tasks.return_value = []
+
+        async def session(*args, **kwargs):
+            """Provide an authenticated Dashboard session."""
+            return {"permissions": ["all"], "login": "test"}
+
+        with patch("webui.backend.app._get_session", session):
+            response = TestClient(create_app(core)).get("/api/tasks")
+
+        self.assertEqual(response.status_code, 200)
+        tasks = response.json()["tasks"]
+        self.assertEqual([task["id"] for task in tasks], [task_id])
+        self.assertEqual(tasks[0]["status"], "completed")
+
+    def test_dashboard_drops_finished_tasks_after_the_grace_window(self):
+        """An old terminal task is not kept on the active task list."""
+        task_id = "old-done"
+        finished = (datetime.now(timezone.utc) - timedelta(seconds=60)).isoformat()
+        redis = _Redis({
+            f"aidir:task:{task_id}": {
+                **_summary(task_id, finished, "local-model"),
+                "status": "completed",
+                "finished_at": finished,
+            },
+        })
+        core = _Core(redis)
+        core.queue.list_tasks.return_value = []
+
+        async def session(*args, **kwargs):
+            """Provide an authenticated Dashboard session."""
+            return {"permissions": ["all"], "login": "test"}
+
+        with patch("webui.backend.app._get_session", session):
+            response = TestClient(create_app(core)).get("/api/tasks")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["tasks"], [])
 
     def test_dashboard_exposes_resolved_smart_route_model(self):
         """Show the concrete model, requested alias, and provider for a smart task."""
@@ -233,7 +301,14 @@ class ViewerSearchTests(unittest.TestCase):
         self.assertEqual(body["tasks"][0]["request_preview"], "type=agent model=new-model messages=1")
         self.assertEqual(body["tasks"][0]["model_id"], "new-model")
         self.assertEqual(redis.scan_calls, 1)
-        self.assertEqual(redis.executed_batches, [list(hashes)])
+        self.assertEqual(redis.executed_batches[0], list(hashes))
+        self.assertEqual(set(redis.executed_batches[1]), {"aidir:task:new", "aidir:task:middle"})
+        summary_reads = redis.requested_fields[:len(hashes)]
+        for fields in summary_reads:
+            self.assertNotIn("payload", fields)
+            self.assertNotIn("result", fields)
+            self.assertNotIn("llm_call_history", fields)
+        self.assertEqual(redis.requested_fields[len(hashes):], [("payload",), ("payload",)])
 
     def test_search_decodes_endpoint_request_previews(self):
         """Decode bounded previews for Ollama, OpenAI parts, embeddings, and MCP."""
