@@ -54,6 +54,7 @@ class SmartRouter:
         resolve_worker_id_for_route: Callable[[str, dict | None], str] | None = None,
         resolve_model_protocol: Callable[[str, str], str] | None = None,
         is_candidate_allowed: Callable[[str, str], bool] | None = None,
+        is_candidate_budget_blocked: Callable[[str, str], bool] | None = None,
         on_selection: Callable[[dict], None] | None = None,
         on_failure: Callable[[dict, str, list[dict]], None] | None = None,
         kv_affinity: KvAffinityStore | None = None,
@@ -78,6 +79,7 @@ class SmartRouter:
         self._resolve_worker_id_for_route = resolve_worker_id_for_route
         self._resolve_model_protocol = resolve_model_protocol
         self._is_candidate_allowed = is_candidate_allowed
+        self._is_candidate_budget_blocked = is_candidate_budget_blocked
         self._on_selection = on_selection
         self._on_failure = on_failure
         self._kv_affinity = kv_affinity
@@ -153,6 +155,7 @@ class SmartRouter:
         candidates: list[dict] = []
         busy_candidates: list[dict] = []
         candidate_probes: list[dict] = []
+        budget_blocked = 0
 
         for index, item in enumerate(items):
             if isinstance(item, dict):
@@ -183,6 +186,9 @@ class SmartRouter:
                 continue
 
             candidate_probes.append(self.candidate_probe_record(index, item, candidate=candidate))
+            if str(candidate.get("probe_error") or "") == "budget_exceeded":
+                budget_blocked += 1
+                continue
             candidates.append(candidate)
             if not affinity_enabled and candidate["can_run_now"]:
                 return self._finish_selection(
@@ -267,6 +273,13 @@ class SmartRouter:
 
         if self._on_failure is not None:
             self._on_failure(route, strategy=strategy, candidate_probes=candidate_probes)
+
+        if budget_blocked and not candidates:
+            raise SmartRouteError(
+                code="BUDGET_EXCEEDED",
+                status_code=429,
+                message=f"Every candidate of '{requested_model}' exceeded its budget",
+            )
 
         raise SmartRouteError(
             code="ROUTING_FAILED",
@@ -585,6 +598,22 @@ class SmartRouter:
                 "probe_error": "candidate_not_allowed",
                 "routing_eligible": False,
                 "admission": "resource_disabled",
+                "model_loaded": False,
+            }
+
+        if self._is_candidate_budget_blocked is not None and self._is_candidate_budget_blocked(
+            provider_id, model_id
+        ):
+            return {
+                **base,
+                "can_run_now": False,
+                "queue_state": None,
+                "probe_ok": False,
+                "probe_source": "budget",
+                "probe_latency_ms": 0,
+                "probe_error": "budget_exceeded",
+                "routing_eligible": False,
+                "admission": "budget_exceeded",
                 "model_loaded": False,
             }
 

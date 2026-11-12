@@ -16,7 +16,7 @@ import re
 import socket
 import struct
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import AsyncGenerator
 from urllib.parse import urlparse
 
@@ -24,6 +24,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from core import log
+from core.billing import FAILURE_CLASSES
 from core.error_logging import attach_request_id_middleware, get_or_create_request_id, log_exception
 from core.endpoints.endpoint_ollama import Endpoint_ollama
 from core.generation_options import GENERATION_OPTION_FIELDS
@@ -113,8 +114,8 @@ class Endpoint_openaix(Endpoint_ollama):
             return await self._handle_embed(request, protocol="openai")
 
         @app.get("/v1/models")
-        async def openai_models():
-            return self._openai_models_response()
+        async def openai_models(request: Request):
+            return self._openai_models_response(request=request)
 
         @app.get("/v1/resources")
         async def openai_resources(request: Request):
@@ -198,11 +199,11 @@ class Endpoint_openaix(Endpoint_ollama):
             )
 
         @app.get("/v1/models/{model_id:path}")
-        async def openai_model(model_id: str):
+        async def openai_model(model_id: str, request: Request):
             # Declared after the queue-state routes so that ".../queue-state"
             # is never swallowed by the path converter.
             try:
-                return self._openai_model_response(model_id)
+                return self._openai_model_response(model_id, request=request)
             except Exception as exc:
                 log("http", "error", f"Model state request failed: {exc}", self.id)
                 return self._error_response(
@@ -739,7 +740,7 @@ class Endpoint_openaix(Endpoint_ollama):
         }
         return payload
 
-    def _openai_model_response(self, model_id: str) -> Response:
+    def _openai_model_response(self, model_id: str, *, request: Request | None = None) -> Response:
         """Return one model per the OpenAI models shape plus an aidir extension block."""
         extension = self._model_extension(model_id)
         if extension is None:
@@ -752,6 +753,14 @@ class Endpoint_openaix(Endpoint_ollama):
                 ),
                 status_code=404,
             )
+        usage = self._usage_block(
+            provider_id=str(extension.get("provider") or ""),
+            model_id=str(extension.get("model") or ""),
+            request=request,
+            include_context=True,
+        )
+        if usage:
+            extension["usage"] = usage
         return JSONResponse({
             "id": model_id,
             "object": "model",
@@ -1021,6 +1030,29 @@ class Endpoint_openaix(Endpoint_ollama):
             "runtime": runtime,
         }
 
+    def _usage_store(self):
+        """Return the usage store of the core, or None when it is not available."""
+        store = getattr(self._core, "usage_store", None)
+        if store is None or not getattr(store, "enabled", False):
+            return None
+        return store
+
+    def _usage_window(self, hours: int = 24) -> tuple[datetime, datetime]:
+        """Return the start and the end of the usage window of the monitoring routes."""
+        end = datetime.now(timezone.utc)
+        return end - timedelta(hours=hours), end
+
+    def _usage_rows(self, hours: int = 24) -> list[dict]:
+        """Return the per-model usage rows of the monitoring window."""
+        store = self._usage_store()
+        if store is None:
+            return []
+        start, end = self._usage_window(hours)
+        try:
+            return store.model_rows(start, end)
+        except Exception:
+            return []
+
     def _service_stats(self) -> dict:
         """Return a JSON snapshot of service counters for the stats route."""
         core = self._core
@@ -1041,6 +1073,20 @@ class Endpoint_openaix(Endpoint_ollama):
         started_at = getattr(core, "started_at", None)
         uptime = max(0.0, time.time() - started_at) if started_at else 0.0
 
+        usage_rows = self._usage_rows(24)
+        usage = {
+            "available": bool(usage_rows),
+            "period": "24h",
+            "calls": sum(int(row.get("calls") or 0) for row in usage_rows),
+            "external_calls": sum(int(row.get("external_calls") or 0) for row in usage_rows),
+            "internal_calls": sum(int(row.get("internal_calls") or 0) for row in usage_rows),
+            "prompt_tokens": sum(int(row.get("prompt_tokens") or 0) for row in usage_rows),
+            "completion_tokens": sum(int(row.get("completion_tokens") or 0) for row in usage_rows),
+            "computed_cost": sum(int(row.get("computed_cost") or 0) for row in usage_rows),
+            "allowance": sum(int(row.get("allowance") or 0) for row in usage_rows),
+            "models": len(usage_rows),
+        }
+
         return {
             "object": "aidir.stats",
             "schema_version": 1,
@@ -1056,6 +1102,7 @@ class Endpoint_openaix(Endpoint_ollama):
                 "enabled": sum(1 for worker in workers.values() if getattr(worker, "enabled", False)),
             },
             "resources": {"total": len(resources)},
+            "usage": usage,
         }
 
     @staticmethod
@@ -1098,7 +1145,143 @@ class Endpoint_openaix(Endpoint_ollama):
             "# TYPE aidir_resources_total gauge",
             f"aidir_resources_total {stats['resources']['total']}",
         ])
+        lines.extend(self._usage_metric_lines())
         return "\n".join(lines) + "\n"
+
+    def _usage_metric_lines(self) -> list[str]:
+        """Render the per-model usage metrics of the last 24 hours.
+
+        The labels stay bounded by the model catalogue and by the configured
+        context buckets. No task id, client id, or prompt-derived value is
+        used as a label.
+        """
+        store = self._usage_store()
+        if store is None:
+            return []
+        rows = self._usage_rows(24)
+        if not rows:
+            return []
+        lines = [
+            "# HELP aidir_model_calls_total LLM calls per model and outcome.",
+            "# TYPE aidir_model_calls_total gauge",
+        ]
+        for row in rows:
+            provider = self._prometheus_escape(str(row.get("provider") or ""))
+            model = self._prometheus_escape(str(row.get("model") or ""))
+            for status, counter in (("success", "successes"), ("failure", "failures"), ("canceled", "canceled")):
+                lines.append(
+                    f'aidir_model_calls_total{{provider="{provider}",model="{model}",status="{status}"}} '
+                    f"{int(row.get(counter) or 0)}"
+                )
+            lines.append(
+                f'aidir_model_internal_calls_total{{provider="{provider}",model="{model}"}} '
+                f"{int(row.get('internal_calls') or 0)}"
+            )
+        lines.extend([
+            "# HELP aidir_model_tokens_total Tokens per model and kind.",
+            "# TYPE aidir_model_tokens_total gauge",
+        ])
+        for row in rows:
+            provider = self._prometheus_escape(str(row.get("provider") or ""))
+            model = self._prometheus_escape(str(row.get("model") or ""))
+            for kind, counter in (
+                ("prompt", "prompt_tokens"),
+                ("cached_prompt", "cached_prompt_tokens"),
+                ("completion", "completion_tokens"),
+            ):
+                lines.append(
+                    f'aidir_model_tokens_total{{provider="{provider}",model="{model}",kind="{kind}"}} '
+                    f"{int(row.get(counter) or 0)}"
+                )
+        lines.extend([
+            "# HELP aidir_model_cost_usd Money per model and kind, in micro-units.",
+            "# TYPE aidir_model_cost_usd gauge",
+        ])
+        for row in rows:
+            provider = self._prometheus_escape(str(row.get("provider") or ""))
+            model = self._prometheus_escape(str(row.get("model") or ""))
+            for kind, counter in (
+                ("reported", "reported_cost"),
+                ("computed", "computed_cost"),
+                ("allowance", "allowance"),
+            ):
+                lines.append(
+                    f'aidir_model_cost_usd{{provider="{provider}",model="{model}",kind="{kind}"}} '
+                    f"{int(row.get(counter) or 0)}"
+                )
+        lines.extend([
+            "# HELP aidir_model_cache_hit_ratio Cached share of the prompt tokens per model.",
+            "# TYPE aidir_model_cache_hit_ratio gauge",
+        ])
+        for row in rows:
+            provider = self._prometheus_escape(str(row.get("provider") or ""))
+            model = self._prometheus_escape(str(row.get("model") or ""))
+            lines.append(
+                f'aidir_model_cache_hit_ratio{{provider="{provider}",model="{model}"}} '
+                f"{float(row.get('cache_hit_rate') or 0.0)}"
+            )
+        start, end = self._usage_window(24)
+        speeds = store.speeds(start, end)
+        if speeds:
+            lines.extend([
+                "# HELP aidir_model_generation_tokens_per_second Generation throughput per model and context bucket.",
+                "# TYPE aidir_model_generation_tokens_per_second gauge",
+            ])
+            for entry in speeds:
+                rate = entry.get("generation_tokens_per_second")
+                if rate is None:
+                    continue
+                provider = self._prometheus_escape(str(entry.get("provider") or ""))
+                model = self._prometheus_escape(str(entry.get("model") or ""))
+                bucket = self._prometheus_escape(str(entry.get("context_bucket") or ""))
+                lines.append(
+                    f'aidir_model_generation_tokens_per_second{{provider="{provider}",model="{model}",'
+                    f'context_bucket="{bucket}"}} {rate}'
+                )
+            lines.extend([
+                "# HELP aidir_model_prefill_tokens_per_second Prefill throughput per model and context bucket.",
+                "# TYPE aidir_model_prefill_tokens_per_second gauge",
+            ])
+            for entry in speeds:
+                rate = entry.get("prefill_tokens_per_second")
+                if rate is None:
+                    continue
+                provider = self._prometheus_escape(str(entry.get("provider") or ""))
+                model = self._prometheus_escape(str(entry.get("model") or ""))
+                bucket = self._prometheus_escape(str(entry.get("context_bucket") or ""))
+                lines.append(
+                    f'aidir_model_prefill_tokens_per_second{{provider="{provider}",model="{model}",'
+                    f'context_bucket="{bucket}"}} {rate}'
+                )
+        limits = store.limits_state()
+        if limits:
+            lines.extend([
+                "# HELP aidir_model_limit_ratio Used share of a limit rule.",
+                "# TYPE aidir_model_limit_ratio gauge",
+            ])
+            for limit in limits:
+                provider = self._prometheus_escape(str(limit.get("scope_id") or "instance"))
+                model = self._prometheus_escape(str(limit.get("scope_type") or "instance"))
+                rule = self._prometheus_escape(str(limit.get("id") or ""))
+                usage = limit.get("usage") or {}
+                bounds = limit.get("limits") or {}
+                ratio = 0.0
+                for usage_key, limit_key in (
+                    ("prefill_tokens", "max_prefill_tokens"),
+                    ("cached_prefill_tokens", "max_cached_prefill_tokens"),
+                    ("generation_tokens", "max_generation_tokens"),
+                    ("money", "max_money"),
+                ):
+                    bound = bounds.get(limit_key)
+                    if not bound:
+                        continue
+                    value = float(usage.get(usage_key) or 0) / float(bound)
+                    ratio = max(ratio, value)
+                lines.append(
+                    f'aidir_model_limit_ratio{{provider="{provider}",model="{model}",limit="{rule}"}} '
+                    f"{round(ratio, 6)}"
+                )
+        return lines
 
     def _peer_resources_response(self, request: Request, resource_id: str | None = None) -> JSONResponse:
         """Return sanitized peer resource state after applying configured access policy."""
@@ -1622,6 +1805,32 @@ class Endpoint_openaix(Endpoint_ollama):
 
         return self._create_task_for_payload(payload, stream, worker_id, route)
 
+    def _budget_refusal(self, route: dict | None) -> str | None:
+        """Return the refusal message when the requested model is over budget.
+
+        A smart alias is not refused here: its candidates are filtered during
+        the route resolution, and the request is refused only when no
+        candidate is left.
+        """
+        if not isinstance(route, dict):
+            return None
+        store = getattr(self._core, "usage_store", None) if self._core is not None else None
+        if store is None or not getattr(store, "enabled", False):
+            return None
+        provider_id = str(route.get("resolved_provider") or "")
+        model_id = str(route.get("resolved_model") or "")
+        if not provider_id or not model_id:
+            return None
+        if self._provider_api(provider_id) == "smart":
+            return None
+        try:
+            rule = store.is_blocked(provider_id=provider_id, model_id=model_id)
+        except Exception:
+            return None
+        if rule is None:
+            return None
+        return f"Budget limit '{rule.id}' exceeded for model '{model_id}'"
+
     async def _build_task_for_payload_async(
         self,
         payload: dict,
@@ -1659,6 +1868,14 @@ class Endpoint_openaix(Endpoint_ollama):
 
         if request_kind == "embed":
             self._ensure_embedding_route(route)
+
+        budget_error = self._budget_refusal(route)
+        if budget_error is not None:
+            raise SmartRouteError(
+                code="BUDGET_EXCEEDED",
+                status_code=429,
+                message=budget_error,
+            )
 
         task = self._create_task_for_payload(payload, stream, worker_id, route, request_kind=request_kind)
         if isinstance(task.payload, dict) and "client" in task.payload:
@@ -2433,9 +2650,12 @@ class Endpoint_openaix(Endpoint_ollama):
             "worker_preferred_provider": preferred_provider,
         }
 
-    def _openai_models_response(self) -> dict:
+    def _openai_models_response(self, request: Request | None = None) -> dict:
         """Build OpenAI-compatible models list response."""
         now = int(time.time())
+        include_context = False
+        if request is not None:
+            include_context = str(request.query_params.get("include_context") or "") in {"1", "true", "yes"}
         data = []
         for model_info in self._collect_model_entries():
             extension = self._model_extension(model_info["id"])
@@ -2448,6 +2668,15 @@ class Endpoint_openaix(Endpoint_ollama):
                     "resources": [],
                     "state": {},
                 }
+            else:
+                usage = self._usage_block(
+                    provider_id=str(extension.get("provider") or ""),
+                    model_id=str(extension.get("model") or ""),
+                    request=request,
+                    include_context=include_context,
+                )
+                if usage:
+                    extension["usage"] = usage
             data.append({
                 "id": model_info["id"],
                 "object": "model",
@@ -2461,6 +2690,103 @@ class Endpoint_openaix(Endpoint_ollama):
             "schema_version": 1,
             "data": data,
         }
+
+    def _usage_block(
+        self,
+        *,
+        provider_id: str,
+        model_id: str,
+        request: Request | None = None,
+        include_context: bool = False,
+    ) -> dict | None:
+        """Return the usage block of one model for the requested period.
+
+        The cost and the allowance are only included for a request that
+        carries a valid endpoint user token. An unauthenticated caller gets
+        the counters and the speed, never the local spend.
+        """
+        store = self._usage_store()
+        if store is None:
+            return None
+        try:
+            from core.usage_api import resolve_period
+
+            period_name = ""
+            if request is not None:
+                period_name = str(request.query_params.get("period") or "24h")
+            start, end, label = resolve_period(period_name, tz=getattr(store, "_tz", timezone.utc))
+            rows = store.model_rows(start, end)
+            row = next(
+                (
+                    item
+                    for item in rows
+                    if str(item.get("provider") or "") == provider_id
+                    and str(item.get("model") or "") == model_id
+                ),
+                None,
+            )
+            if row is None:
+                return None
+            authenticated = self._request_has_api_token(request)
+            block: dict = {
+                "period": {"label": label, "from": start.isoformat(), "to": end.isoformat()},
+                "calls": int(row.get("calls") or 0),
+                "external_calls": int(row.get("external_calls") or 0),
+                "internal_calls": int(row.get("internal_calls") or 0),
+                "successes": int(row.get("successes") or 0),
+                "failures": int(row.get("failures") or 0),
+                "canceled": int(row.get("canceled") or 0),
+                "tokens": {
+                    "prompt": int(row.get("prompt_tokens") or 0),
+                    "prompt_billable": int(row.get("prompt_billable_tokens") or 0),
+                    "cached_prompt": int(row.get("cached_prompt_tokens") or 0),
+                    "cache_write": 0,
+                    "completion": int(row.get("completion_tokens") or 0),
+                    "reasoning": int(row.get("reasoning_tokens") or 0),
+                    "answer": int(row.get("answer_tokens") or 0),
+                    "tool_argument_estimated": 0,
+                },
+                "tools": {"calls": int(row.get("tool_calls") or 0)},
+                "cache": {
+                    "hit_rate": float(row.get("cache_hit_rate") or 0.0),
+                    "savings_usd": int(row.get("cache_savings") or 0) / 1_000_000,
+                },
+                "speed": {
+                    "ttft_ms_avg": int(row.get("ttft_ms_avg") or 0),
+                    "prefill_tokens_per_second": row.get("prefill_tokens_per_second"),
+                    "generation_tokens_per_second": row.get("generation_tokens_per_second"),
+                    "timing_source": "mixed",
+                },
+                "failures_by_class": {
+                    name: int((row.get("failures_by_class") or {}).get(name) or 0)
+                    for name in FAILURE_CLASSES
+                },
+            }
+            if authenticated:
+                block["cost"] = {
+                    "reported_usd": int(row.get("reported_cost") or 0) / 1_000_000,
+                    "computed_usd": int(row.get("computed_cost") or 0) / 1_000_000,
+                    "allowance_usd": int(row.get("allowance") or 0) / 1_000_000,
+                    "list_cost_usd": int(row.get("list_cost") or 0) / 1_000_000,
+                }
+            if include_context:
+                block["context_buckets"] = store.speeds(start, end, provider_id=provider_id, model_id=model_id)
+            return block
+        except Exception as exc:
+            log("http", "warning", f"Usage block unavailable: {exc}", self.id)
+            return None
+
+    def _request_has_api_token(self, request: Request | None) -> bool:
+        """Return whether a request carries a valid endpoint user token."""
+        if request is None:
+            return False
+        token = self._extract_incoming_token(request)
+        if not token:
+            return False
+        try:
+            return self._find_api_user_by_token(token) is not None
+        except Exception:
+            return False
 
     def _ollama_tags_response(self) -> dict:
         """Build limited Ollama-compatible /api/tags response."""
@@ -2994,6 +3320,19 @@ class Endpoint_openaix(Endpoint_ollama):
         error_param: str | None = None,
     ) -> JSONResponse:
         """Protocol-aware error response. Supports compatibility mode toggle."""
+        if code == "BUDGET_EXCEEDED":
+            # The budget refusal keeps one stable shape in every protocol.
+            return JSONResponse(
+                {
+                    "error": {
+                        "message": message,
+                        "type": "insufficient_quota",
+                        "code": "BUDGET_EXCEEDED",
+                        "param": None,
+                    }
+                },
+                status_code=status_code,
+            )
         if self._errors_compatibility_mode:
             payload = (
                 self._openai_error_payload_with_type(

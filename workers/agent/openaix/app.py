@@ -1670,10 +1670,16 @@ class OpenAIxWorker(BaseWorker):
             chunks: list[dict] = [] if save_call else []
             emitted_any_chunk = False
             response_spool = None
+            usage_chunk: dict | None = None
 
             async def tracked_emit_chunk(chunk: dict) -> None:
-                nonlocal emitted_any_chunk
+                nonlocal emitted_any_chunk, usage_chunk
                 emitted_any_chunk = True
+                self._mark_first_delta(history_entry)
+                if usage_chunk is None and isinstance(chunk, dict) and (chunk.get("usage") or chunk.get("timings")):
+                    # The counters of a streamed answer arrive in the chunk that
+                    # carries them, which is not always the last one.
+                    usage_chunk = chunk
                 if emit_chunk is not None:
                     await emit_chunk(chunk)
 
@@ -1714,7 +1720,7 @@ class OpenAIxWorker(BaseWorker):
                         if save_call:
                             save_llm_call(self.id, effective_task_id, upstream_payload, {"stream_chunks": chunks})
                         if task is not None:
-                            await self._finalize_llm_call(task, history_entry, status="ok", http_status=200, response={"stream_chunks": chunks, **(final_data or {})}, response_spool=response_spool, response_content_type=self._response_content_type(resp, "application/x-ndjson"))
+                            await self._finalize_llm_call(task, history_entry, status="ok", http_status=200, response={"stream_chunks": chunks, "usage_chunk": usage_chunk or {}, **(final_data or {})}, response_spool=response_spool, response_content_type=self._response_content_type(resp, "application/x-ndjson"))
                         return WorkerResult(ok=True, data=final_data, usage=(final_data or {}).get("usage"))
             except httpx.ConnectError as exc:
                 if task is not None:

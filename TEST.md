@@ -79,7 +79,10 @@ The suite includes tests for:
   smart routing (`test_kv_affinity`, `test_kv_affinity_routing`,
   `test_session_resources`, `test_smart_router_direct`);
 - cron logging and repair, hooks, HTTP API workers, web search fallback, and
-  WebUI live logs and task viewer search.
+  WebUI live logs and task viewer search;
+- usage metering: the pricing and failure rules, the usage store, the usage API,
+  and the recording of a finished LLM call (`test_billing`, `test_usage_store`,
+  `test_usage_api`, `test_usage_worker`).
 
 To rerun only the tests relevant to a change, pass module names explicitly:
 
@@ -315,6 +318,14 @@ requests where supported, plus an invalid request and an authentication
 failure. For WebUI changes, test login, `/api/auth/me`, task list, task
 viewer, logs, and WebSocket live updates.
 
+For usage metering changes, verify that the counters of a period agree across
+the four surfaces: the `LLM statistic` tab, `/api/usage/summary`,
+`/stats`, and the `aidir.usage` block of `/v1/models`. Check that an
+unauthenticated `/v1/models` caller receives no cost and no allowance, that a
+model without a price shows an unknown cost, and that a limit rule with the
+`block` action answers `429` with `BUDGET_EXCEEDED` and stays blocked until
+the counters are reset.
+
 ## 7. Manual acceptance matrix
 
 | Area | Acceptance checks |
@@ -327,6 +338,7 @@ viewer, logs, and WebSocket live updates.
 | Routing | Direct provider/model route and smart route; expected fallback after an unavailable provider |
 | Resources | Admission, reuse of already loaded resources, queue-state endpoint, and release after completion |
 | WebUI | Login, status, tasks, viewer search, logs, and live log updates |
+| Usage metering | The `LLM statistic` tab, `/api/usage/*`, `/stats`, `/metrics`, the `/v1/models` usage block, and a limit reset |
 | Settings (aiset) | See the manual steps in section 7.1 |
 | Recovery | Core restart with Redis retained; Docker service restart; no orphaned running tasks or leaked locks |
 | Observability | Expected status codes and useful error messages; no request bodies, credentials, or tokens in logs |

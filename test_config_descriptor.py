@@ -67,6 +67,7 @@ TEST_ENV = {
     "ROOT_PASSWORD": "test-password",
     "LOG_LEVEL": "error",
     "LOG_TIMEZONE": "local",
+    "BILLING_TIMEZONE": "UTC",
     "LOG_WIPE_PERIOD": "10000",
     "LOG_WIPE_MAX_AGE": "1000000",
     "LOG_TRIM_PERIOD": "60",

@@ -157,6 +157,20 @@
 
   .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
   @media (max-width: 600px) { .grid-2 { grid-template-columns: 1fr; } }
+
+  /* ── LLM statistic tab ── */
+  .usage-period-bar {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 10px;
+    margin-bottom: 8px;
+  }
+  .usage-period-bar select {
+    background: var(--panel); color: inherit; border: 1px solid var(--border);
+    border-radius: 6px; padding: 6px 8px; font-size: 13px;
+  }
+  .usage-token-split { display: flex; gap: 14px; flex-wrap: wrap; }
+  .usage-token-value { font-size: 1.2rem; font-weight: 700; }
+  .usage-token-label { font-size: .7rem; color: var(--muted); text-transform: uppercase;
+    letter-spacing: .04em; }
   .dashboard-summary {
     display: grid;
     grid-template-columns: minmax(116px, 150px) minmax(116px, 150px) minmax(0, 1fr);
@@ -678,6 +692,7 @@
     <button id="nav-llm" onclick="showPage('llm')">Test LLM</button>
     <button id="nav-mcp" onclick="showPage('mcp')">Test MCP</button>
     <button id="nav-agent" onclick="showPage('agent')">Agent Request</button>
+    <button id="nav-usage" onclick="showPage('usage')">LLM statistic</button>
     <button id="nav-settings" onclick="showPage('settings')">Settings</button>
     <span id="runtime-status" class="nav-status">Ready</span>
     <span class="spacer"></span>
@@ -1106,6 +1121,118 @@
       <pre id="agent-raw-box"
         style="background:#0a0c12;padding:12px;border-radius:6px;overflow:auto;max-height:360px;font-size:12px;white-space:pre-wrap;word-break:break-word;"
       ></pre>
+    </div>
+  </div>
+
+  <!-- LLM statistic -->
+  <div id="page-usage" class="page">
+    <h2>LLM statistic</h2>
+
+    <div class="card">
+      <div class="card-title">Period</div>
+      <div class="usage-period-bar">
+        <select id="usage-period">
+          <option value="24h" selected>Last 24 hours</option>
+          <option value="today">Today</option>
+          <option value="yesterday">Yesterday</option>
+          <option value="7d">Last 7 days</option>
+          <option value="30d">Last 30 days</option>
+          <option value="month">This month</option>
+        </select>
+        <select id="usage-scope">
+          <option value="all" selected>All calls</option>
+          <option value="external">External only</option>
+          <option value="internal">Internal only</option>
+        </select>
+        <span id="usage-timezone" class="health-detail"></span>
+        <button id="usage-refresh-btn" class="btn-sm" type="button">Refresh</button>
+        <span id="usage-updated" class="health-detail"></span>
+      </div>
+      <div id="usage-state" style="font-size:12px;color:var(--muted);"></div>
+    </div>
+
+    <div class="dashboard-summary">
+      <div class="card">
+        <div class="card-title">LLM calls</div>
+        <div class="stat" id="usage-calls">—</div>
+        <div class="health-detail" id="usage-calls-detail"></div>
+      </div>
+      <div class="card">
+        <div class="card-title">Tokens</div>
+        <div class="usage-token-split">
+          <div>
+            <div class="usage-token-value" id="usage-tokens-generated">—</div>
+            <div class="usage-token-label">generated</div>
+          </div>
+          <div>
+            <div class="usage-token-value" id="usage-tokens-prefill">—</div>
+            <div class="usage-token-label">prefill</div>
+          </div>
+          <div>
+            <div class="usage-token-value" id="usage-tokens-cached">—</div>
+            <div class="usage-token-label">from cache</div>
+          </div>
+        </div>
+        <div class="health-detail" id="usage-tokens-detail"></div>
+      </div>
+      <div class="card">
+        <div class="card-title">Cost</div>
+        <div class="stat" id="usage-cost">—</div>
+        <div class="health-detail" id="usage-cost-detail"></div>
+      </div>
+      <div class="card">
+        <div class="card-title">Cache hit rate</div>
+        <div class="stat" id="usage-cache">—</div>
+        <div class="health-detail" id="usage-cache-detail"></div>
+      </div>
+      <div class="card">
+        <div class="card-title">Failures</div>
+        <div class="stat" id="usage-failures">—</div>
+        <div class="health-detail" id="usage-failures-detail"></div>
+      </div>
+      <div class="card">
+        <div class="card-title">Speed</div>
+        <div class="stat" id="usage-speed">—</div>
+        <div class="health-detail" id="usage-speed-detail"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Models</div>
+      <table id="usage-models-table">
+        <thead>
+          <tr>
+            <th>Model</th><th>Provider</th><th>Calls</th><th>External</th><th>Internal</th>
+            <th>Prefill</th><th>From cache</th><th>Generated</th><th>Reasoning</th>
+            <th>Cost</th><th>Allowance</th><th>Cache</th><th>TTFT ms</th>
+            <th>Gen tok/s</th><th>Failures</th>
+          </tr>
+        </thead>
+        <tbody id="usage-models-body"></tbody>
+      </table>
+      <div id="usage-models-empty" class="health-detail" style="display:none;">No LLM calls in this period.</div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Performance by context size</div>
+      <table id="usage-speed-table">
+        <thead>
+          <tr><th>Model</th><th>Context</th><th>Calls</th><th>Prefill tok/s</th><th>Gen tok/s</th><th>TTFT ms</th></tr>
+        </thead>
+        <tbody id="usage-speed-body"></tbody>
+      </table>
+      <div id="usage-speed-empty" class="health-detail" style="display:none;">No speed measurements in this period.</div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Limits</div>
+      <table id="usage-limits-table">
+        <thead>
+          <tr><th>Rule</th><th>Scope</th><th>Period</th><th>Action</th><th>Used</th><th>State</th><th>Reset</th></tr>
+        </thead>
+        <tbody id="usage-limits-body"></tbody>
+      </table>
+      <div id="usage-limits-empty" class="health-detail" style="display:none;">No limit rules are configured.</div>
     </div>
   </div>
 

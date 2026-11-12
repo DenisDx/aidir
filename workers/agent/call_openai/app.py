@@ -142,6 +142,7 @@ class CallOpenAIWorker(OpenAIxWorker):
         """Translate llama.cpp OpenAI SSE chunks into internal Ollama-compatible chunks."""
         provider_id = self._resolve_task_provider_id(task) if task is not None else self._provider_id
         final_data: dict | None = None
+        usage_chunk: dict | None = None
         content_parts: list[str] = []
         thinking_parts: list[str] = []
         upstream_payload = {**payload, "stream": True}
@@ -203,11 +204,19 @@ class CallOpenAIWorker(OpenAIxWorker):
                         status_code, raw, "application/json", response.headers,
                     ))
                 chunk = self._openai_response_to_ollama(data, streaming=True)
+                if usage_chunk is None and (chunk.get("usage") or chunk.get("timings")):
+                    # The counters of a streamed answer arrive in the chunk that
+                    # carries them, which is not always the last one.
+                    usage_chunk = chunk
                 message = chunk.get("message") if isinstance(chunk.get("message"), dict) else {}
                 if message.get("content") is not None:
                     content_parts.append(str(message["content"]))
+                    self._mark_first_delta(history_entry)
                 if message.get("thinking") is not None:
                     thinking_parts.append(str(message["thinking"]))
+                    self._mark_first_delta(history_entry)
+                if message.get("tool_calls") is not None:
+                    self._mark_first_delta(history_entry)
                 final_data = chunk
                 if emit_chunk:
                     await emit_chunk(UpstreamChunk(chunk, protocol="openai", raw=event, content_type=content_type, original=data))
@@ -217,7 +226,7 @@ class CallOpenAIWorker(OpenAIxWorker):
                 history_entry,
                 status="ok",
                 http_status=200,
-                response={"final": final_data or {}},
+                response={"final": final_data or {}, "usage_chunk": usage_chunk or {}},
                 response_spool=response_spool,
                 response_content_type=self._response_content_type(response, "text/event-stream"),
             )

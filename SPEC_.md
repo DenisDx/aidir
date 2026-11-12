@@ -502,3 +502,56 @@ The exec_cmd change takes effect when the provider or the service restarts.
   `canceled`) for 15 seconds after `finished_at` in addition to the active ones,
   so the operator sees the final state for several refresh cycles instead of the
   row disappearing between polls.
+
+## 28. Usage metering, cost, and speed profiles (2026-11-12)
+
+- aidir counts every LLM call per model: the prompt, cached prompt, cache
+  write, generation, reasoning, and answer tokens, the tool calls, the duration,
+  the time to first token, the failures by class, and the cost. The counters
+  live in a local SQLite database (`billing.database`, `logs/usage.sqlite` by
+  default) and survive a restart.
+- No prompt text, response text, file content, credential, or session value is
+  written into the usage database, and no such value becomes a metric label.
+  A client identifier (`envid`) is stored only when it is a known envid of the
+  registry; the calls without one are counted in an empty bucket.
+- The cost of a call is the provider-reported amount when there is one, and the
+  computed amount from the configured prices otherwise. The two are kept apart.
+  OpenCode Go reports `usage.cost` and `usage.opencode.allowance`; the
+  allowance is tracked separately from the charged cost.
+- A smart alias shows one aggregated row. Without prices of its own, its cost is
+  the summed cost of the concrete models it called. A call is counted for the
+  alias and for the concrete model, so the sum over the rows is larger than the
+  number of client requests; the external and the internal calls are counted
+  separately.
+- The reasoning share is never estimated: an unknown share is `0`. The tool-call
+  tokens are measured from the generated tool-call text and are an estimate.
+  A synchronous remote call without provider timings stores the total duration
+  only; no prefill or generation split is invented.
+- The hourly rows cover the current calendar day and the previous one, the
+  finished days are rolled up into daily rows, and the finished months into
+  monthly rows. The rollup runs in the service process and is idempotent.
+- The counters are exposed through the `/api/usage/*` routes, the `usage` block
+  of `/stats` and `/metrics`, the `aidir.usage` block of `/v1/models`, and the
+  `LLM statistic` tab of the WebUI. The tab opens on the last 24 hours.
+  The cost and the allowance of `/v1/models` require an authenticated endpoint
+  user token.
+
+## 29. Configurable limits and the budget refusal (2026-11-12)
+
+- A limit rule has an id, a window (`1h`, `5h`, `1d`, `1w`, `1M`), a mode
+  (`rolling` or `calendar`), optional token and money limits, and an action
+  (`warn`, `route`, or `block`). The same rule shape is accepted on the
+  instance, on a provider, and on a model, including a smart alias.
+- The money metric is automatic: the provider-reported allowance when the
+  provider reported one, the computed cost otherwise.
+- An over-budget model is refused with HTTP `429` and the code
+  `BUDGET_EXCEEDED` in the OpenAI error shape, in every protocol. A smart alias
+  drops an over-budget candidate from its candidate list and is refused only
+  when no candidate is left.
+- The block is sticky: the model stays stopped until the operator resets the
+  counters of the rule, either from the `LLM statistic` tab or with
+  `POST /api/usage/limits/reset`. The reset clears the token counters, the
+  money counter, or both, and the blocked state; the stored aggregates are not
+  changed.
+- The default action is `warn`, so an installation without limits keeps its
+  current behaviour.

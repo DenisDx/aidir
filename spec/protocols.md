@@ -85,11 +85,24 @@ Status mapping for locally generated failures:
 | Upstream timeout | 504 | `UPSTREAM_TIMEOUT` |
 | Task canceled | 503 | `CANCELED` |
 | Any other worker failure | 502 | `UPSTREAM_ERROR` |
+| The model exceeded its budget | 429 | `BUDGET_EXCEEDED` |
 | Unknown model | 404 | `INVALID_MODEL` / `model_not_found` |
 | Embedding request on a chat-only model | 422 | `EMBEDDING_NOT_SUPPORTED` |
 | Routing loop | 409 | `ROUTING_LOOP` |
 | Too many hops | 409 | `ROUTING_HOPS_EXCEEDED` |
 | The service is restarting | 503 | `RESTART_IN_PROGRESS` |
+
+**The budget refusal.** A model that exceeded a limit rule with the `block`
+action is refused with `429` and the OpenAI shape, in every protocol:
+
+```jsonc
+{"error": {"message": "Budget limit 'alias_daily' exceeded: ...", "type": "insufficient_quota", "code": "BUDGET_EXCEEDED", "param": null}}
+```
+
+A smart alias drops an over-budget candidate from its candidate list. The
+request is refused with the same error only when no candidate is left. The
+blocked state is sticky: the model stays blocked until the counters are reset
+through `POST /api/usage/limits/reset`.
 
 ### 1.5 Routing trace headers
 
@@ -330,6 +343,37 @@ base-memory admission check.
 The state is computed from the configuration, the last resource snapshot and
 the in-memory task list; the route does not probe an executor or a peer.
 
+#### The `usage` block
+
+When the usage store is available, the `aidir` block of a model carries a
+`usage` object with the counters of the requested period:
+
+```jsonc
+"usage": {
+  "period": {"label": "24h", "from": "...", "to": "..."},
+  "calls": 42, "external_calls": 40, "internal_calls": 2,
+  "successes": 40, "failures": 2, "canceled": 0,
+  "tokens": {"prompt": 125000, "prompt_billable": 61000, "cached_prompt": 64000,
+             "cache_write": 0, "completion": 18000, "reasoning": 5000, "answer": 13000},
+  "tools": {"calls": 7},
+  "cache": {"hit_rate": 0.512, "savings_usd": 0.0031},
+  "speed": {"ttft_ms_avg": 980, "prefill_tokens_per_second": 4100,
+            "generation_tokens_per_second": 62, "timing_source": "mixed"},
+  "failures_by_class": {"length_finish": 1, "http_5xx": 1}
+}
+```
+
+The period comes from the `period` query parameter: `today`, `yesterday`,
+`24h`, `7d`, `30d`, `month`, or an explicit `from` and `to` pair. The default
+is `24h`.
+
+The cost and the allowance are only included when the request carries a valid
+endpoint user token; an unauthenticated caller never receives the local spend
+or the budget state. The list endpoint adds the block per model and the
+single-model endpoint adds it with the context-bucket vector; the list needs
+`include_context=1` for that vector. The block is omitted when the usage store
+is unavailable, and it never turns a model listing into an error.
+
 ### 2.6 `POST /api/show`
 
 Ollama-shaped metadata synthesized from the configuration:
@@ -469,14 +513,39 @@ Both routes are unauthenticated compatibility probes for monitoring clients.
   "uptime_seconds": 123.456,
   "tasks": { "total": 3, "active": 1, "by_status": { "queued": 2, "running": 1 } },
   "workers": { "total": 4, "enabled": 3 },
-  "resources": { "total": 1 }
+  "resources": { "total": 1 },
+  "usage": {
+    "available": true,
+    "period": "24h",
+    "calls": 42,
+    "external_calls": 40,
+    "internal_calls": 2,
+    "prompt_tokens": 125000,
+    "completion_tokens": 18000,
+    "computed_cost": 3800,
+    "allowance": 2500,
+    "models": 3
+  }
 }
 ```
+
+The `usage` block covers the last 24 hours and is empty when the usage store
+is not available. The money counters are in micro-units of the configured
+currency.
 
 `GET /metrics` returns the same counters in Prometheus text exposition format
 (`text/plain; version=0.0.4`): `aidir_schema_version`, `aidir_up`, `aidir_uptime_seconds`,
 `aidir_tasks_total{status="..."}`, `aidir_tasks_active`, `aidir_workers_total`,
-`aidir_workers_enabled`, and `aidir_resources_total`.
+`aidir_workers_enabled`, `aidir_resources_total`, and the usage series
+`aidir_model_calls_total{provider,model,status}`,
+`aidir_model_internal_calls_total{provider,model}`,
+`aidir_model_tokens_total{provider,model,kind}`,
+`aidir_model_cost_usd{provider,model,kind}`,
+`aidir_model_cache_hit_ratio{provider,model}`,
+`aidir_model_generation_tokens_per_second{provider,model,context_bucket}`,
+`aidir_model_prefill_tokens_per_second{provider,model,context_bucket}`, and
+`aidir_model_limit_ratio{provider,model,limit}`. The labels stay bounded by
+the model catalogue; no task id, client id, or prompt-derived value is used.
 
 ### 2.10 `GET /health`
 
@@ -904,8 +973,35 @@ The timeouts come from `webui.request_timeouts` (`ollama_chat`, `mcp_proxy`,
 `model_list`, `agent_test`). A client-supplied `_timeout` for the agent test is
 clamped to `[1, agent_test_max]`.
 
-### 5.6 Settings routes
+### 5.6 Usage routes
 
+The metering routes need a WebUI session. They answer from the usage database
+and never turn an unavailable store into an error: the payload carries
+`available: false` instead.
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/api/usage/summary` | The totals of the period: calls, tokens, cost, allowance, cache, failures, speed |
+| GET | `/api/usage/models` | One row per model, with the counters and the failure classes |
+| GET | `/api/usage/series` | The non-empty buckets of the period, by hour, day, or month |
+| GET | `/api/usage/speeds` | The speed profiles per model and context bucket |
+| GET | `/api/usage/limits` | The state of every configured limit rule |
+| POST | `/api/usage/limits/reset` | Clear the counters of one rule and its blocked state |
+| GET | `/api/usage/allowance` | The provider-reported allowance per provider |
+| GET | `/api/usage/health` | The metering health of the store |
+
+The query parameters are `period` (the same presets as the model list),
+`from` and `to` (explicit ISO-8601 timestamps), `scope` (`all`, `external`,
+or `internal`; the default is `all`), `provider`, `model`, `sort`, `interval`,
+and `metric`.
+
+`POST /api/usage/limits/reset` takes `{"rule_id": "...", "counter": "tokens" | "money" | "all"}`.
+The token counter clears the prefill and the generation counters of the current
+window; the money counter clears the money counter. The reset also clears the
+blocked state of the rule. The stored aggregates are not changed. A request
+without a rule id is **400**.
+
+### 5.7 Settings routes
 The host routes (the library owns everything under `/api/settings`):
 
 | Method | Path | Purpose |
@@ -937,6 +1033,7 @@ The library routes mounted under `/api/settings` are listed in
 | Test LLM | The configuration, the tools, the dialog |
 | Test MCP | The endpoint/method settings, the available tools, the request and the result |
 | Agent Request | The endpoint and protocol, the context builder, the request logging, the timeout, the dialog |
+| LLM statistic | The period and scope bar, the usage cards, the per-model table, the performance by context size, the limits with their reset buttons |
 | Settings | The editor pane and the assistant pane |
 
 `showPage(name)` toggles the `.active` class and triggers the target page's lazy

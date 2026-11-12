@@ -8,6 +8,8 @@ AI Director (aidir) sits between your clients and AI inference backends. It acce
 Client → Endpoint → [Middleware chain] → Worker → upstream AI → Client
 ```
 
+**License:** MIT. See [LICENSE](LICENSE).
+
 ## Features
 
 - **Easy to install** : just clone it and run install.sh
@@ -16,6 +18,7 @@ Client → Endpoint → [Middleware chain] → Worker → upstream AI → Client
 - **Pluggable workers** — loaded dynamically from `workers/<id>/app.py`
 - **Opt-in lifecycle hooks** — simple Python experiments loaded from `hooks/`
 - **Streaming support** — server-sent chunks forwarded to clients in real time
+- **Usage metering** — per-model tokens, cost, speed, and limits, in the WebUI and in the API
 - **WebUI** — dashboard with live task queue, resource view, and log streaming
 - **Full isolation** — Python venv, Docker for Redis and nginx; no system-level dependencies modified
 
@@ -199,7 +202,77 @@ Key sections:
 - **`webui`** — WebUI port, auth mode, users
 - **`tasks`** — restart drain timeout plus queue/run lifecycle timeouts
 - **`logging`** — log levels per subsystem (0=EMERG … 7=DEBUG)
+- **`billing`** — the usage metering database, the periods, and the instance limits
 - **`resources`** — hardware resources to track (VRAM etc.; enforced in future releases)
+
+### Usage metering, cost, and limits
+
+aidir counts every LLM call: the tokens, the timing, the failures, the cost, and
+the speed per model and per context size. The counters live in a local SQLite
+database (`logs/usage.sqlite` by default), never in the task store, and no
+prompt, response, or file content is written into it.
+
+The **`LLM statistic`** tab of the WebUI shows the totals, the per-model table,
+the speed by context size, and the state of the limit rules. The period bar
+opens on the last 24 hours and can switch to external or internal calls only.
+The same counters are available as `/api/usage/*` routes, in `/stats`, in
+`/metrics`, and in the `aidir.usage` block of `/v1/models`.
+
+The cost is an estimate unless the provider reports one. OpenCode Go reports
+`usage.cost` and `usage.opencode.allowance`; the reported amount is used and
+kept apart from the computed one.
+
+The configuration:
+
+```json5
+{
+  "billing": {
+    "enabled": true,
+    "database": "logs/usage.sqlite",
+    "timezone": "UTC",          // the timezone of the calendar windows
+    "currency": "USD",
+    "retention": { "hourly_days": 2, "daily_months": 24 },
+    "limits": []                // limits of the whole instance
+  },
+  "models": {
+    "providers": {
+      "opencode_go": {
+        "models": [
+          {
+            "id": "glm-5.3",
+            "billing": {
+              "prices": {                       // per million tokens
+                "prefill_per_million": 1.40,
+                "cached_prefill_per_million": 0.26,
+                "generation_per_million": 4.40
+              },
+              "limits": [
+                {
+                  "id": "model_5h",
+                  "period": "5h",               // 1h, 5h, 1d, 1w, 1M
+                  "mode": "rolling",            // or calendar
+                  "max_generation_tokens": 150000,
+                  "max_money": 12,
+                  "action": "warn"              // warn, route, or block
+                }
+              ]
+            }
+          }
+        ]
+      }
+    }
+  }
+}
+```
+
+A smart alias accepts the same `billing` block. Without prices of its own, the
+alias shows the summed cost of the concrete models it called.
+
+`action: "block"` stops the model when the limit is reached and answers the
+next request with `429` and `BUDGET_EXCEEDED`; `action: "route"` removes the
+candidate from the smart routing. The block is sticky: the model stays stopped
+until the counters are reset, either from the tab or with
+`POST /api/usage/limits/reset`.
 
 #### Settings schema and the generated editor
 

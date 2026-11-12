@@ -46,6 +46,23 @@
   "cron": {
     "embedded": false
   },
+  // Usage metering: per-model counters, cost, speed profiles, and limits.
+  // The statistics are collected without prices and without limits; a model
+  // without a price has an unknown cost.
+  "billing": {
+    "enabled": true,
+    "database": "logs/usage.sqlite",
+    "timezone": "${BILLING_TIMEZONE:-UTC}",
+    "currency": "USD",
+    "retention": {
+      // Calendar days of hourly rows: the current one and the previous one.
+      "hourly_days": 2,
+      "daily_months": 24
+    },
+    // Limits of the whole instance. The same shape is accepted on a provider
+    // and on a model.
+    "limits": []
+  },
   "logging": {
     // Default level for all subsystems. String or int (0-7, systemd-journald scale).
     "level": "${LOG_LEVEL:-error}",

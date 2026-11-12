@@ -54,8 +54,16 @@ is kept as it is; a flat `spec_<name>.md` file is not used here.
 | [README.md](README.md) | User-facing installation, configuration, operation, and troubleshooting. |
 | [TEST.md](TEST.md) | Smoke, automated, regression, and manual acceptance test procedures. |
 | [AGENTS.md](AGENTS.md) | Agent workflow and maintenance rules; read-only for agents. |
+| [LICENSE](LICENSE) | The MIT license of the project, © 2026 DenisDx. |
 | [TODO.md](TODO.md) | Existing task notes and configuration reminders. |
 | [ROADMAP.md](ROADMAP.md) | Deferred work and ideas that need discussion before they become a proposal. |
+| [core/usage_store.py](core/usage_store.py) | The durable usage store: the aggregate tables, the envid rows, the speed profiles, the limit counters, the rollup, and the retention. |
+| [core/billing.py](core/billing.py) | The pricing, limit, and failure-classification rules: prices and cost, context buckets, failure classes, limit rules, and the extraction of the metering fields of a response. |
+| [core/usage_api.py](core/usage_api.py) | The `/api/usage/*` routes of the WebUI: summary, models, series, speeds, limits, reset, allowance, and health. |
+| [test_billing.py](test_billing.py) | The pricing, the cost, the context buckets, the failure classes, and the limit rules. |
+| [test_usage_store.py](test_usage_store.py) | The aggregates, the idempotency, the rollup, the retention, the limit counters, the blocked state, and the reset. |
+| [test_usage_api.py](test_usage_api.py) | The usage routes, the period presets, the usage block of the model list, the monitoring routes, and the budget refusal. |
+| [test_usage_worker.py](test_usage_worker.py) | The recording of a finished LLM call: the cost, the failures, the smart alias, and the envid. |
 | [plan_aiset_integration.md](plan_aiset_integration.md) | Migration plan of the settings subsystem to the aiset library: phases, descriptor rules, risks, delivery state. |
 | [proposal_doctor.md](proposal_doctor.md) | Proposal for `core/app.py doctor`: library `doctor` for configuration documents plus host checks (aiset checkout, `.env`, directories, venv, Docker, Redis, nginx, ports), with fix classes and open questions. |
 | [config.descriptor.json5](config.descriptor.json5) | Schema of the root `config.json5`: every key, its type, constraints, secret flag, apply policy and editor help text. |
@@ -111,5 +119,5 @@ is kept as it is; a flat `spec_<name>.md` file is not used here.
 | [proposal_ollama_embed.md](proposal_ollama_embed.md) | Transparent Ollama embedding support through OpenAIx. |
 | [proposal_anthropic.md](proposal_anthropic.md) | Anthropic Messages endpoint, provider transport, per-model protocol routing, and OpenCode Go Messages models. |
 | [proposal_opencode_go.md](proposal_opencode_go.md) | OpenCode Go provider and session integration. |
-| [proposal_billing.md](proposal_billing.md) | Per-model usage metering, price/limit configuration, OpenCode Go allowance, cost calculation, speed profiles, the `LLM statistic` WebUI tab, the `/v1/models` usage extension, and the future cost-aware routing hook. The first review round is integrated and closed all questions; the deferred items are tracked in [ROADMAP.md](ROADMAP.md) as B1-B9. |
+| [proposal_billing.md](proposal_billing.md) | Per-model usage metering, price/limit configuration, OpenCode Go allowance, cost calculation, speed profiles, the `LLM statistic` WebUI tab, the `/v1/models` usage extension, and the future cost-aware routing hook. Implemented; the review round closed all questions, and the deferred items are tracked in [ROADMAP.md](ROADMAP.md) as B1-B9. |
 | [proposal_searxng.md](proposal_searxng.md) | SearXNG search/fetch worker integration. |

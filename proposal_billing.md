@@ -1,6 +1,7 @@
 # Proposal: Model Usage, Billing, and Speed Profiles
 
-Status: draft. Product decisions are recorded; implementation has not started.
+Status: implemented. The phases below are delivered; the deviations of the
+implementation are recorded in `Implementation Notes`.
 
 ## Purpose
 
@@ -1357,3 +1358,34 @@ B9.
   is the first remedy if that becomes visible.
 - The per-envid rows double the write work of the usage store. The write path
   moves to a batching writer if that becomes a problem.
+
+## Implementation Notes
+
+The implementation follows the phases above. The places where it differs from
+the design are listed here.
+
+- **The limit counters are keyed by the hour of the call.** The row of a rule
+  is `(rule_id, window_start, scope_id)` with `window_start` the hour bucket of
+  the call, so the used amount of a window is the sum of the rows inside it.
+  A reset clears the rows of the current window and the blocked state. The
+  effect of a rolling window is therefore exact to the hour.
+- **The money counter follows the same rule** and stores the effective money of
+  the call: the reported allowance when the provider reported one, the computed
+  cost otherwise.
+- **The three aggregate tables carry the design as written**:
+  `usage_hourly`, `usage_daily`, and `usage_monthly`. The envid rows live in
+  `usage_envid`, the speed profiles in `usage_speed`, the idempotency ids in
+  `usage_call_ids`, and the limit counters in `usage_limit_counters`.
+- **The usage block of `/v1/models` is computed per request**, as the review
+  decided; the block is built by one function over a time window, so a snapshot
+  cache can be added later.
+- **The time to the first token is measured in the OpenAI and the Anthropic
+  transports.** The Ollama NDJSON path and the llama.cpp path report their own
+  timings, and a synchronous remote call without timings stores the total
+  duration only.
+- **The failure taxonomy is owned by the usage store.** The worker reports the
+  raw signals; the store maps them. The class list carries the five classes
+  the review added: `empty_response`, `refused`, `budget_exceeded`,
+  `model_unavailable`, and `tool_loop_limit`.
+- **The per-envid rows are written next to the model rows** and are not
+  exposed by the API in the first release, as the review decided.

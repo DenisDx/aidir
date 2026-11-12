@@ -800,6 +800,130 @@
           },
         },
       },
+      // The prices of one model, per million tokens.
+      billing_prices: {
+        typedef: "billing_prices",
+        type: "object",
+        description: "Prices of one model, in currency units per million tokens",
+        children: {
+          prefill_per_million: {
+            type: "number",
+            minimum: 0,
+            description: "Price of one million prompt tokens that were not served from the cache",
+          },
+          cached_prefill_per_million: {
+            type: "number",
+            minimum: 0,
+            description: "Price of one million prompt tokens served from the provider cache",
+          },
+          generation_per_million: {
+            type: "number",
+            minimum: 0,
+            description: "Price of one million generated tokens",
+          },
+          cache_write_per_million: {
+            type: "number",
+            minimum: 0,
+            description: "Price of one million tokens written to the provider cache; optional",
+          },
+        },
+      },
+
+      // One limit rule of a model, a provider, or the instance.
+      billing_limit_rule: {
+        typedef: "billing_limit_rule",
+        type: "object",
+        description: "One limit rule: a window, the token and money limits, and the action",
+        children: {
+          id: {
+            type: "string",
+            min_length: 1,
+            description: "Identifier of the rule; it must be unique in the whole configuration",
+          },
+          period: {
+            type: "string",
+            min_length: 2,
+            description: "Window length, for example 1h, 5h, 1d, 1w, or 1M",
+          },
+          mode: {
+            type: "string",
+            enum: ["rolling", "calendar"],
+            description: "Rolling window looks back one period; calendar window is aligned to the timezone",
+          },
+          max_prefill_tokens: {
+            type: "int",
+            minimum: 0,
+            description: "Limit of the prompt tokens of the window; absent means unlimited",
+          },
+          max_cached_prefill_tokens: {
+            type: "int",
+            minimum: 0,
+            description: "Limit of the cached prompt tokens of the window; absent means unlimited",
+          },
+          max_generation_tokens: {
+            type: "int",
+            minimum: 0,
+            description: "Limit of the generated tokens of the window; absent means unlimited",
+          },
+          max_money: {
+            type: "number",
+            minimum: 0,
+            description: "Limit of the money of the window; absent means unlimited",
+          },
+          money_metric: {
+            type: "string",
+            enum: ["auto"],
+            description: "Money source: the provider allowance when it reported one, the computed cost otherwise",
+          },
+          action: {
+            type: "string",
+            enum: ["warn", "route", "block"],
+            description: "Warn keeps serving, route removes the candidate from smart routing, block refuses the request",
+          },
+        },
+      },
+
+      // The billing block of a model.
+      billing_model_block: {
+        typedef: "billing_model_block",
+        type: "object",
+        description: "Prices and limits of one model",
+        children: {
+          prices: {
+            type: "billing_prices",
+            description: "Prices of the model; a model without prices has an unknown cost",
+          },
+          price_tiers: {
+            type: "array",
+            description: "Prices per prompt size; the first tier whose range contains the prompt size wins",
+            children: {
+              type: "object",
+              description: "One price tier",
+              children: {
+                min_prompt_tokens: {
+                  type: "int",
+                  minimum: 0,
+                  description: "Lowest prompt size of the tier; absent means no lower bound",
+                },
+                max_prompt_tokens: {
+                  type: "int",
+                  minimum: 0,
+                  description: "Highest prompt size of the tier; absent means no upper bound",
+                },
+                prices: {
+                  type: "billing_prices",
+                  description: "Prices of the tier",
+                },
+              },
+            },
+          },
+          limits: {
+            type: "array",
+            description: "Limit rules of the model",
+            children: { type: "billing_limit_rule", description: "One limit rule" },
+          },
+        },
+      },
     },
   },
 }

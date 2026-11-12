@@ -198,6 +198,7 @@ class BaseWorker:
         entry: dict[str, Any] = {
             "call_index": task.llm_call_count,
             "started_at": started_at,
+            "mono_started_at": time.monotonic(),
             "worker_id": self.id,
             "provider_id": provider_id,
             "request_kind": request_kind or "chat",
@@ -244,6 +245,24 @@ class BaseWorker:
         await self._persist_llm_call_diagnostics(task, force=True)
         return entry
 
+    @staticmethod
+    def _mark_first_delta(entry: dict[str, Any] | None) -> None:
+        """Record the moment of the first generated delta of a streamed call."""
+        if isinstance(entry, dict) and not entry.get("first_delta_at"):
+            entry["first_delta_at"] = time.monotonic()
+
+    @staticmethod
+    def _ttft_ms(entry: dict[str, Any]) -> int:
+        """Return the time to the first token of a streamed call, in milliseconds."""
+        first = entry.get("first_delta_at")
+        started = entry.get("mono_started_at")
+        if not first or not started:
+            return 0
+        try:
+            return max(0, int((float(first) - float(started)) * 1000))
+        except (TypeError, ValueError):
+            return 0
+
     async def _finalize_llm_call(
         self,
         task: Task,
@@ -256,6 +275,7 @@ class BaseWorker:
         response_body: bytes | None = None,
         response_spool=None,
         response_content_type: str = "application/json",
+        ttft_ms: int | None = None,
     ) -> None:
         """Finalize one compact LLM-call summary entry and persist it."""
         if not isinstance(entry, dict):
@@ -277,12 +297,27 @@ class BaseWorker:
             entry["http_status"] = int(http_status)
         if error_code:
             entry["error_code"] = error_code
+        if ttft_ms is None:
+            ttft_ms = self._ttft_ms(entry)
+        if ttft_ms:
+            entry["ttft_ms"] = int(ttft_ms)
 
         summary = self._summarize_llm_response(response)
         if summary:
             entry["response_summary"] = summary
         if entry.get("save_llm_request") and isinstance(response, dict):
             entry["response"] = response
+
+        await self._record_usage_event(
+            task,
+            entry,
+            status=status,
+            http_status=http_status,
+            error_code=error_code,
+            response=response,
+            response_body=response_body,
+            ttft_ms=ttft_ms,
+        )
 
         core = getattr(self, "_core", None)
         audit_log = getattr(core, "audit_log", None) if core is not None else None
@@ -318,6 +353,184 @@ class BaseWorker:
                 log("audit", "error", f"Failed to audit LLM response task={task.id}: {exc}", self.id or "worker")
 
         await self._persist_llm_call_diagnostics(task, force=True)
+
+    def _model_alias(self, provider_id: str, model_id: str) -> str:
+        """Return the client-facing alias of a concrete provider model."""
+        provider = self._provider_config(provider_id)
+        for model_cfg in provider.get("models") or []:
+            if not isinstance(model_cfg, dict):
+                continue
+            if str(model_cfg.get("id") or "").strip() != str(model_id or "").strip():
+                continue
+            return str(model_cfg.get("alias") or "").strip()
+        return ""
+
+    def _smart_alias(self, task: Task) -> tuple[str, str]:
+        """Return the smart alias a task was routed through, if it was one."""
+        config = getattr(task, "config", None)
+        route = config.get("route") if isinstance(config, dict) else None
+        if not isinstance(route, dict):
+            return "", ""
+        if str(route.get("selection") or "") != "smart_route":
+            return "", ""
+        provider_id = str(route.get("requested_provider") or "").strip()
+        model_id = str(route.get("requested_alias") or route.get("requested_model") or "").strip()
+        if not provider_id or not model_id:
+            return "", ""
+        return provider_id, model_id
+
+    async def _record_usage_event(
+        self,
+        task: Task,
+        entry: dict[str, Any],
+        *,
+        status: str,
+        http_status: int | None,
+        error_code: str,
+        response: dict | None,
+        response_body: bytes | None,
+        ttft_ms: int | None,
+    ) -> None:
+        """Send one finished LLM call to the usage store.
+
+        The store keeps aggregates only. A call that produced no answer adds
+        its failure class and its duration, and no tokens.
+        """
+        core = getattr(self, "_core", None)
+        store = getattr(core, "usage_store", None) if core is not None else None
+        if store is None or not getattr(store, "enabled", False):
+            return
+
+        from core.billing import classify_failure, extract_usage_fields
+
+        call_index = int(entry.get("call_index") or 0)
+        provider_id = str(entry.get("provider_id") or "")
+        model_id = str(entry.get("model") or "")
+        fields = extract_usage_fields(response)
+        status_group = "success" if status == "ok" else ("canceled" if status == "cancelled" else "failure")
+        error_text = ""
+        if isinstance(response_body, (bytes, bytearray)):
+            error_text = bytes(response_body[:4096]).decode("utf-8", errors="replace")
+        failure_class = ""
+        if status_group == "failure":
+            failure_class = classify_failure(
+                error_code=error_code,
+                http_status=http_status,
+                finish_reason=fields.get("finish_reason") or "",
+                error_body=error_text,
+                empty_response=bool(fields.get("empty_response")),
+            )
+
+        computed_cost = 0
+        cache_savings = 0
+        if fields.get("prompt_tokens"):
+            from core.usage_store import resolve_model_prices
+
+            prices = resolve_model_prices(
+                self._core.config.raw() if self._core is not None else {},
+                provider_id=provider_id,
+                model_id=model_id,
+                prompt_tokens=int(fields.get("prompt_tokens") or 0),
+            )
+            from core.billing import cache_savings_micros, compute_cost_micros
+
+            computed_cost = compute_cost_micros(
+                prices,
+                prompt_tokens=int(fields.get("prompt_tokens") or 0),
+                cached_prompt_tokens=int(fields.get("cached_prompt_tokens") or 0),
+                cache_write_tokens=int(fields.get("cache_write_tokens") or 0),
+                completion_tokens=int(fields.get("completion_tokens") or 0),
+            )
+            cache_savings = cache_savings_micros(
+                prices,
+                prompt_tokens=int(fields.get("prompt_tokens") or 0),
+                cached_prompt_tokens=int(fields.get("cached_prompt_tokens") or 0),
+            )
+
+        reported_cost = fields.get("reported_cost_micros")
+        allowance = fields.get("allowance_micros")
+        effective_money = allowance if allowance is not None else (reported_cost if reported_cost is not None else computed_cost)
+
+        alias_provider, alias_model = self._smart_alias(task)
+        route = (task.config or {}).get("route") if isinstance(task.config, dict) else None
+        protocol = str((route or {}).get("resolved_protocol") or "") if isinstance(route, dict) else ""
+        request_kind = str(entry.get("request_kind") or "chat")
+
+        event = {
+            "usage_event_id": f"{task.id}:{call_index}",
+            "task_id": task.id,
+            "call_index": call_index,
+            "provider_id": provider_id,
+            "model_id": model_id,
+            "model_alias": self._model_alias(provider_id, model_id),
+            "alias_provider_id": alias_provider,
+            "alias_model_id": alias_model,
+            "protocol": protocol,
+            "request_kind": request_kind,
+            "stream": bool(entry.get("stream")),
+            "started_at": str(entry.get("started_at") or ""),
+            "finished_at": str(entry.get("finished_at") or ""),
+            "status": status,
+            "status_group": status_group,
+            "failure_class": failure_class,
+            "error_code": error_code,
+            "http_status": http_status,
+            "scope": "external" if call_index <= 1 else "internal",
+            "client_request": call_index <= 1,
+            "total_ms": int(entry.get("duration_ms") or 0),
+            "ttft_ms": int(ttft_ms if ttft_ms is not None else entry.get("ttft_ms") or 0),
+            "queue_ms": 0,
+            "prefill_ms": int(fields.get("prefill_ms") or 0),
+            "generation_ms": int(fields.get("generation_ms") or 0),
+            "timing_source": fields.get("timing_source") or "total_only",
+            "prompt_tokens": int(fields.get("prompt_tokens") or 0),
+            "cached_prompt_tokens": int(fields.get("cached_prompt_tokens") or 0),
+            "cache_write_tokens": int(fields.get("cache_write_tokens") or 0),
+            "completion_tokens": int(fields.get("completion_tokens") or 0),
+            "reasoning_tokens": int(fields.get("reasoning_tokens") or 0),
+            "answer_tokens": int(fields.get("answer_tokens") or 0),
+            "tool_calls": int(fields.get("tool_calls") or 0),
+            "tool_argument_tokens_estimated": int(fields.get("tool_argument_tokens_estimated") or 0),
+            "input_files": 0,
+            "input_file_bytes": 0,
+            "reported_cost_micros": reported_cost,
+            "computed_cost_micros": computed_cost,
+            "allowance_micros": allowance,
+            "list_cost_micros": fields.get("list_cost_micros"),
+            "effective_money_micros": effective_money,
+            "cache_savings_micros": cache_savings,
+            "billing_source": fields.get("billing_source") or "",
+            "cost_estimated": bool(fields.get("cost_estimated")),
+            "envid": self._call_envid(task),
+        }
+        try:
+            store.record_call(event)
+        except Exception as exc:
+            log("core", "warning", f"Failed to record usage event: {exc}", self.id or "worker")
+
+    def _call_envid(self, task: Task) -> str:
+        """Return the envid of a call, when it is a known envid of the registry."""
+        raw = ""
+        payload = getattr(task, "payload", None)
+        if isinstance(payload, dict):
+            raw = str(payload.get("envid") or "")
+        if not raw:
+            config = getattr(task, "config", None)
+            client = config.get("client") if isinstance(config, dict) else None
+            if isinstance(client, dict):
+                raw = str(client.get("envid") or "")
+        envid = raw.strip()
+        if not envid:
+            return ""
+        registry = getattr(self._core, "envid_registry", None) if self._core is not None else None
+        if registry is None:
+            return ""
+        try:
+            if registry.get(envid) is None:
+                return ""
+        except Exception:
+            return ""
+        return envid
 
     async def _finalize_latest_started_llm_call(
         self,
@@ -376,6 +589,32 @@ class BaseWorker:
         stream_chunks = response.get("stream_chunks") if isinstance(response.get("stream_chunks"), list) else []
         if stream_chunks:
             summary["stream_chunk_count"] = len(stream_chunks)
+
+        # Provider billing and token details, kept so the viewer and the usage
+        # store do not have to parse the raw body again.
+        details = response.get("usage") if isinstance(response.get("usage"), dict) else {}
+        opencode = details.get("opencode") if isinstance(details.get("opencode"), dict) else {}
+        for key in ("cost", "cache_read_input_tokens", "cache_creation_input_tokens"):
+            value = details.get(key)
+            if value is not None:
+                summary[key] = value
+        for key in ("billing_source", "list_cost", "allowance", "estimated"):
+            value = opencode.get(key)
+            if value is not None:
+                summary[key] = value
+        prompt_details = details.get("prompt_tokens_details") if isinstance(details.get("prompt_tokens_details"), dict) else {}
+        completion_details = (
+            details.get("completion_tokens_details") if isinstance(details.get("completion_tokens_details"), dict) else {}
+        )
+        if prompt_details.get("cached_tokens") is not None:
+            summary["cached_prompt_tokens"] = prompt_details["cached_tokens"]
+        if completion_details.get("reasoning_tokens") is not None:
+            summary["reasoning_tokens"] = completion_details["reasoning_tokens"]
+
+        timings = response.get("timings") if isinstance(response.get("timings"), dict) else {}
+        for key in ("prompt_ms", "predicted_ms"):
+            if timings.get(key) is not None:
+                summary[key] = timings[key]
 
         return summary
 

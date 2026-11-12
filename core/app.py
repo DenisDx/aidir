@@ -56,6 +56,7 @@ from core.resources import Resources
 from core.scheduler import Scheduler
 from core.task import STATUS_CREATED, STATUS_QUEUED, STATUS_RUNNING
 from core.task import STATUS_CANCELED, STATUS_COMPLETED, STATUS_FAILED
+from core.usage_store import UsageStore, load_usage_rules
 from core.workers_loader import load_workers, resolve_worker_configs
 from core.config_merger import update_config
 from core.endpoints.endpoint_anthropic import Endpoint_anthropic
@@ -118,6 +119,7 @@ class Core:
         self.hooks = HookManager(_ROOT, self.llama_cpp_server_manager, self.config.raw())
         self.envid_registry: EnvidRegistry | None = None
         self.audit_log: AuditLog | None = None
+        self.usage_store: UsageStore | None = None
         self._background_tasks: set[asyncio.Task] = set()
         self._embedded_cron_enabled = False
         self._restart_requested = False
@@ -135,6 +137,57 @@ class Core:
         interrupted while their workers are still running them.
         """
         return not self._loop_workers_only
+
+    def _open_usage_store(self) -> UsageStore | None:
+        """Open the usage store and load the limit rules of the configuration.
+
+        The store is the single writer of the usage database, so it lives in
+        the service process only. A failure to open it is reported and does
+        not stop the service.
+        """
+        if not bool(self.config.get("billing.enabled", True)):
+            return None
+        if self._loop_workers_only:
+            # The cron process is a separate process and must not write to the
+            # usage database while the service owns it.
+            return None
+        database = str(self.config.get("billing.database", "logs/usage.sqlite") or "logs/usage.sqlite")
+        path = Path(database)
+        if not path.is_absolute():
+            if path.parts and path.parts[0] == "logs":
+                path = logs_dir() / Path(*path.parts[1:])
+            else:
+                path = _ROOT / path
+        retention = self.config.get("billing.retention") or {}
+        store = UsageStore(
+            path,
+            timezone_name=str(self.config.get("billing.timezone", "UTC") or "UTC"),
+            currency=str(self.config.get("billing.currency", "USD") or "USD"),
+            hourly_days=int(retention.get("hourly_days", 2) or 2),
+            daily_months=int(retention.get("daily_months", 24) or 24),
+        )
+        try:
+            store.open()
+            store.set_rules(load_usage_rules(self.config.raw()))
+            store.rollup()
+        except Exception as exc:
+            log("system", "error", f"Usage store disabled: {exc}")
+            store.close()
+            return None
+        self._track_background_task(
+            asyncio.create_task(self._run_usage_rollup(store), name="usage-rollup")
+        )
+        log("core", "info", f"Usage store ready: {store.path}")
+        return store
+
+    async def _run_usage_rollup(self, store: UsageStore) -> None:
+        """Close the finished buckets and apply the retention rules periodically."""
+        while True:
+            await asyncio.sleep(600)
+            try:
+                store.rollup()
+            except Exception as exc:
+                log("system", "warning", f"Usage rollup failed: {exc}")
 
     def _warn_ambiguous_model_ids(self) -> None:
         """Warn once when several provider models expose the same external name."""
@@ -238,6 +291,9 @@ class Core:
             queue_size=self.config.get("logging.audit.writer_queue_size", 256),
             overflow_policy=self.config.get("logging.audit.overflow_policy", "best_effort"),
         )
+
+        # ── Usage store ─────────────────────────────────────────────────────
+        self.usage_store = self._open_usage_store()
 
         # ── Redis ──────────────────────────────────────────────────────────
         redis_cfg = self.config.get("redis") or {}
@@ -461,6 +517,10 @@ class Core:
         
         if self.redis:
             await shutdown_step("Redis connection", self.redis.aclose(), 5.0)
+
+        if self.usage_store is not None:
+            self.usage_store.close()
+            self.usage_store = None
         
         total_elapsed = time.monotonic() - started_at
         log("core", lifecycle_level, f"Core stopping completed in {total_elapsed:.3f}s")
@@ -508,6 +568,17 @@ class Core:
         except Exception as exc:
             log("system", "error", f"Config reload: the resources could not be updated: {exc}")
             result["resources_error"] = str(exc)
+
+        # The usage rules: the limit rules and the prices are re-read, so a new
+        # budget takes effect without a restart.
+        usage_store = getattr(self, "usage_store", None)
+        if usage_store is not None:
+            try:
+                usage_store.set_rules(load_usage_rules(after))
+                result["usage_rules"] = len(usage_store.rules)
+            except Exception as exc:
+                log("system", "error", f"Config reload: the usage rules could not be loaded: {exc}")
+                result["usage_rules_error"] = str(exc)
 
         result["restart_required"] = self._sections_needing_restart(before, after)
         if result["restart_required"]:

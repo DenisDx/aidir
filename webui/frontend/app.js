@@ -68,6 +68,7 @@ function showPage(name) {
   if (name === 'llm')      loadWorkersModels();
   if (name === 'mcp')      loadMcpEndpoints();
   if (name === 'agent')    loadAgentEndpoints();
+  if (name === 'usage')    loadUsageStats();
 }
 
 function setLoginServerState(isUnavailable, message = '') {
@@ -2464,4 +2465,200 @@ async function sendAgentQueryFromPanel() {
     showScreen('login');
     setLoginServerState(true, 'Server is unavailable. Please try again later.');
   }
+})();
+
+// ── LLM statistic ───────────────────────────────────────────────────────────
+// The usage tab reads the metering database through /api/usage/*. The period
+// and the call scope only change the query window; they never change the
+// stored data.
+
+function usageMoney(micros) {
+  const value = Number(micros || 0) / 1e6;
+  return value.toFixed(6);
+}
+
+function usageRate(value) {
+  return value === null || value === undefined ? '—' : Number(value).toFixed(1);
+}
+
+function usageQuery() {
+  const period = $('usage-period') ? $('usage-period').value : '24h';
+  const scope = $('usage-scope') ? $('usage-scope').value : 'all';
+  return `period=${encodeURIComponent(period)}&scope=${encodeURIComponent(scope)}`;
+}
+
+function renderUsageSummary(payload) {
+  if (!payload || !payload.available) {
+    $('usage-state').textContent = 'Usage statistics are not available.';
+    return;
+  }
+  const tokens = payload.tokens || {};
+  const cost = payload.cost || {};
+  const speed = payload.speed || {};
+  const calls = Number(payload.calls || 0);
+  $('usage-state').textContent = '';
+
+  $('usage-calls').textContent = calls;
+  $('usage-calls-detail').textContent =
+    `external ${payload.external_calls || 0} · internal ${payload.internal_calls || 0} · requests ${payload.client_requests || 0}`;
+
+  $('usage-tokens-generated').textContent = (tokens.completion || 0).toLocaleString();
+  $('usage-tokens-prefill').textContent = (tokens.prompt_billable || 0).toLocaleString();
+  $('usage-tokens-cached').textContent = (tokens.cached_prompt || 0).toLocaleString();
+  $('usage-tokens-detail').textContent =
+    `prompt total ${(tokens.prompt || 0).toLocaleString()} · ` +
+    `reasoning ${(tokens.reasoning || 0).toLocaleString()}`;
+
+  const reported = Number(cost.reported || 0);
+  const computed = Number(cost.computed || 0);
+  $('usage-cost').textContent = usageMoney(reported || computed);
+  $('usage-cost-detail').textContent =
+    `${reported ? 'reported' : 'computed'} · allowance ${usageMoney(cost.allowance)}`;
+
+  $('usage-cache').textContent = `${Math.round((payload.cache?.hit_rate || 0) * 1000) / 10}%`;
+  $('usage-cache-detail').textContent = `saved ${usageMoney(payload.cache?.savings)}`;
+
+  const failures = Number(payload.failures || 0);
+  $('usage-failures').textContent = failures;
+  $('usage-failures-detail').textContent = calls ? `${Math.round((failures / calls) * 1000) / 10}% of the calls` : 'no calls';
+
+  $('usage-speed').textContent = usageRate(speed.generation_tokens_per_second);
+  $('usage-speed-detail').textContent =
+    `TTFT ${speed.ttft_ms_avg || 0} ms · prefill ${usageRate(speed.prefill_tokens_per_second)} tok/s`;
+}
+
+function renderUsageModels(rows) {
+  const body = $('usage-models-body');
+  body.innerHTML = '';
+  const list = Array.isArray(rows) ? rows : [];
+  $('usage-models-empty').style.display = list.length ? 'none' : 'block';
+  list.forEach((row) => {
+    const tr = document.createElement('tr');
+    const failures = Object.entries(row.failures_by_class || {})
+      .filter(([, count]) => count > 0)
+      .map(([name, count]) => `${name}:${count}`)
+      .join(' ');
+    const cells = [
+      row.model || '',
+      row.provider || '',
+      row.calls || 0,
+      row.external_calls || 0,
+      row.internal_calls || 0,
+      row.prompt_billable_tokens ?? 0,
+      row.cached_prompt_tokens || 0,
+      row.completion_tokens || 0,
+      row.reasoning_tokens || 0,
+      usageMoney(row.computed_cost),
+      usageMoney(row.allowance),
+      `${Math.round((row.cache_hit_rate || 0) * 1000) / 10}%`,
+      row.ttft_ms_avg || 0,
+      usageRate(row.generation_tokens_per_second),
+      failures || '—',
+    ];
+    cells.forEach((value) => {
+      const td = document.createElement('td');
+      td.textContent = String(value);
+      tr.appendChild(td);
+    });
+    body.appendChild(tr);
+  });
+}
+
+function renderUsageSpeeds(rows) {
+  const body = $('usage-speed-body');
+  body.innerHTML = '';
+  const list = Array.isArray(rows) ? rows : [];
+  $('usage-speed-empty').style.display = list.length ? 'none' : 'block';
+  list.forEach((row) => {
+    const tr = document.createElement('tr');
+    const cells = [
+      `${row.provider || ''}/${row.model || ''}`,
+      row.context_bucket || '',
+      row.calls || 0,
+      usageRate(row.prefill_tokens_per_second),
+      usageRate(row.generation_tokens_per_second),
+      row.ttft_ms_avg || 0,
+    ];
+    cells.forEach((value) => {
+      const td = document.createElement('td');
+      td.textContent = String(value);
+      tr.appendChild(td);
+    });
+    body.appendChild(tr);
+  });
+}
+
+function renderUsageLimits(limits) {
+  const body = $('usage-limits-body');
+  body.innerHTML = '';
+  const list = Array.isArray(limits) ? limits : [];
+  $('usage-limits-empty').style.display = list.length ? 'none' : 'block';
+  list.forEach((rule) => {
+    const tr = document.createElement('tr');
+    const usage = rule.usage || {};
+    const cells = [
+      rule.id || '',
+      `${rule.scope_type || ''}${rule.scope_id ? ` ${rule.scope_id}` : ''}`,
+      `${rule.period || ''} ${rule.mode || ''}`,
+      rule.action || '',
+      `prefill ${usage.prefill_tokens || 0} · generation ${usage.generation_tokens || 0} · money ${usageMoney(usage.money)}`,
+      rule.blocked ? 'blocked' : 'ok',
+    ];
+    cells.forEach((value) => {
+      const td = document.createElement('td');
+      td.textContent = String(value);
+      tr.appendChild(td);
+    });
+    const actions = document.createElement('td');
+    ['tokens', 'money'].forEach((counter) => {
+      const button = document.createElement('button');
+      button.className = 'btn-sm';
+      button.type = 'button';
+      button.textContent = `Reset ${counter}`;
+      button.addEventListener('click', () => resetUsageLimit(rule.id, counter));
+      actions.appendChild(button);
+    });
+    tr.appendChild(actions);
+    body.appendChild(tr);
+  });
+}
+
+async function resetUsageLimit(ruleId, counter) {
+  if (!ruleId) return;
+  if (!window.confirm(`Reset the ${counter} counter of the limit '${ruleId}'?`)) return;
+  const res = await apiPost('/api/usage/limits/reset', { rule_id: ruleId, counter });
+  if (!res.ok) {
+    $('usage-state').textContent = `Reset failed: ${res.data?.error || res.status}`;
+    return;
+  }
+  await loadUsageStats();
+}
+
+async function loadUsageStats() {
+  const query = usageQuery();
+  const [summary, models, speeds, limits] = await Promise.all([
+    apiGet(`/api/usage/summary?${query}`),
+    apiGet(`/api/usage/models?${query}`),
+    apiGet(`/api/usage/speeds?${query}`),
+    apiGet('/api/usage/limits'),
+  ]);
+  if (!summary && !models) {
+    $('usage-state').textContent = 'Usage statistics are not available.';
+    return;
+  }
+  renderUsageSummary(summary);
+  renderUsageModels(models?.models);
+  renderUsageSpeeds(speeds?.speeds);
+  renderUsageLimits(limits?.limits);
+  $('usage-updated').textContent = `Updated ${new Date().toLocaleTimeString()}`;
+}
+
+// The script is loaded at the end of the body, so the elements already exist.
+(() => {
+  const period = $('usage-period');
+  const scope = $('usage-scope');
+  const refresh = $('usage-refresh-btn');
+  if (period) period.addEventListener('change', loadUsageStats);
+  if (scope) scope.addEventListener('change', loadUsageStats);
+  if (refresh) refresh.addEventListener('click', loadUsageStats);
 })();

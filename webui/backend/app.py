@@ -2059,6 +2059,10 @@ def create_app(
 
     mount_settings_api(app, core)
 
+    from core.usage_api import mount_usage_api
+
+    mount_usage_api(app, core, require_session=_require_session)
+
     if _FRONTEND_DIR.exists():
         app.mount("/", StaticFiles(directory=str(_FRONTEND_DIR), html=True), name="frontend")
 

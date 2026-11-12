@@ -1225,6 +1225,25 @@
                     },
                   },
                 },
+                billing: {
+                  type: "object",
+                  apply: "reload",
+                  description: "Billing settings of this provider",
+                  children: {
+                    usage_source: {
+                      type: "string",
+                      enum: ["auto", "opencode"],
+                      apply: "reload",
+                      description: "Where the cost comes from: the provider usage object or the computed prices",
+                    },
+                    limits: {
+                      type: "array",
+                      apply: "reload",
+                      description: "Limit rules that apply to every model of this provider",
+                      children: { type: "billing_limit_rule", description: "One limit rule" },
+                    },
+                  },
+                },
                 models: {
                   type: "array",
                   apply: "reload",
@@ -1233,6 +1252,11 @@
                     type: "object",
                     description: "One model offered by this provider",
                     children: {
+                      billing: {
+                        type: "billing_model_block",
+                        apply: "reload",
+                        description: "Prices and limit rules of this model",
+                      },
                       id: {
                         type: "string",
                         min_length: 1,
@@ -1593,6 +1617,68 @@
             description: "Seconds a task owned by another instance stays visible and reclaimable",
             env: { allowed: true, convert: "int" },
             ui: { placeholder: "2500000" },
+          },
+        },
+      },
+
+      // ── Usage metering and billing ──────────────────────────────────────
+      billing: {
+        type: "object",
+        apply: "restart",
+        description: "Usage metering: the local statistics database, the periods, and the instance limits",
+        children: {
+          enabled: {
+            type: "bool",
+            apply: "restart",
+            description: "Collect the model usage statistics",
+          },
+          database: {
+            type: "string",
+            min_length: 1,
+            apply: "restart",
+            description: "Path of the usage database; a relative path is resolved against the aidir root",
+            ui: { placeholder: "logs/usage.sqlite" },
+          },
+          timezone: {
+            type: "string",
+            min_length: 1,
+            apply: "restart",
+            description: "Timezone the calendar windows and the displayed periods use",
+            ui: { placeholder: "UTC" },
+          },
+          currency: {
+            type: "string",
+            min_length: 1,
+            apply: "restart",
+            description: "Currency the configured prices are expressed in",
+            ui: { placeholder: "USD" },
+          },
+          retention: {
+            type: "object",
+            apply: "restart",
+            description: "How long the statistics are kept",
+            children: {
+              hourly_days: {
+                type: "int",
+                minimum: 1,
+                maximum: 90,
+                apply: "restart",
+                description: "Calendar days of hourly rows: the current one and the previous ones",
+              },
+              daily_months: {
+                type: "int",
+                minimum: 1,
+                maximum: 240,
+                apply: "restart",
+                description: "Months of daily rows before they are deleted",
+              },
+            },
+          },
+          limits: {
+            type: "array",
+            apply: "reload",
+            description: "Limit rules that apply to the whole instance",
+            children: { type: "billing_limit_rule", description: "One limit rule" },
           },
         },
       },

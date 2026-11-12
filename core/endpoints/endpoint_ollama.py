@@ -45,6 +45,7 @@ _HTTP_INVALID = 400
 _HTTP_NO_WRKR = 422
 _HTTP_UPSTREAM= 502
 _HTTP_TIMEOUT = 504
+_HTTP_BUDGET  = 429
 
 
 class Endpoint_ollama(BaseEndpoint):
@@ -612,6 +613,16 @@ class Endpoint_ollama(BaseEndpoint):
                 return False
             return bool(checker(requirements, model_id, provider_id))
 
+        def is_candidate_budget_blocked(provider_id: str, model_id: str) -> bool:
+            """Return whether a candidate exceeded its budget and must not be used."""
+            store = getattr(self._core, "usage_store", None) if self._core is not None else None
+            if store is None or not getattr(store, "enabled", False):
+                return False
+            try:
+                return store.is_candidate_blocked(provider_id, model_id) is not None
+            except Exception:
+                return False
+
         return SmartRouter(
             endpoint_id=self.id,
             default_worker_id=worker_id,
@@ -629,6 +640,7 @@ class Endpoint_ollama(BaseEndpoint):
             resolve_worker_id_for_route=self._resolve_worker_id_for_route,
             resolve_model_protocol=self._model_protocol,
             is_candidate_allowed=is_candidate_allowed,
+            is_candidate_budget_blocked=is_candidate_budget_blocked,
             on_selection=self._log_smart_route_selection,
             on_failure=self._log_smart_route_failure,
             kv_affinity=getattr(self._core, "kv_affinity", None) if self._core is not None else None,
@@ -1262,6 +1274,15 @@ class Endpoint_ollama(BaseEndpoint):
                 return JSONResponse(
                     {"error": {"code": error.get("code"), "message": error.get("message", "Request timed out")}},
                     status_code=_HTTP_TIMEOUT,
+                )
+            if error.get("code") == "BUDGET_EXCEEDED":
+                return JSONResponse(
+                    {"error": {
+                        "code": "BUDGET_EXCEEDED",
+                        "message": error.get("message", "Budget limit exceeded"),
+                        "type": "insufficient_quota",
+                    }},
+                    status_code=_HTTP_BUDGET,
                 )
             return JSONResponse(
                 {"error": error},

@@ -171,6 +171,8 @@ class CallAnthropicWorker(CallOpenAIWorker):
                         await self._finalize_llm_call(task, history_entry, status="http_error", http_status=502, error_code="UPSTREAM_ERROR", response_spool=response_spool, response_content_type=content_type)
                     return WorkerResult(ok=False, error={"code": "UPSTREAM_ERROR", "message": str(exc)})
                 event_type = str(data.get("type") or "")
+                if event_type in {"content_block_delta", "message_delta"}:
+                    self._mark_first_delta(history_entry)
                 if emit_chunk:
                     if event_type == "message_stop":
                         final = decoder.result()
