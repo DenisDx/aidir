@@ -527,6 +527,11 @@ The exec_cmd change takes effect when the provider or the service restarts.
   tokens are measured from the generated tool-call text and are an estimate.
   A synchronous remote call without provider timings stores the total duration
   only; no prefill or generation split is invented.
+- The prefill throughput counts the tokens the prefill really processed. The
+  cached prompt tokens are restored from the provider cache and are not
+  computed again, so they do not count. The provider counter is used when it
+  exists, for example the llama.cpp `timings.prompt_n`; otherwise the uncached
+  prompt tokens are the processed ones.
 - The hourly rows cover the current calendar day and the previous one, the
   finished days are rolled up into daily rows, and the finished months into
   monthly rows. The rollup runs in the service process and is idempotent.

@@ -2755,6 +2755,7 @@ class Endpoint_openaix(Endpoint_ollama):
                     "ttft_ms_avg": int(row.get("ttft_ms_avg") or 0),
                     "prefill_tokens_per_second": row.get("prefill_tokens_per_second"),
                     "generation_tokens_per_second": row.get("generation_tokens_per_second"),
+                    "generation_share": row.get("generation_share"),
                     "timing_source": "mixed",
                 },
                 "failures_by_class": {

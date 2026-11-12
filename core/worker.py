@@ -485,6 +485,7 @@ class BaseWorker:
             "timing_source": fields.get("timing_source") or "total_only",
             "prompt_tokens": int(fields.get("prompt_tokens") or 0),
             "cached_prompt_tokens": int(fields.get("cached_prompt_tokens") or 0),
+            "prefill_tokens": int(fields.get("prefill_tokens") or 0),
             "cache_write_tokens": int(fields.get("cache_write_tokens") or 0),
             "completion_tokens": int(fields.get("completion_tokens") or 0),
             "reasoning_tokens": int(fields.get("reasoning_tokens") or 0),

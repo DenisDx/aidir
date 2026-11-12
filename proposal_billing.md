@@ -839,7 +839,12 @@ compared silently with an estimate.
 
 - `ttft_ms`: request start to first generated content/reasoning/tool token;
 - `prefill_ms` and `generation_ms` when separable;
-- `prefill_tps = prompt_tokens / prefill_seconds`;
+- `prefill_tps = prefill_tokens / prefill_seconds`, where `prefill_tokens` are
+  the tokens the prefill really processed. The cached prompt tokens are only
+  restored from the provider cache and are not computed again, so they do not
+  count. The provider counter is used when it exists, for example the
+  llama.cpp `timings.prompt_n`; otherwise the uncached prompt tokens are the
+  processed ones;
 - `generation_tps = generation_tokens / generation_seconds`;
 - `reasoning_share = reasoning_tokens / completion_tokens`;
 - `queue_ms` separately from model execution time;
@@ -1043,8 +1048,8 @@ period never changes stored data, it only changes the query window.
 Layout:
 
 1. **Period bar**
-   - presets: Last 24 hours (default), Today, Yesterday, Last 7 days, Last 30
-     days, This month, Custom range;
+   - presets: Last 24 hours (default), Today, Yesterday, Current hour, Previous
+     hour, Last 7 days, Last 30 days, This month, Custom range;
    - a call-scope selector: All calls (default), External only, Internal only;
    - a visible timezone label from `billing.timezone`;
    - a refresh action and the last snapshot time.

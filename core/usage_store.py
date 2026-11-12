@@ -65,6 +65,7 @@ _AGG_COUNTERS: tuple[str, ...] = (
 _SPEED_COUNTERS: tuple[str, ...] = (
     "calls",
     "prompt_tokens",
+    "prefill_tokens",
     "generation_tokens",
     "reasoning_tokens",
     "prefill_ms",
@@ -275,6 +276,13 @@ class UsageStore:
                 """
             )
 
+        # The speed table learned the prefill counter after the first release.
+        speed_columns = {row[1] for row in connection.execute("PRAGMA table_info(usage_speed)")}
+        if "prefill_tokens" not in speed_columns:
+            connection.execute(
+                "ALTER TABLE usage_speed ADD COLUMN prefill_tokens INTEGER NOT NULL DEFAULT 0"
+            )
+
     # ── Configuration ───────────────────────────────────────────────────────
 
     def set_rules(self, rules: Iterable[LimitRule]) -> None:
@@ -471,9 +479,15 @@ class UsageStore:
         self._upsert_envid(connection, bucket, provider_id, model_id, envid, envid_counters)
 
         bucket_name = context_bucket(counters["prompt_tokens"])
+        prefill_tokens = int(event.get("prefill_tokens") or 0)
+        if not prefill_tokens:
+            # Without the provider counter, the tokens that were not cached are
+            # the ones the prefill processed.
+            prefill_tokens = max(0, counters["prompt_tokens"] - counters["cached_prompt_tokens"])
         speed_counters = {name: 0 for name in _SPEED_COUNTERS}
         speed_counters["calls"] = 1
         speed_counters["prompt_tokens"] = counters["prompt_tokens"]
+        speed_counters["prefill_tokens"] = prefill_tokens
         speed_counters["generation_tokens"] = counters["completion_tokens"]
         speed_counters["reasoning_tokens"] = counters["reasoning_tokens"]
         speed_counters["prefill_ms"] = counters["prefill_ms_sum"]
@@ -958,9 +972,15 @@ class UsageStore:
                 else 0.0
             )
             entry["ttft_ms_avg"] = int(entry["ttft_ms_sum"] / entry["calls"]) if entry["calls"] else 0
+            model_time = int(entry["prefill_ms_sum"] or 0) + int(entry["generation_ms_sum"] or 0)
+            entry["generation_share"] = (
+                round(int(entry["generation_ms_sum"] or 0) / model_time * 100, 1)
+                if model_time
+                else None
+            )
             entry["prefill_tokens_per_second"] = (
-                round(entry["prompt_tokens"] / (entry["prefill_ms_sum"] / 1000), 3)
-                if entry["prefill_ms_sum"]
+                round(entry["prompt_billable_tokens"] / (entry["prefill_ms_sum"] / 1000), 3)
+                if entry["prefill_ms_sum"] and entry["prompt_billable_tokens"]
                 else None
             )
             entry["generation_tokens_per_second"] = (
@@ -1038,6 +1058,7 @@ class UsageStore:
                     "context_bucket": key[2],
                     "calls": 0,
                     "prompt_tokens": 0,
+                    "prefill_tokens": 0,
                     "generation_tokens": 0,
                     "reasoning_tokens": 0,
                     "prefill_ms": 0,
@@ -1051,8 +1072,8 @@ class UsageStore:
         result = []
         for entry in merged.values():
             entry["prefill_tokens_per_second"] = (
-                round(entry["prompt_tokens"] / (entry["prefill_ms"] / 1000), 3)
-                if entry["prefill_ms"]
+                round(entry["prefill_tokens"] / (entry["prefill_ms"] / 1000), 3)
+                if entry["prefill_ms"] and entry["prefill_tokens"]
                 else None
             )
             entry["generation_tokens_per_second"] = (

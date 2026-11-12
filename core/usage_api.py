@@ -14,7 +14,16 @@ from fastapi import Depends, Request
 from fastapi.responses import JSONResponse
 
 # Presets of the period bar.
-PERIOD_PRESETS: tuple[str, ...] = ("today", "yesterday", "24h", "7d", "30d", "month")
+PERIOD_PRESETS: tuple[str, ...] = (
+    "today",
+    "yesterday",
+    "current_hour",
+    "prev_hour",
+    "24h",
+    "7d",
+    "30d",
+    "month",
+)
 
 # Micro-units in one currency unit.
 _MICROS = 1_000_000
@@ -51,6 +60,15 @@ def resolve_period(
         start = (local - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
         end = start + timedelta(days=1)
         label = "yesterday"
+    elif name in {"current_hour", "prev_hour"}:
+        # The buckets are UTC hours, so the hour windows follow the bucket
+        # boundaries and not the local clock.
+        hour = moment.astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0)
+        if name == "prev_hour":
+            hour -= timedelta(hours=1)
+        start = hour
+        end = hour + timedelta(hours=1)
+        label = name
     elif name == "7d":
         start = local - timedelta(days=7)
         end = moment
@@ -178,7 +196,7 @@ def mount_usage_api(
             },
             "speed": {
                 "ttft_ms_avg": int(totals.get("ttft_ms_sum") or 0) // max(1, int(totals.get("calls") or 1)),
-                "prefill_tokens_per_second": _rate(totals.get("prompt_tokens"), totals.get("prefill_ms_sum")),
+                "prefill_tokens_per_second": _rate(billable_prompt, totals.get("prefill_ms_sum")),
                 "generation_tokens_per_second": _rate(totals.get("completion_tokens"), totals.get("generation_ms_sum")),
             },
             "models": rows,

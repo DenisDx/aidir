@@ -358,14 +358,16 @@ When the usage store is available, the `aidir` block of a model carries a
   "tools": {"calls": 7},
   "cache": {"hit_rate": 0.512, "savings_usd": 0.0031},
   "speed": {"ttft_ms_avg": 980, "prefill_tokens_per_second": 4100,
-            "generation_tokens_per_second": 62, "timing_source": "mixed"},
+            "generation_tokens_per_second": 62, "generation_share": 72.5,
+            "timing_source": "mixed"},
   "failures_by_class": {"length_finish": 1, "http_5xx": 1}
 }
 ```
 
 The period comes from the `period` query parameter: `today`, `yesterday`,
-`24h`, `7d`, `30d`, `month`, or an explicit `from` and `to` pair. The default
-is `24h`.
+`current_hour`, `prev_hour`, `24h`, `7d`, `30d`, `month`, or an explicit `from`
+and `to` pair. The default is `24h`. The two hour presets are the UTC hour
+buckets of the store: the current one and the one before it.
 
 The cost and the allowance are only included when the request carries a valid
 endpoint user token; an unauthenticated caller never receives the local spend

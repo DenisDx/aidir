@@ -1135,6 +1135,8 @@
           <option value="24h" selected>Last 24 hours</option>
           <option value="today">Today</option>
           <option value="yesterday">Yesterday</option>
+          <option value="current_hour">Current hour</option>
+          <option value="prev_hour">Previous hour</option>
           <option value="7d">Last 7 days</option>
           <option value="30d">Last 30 days</option>
           <option value="month">This month</option>
@@ -1205,7 +1207,9 @@
             <th>Model</th><th>Provider</th><th>Calls</th><th>External</th><th>Internal</th>
             <th>Prefill</th><th>From cache</th><th>Generated</th><th>Reasoning</th>
             <th>Cost</th><th>Allowance</th><th>Cache</th><th>TTFT ms</th>
-            <th>Gen tok/s</th><th>Failures</th>
+            <th>Gen tok/s</th>
+            <th title="Share of the model time spent on generation; the rest is the prefill">Gen share</th>
+            <th>Failures</th>
           </tr>
         </thead>
         <tbody id="usage-models-body"></tbody>

@@ -185,7 +185,38 @@ class TestAggregates(UsageStoreTestCase):
         speeds = self.store.speeds(start, end)
         self.assertTrue(speeds)
         self.assertEqual(speeds[0]["context_bucket"], "0-10k")
-        self.assertEqual(speeds[0]["prefill_tokens_per_second"], round(1000 / 0.3, 3))
+        # 1000 prompt tokens, 100 of them cached: 900 tokens were processed.
+        self.assertEqual(speeds[0]["prefill_tokens_per_second"], round(900 / 0.3, 3))
+
+    def test_the_prefill_rate_counts_only_the_new_tokens(self) -> None:
+        """The cached tokens are restored, so they do not count in the prefill."""
+        self.store.record_call(
+            _event(
+                prompt_tokens=1000,
+                cached_prompt_tokens=800,
+                prefill_tokens=200,
+                prefill_ms=1000,
+            )
+        )
+        start, end = self._window()
+        speeds = self.store.speeds(start, end)
+        self.assertEqual(speeds[0]["prefill_tokens_per_second"], 200.0)
+        rows = self.store.model_rows(start, end)
+        self.assertEqual(rows[0]["prefill_tokens_per_second"], 200.0)
+
+    def test_the_generation_share_of_the_model_time(self) -> None:
+        """The share of the model time that went into the generation."""
+        self.store.record_call(_event(prefill_ms=1000, generation_ms=3000))
+        start, end = self._window()
+        rows = self.store.model_rows(start, end)
+        self.assertEqual(rows[0]["generation_share"], 75.0)
+
+    def test_the_generation_share_without_a_model_time(self) -> None:
+        """A call without a separable timing has no generation share."""
+        self.store.record_call(_event(prefill_ms=0, generation_ms=0))
+        start, end = self._window()
+        rows = self.store.model_rows(start, end)
+        self.assertIsNone(rows[0]["generation_share"])
 
     def test_an_idle_hour_writes_no_row(self) -> None:
         """A period without traffic has no row."""

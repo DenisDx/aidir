@@ -274,6 +274,19 @@ class TestPeriodResolution(unittest.TestCase):
         self.assertEqual(label, "custom")
         self.assertEqual(end - start, timedelta(days=1))
 
+    def test_the_hour_windows_follow_the_bucket_boundaries(self) -> None:
+        """The last hour and the previous hour are the UTC hour buckets."""
+        now = datetime(2026, 11, 12, 12, 34, 56, tzinfo=timezone.utc)
+        start, end, label = resolve_period("current_hour", tz=timezone.utc, now=now)
+        self.assertEqual(label, "current_hour")
+        self.assertEqual(start, datetime(2026, 11, 12, 12, 0, tzinfo=timezone.utc))
+        self.assertEqual(end, datetime(2026, 11, 12, 13, 0, tzinfo=timezone.utc))
+
+        start, end, label = resolve_period("prev_hour", tz=timezone.utc, now=now)
+        self.assertEqual(label, "prev_hour")
+        self.assertEqual(start, datetime(2026, 11, 12, 11, 0, tzinfo=timezone.utc))
+        self.assertEqual(end, datetime(2026, 11, 12, 12, 0, tzinfo=timezone.utc))
+
 
 class TestMonitoringRoutes(UsageApiTestCase):
     """Verify the usage part of the stats and metrics routes."""

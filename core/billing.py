@@ -743,6 +743,12 @@ def extract_usage_fields(response: dict | None) -> dict[str, Any]:
     generation_ms = int(timings.get("predicted_ms") or 0)
     timing_source = "provider" if timings else "total_only"
 
+    # The prefill processes the new tokens only: the cached ones are restored
+    # from the provider cache and are not computed again.
+    processed_prefill = _first_int(timings, "prompt_n")
+    if not processed_prefill:
+        processed_prefill = max(0, prompt_tokens - cached_prompt_tokens)
+
     reported_cost = usage.get("cost")
     allowance = opencode.get("allowance")
     list_cost = opencode.get("list_cost")
@@ -750,6 +756,7 @@ def extract_usage_fields(response: dict | None) -> dict[str, Any]:
     return {
         "prompt_tokens": prompt_tokens,
         "cached_prompt_tokens": cached_prompt_tokens,
+        "prefill_tokens": processed_prefill,
         "cache_write_tokens": cache_write_tokens,
         "completion_tokens": completion_tokens,
         "reasoning_tokens": reasoning_tokens,

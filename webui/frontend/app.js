@@ -2553,6 +2553,9 @@ function renderUsageModels(rows) {
       `${Math.round((row.cache_hit_rate || 0) * 1000) / 10}%`,
       row.ttft_ms_avg || 0,
       usageRate(row.generation_tokens_per_second),
+      row.generation_share === null || row.generation_share === undefined
+        ? '—'
+        : `${row.generation_share}%`,
       failures || '—',
     ];
     cells.forEach((value) => {

@@ -245,6 +245,31 @@ class TestUsageExtraction(unittest.TestCase):
         self.assertEqual(fields["prompt_tokens"], 42)
         self.assertEqual(fields["completion_tokens"], 7)
 
+    def test_the_prefill_counts_only_the_new_tokens(self) -> None:
+        """The cached tokens are restored, not computed, and do not count."""
+        fields = extract_usage_fields({
+            "usage": {
+                "prompt_tokens": 104454,
+                "completion_tokens": 201,
+                "prompt_tokens_details": {"cached_tokens": 103138},
+            },
+            "timings": {"cache_n": 103138, "prompt_n": 1316, "prompt_ms": 6050.7},
+        })
+        self.assertEqual(fields["prefill_tokens"], 1316)
+        self.assertEqual(fields["cached_prompt_tokens"], 103138)
+
+    def test_the_prefill_falls_back_to_the_uncached_tokens(self) -> None:
+        """Without a provider counter the uncached tokens are the prefill."""
+        fields = extract_usage_fields({
+            "usage": {
+                "prompt_tokens": 1000,
+                "completion_tokens": 10,
+                "prompt_tokens_details": {"cached_tokens": 800},
+            },
+            "timings": {"prompt_ms": 500},
+        })
+        self.assertEqual(fields["prefill_tokens"], 200)
+
 
 class TestLimitRules(unittest.TestCase):
     """Verify the parsing and the windows of the limit rules."""
