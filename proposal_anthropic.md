@@ -667,7 +667,7 @@ Modify:
 - `webui/backend/app.py`, `webui/frontend/app.js`,
   `webui/frontend/index.html` — tester protocol handling;
 - `README.md`, `README_*.md` — user documentation;
-- `DOCUMENTS.MD` — document index;
+- `DOCUMENTS.md` — document index;
 - `TEST.md` — acceptance procedures;
 - `memory/context.md`, `memory/history.md` — project state.
 
@@ -719,4 +719,4 @@ The feature is releasable when:
    error envelopes;
 8. redaction review finds no credential, session, or identity leak;
 9. `test_config_descriptor.py` and the focused suites pass;
-10. README, localized READMEs, `TEST.md`, `DOCUMENTS.MD`, and memory are updated.
+10. README, localized READMEs, `TEST.md`, `DOCUMENTS.md`, and memory are updated.

@@ -66,7 +66,7 @@ Priority meaning:
 | U42 | Documentation | P3 | `proposal_hooks.md` states that both bundled hooks ship disabled; `hooks/llama_cpp_empty_response_recovery.py` has `ENABLED = True` | `proposal_hooks.md:160-163`; `hooks/llama_cpp_empty_response_recovery.py:5` |
 | U43 | Documentation | P3 | The README references `prod.json5.example`, which does not exist in the repository | `README.md:62-63` |
 | U44 | Documentation | P3 | The plan documents quote stale test counts (574 and 366; the actual number is 586) | `plan_kv_keeper.md:5`; `plan_aiset_integration.md:433` |
-| U45 | Documentation | P3 | Several proposal status lines are stale: `proposal_kv_keeper.md` says "Proposed, not implemented", `proposal_searxng.md` says "Status: proposal", `_proposal_embedding.md` says "Proposed" — all three are shipped | those files |
+| U45 | Documentation | P3 | Several proposal status lines are stale: `proposal_kv_keeper.md` says "Proposed, not implemented", `proposal_searxng.md` says "Status: proposal", `local_proposal_embedding.md` says "Proposed" — all three are shipped | those files |
 
 ---
 
@@ -716,7 +716,7 @@ logged out.
    `hmac.compare_digest`; the value is read from `webui.auth.users[].password`.
 - `webui/backend/app.py:783-807` — a failed login is logged with the attempted
    login and the client IP, but nothing limits the attempts.
-- `_proposal_update_1.md` item F4 records the same finding; it was never
+- `local_proposal_update_1.md` item F4 records the same finding; it was never
    implemented.
 
 **Impact**
@@ -746,7 +746,7 @@ but it is also copied into backups and readable by anything that can read the
    redirects, with no check on the target address.
 - The SearXNG path resolves and fetches the same URL
   (`workers/tool/web_fetch/app.py:407-412`).
-- `_proposal_update_1.md` item F5 records the same finding; it was never
+- `local_proposal_update_1.md` item F5 records the same finding; it was never
    implemented.
 
 **Impact**
@@ -779,7 +779,7 @@ possibly into the model's output.
 **Evidence**
 - `webui/backend/app.py:1622-1626` — the `_timeout` field of the request body
    becomes the HTTP timeout without an upper bound.
-- `_proposal_update_1.md` item F9 records the same finding; it was never
+- `local_proposal_update_1.md` item F9 records the same finding; it was never
    implemented.
 
 **Impact**
@@ -802,7 +802,7 @@ connection.
 - `logs/` and `logs/audit/` are created with the default mode `0755`.
 - The logs hold the request and response bodies of every task
    (`core/audit_log.py`).
-- `_proposal_update_1.md` item F10 records the same finding; it was never
+- `local_proposal_update_1.md` item F10 records the same finding; it was never
    implemented.
 
 **Impact**
@@ -874,7 +874,7 @@ executes as its own user. The permission model is the only barrier.
 **Evidence**
 - `webui/backend/app.py:1235-1248` accepts the token as the `?token=` query
    parameter, in addition to the cookie.
-- `_proposal_update_1.md` item F6 records the same finding; the cookie path was
+- `local_proposal_update_1.md` item F6 records the same finding; the cookie path was
    added, the query parameter was kept.
 
 **Impact**
@@ -1289,14 +1289,14 @@ Small, but a reader uses these numbers to judge whether a document is current.
 - `proposal_searxng.md:3` — "## Status: proposal", although the provider chain is
    shipped (`workers/tool/web_search/app.py:114-131`,
    `workers/tool/web_fetch/app.py:160-177`).
-- `_proposal_embedding.md:5` — "Proposed", although the embeddings are shipped
+- `local_proposal_embedding.md:5` — "Proposed", although the embeddings are shipped
    (`openaix_spec.md:292-306`, `test_openaix_embeddings.py`).
 - `proposal_ollama_embed.md` — no status line at all.
 - `proposal_anthropic.md` — no status line; the "Decision" section reads as if
    nothing shipped.
 
 **Impact**
-`DOCUMENTS.MD` states that the index describes responsibilities and not the
+`DOCUMENTS.md` states that the index describes responsibilities and not the
 implementation status, and that a proposal may contain both planned and completed
 work — so a reader who consults a proposal for the status gets "not implemented"
 for a shipped feature.

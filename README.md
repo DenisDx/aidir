@@ -96,7 +96,7 @@ The shared cross-project settings library, aiset, lives in the
 consumed as a Git submodule pinned to one commit. Its complete draft is in
 [aiset/SPEC_.md](aiset/SPEC_.md) and the integration plan for this project is in
 [plan_aiset_integration.md](plan_aiset_integration.md). See
-[DOCUMENTS.MD](DOCUMENTS.MD) for the project document index.
+[DOCUMENTS.md](DOCUMENTS.md) for the project document index.
 
 ### Updating the aiset library
 
@@ -497,14 +497,17 @@ exposes the sensor command or monitoring configuration.
 bodies larger than `logging.audit.max_inline_body_bytes` are file-backed. The
 default inline limit is 1 MiB. Audit partitions are retained according to
 `retention_days` and `max_total_bytes`; `emergency_max_total_bytes` is used only
-when normal retention cannot keep storage within the emergency limit.
+when normal retention cannot keep storage within the emergency limit, and it
+never removes the current day's partition.
 
 The authenticated Task Viewer exposes compact task summaries at
 `/api/tasks/viewer/search`. Individual task details include an audit-event
 manifest at `/api/tasks/viewer/{task_id}/detail`; request and raw event bodies
 are loaded only through `/api/tasks/viewer/{task_id}/request` and
 `/api/tasks/viewer/{task_id}/raw`. File-backed bodies use the opaque
-`/api/tasks/viewer/audit-files/{file_id}` endpoint.
+`/api/tasks/viewer/audit-files/{file_id}` endpoint. When the client-request
+audit event is no longer available, Show Request falls back to the task payload
+stored in Redis.
 
 External terminal task metadata is removed by cron after
 `tasks.external_task_live` seconds (default: 86400). Queued and running tasks

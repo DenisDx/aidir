@@ -139,6 +139,99 @@ ollama). The notes and the target sequence stay in `TODO.md`.
 
 Source: `proposal_update4.md` W48 / `TODO.md`.
 
+## Deferred usage and billing work
+
+Source: `proposal_billing.md`.
+
+### B1: OpenCode Go provider allowance view
+
+Status: deferred to a future version.
+
+OpenCode Go exposes an undocumented read-only route, `GET {baseUrl}/v1/usage`,
+that returns rolling, weekly, and monthly allowance percentages with reset
+times. The first release does not poll it. A later version may poll it on a
+bounded interval to show the provider view beside the locally computed limits.
+The route is not a public contract, so the poll stays best-effort and must
+never replace the local counters. The provider view also needs a staleness
+limit, after which the UI must mark it unavailable.
+
+### B2: Percentile latency and throughput
+
+Status: deferred to a future version.
+
+The first release stores weighted averages only. A later version may add p50 and
+p95 latency and throughput. That requires bounded histograms, and the schema
+must be extended with them when the work starts. The current aggregate schema
+does not reserve space for them.
+
+### B3: Richer price sets
+
+Status: deferred to a future version.
+
+The first release has one price per token kind and an optional context-size
+tier. A later version may add time-of-day prices, for example peak and
+off-peak, a separate cache-write price, and prices for image, audio, and
+embedding units. Each of them needs its own unit definition before it can be
+stored.
+
+### B4: Raw per-call retention and re-aggregation
+
+Status: deferred to a future version.
+
+The first release aggregates on every call and keeps no raw per-call statistics
+table, so a statistics bug cannot be repaired by re-aggregation. A later
+version may add an optional raw table with a retention window, and it must be
+opt-in because it multiplies the storage.
+
+### B5: Batched usage writes
+
+Status: deferred to a future version.
+
+The first release writes one small transaction per completed LLM call. If the
+write rate becomes a problem, the write path moves to a batching writer
+without a schema change. The metering-health counter must show the difference.
+
+### B6: Per-envid exposure
+
+Status: deferred to a future version.
+
+The first release collects the usage per envid in the usage store and stores
+the calls without an envid in the empty bucket. The data is not exposed. A
+later version may add the per-envid rows to the WebUI and to the usage
+endpoints. That needs a decision on privacy, on the display of the empty
+bucket, and on label cardinality.
+
+### B7: Cost-aware and speed-aware routing
+
+Status: deferred to a future version.
+
+The first release excludes a smart candidate whose limit is exhausted and
+nothing else. Cost, cost per successful answer, cached-input cost, speed, and
+a normalized quality score do not influence the routing yet. A later version
+may add a tie-break that prefers a cheaper or faster candidate when quality
+and availability are otherwise equal. The signals exist in the usage store by
+then.
+
+### B8: `/v1/models` usage snapshot and switch
+
+Status: deferred to a future version.
+
+The first release builds the `/v1/models` usage block on every request. A
+later version may keep a snapshot of the usage summary and add a query
+parameter that turns the usage block off, so a client that does not need it
+keeps the small old response.
+
+### B9: More failure classes
+
+Status: deferred to a future version.
+
+The failure taxonomy of the first release covers the classes that the existing
+error codes and the provider shapes give for free. A later version may split
+the coarse classes further, for example a canceled call into a client
+disconnect and a service restart, or the tool-loop stop into a length stop and
+a loop limit. The taxonomy stays open, and an unknown shape falls into
+`other_error`.
+
 ## Deferred architecture
 
 - The middleware chain and the `before_tools` extension. They are recorded in

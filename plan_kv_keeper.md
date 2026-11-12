@@ -103,7 +103,7 @@ Status: complete.
 - Update this plan with final state and any deviations.
 
 Completed: `test_kv_affinity`, `test_kv_affinity_routing` and
-`test_session_resources` added; `README.md`, `TEST.md` and `DOCUMENTS.MD`
+`test_session_resources` added; `README.md`, `TEST.md` and `DOCUMENTS.md`
 updated. The full unittest discovery run passes (the full suite).
 
 ## Important Notes Discovered During Work

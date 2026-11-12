@@ -78,7 +78,7 @@ Priority meaning:
 | W46 | Protocol | P2 | Closed by decision: each attempt gets the full run budget and inter-attempt waits are not charged to it | `spec_timeouts.md` TBD |
 | W47 | Acceptance | P2 | Deferred to ROADMAP: the generated editor still needs a human browser acceptance through nginx; the procedure stays in `TEST.md` 7.1 | `plan_aiset_integration.md`, `TEST.md` 7.1 |
 | W48 | Tooling | P3 | Deferred to ROADMAP: several selectable `<name>.json5.example` sets and installation scripts for a full configuration set | `TODO.md` |
-| W49 | Documentation | P3 | Closed by policy: the historical analysis is not rewritten; later rounds record their resolutions in their own ledgers | `_proposal_update_1.md` F1–F13 |
+| W49 | Documentation | P3 | Closed by policy: the historical analysis is not rewritten; later rounds record their resolutions in their own ledgers | `local_proposal_update_1.md` F1–F13 |
 
 ### 1.1 Status snapshot (2026-10-24)
 

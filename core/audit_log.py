@@ -254,7 +254,9 @@ class AuditLog:
                 continue
             body = event.get("data")
             endpoint = str(event.get("endpoint") or "").strip()
-            model = str(body.get("model") or body.get("name") or "").strip() if isinstance(body, dict) else ""
+            model = str(event.get("model") or "").strip()
+            if not model and isinstance(body, dict):
+                model = str(body.get("model") or body.get("name") or "").strip()
             task_id = str(event.get("task_id") or "").strip()
             if not endpoint or not model or not task_id:
                 continue
@@ -359,17 +361,11 @@ class AuditLog:
             age_eligible = (today - partition_date).days >= max(2, retention_days)
             quota_eligible = total > max_total_bytes and (today - partition_date).days >= 2
             emergency_pressure = force_emergency or total > emergency_max_total_bytes
-            emergency_eligible = emergency_pressure and (
-                partition_date < today
-                or (len(ordered_days) == 1 and day == ordered_days[-1])
-            )
+            # Today's partition is the live evidence for current tasks. Emergency
+            # retention must never delete it, even when it is the only day left.
+            emergency_eligible = emergency_pressure and partition_date < today
             if not age_eligible and not quota_eligible and not emergency_eligible:
                 continue
-            if partition_date == today and emergency_eligible:
-                logging.getLogger(__name__).warning(
-                    "Audit emergency retention is deleting today's active partition to stay within %s bytes",
-                    emergency_max_total_bytes,
-                )
             files = candidates[day]
             bytes_removed = self._partition_usage_bytes(day, files)
             self._set_partition_state(day, "deleting")
@@ -787,7 +783,7 @@ class AuditLog:
         }
         normalized_content_type = content_type.split(";", 1)[0].strip().lower()
         body_format = self._body_format_for_content_type(normalized_content_type)
-        if self._must_store_body_as_file(normalized_content_type):
+        if len(body) > self._max_inline_body_bytes or self._must_store_body_as_file(normalized_content_type):
             return fields | {"body_format": body_format} | self._store_body_file(body, normalized_content_type, day)
 
         try:

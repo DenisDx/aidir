@@ -9,7 +9,31 @@ highest-numbered `proposal_updateN.md` is open; older `proposal_update*` files
 are closed. Non-update proposals keep their own status. Deferred work lives in
 `ROADMAP.md`.
 
+## Local documents
+
+A file whose name starts with `local_` is a local replacement for the document
+of the same name without the prefix, in the same directory: `local_SPEC.md`
+replaces `SPEC.md`, `local_AGENTS.md` replaces `AGENTS.md`. A local replacement
+keeps the role, the protection, and the editing rules of the document it
+replaces, and it is used instead of the tracked file whenever it exists. Local
+files are excluded from Git by the `local_*` pattern in `.gitignore`, so they
+are not part of the shared repository state.
+
+The local documents of this checkout:
+
+| Document | Replaces | Responsibility |
+|---|---|---|
+| [local_SPEC.md](local_SPEC.md) | `SPEC.md` | The local variant of the base technical specification. |
+| [local_proposal_embedding.md](local_proposal_embedding.md) | `proposal_embedding.md` | Queue-managed OpenAIx embeddings. |
+| [local_proposal_log_refactoring.md](local_proposal_log_refactoring.md) | `proposal_log_refactoring.md` | Logging and audit storage and viewer refactoring. |
+| [local_proposal_refactoring_1.md](local_proposal_refactoring_1.md) | `proposal_refactoring_1.md` | First refactoring plan and execution record. |
+| [local_proposal_update_1.md](local_proposal_update_1.md) | `proposal_update_1.md` | Proposed first security-update round. |
+
 ## Specifications
+
+The scoped specifications of this project live in the `spec/` directory, one
+document per topic. The `spec/<topic>.md` path is the established location and
+is kept as it is; a flat `spec_<name>.md` file is not used here.
 
 | Document | Responsibility |
 |---|---|
@@ -73,10 +97,6 @@ are closed. Non-update proposals keep their own status. Deferred work lives in
 
 | Document | Responsibility |
 |---|---|
-| [_proposal_embedding.md](_proposal_embedding.md) | Queue-managed OpenAIx embeddings. |
-| [_proposal_log_refactoring.md](_proposal_log_refactoring.md) | Logging/audit storage and viewer refactoring. |
-| [_proposal_refactoring_1.md](_proposal_refactoring_1.md) | First refactoring plan and execution record. |
-| [_proposal_update_1.md](_proposal_update_1.md) | Proposed first security-update round. |
 | [before_tools_worker.md](before_tools_worker.md) | Pre-tool-call context-processing hook. Deferred; see SPEC.md §14.4. |
 | [proposal_update1.md](proposal_update1.md) | Closed first work list: the 45 confirmed defects and design gaps from SPEC.md §14, each with its evidence, the proposed modification and its validation. |
 | [proposal_security_dashboard.md](proposal_security_dashboard.md) | Dashboard security panel, left of the system-health card, listing open security findings such as MCP without authentication. |
@@ -91,4 +111,5 @@ are closed. Non-update proposals keep their own status. Deferred work lives in
 | [proposal_ollama_embed.md](proposal_ollama_embed.md) | Transparent Ollama embedding support through OpenAIx. |
 | [proposal_anthropic.md](proposal_anthropic.md) | Anthropic Messages endpoint, provider transport, per-model protocol routing, and OpenCode Go Messages models. |
 | [proposal_opencode_go.md](proposal_opencode_go.md) | OpenCode Go provider and session integration. |
+| [proposal_billing.md](proposal_billing.md) | Per-model usage metering, price/limit configuration, OpenCode Go allowance, cost calculation, speed profiles, the `LLM statistic` WebUI tab, the `/v1/models` usage extension, and the future cost-aware routing hook. The first review round is integrated and closed all questions; the deferred items are tracked in [ROADMAP.md](ROADMAP.md) as B1-B9. |
 | [proposal_searxng.md](proposal_searxng.md) | SearXNG search/fetch worker integration. |

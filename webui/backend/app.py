@@ -206,6 +206,49 @@ def _parse_json_field(value: str | None) -> Any:
         return value
 
 
+def _hydrate_audit_event(audit_log: Any, event: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Attach an on-demand body to a file-backed audit event for the viewer."""
+    if not isinstance(event, dict) or "data" in event:
+        return event
+    body_file = event.get("body_file")
+    if not isinstance(body_file, dict):
+        return event
+    relative_path = Path(str(body_file.get("relative_path") or ""))
+    if relative_path.is_absolute() or ".." in relative_path.parts:
+        return event
+    try:
+        body = (audit_log.directory / relative_path).read_bytes()
+        decoded = body.decode("utf-8")
+    except (OSError, UnicodeDecodeError):
+        return event
+    hydrated = dict(event)
+    try:
+        hydrated["data"] = json.loads(decoded)
+        hydrated["data_encoding"] = "json"
+    except json.JSONDecodeError:
+        hydrated["data"] = decoded
+        hydrated["data_encoding"] = "utf-8"
+    return hydrated
+
+
+def _task_payload_event(task_id: str, raw: dict[str, str]) -> dict[str, Any] | None:
+    """Build a synthetic client-request event from the persisted task payload."""
+    payload = _parse_json_field(raw.get("payload"))
+    if payload in (None, ""):
+        return None
+    return {
+        "schema_version": 1,
+        "event_id": f"task-payload:{task_id}",
+        "recorded_at": raw.get("created_at") or "",
+        "type": "client_request",
+        "task_id": task_id,
+        "source": "task_payload",
+        "data": payload,
+        "data_encoding": "json" if not isinstance(payload, str) else "utf-8",
+        "body_format": "json",
+    }
+
+
 def _hmget_hash(fields: tuple[str, ...], values: list[Any]) -> dict[str, Any]:
     """Build a task-hash fragment from an HMGET reply, omitting missing fields."""
     return {field: value for field, value in zip(fields, values) if value is not None}
@@ -1172,14 +1215,24 @@ def create_app(
 
     @app.get("/api/tasks/viewer/{task_id}/request")
     async def task_viewer_request(task_id: str, session: dict = Depends(_require_session)):
-        """Return the client-request body only when its audit event exists."""
+        """Return the client-request body from audit, or the task payload as a fallback."""
         audit_log = getattr(core, "audit_log", None)
-        if audit_log is None:
-            raise HTTPException(status_code=404, detail="Audit is unavailable")
-        for event in audit_log.list_task_events(task_id):
-            if event["type"] == "client_request":
-                return {"event": audit_log.read_event(event["event_id"])}
-        raise HTTPException(status_code=404, detail="Client request audit event is unavailable")
+        if audit_log is not None:
+            for event in audit_log.list_task_events(task_id):
+                if event["type"] == "client_request":
+                    hydrated = _hydrate_audit_event(audit_log, audit_log.read_event(event["event_id"]))
+                    if isinstance(hydrated, dict):
+                        return {"event": hydrated}
+        live_task = core.queue.get_task(task_id) if core.queue else None
+        if live_task is not None:
+            raw = live_task.to_redis_hash()
+        else:
+            ns = core.config.get("instance", "aidir")
+            raw = await core.redis.hgetall(f"{ns}:task:{task_id}")
+        event = _task_payload_event(task_id, raw or {})
+        if event is None:
+            raise HTTPException(status_code=404, detail="Client request audit event is unavailable")
+        return {"event": event}
 
     @app.get("/api/tasks/viewer/{task_id}/raw")
     async def task_viewer_raw(task_id: str, type: str, event_id: str, session: dict = Depends(_require_session)):
@@ -1192,7 +1245,7 @@ def create_app(
         event = audit_log.read_event(event_id)
         if event is None or event.get("task_id") != task_id or event.get("type") != type:
             raise HTTPException(status_code=404, detail="Audit event not found")
-        return {"event": event}
+        return {"event": _hydrate_audit_event(audit_log, event)}
 
     @app.get("/api/tasks/viewer/audit-files/{file_id}")
     async def task_viewer_audit_file(file_id: str, session: dict = Depends(_require_session)):

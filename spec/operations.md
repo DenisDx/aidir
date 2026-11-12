@@ -568,9 +568,12 @@ A partition is removed when:
 - its age is at least `max(2, retention_days)`;
 - the total exceeds `max_total_bytes` **and** the partition is at least two days
   old;
-- the emergency limit is exceeded **and** the partition is not today;
-- the emergency limit is still exceeded when today's partition is the only daily
-  partition left. This removal is logged prominently and is the last resort.
+- the emergency limit is exceeded **and** the partition is not today.
+
+Today's partition is never removed by emergency retention, even when it is the
+only daily partition left. If storage is still above the limits, the retention
+reports an unhealthy status instead of destroying the active day's audit
+evidence.
 
 The deletion state is persisted before the filesystem is touched, so an
 interrupted deletion is resumed by `reconcile_partitions()` and the events of a

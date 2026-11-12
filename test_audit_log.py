@@ -186,6 +186,43 @@ class AuditLogTests(unittest.TestCase):
             self.assertFalse(json_spool.exists())
             self.assertFalse(text_spool.exists())
 
+    def test_in_memory_body_event_honors_the_inline_limit(self):
+        """Store oversized JSON, text, and SSE bodies as exact files, not inline."""
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            audit_log = AuditLog(temporary_directory, max_inline_body_bytes=8)
+            cases = (
+                ("application/json", b'{"model":"example"}'),
+                ("text/plain", b"hello world"),
+                ("text/event-stream", b"data: {'ok':true}\n\n"),
+            )
+            for content_type, body in cases:
+                event = audit_log.record_body_event(
+                    "client_request", body, content_type=content_type
+                )
+                self.assertEqual(event["body_storage"], "file", content_type)
+                self.assertNotIn("data", event, content_type)
+                body_path = audit_log.directory / event["body_file"]["relative_path"]
+                self.assertEqual(body_path.read_bytes(), body)
+                self.assertEqual(event["body_bytes"], len(body))
+
+    def test_recent_routes_use_event_metadata_for_file_backed_bodies(self):
+        """Keep route filters working when a large request body is file-backed."""
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            audit_log = AuditLog(temporary_directory, max_inline_body_bytes=8)
+            audit_log.record_body_event(
+                "client_request",
+                b'{"model":"large-model"}',
+                content_type="application/json",
+                endpoint="/v1/chat/completions",
+                task_id="task-large",
+                model="large-model",
+            )
+
+            routes, task_routes = audit_log.recent_client_request_routes()
+
+        self.assertEqual(task_routes["task-large"], "/v1/chat/completions\x1flarge-model")
+        self.assertEqual(routes[0]["label"], "large-model | /v1/chat/completions")
+
     def test_completed_sse_decodes_all_json_chunks_without_changing_body_metadata(self):
         """Finalize complete SSE into ordered JSON values with exact original byte metadata."""
         values = [
@@ -659,8 +696,8 @@ class AuditLogTests(unittest.TestCase):
             self.assertFalse(closed_journal.exists())
             self.assertTrue(active_journal.exists())
 
-    def test_emergency_retention_removes_today_when_it_is_the_only_partition(self):
-        """One oversized active day must not wait until tomorrow to be reclaimed."""
+    def test_emergency_retention_preserves_today_when_it_is_the_only_partition(self):
+        """Emergency retention must never delete the active local day."""
         with tempfile.TemporaryDirectory() as temporary_directory:
             audit_log = AuditLog(temporary_directory)
             today = datetime.now().astimezone().date().isoformat()
@@ -673,8 +710,8 @@ class AuditLogTests(unittest.TestCase):
                 emergency_max_total_bytes=0,
             )
 
-            self.assertEqual(removed, [today])
-            self.assertFalse(active_journal.exists())
+            self.assertEqual(removed, [])
+            self.assertTrue(active_journal.exists())
 
     def test_forced_emergency_retention_stops_after_reaching_target(self):
         """Avoid deleting later closed partitions after one deletion meets the emergency target."""

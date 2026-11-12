@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import json
+import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from fastapi.testclient import TestClient
@@ -60,6 +62,10 @@ class _Redis:
         """Return all seeded task keys in one bounded page."""
         self.scan_calls += 1
         return 0, list(self.hashes)
+
+    async def hgetall(self, key):
+        """Return one seeded task hash."""
+        return dict(self.hashes.get(key, {}))
 
     def pipeline(self, transaction=False):
         """Create a single batched hash-read pipeline."""
@@ -566,3 +572,67 @@ class ViewerSearchTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual([task["id"] for task in response.json()["tasks"]], ["llama"])
+
+    def test_request_falls_back_to_the_persisted_task_payload(self):
+        """Show the stored request when no client-request audit event survived."""
+        task_id = "payload-task"
+        payload = {"messages": [{"role": "user", "content": "hello"}]}
+        hashes = {
+            f"aidir:task:{task_id}": {
+                **_summary(task_id, "2026-10-01T12:00:00+00:00", "model"),
+                "payload": json.dumps(payload),
+            },
+        }
+        core = _Core(_Redis(hashes))
+
+        async def session(*args, **kwargs):
+            """Provide an authenticated Viewer session."""
+            return {"permissions": ["all"], "login": "test"}
+
+        with patch("webui.backend.app._get_session", session):
+            response = TestClient(create_app(core)).get(
+                f"/api/tasks/viewer/{task_id}/request"
+            )
+
+        self.assertEqual(response.status_code, 200)
+        event = response.json()["event"]
+        self.assertEqual(event["source"], "task_payload")
+        self.assertEqual(event["type"], "client_request")
+        self.assertEqual(event["data"], payload)
+
+    def test_request_hydrates_a_file_backed_client_request(self):
+        """Read an oversized request body from its audit file on demand."""
+        with tempfile.TemporaryDirectory() as directory:
+            task_id = "file-task"
+            body = {"messages": [{"role": "user", "content": "large"}]}
+            relative = Path("files") / "2026-10-01" / "body"
+            path = Path(directory) / relative
+            path.parent.mkdir(parents=True)
+            path.write_text(json.dumps(body), encoding="utf-8")
+            event = {
+                "event_id": "event-1",
+                "task_id": task_id,
+                "type": "client_request",
+                "body_file": {"relative_path": str(relative), "content_type": "application/json"},
+            }
+            core = _Core(_Redis({}))
+            core.audit_log = MagicMock()
+            core.audit_log.directory = Path(directory)
+            core.audit_log.list_task_events.return_value = [
+                {"event_id": "event-1", "type": "client_request"}
+            ]
+            core.audit_log.read_event.return_value = event
+
+            async def session(*args, **kwargs):
+                """Provide an authenticated Viewer session."""
+                return {"permissions": ["all"], "login": "test"}
+
+            with patch("webui.backend.app._get_session", session):
+                response = TestClient(create_app(core)).get(
+                    f"/api/tasks/viewer/{task_id}/request"
+                )
+
+        self.assertEqual(response.status_code, 200)
+        hydrated = response.json()["event"]
+        self.assertEqual(hydrated["data"], body)
+        self.assertEqual(hydrated["data_encoding"], "json")

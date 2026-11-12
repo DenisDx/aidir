@@ -26,7 +26,7 @@ narrow, one-time correction.
 - `proposal_update*` is reserved for small list fixes, bugs and inaccuracies.
   Large new features belong in a separate `proposal_<name>.md`.
 - Deferred work and ideas that still need discussion belong in `ROADMAP.md`.
-- `DOCUMENTS.MD` must stay synchronized with every document added, renamed or
+- `DOCUMENTS.md` must stay synchronized with every document added, renamed or
   closed.
 - `SPEC_NEW.md` is not a current document name. References to it mean
   `SPEC.md`.
@@ -123,7 +123,7 @@ beginning.
 - W5 (settings-editor write of `exec_cmd`) is deferred. It is tracked in
   `ROADMAP.md`.
 - W7 (CSRF token) is deferred. It is tracked in `ROADMAP.md`.
-- The security analysis in `_proposal_update_1.md` is historical. Its open
+- The security analysis in `local_proposal_update_1.md` is historical. Its open
   findings are tracked by the current proposal ledger and `ROADMAP.md`, not by
   editing the closed security analysis in place.
 
@@ -171,9 +171,10 @@ accepted for configuration compatibility but deprecated and ignored.
 - Audit `durable` enqueue and receipt waits are bounded. A failure raises
   `TimeoutError` and marks health unhealthy. `best_effort` still drops on queue
   overflow, and `dropped_recent` is visible in the execution-health line.
-- Emergency audit retention may delete today's partition when it is the only
-  daily partition left and the emergency limit is exceeded. The deletion is
-  logged at warning level.
+- Emergency audit retention never deletes today's partition, even when it is
+  the only daily partition left. If the emergency limit is still exceeded, the
+  retention reports an unhealthy status instead of destroying the active day's
+  audit evidence.
 - Upstream error responses preserve `retry-after`, `request-id`, `x-request-id`
   and the `x-ratelimit-*` family. Other upstream headers are dropped.
 - Anthropic signed thinking blocks keep their signature through conversion. The

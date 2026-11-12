@@ -356,7 +356,7 @@ Every phase ends green on the existing test suite and is separately revertable.
   (`core/config.py:30-394`), `json5` and `python-dotenv` imports where they are
   no longer needed, and the three legacy settings endpoints.
 - `README.md`, `README_RU.md` (if present), `TEST.md`, `SPEC_.md` corrections for
-  the semantics that changed, `DOCUMENTS.MD`, `memory/context.md`,
+  the semantics that changed, `DOCUMENTS.md`, `memory/context.md`,
   `memory/history.md`.
 
 ---

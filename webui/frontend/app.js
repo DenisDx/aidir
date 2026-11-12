@@ -1234,14 +1234,23 @@ async function openTaskViewerSteps(task) {
   const data = await apiGet(`/api/tasks/viewer/${encodeURIComponent(taskId)}/detail`);
   if (!data) return;
   const container = document.createElement('div');
-  const metadata = document.createElement('pre');
-  metadata.textContent = JSON.stringify(data.task || {}, null, 2);
+  const viewer = window.TaskStepsViewer;
+  const metadata = viewer && typeof viewer.renderJsonTree === 'function'
+    ? viewer.renderJsonTree(data.task || {}, false, true)
+    : document.createTextNode(JSON.stringify(data.task || {}, null, 2));
   container.appendChild(metadata);
   const title = `Task ${taskId}`;
   const subtitle = data.active ? 'Task is active; completed audit events only.' : 'Compact task metadata and audit manifest';
   const openManifest = () => openTaskViewerNodeModal(title, subtitle, container);
+  const auditEvents = Array.isArray(data.audit_events) ? data.audit_events : [];
+  if (!auditEvents.length) {
+    const note = document.createElement('div');
+    note.className = 'task-steps-summary-label';
+    note.textContent = 'No audit events are retained for this task.';
+    container.appendChild(note);
+  }
 
-  for (const event of data.audit_events || []) {
+  for (const event of auditEvents) {
     const button = document.createElement('button');
     button.type = 'button';
     button.className = 'btn secondary';

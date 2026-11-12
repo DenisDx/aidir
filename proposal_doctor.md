@@ -318,7 +318,7 @@ same rows it already renders for the editor.
 | 6 | `--quick` at service start, **before the servers bind**, plus the two-line startup hint; never blocking | `core/app.py` |
 | 7 | Tests: broken config, `--config-only` touches nothing, `--help` works with a broken config, Redis down, port mismatch, `--root` without TTY, fixes idempotent, exit codes | `test_doctor.py` (new) |
 | 8 | Run the report at the end of installation and print the summary | `install.sh` |
-| 9 | Document the command, modes and exit codes | `README.md`, `TEST.md`, `DOCUMENTS.MD` |
+| 9 | Document the command, modes and exit codes | `README.md`, `TEST.md`, `DOCUMENTS.md` |
 
 Steps 1, 5 and 6 can ship first: a report-only doctor that calls
 `Service.load().issues` and logs one line at startup already solves the 040 class

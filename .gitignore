@@ -31,8 +31,7 @@ config.json5.lock
 memory/
 AGENTS.md
 
-#local files
-_local_*.*
-_local_*/
+# local files: local_* replaces the matching document in the same directory
+local_*
 
 # aiset is a Git submodule (see .gitmodules), not an ignored directory.
