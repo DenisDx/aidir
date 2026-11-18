@@ -40,7 +40,17 @@
   "redis": {
     "host": "${REDIS_HOST:-127.0.0.1}",
     "port": ${REDIS_PORT:-6379},
-    "password": "${REDIS_PASSWORD:-}"
+    "password": "${REDIS_PASSWORD:-}",
+    // redis: plain in-memory server. dragonfly: Redis-compatible server with
+    // SSD tiering, so cold task bodies live on disk while keys stay in RAM.
+    "backend": "${REDIS_BACKEND:-redis}",
+    // Server memory cap. 0 disables it. With Dragonfly this is the RAM budget;
+    // bodies beyond it are moved to the SSD tier.
+    "maxmemory": "${REDIS_MAXMEMORY:-0}",
+    "maxmemory_policy": "${REDIS_MAXMEMORY_POLICY:-noeviction}",
+    "maxmemory_samples": ${REDIS_MAXMEMORY_SAMPLES:-5},
+    "lazyfree_lazy_expire": "${REDIS_LAZYFREE_LAZY_EXPIRE:-false}",
+    "lazyfree_lazy_user_del": "${REDIS_LAZYFREE_LAZY_USER_DEL:-false}"
   },
   // Run periodic maintenance inside the aidir process instead of system cron.
   "cron": {
@@ -746,7 +756,12 @@
     // Max execution time after the task actually starts running.
     "run_timeout": ${TASK_RUN_TIMEOUT_SECONDS:-300},
     // Retain completed external task metadata for one day; set 0 to disable cleanup.
-    "external_task_live": ${EXTERNAL_TASK_LIVE_SECONDS:-86400}
+    "external_task_live": ${EXTERNAL_TASK_LIVE_SECONDS:-86400},
+    // Store finished-task bodies in one compressed string key instead of the
+    // task hash, so a tiering backend can keep them out of RAM.
+    "body_storage": "${TASKS_BODY_STORAGE:-true}",
+    "body_compression_level": ${TASKS_BODY_COMPRESSION_LEVEL:-6},
+    "body_offload_batch": ${TASKS_BODY_OFFLOAD_BATCH:-500}
   },
   "envids": {
     "check_period_minutes": ${ENVIDS_CHECK_PERIOD_MINUTES:-600},

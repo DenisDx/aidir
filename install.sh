@@ -568,6 +568,61 @@ if [[ -z "${NGINX_HTTP_PORT:-}" ]]; then
   info "NGINX_HTTP_PORT not set; defaulted to $NGINX_HTTP_PORT"
 fi
 
+# ── Datastore backend ────────────────────────────────────────────────────────
+# redis:     plain in-memory Redis.
+# dragonfly: Redis-compatible, keeps keys/metadata in RAM and moves cold task
+#            bodies to the local SSD tier, so the RAM cap is not a data cap.
+REDIS_BACKEND="${REDIS_BACKEND:-${AIDIR_DATASTORE:-}}"
+if [[ -z "$REDIS_BACKEND" ]]; then
+  if [[ -t 0 ]]; then
+    echo
+    echo "Datastore backend:"
+    echo "  1) redis      plain in-memory Redis"
+    echo "  2) dragonfly  Redis-compatible, task bodies tiered to SSD"
+    read -r -p "Choose [1/2] (default 1): " DATASTORE_CHOICE
+    case "$DATASTORE_CHOICE" in
+      2|dragonfly|df) REDIS_BACKEND="dragonfly" ;;
+      *) REDIS_BACKEND="redis" ;;
+    esac
+  else
+    REDIS_BACKEND="redis"
+  fi
+fi
+case "$REDIS_BACKEND" in
+  redis|dragonfly) ;;
+  *) die "REDIS_BACKEND must be 'redis' or 'dragonfly' (got '$REDIS_BACKEND')" ;;
+esac
+set_env_var "$ENV_FILE" "REDIS_BACKEND" "$REDIS_BACKEND"
+
+# A RAM cap is safe with Dragonfly because cold bodies live on SSD. Plain Redis
+# has no disk tier, so an aggressive default would start rejecting writes on an
+# existing dataset; keep it unlimited unless the operator set a value.
+if [[ -z "${REDIS_MAXMEMORY:-}" ]]; then
+  if [[ "$REDIS_BACKEND" == "dragonfly" ]]; then
+    REDIS_MAXMEMORY="3gb"
+  else
+    REDIS_MAXMEMORY="0"
+  fi
+  set_env_var "$ENV_FILE" "REDIS_MAXMEMORY" "$REDIS_MAXMEMORY"
+fi
+if [[ -z "${REDIS_MAXMEMORY_POLICY:-}" ]]; then
+  REDIS_MAXMEMORY_POLICY="noeviction"
+  set_env_var "$ENV_FILE" "REDIS_MAXMEMORY_POLICY" "$REDIS_MAXMEMORY_POLICY"
+fi
+info "Datastore backend: $REDIS_BACKEND (maxmemory=${REDIS_MAXMEMORY:-0})"
+
+# The base file stays the default; Dragonfly is layered as an override so a
+# plain `docker compose up -d` on an existing install keeps starting Redis.
+COMPOSE_FILE_ARGS=(-f "$SCRIPT_DIR/docker-compose.yml")
+if [[ "$REDIS_BACKEND" == "dragonfly" ]]; then
+  DATASTORE_CONTAINER="aidir_redis"
+  DATASTORE_LABEL="Dragonfly"
+  COMPOSE_FILE_ARGS+=(-f "$SCRIPT_DIR/docker-compose.dragonfly.yml")
+else
+  DATASTORE_CONTAINER="aidir_redis"
+  DATASTORE_LABEL="Redis"
+fi
+
 # ── Step 3: venv + dependencies ───────────────────────────────────────────────
 if [[ -d "$VENV_DIR" ]] && [[ ! -x "$VENV_DIR/bin/python" || ! -x "$VENV_DIR/bin/pip" ]]; then
   warn "Existing venv is incomplete (missing bin/python or bin/pip); recreating it..."
@@ -588,14 +643,14 @@ info "Python dependencies OK"
 # ── Step 4: Docker images / containers ────────────────────────────────────────
 info "Building Docker images…"
 cd "$SCRIPT_DIR"
-if ! $DOCKER_COMPOSE build; then
+if ! $DOCKER_COMPOSE "${COMPOSE_FILE_ARGS[@]}" build; then
   warn "Docker build failed (possible containerd cache issue); retrying with --no-cache…"
-  $DOCKER_COMPOSE build --no-cache || die "Docker build failed on retry. Check Docker/containerd state and re-run."
+  $DOCKER_COMPOSE "${COMPOSE_FILE_ARGS[@]}" build --no-cache || die "Docker build failed on retry. Check Docker/containerd state and re-run."
 fi
 DOCKER_BUILT=1
 
 stop_existing_aidir_service
-$DOCKER_COMPOSE down --remove-orphans
+$DOCKER_COMPOSE "${COMPOSE_FILE_ARGS[@]}" down --remove-orphans
 
 info "Checking local listener ports..."
 configure_listener_port "Redis" "REDIS_PORT" "${REDIS_HOST:-127.0.0.1}" "6379"
@@ -604,20 +659,20 @@ configure_listener_port "WebUI backend" "WEBUI_PORT" "${WEBUI_HOST:-0.0.0.0}" "2
 configure_listener_port "OpenAIx endpoint" "OPENAIX_ENDPOINT_PORT" "${OPENAIX_ENDPOINT_HOST:-0.0.0.0}" "21434"
 configure_listener_port "MCP endpoint" "MCP_ENDPOINT_PORT" "${MCP_ENDPOINT_HOST:-0.0.0.0}" "20001"
 
-info "Starting Docker services (redis, nginx)…"
-$DOCKER_COMPOSE up -d --remove-orphans
+info "Starting Docker services (${REDIS_BACKEND}, nginx)…"
+$DOCKER_COMPOSE "${COMPOSE_FILE_ARGS[@]}" up -d --remove-orphans
 DOCKER_STARTED=1
 
-# Wait for Redis
-info "Waiting for Redis to be healthy…"
+# Wait for the datastore (both images ship redis-cli).
+info "Waiting for ${DATASTORE_LABEL} to be healthy…"
 REDIS_HOST="${REDIS_HOST:-127.0.0.1}"
 REDIS_PORT="${REDIS_PORT:-6379}"
-for i in $(seq 1 20); do
-  if docker exec -e REDISCLI_AUTH="${REDIS_PASSWORD:-}" aidir_redis redis-cli ping 2>/dev/null | grep -q PONG; then
-    info "Redis is up"
+for i in $(seq 1 40); do
+  if docker exec -e REDISCLI_AUTH="${REDIS_PASSWORD:-}" "$DATASTORE_CONTAINER" redis-cli ping 2>/dev/null | grep -q PONG; then
+    info "${DATASTORE_LABEL} is up"
     break
   fi
-  [[ $i -eq 20 ]] && die "Redis did not become healthy in time"
+  [[ $i -eq 40 ]] && die "${DATASTORE_LABEL} did not become healthy in time"
   sleep 1
 done
 
@@ -687,7 +742,11 @@ else
 fi
 
 DOCKER_COMPOSE_BIN="$(command -v docker) compose"
-SERVICE_EXEC_START_PRE="ExecStartPre=$DOCKER_COMPOSE_BIN -f $SCRIPT_DIR/docker-compose.yml up -d"
+COMPOSE_PRE_FILES="-f $SCRIPT_DIR/docker-compose.yml"
+if [[ "$REDIS_BACKEND" == "dragonfly" ]]; then
+  COMPOSE_PRE_FILES="$COMPOSE_PRE_FILES -f $SCRIPT_DIR/docker-compose.dragonfly.yml"
+fi
+SERVICE_EXEC_START_PRE="ExecStartPre=$DOCKER_COMPOSE_BIN $COMPOSE_PRE_FILES up -d"
 
 SERVICE_FILE="$SYSTEMD_DIR/$SERVICE_NAME.service"
 
@@ -776,7 +835,7 @@ if [[ "$DOCKER_BUILT" -eq 1 ]]; then
   info "  Docker build   : completed"
 fi
 if [[ "$DOCKER_STARTED" -eq 1 ]]; then
-  info "  Docker services: started (redis, nginx)"
+  info "  Docker services: started (${REDIS_BACKEND}, nginx)"
 fi
 if [[ "$CRON_UPDATED" -eq 1 ]]; then
   info "  Cron schedule  : ${CRON_STATE} (${CRON_PERIOD}m)"
@@ -792,7 +851,7 @@ echo ""
   info "  OpenAIx/Ollama API     : http://localhost:${OPENAIX_ENDPOINT_PORT:-21434}"
   info "  MCP endpoint           : http://localhost:${MCP_ENDPOINT_PORT:-20001}/mcp"
   info "  WebUI backend (direct) : http://${WEBUI_HOST:-0.0.0.0}:${WEBUI_PORT:-20082}"
-  info "  Redis                  : ${REDIS_HOST:-127.0.0.1}:${REDIS_PORT:-6379}"
+  info "  ${DATASTORE_LABEL}                  : ${REDIS_HOST:-127.0.0.1}:${REDIS_PORT:-6379} (maxmemory ${REDIS_MAXMEMORY:-0})"
   info "  Upstream Ollama        : ${OLLAMA_BASE_URL:-http://127.0.0.1:11434}"
 
   echo ""

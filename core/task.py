@@ -132,6 +132,7 @@ class Task:
             "result":      json.dumps(self.result) if self.result is not None else "",
             "upstream_response": json.dumps(self.upstream_response) if self.upstream_response is not None else "",
             "error":       json.dumps(self.error) if self.error else "",
+            "error_code":  str((self.error or {}).get("code") or "") if isinstance(self.error, dict) else "",
             "llm_call_count": str(int(self.llm_call_count or 0)),
             "llm_call_history": json.dumps(self.llm_call_history or []),
             "hook_metadata": json.dumps(self.hook_metadata or {}),

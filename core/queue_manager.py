@@ -19,6 +19,7 @@ from core.task import (
     STATUS_CREATED, STATUS_QUEUED, STATUS_RUNNING,
     STATUS_COMPLETED, STATUS_FAILED, STATUS_CANCELED,
 )
+from core.task_store import TaskStore
 
 if TYPE_CHECKING:
     pass
@@ -41,12 +42,20 @@ class QueueManager:
         status_change_callback: Callable[[Task], Awaitable[None]] | None = None,
         task_created_callback: Callable[[Task], Awaitable[None]] | None = None,
         audit_log=None,
+        body_compression_level: int = 6,
+        body_storage_enabled: bool = True,
     ) -> None:
         self._redis = redis_client
         self._ns = instance                        # key namespace
         self._tasks: dict[str, Task] = {}          # task_id -> Task
         self._status_change_callback = status_change_callback
         self._task_created_callback = task_created_callback
+        self._store = TaskStore(
+            redis_client,
+            instance,
+            compression_level=body_compression_level,
+            enabled=body_storage_enabled,
+        )
         # The queue-state aggregation scans every queued task, and the dashboard
         # asks for it every three seconds. The answer is a snapshot, so a short
         # cache is enough and the cost of the scan disappears.
@@ -77,6 +86,9 @@ class QueueManager:
         task.updated_at = datetime.now(timezone.utc)
         pipe = self._redis.pipeline(transaction=True)
         pipe.zadd(self._q(task.type), {task.id: self._queue_score(task)})
+        # A retry or a re-enqueue writes the full inline hash again; a body blob
+        # and its marker from an earlier terminal state must not shadow it.
+        self._store.reset_inline(task.id, pipe=pipe)
         pipe.hset(self._tk(task.id), mapping=task.to_redis_hash())
         await pipe.execute()
         self._tasks[task.id] = task
@@ -219,15 +231,10 @@ class QueueManager:
         task.updated_at = now
         task.finished_at = now
         task.error = None
-        await self._redis.hset(self._tk(task.id), mapping={
-            "status":      STATUS_COMPLETED,
-            "updated_at":  now.isoformat(),
-            "finished_at": task.finished_at.isoformat(),
-            "result":      json.dumps(task.result) if task.result is not None else "",
-            "upstream_response": json.dumps(task.upstream_response) if task.upstream_response is not None else "",
-            "error":       "",
-            "error_code":  "",
-        })
+        # Terminal tasks hold the bulk of the data, so they are written in the
+        # split layout: metadata stays in the hash, bodies go to one compressed
+        # string key that an SSD-tiering store can move out of RAM.
+        await self._store.save_terminal(task.id, task.to_redis_hash())
         await task._chunk_queue.put(None)   # stream sentinel
         task._done_event.set()
         self._record_terminal_audit(task)
@@ -240,13 +247,7 @@ class QueueManager:
         task.updated_at = now
         task.finished_at = now
         task.error = error
-        await self._redis.hset(self._tk(task.id), mapping={
-            "status":      STATUS_FAILED,
-            "updated_at":  now.isoformat(),
-            "finished_at": task.finished_at.isoformat(),
-            "error":       json.dumps(error),
-            "error_code":  str(error.get("code") or ""),
-        })
+        await self._store.save_terminal(task.id, task.to_redis_hash())
         await task._chunk_queue.put(None)   # stream sentinel
         task._done_event.set()
         self._record_terminal_audit(task)
@@ -258,11 +259,7 @@ class QueueManager:
         task.status = STATUS_CANCELED
         task.updated_at = now
         task.finished_at = now
-        await self._redis.hset(self._tk(task.id), mapping={
-            "status":      STATUS_CANCELED,
-            "updated_at":  now.isoformat(),
-            "finished_at": task.finished_at.isoformat(),
-        })
+        await self._store.save_terminal(task.id, task.to_redis_hash())
         await task._chunk_queue.put(None)   # stream sentinel
         task._done_event.set()
         self._record_terminal_audit(task)
@@ -293,7 +290,7 @@ class QueueManager:
             })
         pipe = self._redis.pipeline()
         if not is_external:
-            pipe.delete(self._tk(task_id))
+            self._store.delete(task_id, pipe=pipe)
         # Always remove from queue ZSET (task is no longer waiting)
         for task_type in self._QUEUE_TASK_TYPES:
             pipe.zrem(self._q(task_type), task_id)
@@ -313,10 +310,7 @@ class QueueManager:
         """
         if task_id in self._tasks:
             return self._tasks[task_id]
-        try:
-            raw = await self._redis.hgetall(self._tk(task_id))
-        except Exception:
-            return None
+        raw = await self._store.load(task_id)
         if not raw:
             return None
         try:

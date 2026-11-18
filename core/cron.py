@@ -26,6 +26,7 @@ from core import log             # noqa: E402
 from core.app import Core        # noqa: E402
 from core.audit_log import AuditLog  # noqa: E402
 from core.logger import logs_dir  # noqa: E402
+from core.task_store import offload_terminal_task_bodies  # noqa: E402
 from core.workers_loader import resolve_worker_configs  # noqa: E402
 
 import redis.asyncio as aioredis  # noqa: E402
@@ -256,6 +257,34 @@ async def retain_audit_logs(redis: aioredis.Redis) -> None:
         log("audit", "info", f"Removed audit partitions: {', '.join(removed)}", "retention")
 
 
+async def offload_task_bodies(redis: aioredis.Redis) -> None:
+    """Move inline bodies of terminal tasks to compressed string keys.
+
+    The cursor in Redis drains a large backlog across cycles. This also
+    converts tasks written before the split layout existed, and terminal tasks
+    that a cron job marked directly without going through QueueManager.
+    """
+    interval = max(10, _to_int(config.get("cron_period") or 60, 60))
+    if not await _should_run(redis, "offload_task_bodies", interval):
+        return
+
+    namespace = config.get("instance", "aidir")
+    batch = max(1, _to_int(config.get("tasks.body_offload_batch") or 500, 500))
+    result = await offload_terminal_task_bodies(
+        redis,
+        namespace,
+        limit=batch,
+        compression_level=_to_int(config.get("tasks.body_compression_level") or 6, 6),
+        enabled=bool(config.get("tasks.body_storage", True)),
+    )
+    if result.get("offloaded"):
+        log(
+            "system",
+            "info",
+            f"offload_task_bodies: compressed {result['offloaded']} task body set(s)",
+        )
+
+
 async def cleanup_stale_tasks(redis: aioredis.Redis) -> None:
     """Fail running tasks that outlived their run timeout by a safety margin."""
     interval = max(10, _to_int(config.get("cron_period") or 60, 60))
@@ -407,7 +436,7 @@ async def cleanup_expired_tasks(redis: aioredis.Redis) -> None:
                     ft_dt = ft_dt.replace(tzinfo=timezone.utc)
                 ft = ft_dt.timestamp()
                 if ft < cutoff:
-                    await redis.delete(key)
+                    await redis.delete(key, f"{ns}:taskbody:{task_id}")
                     deleted += 1
             except Exception as exc:
                 log("system", "warning", f"cleanup_expired_tasks: skip {key}: {exc}")
@@ -593,6 +622,7 @@ async def run_cycle(redis: aioredis.Redis, core: Core | None = None) -> None:
         await _run_job("retain_audit_logs", retain_audit_logs(redis)),
         await _run_job("health_check", health_check(redis)),
         await _run_job("cleanup_stale_tasks", cleanup_stale_tasks(redis)),
+        await _run_job("offload_task_bodies", offload_task_bodies(redis)),
         await _run_job("cleanup_expired_tasks", cleanup_expired_tasks(redis)),
         await _run_job("prune_envid_contexts", prune_envid_contexts(redis)),
         await _run_job("keep_alive_ping", keep_alive_ping(redis)),

@@ -36,6 +36,7 @@ from fastapi.staticfiles import StaticFiles
 from core import log
 from core.error_logging import attach_request_id_middleware, get_or_create_request_id, log_exception
 from core.messages_protocol import internal_request_to_messages
+from core.task_store import TaskStore
 
 if TYPE_CHECKING:
     from core.app import Core
@@ -395,7 +396,10 @@ def _find_envid(value: Any, depth: int = 0) -> str:
 
 
 def _task_envid(task: dict[str, Any]) -> str:
-    """Extract envid from task payload/context, including nested structures."""
+    """Extract envid from the metadata field or the decoded body structures."""
+    direct = str(task.get("envid") or "").strip()
+    if direct:
+        return direct
     for source_name in ("context", "payload", "parent_context"):
         source = task.get(source_name)
         found = _find_envid(source)
@@ -1149,11 +1153,11 @@ def create_app(
             if raw_payload is None
         ]
         if missing_payload_keys:
-            pipeline = core.redis.pipeline(transaction=False)
-            for task_key in missing_payload_keys:
-                pipeline.hmget(task_key, "payload")
-            for task_key, values in zip(missing_payload_keys, await pipeline.execute()):
-                payloads[task_key] = values[0] if values else None
+            store = TaskStore(core.redis, ns)
+            ids = [task_key.rsplit(":", 1)[-1] for task_key in missing_payload_keys]
+            fetched = await store.load_payloads(ids)
+            for task_key, task_id in zip(missing_payload_keys, ids):
+                payloads[task_key] = fetched.get(task_id) or None
 
         tasks = []
         for _, _, task, task_key, _ in items:
@@ -1178,7 +1182,7 @@ def create_app(
             return {"task": _task_to_api_item(_task_from_hash(live_task.to_redis_hash()), core)}
 
         ns = core.config.get("instance", "aidir")
-        raw = await core.redis.hgetall(f"{ns}:task:{task_id}")
+        raw = await TaskStore(core.redis, ns).load(task_id)
         if not raw:
             raise HTTPException(status_code=404, detail="Task not found")
         return {"task": _task_to_api_item(_task_from_hash(raw), core)}
@@ -1192,7 +1196,7 @@ def create_app(
             task = _task_summary_from_hash(raw, core)
         else:
             ns = core.config.get("instance", "aidir")
-            raw = await core.redis.hgetall(f"{ns}:task:{task_id}")
+            raw = await TaskStore(core.redis, ns).load(task_id)
             if not raw:
                 raise HTTPException(status_code=404, detail="Task not found")
             task = _task_summary_from_hash(raw, core)
@@ -1228,7 +1232,7 @@ def create_app(
             raw = live_task.to_redis_hash()
         else:
             ns = core.config.get("instance", "aidir")
-            raw = await core.redis.hgetall(f"{ns}:task:{task_id}")
+            raw = await TaskStore(core.redis, ns).load(task_id)
         event = _task_payload_event(task_id, raw or {})
         if event is None:
             raise HTTPException(status_code=404, detail="Client request audit event is unavailable")

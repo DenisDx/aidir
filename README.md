@@ -136,9 +136,15 @@ Copy from `.env.example`. **Never commit this file** (it is in `.gitignore`).
 |---|---|---|
 | `AIDIR_INSTANCE` | `aidir1` | Key prefix in Redis; change if running multiple instances |
 | `AIDIR_ROOT` | *(must set)* | Absolute path to the project directory |
-| `REDIS_HOST` | `127.0.0.1` | Redis host |
-| `REDIS_PORT` | `6379` | Redis port |
-| `REDIS_PASSWORD` | *(empty)* | Redis password (leave empty for no auth) |
+| `REDIS_HOST` | `127.0.0.1` | Datastore host |
+| `REDIS_PORT` | `6379` | Datastore port |
+| `REDIS_PASSWORD` | *(empty)* | Datastore password (leave empty for no auth) |
+| `REDIS_BACKEND` | `redis` | `redis` for plain Redis, `dragonfly` for SSD tiering; also selected by `install.sh` |
+| `REDIS_MAXMEMORY` | `0` (Redis) / `3gb` (Dragonfly) | RAM cap such as `3gb`; `0` disables it |
+| `REDIS_MAXMEMORY_POLICY` | `noeviction` | Eviction policy for plain Redis |
+| `REDIS_MAXMEMORY_SAMPLES` | `5` | Keys sampled per eviction decision |
+| `REDIS_LAZYFREE_LAZY_EXPIRE` | `false` | Free expired values asynchronously |
+| `REDIS_LAZYFREE_LAZY_USER_DEL` | `false` | Free user-deleted values asynchronously |
 | `OPENAIX_ENDPOINT_PORT` | `21434` | Port where aidir listens for OpenAIx/Ollama-compatible API clients |
 | `OPENAIX_ENDPOINT_HOST` | `0.0.0.0` | Bind address for the OpenAIx endpoint |
 | `MCP_ENDPOINT_PORT` | `20001` | Port where aidir listens for MCP JSON-RPC requests |
@@ -588,6 +594,38 @@ are never removed by this retention job. On service startup, persisted queued
 agent and tool tasks are restored before scheduling; malformed queue members
 are quarantined, while persisted running tasks are marked failed with
 `SERVICE_RESTARTED` rather than replayed.
+
+### Datastore: Redis or Dragonfly
+
+Plain Redis remains the default and needs no changes: the application keeps
+using one Redis hash per task, and data written before the split layout is read
+transparently.
+
+Finished tasks are written in a split layout: the task hash keeps small
+metadata, while `payload`, `result`, `upstream_response` and
+`llm_call_history` move to one compressed string key
+(`<instance>:taskbody:<id>`). Cron converts terminal tasks written by older
+versions in batches (`tasks.body_offload_batch`). The compression level is
+`tasks.body_compression_level` (0 disables compression).
+
+This layout lets Dragonfly move cold bodies to an SSD while keys and metadata
+stay in RAM. `install.sh` asks which backend to use and keeps the choice in
+`.env` (`REDIS_BACKEND`); the base `docker-compose.yml` always starts Redis, and
+the installer adds `docker-compose.dragonfly.yml` when Dragonfly is selected.
+Dragonfly requires a memory lock limit and `seccomp=unconfined` because SSD
+tiering uses io_uring. The RAM budget is `redis.maxmemory` (`REDIS_MAXMEMORY`),
+for example `3gb`; it is not a capacity limit because bodies can live on disk.
+
+To convert an existing Redis installation, start Dragonfly on a second port and
+copy the data while the old server is still running:
+
+```bash
+python -m core.migrate_datastore \
+  --source-port 6379 --dest-port 6380
+```
+
+The tool preserves TTLs, copies every key type used by aidir, and writes
+terminal task bodies in the split compressed layout.
 
 ### llama.cpp providers
 

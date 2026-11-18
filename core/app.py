@@ -90,6 +90,15 @@ def _enable_signal_stack_dump() -> None:
         pass
 
 
+def _body_compression_level(config) -> int:
+    """Body compression level from config, clamped to the zlib range."""
+    try:
+        level = int(config.get("tasks.body_compression_level", 6) or 0)
+    except (TypeError, ValueError):
+        level = 6
+    return max(0, min(9, level))
+
+
 class Core:
     """
     Central orchestrator.
@@ -307,6 +316,7 @@ class Core:
         try:
             await self.redis.ping()
             log("core", lifecycle_level, "Redis connected")
+            await self._apply_redis_runtime_settings()
         except Exception as exc:
             host = redis_cfg.get("host", "127.0.0.1")
             port = redis_cfg.get("port", 6379)
@@ -337,6 +347,8 @@ class Core:
             status_change_callback=self._on_task_status_change,
             task_created_callback=self._on_task_created,
             audit_log=self.audit_log,
+            body_compression_level=_body_compression_level(self.config),
+            body_storage_enabled=bool(self.config.get("tasks.body_storage", True)),
         )
         if self._owns_task_recovery():
             recovery = await self.queue.recover_startup_tasks()
@@ -525,6 +537,47 @@ class Core:
         total_elapsed = time.monotonic() - started_at
         log("core", lifecycle_level, f"Core stopping completed in {total_elapsed:.3f}s")
 
+    async def _apply_redis_runtime_settings(self) -> None:
+        """Apply the datastore memory policy from config, best-effort.
+
+        The container also receives the same values as startup flags, so the
+        limit holds before aidir starts. CONFIG SET is what makes the config
+        file authoritative when it changes on reload. A server that does not
+        support one of the settings (Dragonfly ignores a few Redis options)
+        logs a warning instead of failing the start.
+        """
+        cfg = self.config.get("redis") or {}
+        backend = str(cfg.get("backend") or "redis")
+        settings = {"maxmemory": str(cfg.get("maxmemory") or "0")}
+        if backend != "dragonfly":
+            # Dragonfly exposes maxmemory but not the plain-Redis eviction and
+            # lazy-free options; sending them would only log warnings.
+            settings.update({
+                "maxmemory-policy": str(cfg.get("maxmemory_policy") or "noeviction"),
+                "maxmemory-samples": str(cfg.get("maxmemory_samples") or 5),
+                "lazyfree-lazy-expire": "yes" if cfg.get("lazyfree_lazy_expire") else "no",
+                "lazyfree-lazy-user-del": "yes" if cfg.get("lazyfree_lazy_user_del") else "no",
+            })
+        applied: list[str] = []
+        for name, value in settings.items():
+            try:
+                await self.redis.config_set(name, value)
+                applied.append(name)
+            except Exception as exc:
+                log("system", "warning", f"Redis setting {name}={value} was not applied: {exc}")
+        try:
+            memory = await self.redis.info("memory")
+            used = int(memory.get("used_memory") or 0)
+            used_human = str(memory.get("used_memory_human") or f"{used} B")
+            log(
+                "system",
+                "info",
+                f"Datastore backend={backend} used_memory={used_human} "
+                f"maxmemory={settings['maxmemory']} applied={len(applied)}/{len(settings)}",
+            )
+        except Exception:
+            log("system", "info", f"Datastore backend={backend} settings applied={len(applied)}/{len(settings)}")
+
     async def reload_config(self) -> dict:
         """Re-read the configuration and re-apply the parts that may change at runtime.
 
@@ -581,6 +634,7 @@ class Core:
                 result["usage_rules_error"] = str(exc)
 
         result["restart_required"] = self._sections_needing_restart(before, after)
+        await self._apply_redis_runtime_settings()
         if result["restart_required"]:
             log(
                 "system",

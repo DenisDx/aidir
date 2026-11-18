@@ -702,8 +702,9 @@ def _check_redis(context: Context) -> CheckResult:
     """
     host, port, password = _redis_settings(context)
     reachable, error = _redis_ping(host, port, password)
-    published = _compose_published_port(context, "redis", 6379)
-    container = _compose_container(context, "redis")
+    service = _datastore_service(context)
+    published = _compose_published_port(context, service, 6379)
+    container = _compose_container(context, service)
     details: list[str] = []
     unprotected = not _redis_host_is_loopback(host) and not password
     if unprotected:
@@ -751,7 +752,7 @@ def _check_redis(context: Context) -> CheckResult:
         word in holder.lower() for word in ("docker-proxy", "dockerd", "containerd")
     )
     foreign_holder = bool(holder) and not docker_holder
-    logs = _container_log_lines(context, "redis") if container and not context.dry_run else []
+    logs = _container_log_lines(context, service) if container and not context.dry_run else []
     permission_denied = any("permission denied" in line.lower() for line in logs)
     listening_inside = inside.startswith(("pong", "auth-required"))
 
@@ -769,16 +770,16 @@ def _check_redis(context: Context) -> CheckResult:
         if chown.get("applied"):
             result.fixes.append({"action": "recreate redis", "class": VISIBLE})
             _apply_fix(context, result.fixes[-1],
-                       command=_compose_command(context, ["up", "-d", "--force-recreate", "redis"]))
+                       command=_compose_command(context, ["up", "-d", "--force-recreate", service]))
     elif context.fix_all:
         result.fixes.append({"action": "docker compose up -d --force-recreate redis",
                              "class": VISIBLE})
         _apply_fix(context, result.fixes[-1],
-                   command=_compose_command(context, ["up", "-d", "--force-recreate", "redis"]))
+                   command=_compose_command(context, ["up", "-d", "--force-recreate", service]))
     elif context.fix and not container:
         result.fixes.append({"action": "docker compose up -d redis", "class": SAFE})
         _apply_fix(context, result.fixes[-1],
-                   command=_compose_command(context, ["up", "-d", "redis"]))
+                   command=_compose_command(context, ["up", "-d", service]))
 
     if any(fix.get("applied") for fix in result.fixes) and not context.dry_run:
         reachable, error = _wait_redis(host, port, password)
@@ -799,7 +800,7 @@ def _check_redis(context: Context) -> CheckResult:
     # explains itself in the last lines.
     state = _docker_state(context, container) if container else state
     if container and not context.dry_run:
-        logs = _container_log_lines(context, "redis")
+        logs = _container_log_lines(context, service)
         for line in logs:
             result.details.append(f"log: {line}")
     attempted = bool(result.fixes and result.fixes[-1].get("attempted"))
@@ -1245,8 +1246,11 @@ def _run(command: Sequence[str], *, timeout: int = 30) -> tuple[int, str]:
 
 
 def _compose_command(context: Context, args: Sequence[str]) -> list[str]:
-    """The compose invocation for this checkout."""
-    return ["docker", "compose", "-f", str(context.root / "docker-compose.yml"), *args]
+    """The compose invocation for this checkout and the configured backend."""
+    command = ["docker", "compose", "-f", str(context.root / "docker-compose.yml")]
+    if _datastore_backend(context) == "dragonfly":
+        command += ["-f", str(context.root / "docker-compose.dragonfly.yml")]
+    return [*command, *args]
 
 
 def _compose(context: Context, args: Sequence[str], *, timeout: int = 30) -> tuple[int, str]:
@@ -1410,6 +1414,18 @@ def _port_from_address(value: str) -> int | None:
     return int(port) if port.isdigit() else None
 
 
+def _datastore_backend(context: Context) -> str:
+    """Configured datastore backend: redis or dragonfly."""
+    settings = _resolved(context)
+    backend = str(settings.get("redis.backend") or _env(context).get("REDIS_BACKEND", "redis"))
+    return "dragonfly" if backend == "dragonfly" else "redis"
+
+
+def _datastore_service(context: Context) -> str:
+    """Compose service name; both backends keep the name `redis`."""
+    return "redis"
+
+
 def _redis_settings(context: Context) -> tuple[str, int, str]:
     """Redis host, port and password from the resolved config or .env."""
     settings = _resolved(context)
@@ -1423,7 +1439,8 @@ def _redis_settings(context: Context) -> tuple[str, int, str]:
 
 def _container_redis_ping(context: Context) -> tuple[str, str]:
     """Whether Redis answers *inside* its container: pong, auth-required, no."""
-    code, out = _compose(context, ["exec", "-T", "redis", "redis-cli", "ping"], timeout=15)
+    service = _datastore_service(context)
+    code, out = _compose(context, ["exec", "-T", service, "redis-cli", "ping"], timeout=15)
     text = out.strip()
     lowered = text.lower()
     if "pong" in lowered:

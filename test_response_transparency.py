@@ -16,6 +16,8 @@ from core.endpoints.endpoint_openaix import Endpoint_openaix
 from core.queue_manager import QueueManager
 from core.scheduler import Scheduler
 from core.task import STATUS_COMPLETED, STATUS_FAILED, Task
+from core.task_store import TaskStore
+from test_task_store import FakeRedis
 from core.task_types.task_agent import Task_agent
 from core.upstream_response import UpstreamChunk, capture_response, original_payload, original_response
 from core.worker import WorkerResult
@@ -376,7 +378,7 @@ class ResponseTransparencyTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_scheduler_transfers_and_persists_original_transport(self) -> None:
         """Exercise the real scheduler and queue handoff, not just endpoint helper state."""
-        redis = SimpleNamespace(hset=AsyncMock())
+        redis = FakeRedis()
         queue = QueueManager(redis)
         task = Task_agent(payload={})
         queue._tasks[task.id] = task
@@ -386,7 +388,8 @@ class ResponseTransparencyTests(unittest.IsolatedAsyncioTestCase):
         await scheduler._run_task(task, worker)
         self.assertEqual(task.status, STATUS_COMPLETED)
         self.assertEqual(task.upstream_response, metadata)
-        self.assertEqual(json.loads(redis.hset.call_args.kwargs["mapping"]["upstream_response"]), metadata)
+        stored = await TaskStore(redis, "aidir").load(task.id)
+        self.assertEqual(json.loads(stored["upstream_response"]), metadata)
 
     def test_task_hash_has_no_none_values_with_empty_context(self) -> None:
         """Serialize an empty runtime context without a None envid breaking Redis."""
@@ -415,7 +418,7 @@ class ResponseTransparencyTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_scheduler_preserves_upstream_error_when_fallback_requeue_fails(self) -> None:
         """Keep the real upstream failure when smart-fallback persistence fails."""
-        redis = SimpleNamespace(hset=AsyncMock())
+        redis = FakeRedis()
         queue = QueueManager(redis)
         task = Task_agent(payload={"model": "local-only", "messages": []}, stream=True)
         task.config = {
@@ -444,21 +447,25 @@ class ResponseTransparencyTests(unittest.IsolatedAsyncioTestCase):
             await scheduler._run_task(task, worker)
         self.assertEqual(task.status, STATUS_FAILED)
         self.assertEqual(task.error, error)
-        self.assertEqual(json.loads(redis.hset.call_args.kwargs["mapping"]["error"]), error)
+        stored = await TaskStore(redis, "aidir").load(task.id)
+        self.assertEqual(json.loads(stored["error"]), error)
 
     async def test_queue_persists_and_clears_original_response(self) -> None:
         """Persist the final transport and clear it before a subsequent attempt."""
-        redis = SimpleNamespace(hset=AsyncMock())
+        redis = FakeRedis()
         queue = QueueManager(redis)
         task = Task_agent(payload={})
         task.upstream_response = capture_response("openai", 200, "application/json", json.dumps(self.openai))
         queue._tasks[task.id] = task
         await queue.mark_completed(task)
-        stored = redis.hset.call_args.kwargs["mapping"]["upstream_response"]
-        self.assertEqual(json.loads(stored), task.upstream_response)
+        store = TaskStore(redis, "aidir")
+        stored = await store.load(task.id)
+        self.assertEqual(json.loads(stored["upstream_response"]), task.upstream_response)
+        await queue.add_task(task, is_retry=True)
         await queue.mark_running(task.id, "worker")
         self.assertIsNone(task.upstream_response)
-        self.assertEqual(redis.hset.call_args.kwargs["mapping"]["upstream_response"], "")
+        cleared = await store.load(task.id)
+        self.assertEqual(cleared["upstream_response"], "")
 
     def test_real_http_routes_keep_native_response_bytes(self) -> None:
         """Exercise actual OpenAI/Ollama HTTP routes with a completed native response."""

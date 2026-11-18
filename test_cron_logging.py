@@ -326,6 +326,7 @@ class TestCronLogging(unittest.TestCase):
         orig_trim = cron.trim_logs_by_size
         orig_health = cron.health_check
         orig_cleanup_stale = cron.cleanup_stale_tasks
+        orig_offload = cron.offload_task_bodies
         orig_cleanup_expired = cron.cleanup_expired_tasks
         orig_prune_envid = cron.prune_envid_contexts
         orig_keep_alive = cron.keep_alive_ping
@@ -339,6 +340,7 @@ class TestCronLogging(unittest.TestCase):
             cron.trim_logs_by_size = lambda r: _ok("trim")
             cron.health_check = lambda r: _ok("health")
             cron.cleanup_stale_tasks = lambda r: _ok("cleanup_stale")
+            cron.offload_task_bodies = lambda r: _ok("offload")
             cron.cleanup_expired_tasks = lambda r: _ok("cleanup_expired")
             cron.prune_envid_contexts = lambda r: _ok("prune_envid")
             cron.keep_alive_ping = lambda r: _ok("keep_alive")
@@ -353,6 +355,7 @@ class TestCronLogging(unittest.TestCase):
             cron.trim_logs_by_size = orig_trim
             cron.health_check = orig_health
             cron.cleanup_stale_tasks = orig_cleanup_stale
+            cron.offload_task_bodies = orig_offload
             cron.cleanup_expired_tasks = orig_cleanup_expired
             cron.prune_envid_contexts = orig_prune_envid
             cron.keep_alive_ping = orig_keep_alive
@@ -365,6 +368,7 @@ class TestCronLogging(unittest.TestCase):
             "trim",
             "health",
             "cleanup_stale",
+            "offload",
             "cleanup_expired",
             "prune_envid",
             "keep_alive",
@@ -402,6 +406,7 @@ class TestCronLogging(unittest.TestCase):
             "retain_audit_logs": cron.retain_audit_logs,
             "health_check": cron.health_check,
             "cleanup_stale_tasks": cron.cleanup_stale_tasks,
+            "offload_task_bodies": cron.offload_task_bodies,
             "cleanup_expired_tasks": cron.cleanup_expired_tasks,
             "prune_envid_contexts": cron.prune_envid_contexts,
             "keep_alive_ping": cron.keep_alive_ping,
@@ -415,6 +420,7 @@ class TestCronLogging(unittest.TestCase):
             cron.retain_audit_logs = _ok
             cron.health_check = _ok
             cron.cleanup_stale_tasks = _ok
+            cron.offload_task_bodies = _ok
             cron.cleanup_expired_tasks = _ok
             cron.prune_envid_contexts = _ok
             cron.keep_alive_ping = _ok

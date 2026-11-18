@@ -1,0 +1,32 @@
+# Dragonfly overlay for docker-compose.yml.
+#
+# It keeps the service name and container name (`redis` / `aidir_redis`), so the
+# application, doctor and the install script need no special casing. Only the
+# image and the process arguments change: Dragonfly speaks the Redis protocol
+# and adds an SSD tier for large values.
+#
+# Use it together with the base file:
+#   docker compose -f docker-compose.yml -f docker-compose.dragonfly.yml up -d
+services:
+  redis:
+    image: ${DRAGONFLY_IMAGE:-docker.dragonflydb.io/dragonflydb/dragonfly:v2.1.0}
+    # A separate data directory keeps the Redis dump intact as a backup and
+    # stops Dragonfly from loading a multi-gigabyte RDB into the RAM budget.
+    volumes:
+      - ./docker/volumes/dragonfly:/data
+    # SSD tiering needs io_uring, which Docker's default seccomp profile blocks.
+    security_opt:
+      - seccomp=unconfined
+    ulimits:
+      memlock: -1
+    command:
+      - "--proactor_threads=${DRAGONFLY_PROACTOR_THREADS:-4}"
+      - "--maxmemory=${REDIS_MAXMEMORY:-3gb}"
+      - "--requirepass=${REDIS_PASSWORD:-}"
+      - "--dir=/data"
+      - "--dbfilename=${DRAGONFLY_DBFILENAME:-dump}"
+      - "--tiered_prefix=/data/tiered/aidir"
+      - "--tiered_offload_threshold=${DRAGONFLY_OFFLOAD_THRESHOLD:-0.40}"
+      - "--tiered_upload_threshold=${DRAGONFLY_UPLOAD_THRESHOLD:-0.20}"
+      - "--tiered_min_value_size=${DRAGONFLY_TIER_MIN_VALUE_SIZE:-16384}"
+      - "--tiered_max_file_size=${DRAGONFLY_TIER_MAX_FILE_SIZE:-34359738368}"

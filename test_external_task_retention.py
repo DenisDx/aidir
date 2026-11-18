@@ -26,9 +26,9 @@ class _Redis:
         task = self.hashes[key]
         return [task.get(field) for field in fields]
 
-    async def delete(self, key):
-        """Delete one expired terminal task hash."""
-        self.deleted.append(key)
+    async def delete(self, *keys):
+        """Delete one expired terminal task and its body blob."""
+        self.deleted.extend(keys)
 
 
 class ExternalTaskRetentionTests(unittest.IsolatedAsyncioTestCase):
@@ -55,7 +55,7 @@ class ExternalTaskRetentionTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(cron, "_should_run", return_value=True), patch.object(cron.config, "get", side_effect=get_config):
             await cron.cleanup_expired_tasks(redis)
 
-        self.assertEqual(redis.deleted, ["aidir:task:old"])
+        self.assertEqual(redis.deleted, ["aidir:task:old", "aidir:taskbody:old"])
 
 
 if __name__ == "__main__":

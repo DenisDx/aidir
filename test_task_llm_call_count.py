@@ -32,11 +32,66 @@ from core.task_types.task_agent import Task_agent
 from webui.backend.app import create_app
 
 
+class _FakePipeline:
+    """Minimal pipeline for the split task store."""
+
+    def __init__(self, redis: "_FakeRedisCounter") -> None:
+        self._redis = redis
+        self._ops: list[tuple] = []
+
+    def hset(self, key, mapping=None, field=None, value=None):
+        self._ops.append(("hset", key, mapping, field, value))
+        return self
+
+    def hdel(self, key, *fields):
+        self._ops.append(("hdel", key, fields))
+        return self
+
+    def set(self, key, value):
+        self._ops.append(("set", key, value))
+        return self
+
+    def get(self, key):
+        self._ops.append(("get", key))
+        return self
+
+    def hget(self, key, field):
+        self._ops.append(("hget", key, field))
+        return self
+
+    def delete(self, *keys):
+        self._ops.append(("delete", keys))
+        return self
+
+    async def execute(self):
+        results = []
+        for op in self._ops:
+            name = op[0]
+            if name == "hset":
+                results.append(await self._redis.hset(op[1], mapping=op[2], field=op[3], value=op[4]))
+            elif name == "hdel":
+                results.append(await self._redis.hdel(op[1], *op[2]))
+            elif name == "set":
+                results.append(await self._redis.set(op[1], op[2]))
+            elif name == "get":
+                results.append(await self._redis.get(op[1]))
+            elif name == "hget":
+                results.append(await self._redis.hget(op[1], op[2]))
+            elif name == "delete":
+                results.append(await self._redis.delete(*op[1]))
+        self._ops = []
+        return results
+
+
 class _FakeRedisCounter:
     """Tiny redis stub supporting the subset used by QueueManager."""
 
     def __init__(self) -> None:
         self.hashes: dict[str, dict[str, str]] = {}
+        self.strings: dict[str, str] = {}
+
+    def pipeline(self, transaction=False):
+        return _FakePipeline(self)
 
     async def hincrby(self, key: str, field: str, amount: int) -> int:
         item = self.hashes.setdefault(key, {})
@@ -44,8 +99,41 @@ class _FakeRedisCounter:
         item[field] = str(next_value)
         return next_value
 
-    async def hset(self, key: str, mapping: dict[str, str]) -> None:
-        self.hashes.setdefault(key, {}).update(mapping)
+    async def hset(self, key: str, mapping: dict[str, str] | None = None, field=None, value=None) -> None:
+        item = self.hashes.setdefault(key, {})
+        if mapping:
+            item.update(mapping)
+        if field is not None:
+            item[str(field)] = str(value)
+
+    async def hdel(self, key: str, *fields: str) -> int:
+        item = self.hashes.get(key, {})
+        removed = 0
+        for name in fields:
+            if name in item:
+                del item[name]
+                removed += 1
+        return removed
+
+    async def hget(self, key: str, field: str):
+        return self.hashes.get(key, {}).get(field)
+
+    async def hgetall(self, key: str) -> dict[str, str]:
+        return dict(self.hashes.get(key, {}))
+
+    async def get(self, key: str):
+        return self.strings.get(key)
+
+    async def set(self, key: str, value: str) -> bool:
+        self.strings[key] = value
+        return True
+
+    async def delete(self, *keys: str) -> int:
+        removed = 0
+        for key in keys:
+            removed += 1 if self.strings.pop(key, None) is not None else 0
+            removed += 1 if self.hashes.pop(key, None) is not None else 0
+        return removed
 
 
 class _FakeTaskQueue:

@@ -33,7 +33,7 @@ python -m pip install -r requirements.txt
 The automated tests are mostly isolated from external AI services, but the
 live smoke and acceptance checks require:
 
-- Redis running on the configured `REDIS_HOST` and `REDIS_PORT`;
+- Redis or Dragonfly running on the configured `REDIS_HOST` and `REDIS_PORT`;
 - the AIDIR core service running for endpoint and WebUI checks;
 - Docker Compose services running for Redis and the public nginx entrypoint;
 - an upstream Ollama or another configured provider for inference checks;
@@ -73,6 +73,9 @@ The suite includes tests for:
   llama.cpp lifecycle;
 - scheduler priority, queue bypass, timeout diagnostics, restart recovery,
   shutdown, and task call counts;
+- task body/metadata split, compression, backward-compatible reads, and the
+  terminal-body offload pass (`test_task_store`);
+- datastore backend configuration and the Dragonfly overlay (`test_config_descriptor`);
 - resource monitoring, resource reuse, peer resources, and context overflow;
 - prefix-affinity routing, context fingerprints, context-only identity,
   resource-wait history, per-model parallel session admission, and direct
